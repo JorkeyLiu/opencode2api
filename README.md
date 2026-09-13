@@ -292,7 +292,7 @@ OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Z
 1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用；不要求名称包含 `free`。
 2. 模型 ID 大小写不敏感地包含 `free`；即使 metadata 尚未就绪、缺少该模型或显示为付费，也仍按名称条件视为免费。
 
-免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 target（固定 public 凭证 × 指派池代理 × 本次模型）；每个可用 target 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 target 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点、`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
+免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。候选分散与 fallback 由冻结顺序负责（HRW/round-robin 决定 target 顺序，fallback 按顺序走下一个）；同 target retry 只负责临时性验证，从不负责分散。匿名通道每个可用 target 最多一次 fallback 发送，整个通道另有唯一共享 transient token：首次传输错误、408/425 或 5xx 在同一 target、同 Route Session、同 body 上追加一次 transient retry；普通 4xx（404/422 等，排除 400/401/403/429/408/425）直接结束匿名通道（不再扫剩余代理），随后可进入认证 Key 阶段。任意 candidate 首次精确 HTTP 400 走专用恢复：同一 candidate 轮换 Route Session 后精确重放一次（同 request ID、attempt +1、同 target/协议/credential/proxy，始终在向客户端写任何字节之前；Responses 重放同时清理 `previous_response_id` 与 `input[]` 中的 `reasoning` 旧引用；不消耗 transient token），重放结果即整条路由最终结果，不再扫剩余代理、不进入认证 Tier。anonymous 不受 `retry.max_attempts` 截断。认证 Tier 按 `prefer` 排序（`go` 默认 Go→Zen，`zen` 则 Zen→Go），每 Tier 独立 transient token 与真实发送预算；精确 400 同样单次重放且终结整条路由，普通 4xx 结束当前 Tier 后可回退另一 Tier。客户端取消或请求总 deadline 立即终止整条路由，不再 retry/fallback，不改变任何状态。监控中的 `proxy_node` 表示所选代理节点、`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
 
 只有匿名通道、且 `zen_keys` 与 `go_keys` 都为空时，`/v1/models` 只展示按上述规则可匿名使用的模型。只要配置了任一真实上游 Key，模型列表仍展示该 Key 路由可用的完整模型集合。
 
@@ -302,9 +302,9 @@ models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址�
 
 代理以具名池组织，`proxy_routing` 决定 anonymous / zen / go 各自使用哪个池。相同引用共享同一传输池实例，不同引用完全隔离：Zen credential 只使用 `proxy_routing.zen` 指向的池，Go credential 只使用 `.go`，匿名凭证只走 `.anonymous`；隔离模式下各通道的候选互不相见。
 
-每次请求按 credential×proxy×模型展开 target 候选并冻结顺序：有会话时按会话对完整 target 做 HRW（Rendezvous）降序排列，保证同会话同模型同资源下顺序稳定、节点增删只做最小扰动；无会话的后台路径使用原子 round-robin 起始偏移，不使用随机。失败后按冻结顺序走下一个，同请求内不重排。
+每次请求按 credential×proxy×模型展开 target 候选并冻结顺序：有会话时按会话对完整 target 做 HRW（Rendezvous）降序排列，保证同会话同模型同资源下顺序稳定、节点增删只做最小扰动；无会话的后台路径使用原子 round-robin 起始偏移，不使用随机。分散与 fallback 只由该冻结顺序决定，同请求内不重排；同 target retry 永远不改变顺序，只在同一 target 上做临时性验证。
 
-状态分三层：proxy 传输健康只由超时/拒绝等连通性失败改变，HTTP 状态从不直接改变它；HTTP 401 全局冷却该 credential；403/429/5xx 只冷却命中的单个 (credential, proxy, model) target，同 credential 同 proxy 的其他模型不受影响；普通 4xx（含 400/404/422）中性，既不冷却也不清理已有状态；2xx 只清理本 target 与本 credential 的 401 状态。冷却按 `performance.failure_cooldown_seconds` 指数退避（确定性 ±20% 抖动，总封顶 5 分钟），429/403 的 `Retry-After` 取更大值同样封顶 5 分钟。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态 key×healthy proxy 遍历，只读 healthy 代理顺序，不读写前台 credential/target 状态，也不改变 proxy healthy/checking；刷新 context deadline/cancel 只是刷新失败，失败保留旧快照。
+状态分层：单次前台传输错误为中性，不写 target/credential 冷却，也不会立即因 timeout/refused 将 proxy 标 unhealthy；它只触发现有异步中性 proxy 健康 verification，只有该独立 probe 明确得到连通性失败（timeout/refused 等）时才允许翻转 proxy healthy。HTTP 状态从不直接改变 proxy 健康；HTTP 401 全局冷却该 credential；403/429/5xx 只冷却命中的单个 (credential, proxy, model) target，同 credential 同 proxy 的其他模型不受影响；408/425 为 transient 中性（可 retry/fallback，不冷却）；普通 4xx（含精确 400 与 404/422）中性，既不冷却也不清理已有状态（其中精确 400 另有同 target 单次会话重放语义，见上）；2xx 只清理本 target 与本 credential 的 401 状态。Route Session override 是内存 Gateway authority 的一部分（首代无状态派生，仅 400 轮换后存储，有界、idle TTL、确定性淘汰；不持久化、不进投影/日志/metrics/history/admin）。冷却按 `performance.failure_cooldown_seconds` 指数退避（确定性 ±20% 抖动，总封顶 5 分钟），429/403 的 `Retry-After` 取更大值同样封顶 5 分钟。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态 key×healthy proxy 遍历，只读 healthy 代理顺序，不读写前台 credential/target/route-session 状态，也不改变 proxy healthy/checking；刷新 context deadline/cancel 只是刷新失败，失败保留旧快照。
 
 共享单池示例（默认，行为与旧版单代理池一致）：
 
@@ -364,7 +364,7 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `retry.max_attempts` | 每个认证 Key Tier 的最大尝试次数，包含第一次请求。Tier 内部遇到网络错误、401/403、限流或 5xx 按冻结的 target 顺序切换；其他 4xx 会结束当前 Tier。只要还有另一个可用 Tier，当前 Tier 的最终失败会继续按 `prefer` 顺序回退。anonymous 不使用此上限，而是将每个当前可用 target 各尝试一次。 |
+| `retry.max_attempts` | 每个认证 Key Tier 的真实发送预算，含首次发送与同 target transient retry。同一 Tier 内首次传输错误、408/425 或 5xx 共享一次同 target transient retry（同 Route Session、同 body）；401/403/429 无同 target retry，直接按冻结顺序 fallback；普通 4xx 结束当前 Tier。任意 candidate 首次精确 400 走专用 Route Session 重放一次，该次固定额外允许、不受本预算截断，重放结果即路由最终结果、不再走剩余候选或回退另一 Tier。只有非 400 恢复路径的 Tier 最终失败，且还有另一个可用 Tier 时，才按 `prefer` 回退。anonymous 不使用此上限，每个可用 target 最多一次 fallback 发送，另加全通道一次 transient retry 与可选一次 400 重放；普通 4xx 直接结束匿名通道。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
@@ -444,9 +444,10 @@ keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用
 代理会为上游添加 OpenCode 使用的 `User-Agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request` 和 `x-opencode-project` 请求头。
 
 - 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
-- 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
-- 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致；会话用于对 credential×proxy×模型 target 做 HRW 稳定排序，同会话的各轮落在同一 target，失败时按序回退。
+- 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成客户端会话 ID。
+- 没有显式会话标识时，使用第一条用户消息生成稳定客户端会话 ID，使同一段多轮对话保持一致；客户端会话只用于对 credential×proxy×模型 target 做 HRW 稳定排序，同会话的各轮落在同一 target，失败时按序回退；400 恢复不修改它、不重排已冻结候选。
 - 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
+- 上游实际发送的是按 route target scope 分离的 Route Session（上游 authority、tier、credential 内部身份、proxy pool、proxy 原始身份、target protocol；不含 model、不存原始 credential）：写入 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`，并同步覆盖已存在的 body `conversation_id`、`metadata.session_id`（缺失不新增，类型不符明确报错）。首代稳定无状态派生，仅 400 轮换后保存有界内存 override；Apply 会按 target scope 过滤迁移，重启丢失；override 不进日志/metrics/history/admin。
 - 上游请求同时发送 `x-session-affinity`、`X-Session-Id` 和可选的 `x-parent-session-id`，以兼容 OpenCode 近期的会话关联要求。
 
 ## 致谢

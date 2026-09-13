@@ -277,12 +277,20 @@ func TestRefreshDoesNotCreateCredentialState(t *testing.T) {
 			t.Fatalf("refresh must not create credential state")
 		}
 	}
-	// Transport failure via explicit proxy error still marks health on the
-	// real inference path, proving the refresh no-op did not disable it.
+	// A single foreground transport error stays neutral on the real inference
+	// path (no immediate health flip), proving the refresh no-op did not
+	// disable the path; only the independent probe result may flip health.
 	pool := gateway.pools["shared"]
 	cand := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m")
 	gateway.applyAttemptOutcome(context.Background(), cand, nil, syscall.ECONNREFUSED)
+	if !pool.items[0].healthy.Load() {
+		t.Fatalf("single transport failure must not immediately mark proxy unhealthy")
+	}
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
+		t.Fatalf("single transport failure must not cool target")
+	}
+	gateway.applyProxyHealthResult(proxyHealthResult{proxy: pool.items[0], err: syscall.ECONNREFUSED, failed: true, wasHealthy: true}, "test probe", 0)
 	if pool.items[0].healthy.Load() {
-		t.Fatalf("real transport failure must still mark proxy unhealthy")
+		t.Fatalf("failed probe must still mark proxy unhealthy")
 	}
 }

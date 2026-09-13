@@ -421,6 +421,7 @@ const (
 	AttemptClassAuthFailure      = "auth_failure"
 	AttemptClassRateLimited      = "rate_limited"
 	AttemptClassUpstreamFailure  = "upstream_failure"
+	AttemptClassTransientClient  = "transient_client"
 	AttemptClassClientRejected   = "client_rejected"
 	AttemptClassOtherResponse    = "other_response"
 )
@@ -431,10 +432,15 @@ const anonymousCredentialID = "anonymous"
 
 // attemptClassification carries the current routing semantics for one
 // upstream attempt without changing control flow. Retryable mirrors the
-// authenticated tier loop (only client_rejected ends the tier); CoolsDown
-// mirrors whether the attempt class can cool scheduler state (credential or
-// target). The scheduler itself branches on status codes for ownership;
-// callers only read these flags for observability.
+// fallback action (transport failures, 408/425, 401/403/429, 5xx, and other
+// responses advance the frozen candidate list; route-terminal 400 and
+// ordinary 4xx do not); CoolsDown mirrors whether the attempt class can cool
+// scheduler state (credential for 401, target for 403/429/5xx). 408/425 are
+// transient client responses: retryable and state-neutral, never ordinary
+// client rejections. Transport attempts never cool scheduler state; they only
+// trigger the async neutral proxy health verification. The scheduler itself
+// branches on status codes for ownership; callers only read these flags for
+// observability.
 type attemptClassification struct {
 	Class     string
 	Retryable bool
@@ -449,13 +455,15 @@ func classifyAttempt(status int, transportError bool) attemptClassification {
 		return attemptClassification{Class: AttemptClassSuccess}
 	}
 	if transportError {
-		return attemptClassification{Class: AttemptClassTransportFailure, Retryable: true, CoolsDown: true}
+		return attemptClassification{Class: AttemptClassTransportFailure, Retryable: true}
 	}
 	switch {
 	case status == 401 || status == 403:
 		return attemptClassification{Class: AttemptClassAuthFailure, Retryable: true, CoolsDown: true}
 	case status == 429:
 		return attemptClassification{Class: AttemptClassRateLimited, Retryable: true, CoolsDown: true}
+	case status == 408 || status == 425:
+		return attemptClassification{Class: AttemptClassTransientClient, Retryable: true}
 	case status >= 500:
 		return attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
 	case status >= 400 && status < 500:

@@ -24,8 +24,8 @@ func TestClassifyAttemptMatrix(t *testing.T) {
 	}{
 		{"success_200", 200, false, AttemptClassSuccess, false, false, false},
 		{"success_201", 201, false, AttemptClassSuccess, false, false, false},
-		{"transport", 0, true, AttemptClassTransportFailure, true, true, false},
-		{"transport_with_status", 500, true, AttemptClassTransportFailure, true, true, false},
+		{"transport", 0, true, AttemptClassTransportFailure, true, false, false},
+		{"transport_with_status", 500, true, AttemptClassTransportFailure, true, false, false},
 		{"auth_401", 401, false, AttemptClassAuthFailure, true, true, false},
 		{"auth_403", 403, false, AttemptClassAuthFailure, true, true, false},
 		{"rate_limited", 429, false, AttemptClassRateLimited, true, true, false},
@@ -34,6 +34,8 @@ func TestClassifyAttemptMatrix(t *testing.T) {
 		{"client_400", 400, false, AttemptClassClientRejected, false, false, true},
 		{"client_404", 404, false, AttemptClassClientRejected, false, false, true},
 		{"client_422", 422, false, AttemptClassClientRejected, false, false, true},
+		{"transient_408", 408, false, AttemptClassTransientClient, true, false, false},
+		{"transient_425", 425, false, AttemptClassTransientClient, true, false, false},
 		{"other_zero", 0, false, AttemptClassOtherResponse, true, false, false},
 		{"other_redirect", 302, false, AttemptClassOtherResponse, true, false, false},
 	}
@@ -178,13 +180,23 @@ func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 		t.Fatalf("success must clear cooldown, got %d", got)
 	}
-	// Non-proxy transport errors cool the target without marking the proxy.
-	gateway.applyAttemptOutcome(t.Context(), cand, nil, errors.New("connection reset by peer"))
-	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
-		t.Fatalf("transport failure must cool down")
+	// Single transport errors are neutral: no target cooldown, no proxy flip.
+	// They only trigger the async neutral verification; the classification
+	// stays retryable without claiming a cooldown.
+	class := gateway.applyAttemptOutcome(t.Context(), cand, nil, errors.New("connection reset by peer"))
+	if class.Class != AttemptClassTransportFailure || !class.Retryable || class.CoolsDown {
+		t.Fatalf("transport class=%+v want retryable=true coolsDown=false", class)
+	}
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
+		t.Fatalf("transport failure must not cool target, got %d", got)
 	}
 	if !proxy.healthy.Load() {
-		t.Fatalf("neutral transport error must not mark proxy unhealthy")
+		t.Fatalf("single transport error must not mark proxy unhealthy")
+	}
+	// Re-cool with 429 so the snapshot below still covers a cooling proxy.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
+		t.Fatalf("rate_limited must cool down")
 	}
 	statuses := gateway.anonymousTargetSummaries()
 	if len(statuses) != 2 {

@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,8 +19,8 @@ import (
 //     (timeout/deadline/refused) may set unhealthy; HTTP statuses never do.
 //   - credentialState: global per-credential cooldown, 401 only.
 //   - targetState: per (tier, credential, pool, proxy, model) cooldown for
-//     403/429/5xx and neutral transport errors. Ordinary 4xx is a no-op and
-//     2xx clears only the single target.
+//     403/429/5xx only. Transport errors and ordinary 4xx (including 400)
+//     are neutral no-ops and 2xx clears only the single target.
 //
 // Target identity uses the raw configured proxy URL string qualified by pool
 // name for internal matching; external output always uses redactURL.
@@ -93,12 +94,13 @@ type targetEntry struct {
 }
 
 type targetScheduler struct {
-	mu           sync.Mutex
-	baseCooldown time.Duration
-	credState    map[string]*credentialEntry
-	targetState  map[string]*targetEntry
-	credDisplay  map[string]string
-	roundRobin   atomic.Uint64
+	mu            sync.Mutex
+	baseCooldown  time.Duration
+	credState     map[string]*credentialEntry
+	targetState   map[string]*targetEntry
+	credDisplay   map[string]string
+	roundRobin    atomic.Uint64
+	routeSessions *routeSessionStore
 }
 
 func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
@@ -106,11 +108,266 @@ func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
 		baseCooldown = 15 * time.Second
 	}
 	return &targetScheduler{
-		baseCooldown: baseCooldown,
-		credState:    make(map[string]*credentialEntry),
-		targetState:  make(map[string]*targetEntry),
-		credDisplay:  make(map[string]string),
+		baseCooldown:  baseCooldown,
+		credState:     make(map[string]*credentialEntry),
+		targetState:   make(map[string]*targetEntry),
+		credDisplay:   make(map[string]string),
+		routeSessions: newRouteSessionStore(),
 	}
+}
+
+// Route-session layer: client session vs upstream route session.
+//
+// The client session (ids.Session) is only affinity input for HRW ordering.
+// The upstream route session is what leaves the process in
+// x-opencode-session / x-session-affinity / X-Session-Id and in the prepared
+// body session fields. Its scope is target-bound: upstream authority
+// (normalized base URL), tier, internal credential identity, proxy pool, raw
+// proxy identity, and target protocol. Model is intentionally excluded so a
+// rotation does not fragment per model. Raw key material never enters the
+// scope; only the internal credential ID does. Scope keys, tokens, and raw
+// identities never enter projections, logs, metrics, or admin output.
+
+// routeSessionStoreCap bounds the in-memory 400-rotation override map.
+// First-generation sessions are stateless derivations and never stored;
+// only post-rotation overrides occupy entries.
+const routeSessionStoreCap = 4096
+
+// routeSessionIdleTTL expires an override that has not been used recently.
+// Expiry is checked on access and during insert/migration pruning.
+const routeSessionIdleTTL = 30 * time.Minute
+
+// routeSessionScope is the target-bound identity for one upstream route
+// session. It deliberately excludes model and any secret material.
+type routeSessionScope struct {
+	Authority string
+	Tier      Tier
+	CredID    string
+	Pool      string
+	ProxyRaw  string
+	Protocol  Protocol
+}
+
+func normalizeRouteAuthority(baseURL string) string {
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+func routeScopeForCandidate(authority string, cand targetCandidate, protocol Protocol) routeSessionScope {
+	return routeSessionScope{
+		Authority: normalizeRouteAuthority(authority),
+		Tier:      cand.Tier,
+		CredID:    cand.CredID,
+		Pool:      cand.PoolName,
+		ProxyRaw:  cand.ProxyRaw,
+		Protocol:  protocol,
+	}
+}
+
+func (s routeSessionScope) key() string {
+	return s.Authority + "\x00" + string(s.Tier) + "\x00" + s.CredID + "\x00" + s.Pool + "\x00" + s.ProxyRaw + "\x00" + string(s.Protocol)
+}
+
+// deriveFirstRouteSession is the stable, target-bound first generation:
+// SHA-256 over an independent domain, the client session key, and the target
+// scope. The rss_ prefix keeps it disjoint from the ses_ client namespace.
+// The same client+target is stable across requests; different targets always
+// differ.
+func deriveFirstRouteSession(clientSession string, scope routeSessionScope) string {
+	sum := sha256.Sum256([]byte("route-session-v1\x00" + clientSession + "\x00" + scope.key()))
+	return "rss_" + hex.EncodeToString(sum[:12])
+}
+
+func newRouteSessionToken() string {
+	return randomID("rss", 12)
+}
+
+type routeSessionEntry struct {
+	token    string
+	lastUsed int64 // unix nanos
+	scope    routeSessionScope
+}
+
+type routeSessionStore struct {
+	mu      sync.Mutex
+	entries map[string]*routeSessionEntry
+}
+
+func newRouteSessionStore() *routeSessionStore {
+	return &routeSessionStore{entries: make(map[string]*routeSessionEntry)}
+}
+
+func routeSessionMapKey(clientSession string, scope routeSessionScope) string {
+	return clientSession + "\x00" + scope.key()
+}
+
+// routeSessionFor returns the current upstream route session for one client
+// session + target scope: the stored override when present and fresh,
+// otherwise the stable first generation. Access refreshes idle TTL.
+func (s *targetScheduler) routeSessionFor(clientSession string, scope routeSessionScope) string {
+	if s == nil || s.routeSessions == nil {
+		return deriveFirstRouteSession(clientSession, scope)
+	}
+	return s.routeSessions.get(clientSession, scope)
+}
+
+// rotateRouteSession implements compare-and-rotate: when the stored token
+// still equals the observed token (or no override exists yet), it installs a
+// fresh cryptographically random token; when a concurrent request already
+// rotated, it returns the current token without generating a second
+// generation.
+func (s *targetScheduler) rotateRouteSession(clientSession string, scope routeSessionScope, observed string) string {
+	if s == nil || s.routeSessions == nil {
+		return newRouteSessionToken()
+	}
+	return s.routeSessions.rotate(clientSession, scope, observed)
+}
+
+func (st *routeSessionStore) get(clientSession string, scope routeSessionScope) string {
+	if st == nil {
+		return deriveFirstRouteSession(clientSession, scope)
+	}
+	key := routeSessionMapKey(clientSession, scope)
+	now := time.Now().UnixNano()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if entry, ok := st.entries[key]; ok {
+		if now-entry.lastUsed > int64(routeSessionIdleTTL) {
+			delete(st.entries, key)
+		} else {
+			entry.lastUsed = now
+			return entry.token
+		}
+	}
+	return deriveFirstRouteSession(clientSession, scope)
+}
+
+// rotate generates the candidate token before taking the lock so crypto/rand
+// never blocks the critical section, then confirms inside the lock
+// (CAS-like): only the holder of the observed generation installs the new
+// one.
+func (st *routeSessionStore) rotate(clientSession string, scope routeSessionScope, observed string) string {
+	candidate := newRouteSessionToken()
+	if st == nil {
+		return candidate
+	}
+	key := routeSessionMapKey(clientSession, scope)
+	now := time.Now().UnixNano()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if entry, ok := st.entries[key]; ok {
+		if now-entry.lastUsed > int64(routeSessionIdleTTL) {
+			entry.token = candidate
+			entry.lastUsed = now
+			entry.scope = scope
+			return candidate
+		}
+		if entry.token != observed {
+			entry.lastUsed = now
+			return entry.token
+		}
+		entry.token = candidate
+		entry.lastUsed = now
+		return candidate
+	}
+	if len(st.entries) >= routeSessionStoreCap {
+		st.pruneExpiredLocked(now)
+		if len(st.entries) >= routeSessionStoreCap {
+			st.evictOldestLocked()
+		}
+	}
+	if st.entries == nil {
+		st.entries = make(map[string]*routeSessionEntry)
+	}
+	st.entries[key] = &routeSessionEntry{token: candidate, lastUsed: now, scope: scope}
+	return candidate
+}
+
+func (st *routeSessionStore) pruneExpiredLocked(now int64) {
+	for key, entry := range st.entries {
+		if entry == nil || now-entry.lastUsed > int64(routeSessionIdleTTL) {
+			delete(st.entries, key)
+		}
+	}
+}
+
+// evictOldestLocked deterministically removes the least-recently-used entry
+// (smallest lastUsed, tie-break smallest key). Route overrides carry no
+// active-cooldown obligation, so eviction always applies at the cap.
+func (st *routeSessionStore) evictOldestLocked() {
+	var victim string
+	var victimAt int64
+	found := false
+	for key, entry := range st.entries {
+		at := int64(0)
+		if entry != nil {
+			at = entry.lastUsed
+		}
+		if !found || at < victimAt || (at == victimAt && key < victim) {
+			victim, victimAt, found = key, at, true
+		}
+	}
+	if found {
+		delete(st.entries, victim)
+	}
+}
+
+func (st *routeSessionStore) count() int {
+	if st == nil {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.entries)
+}
+
+// migrateRouteSessionsFrom copies still-fresh overrides whose target scope
+// still exists in the new Gateway (checked via valid). Expired entries never
+// cross Apply; new scopes start stateless and removed scopes are dropped.
+// Insertion respects the cap with the same prune-then-evict policy.
+func (st *routeSessionStore) migrateRouteSessionsFrom(old *routeSessionStore, valid func(routeSessionScope) bool) int {
+	if st == nil || old == nil || st == old {
+		return 0
+	}
+	now := time.Now().UnixNano()
+	old.mu.Lock()
+	type copied struct {
+		key   string
+		entry routeSessionEntry
+	}
+	staged := make([]copied, 0, len(old.entries))
+	for key, entry := range old.entries {
+		if entry == nil || entry.token == "" {
+			continue
+		}
+		if now-entry.lastUsed > int64(routeSessionIdleTTL) {
+			continue
+		}
+		staged = append(staged, copied{key: key, entry: *entry})
+	}
+	old.mu.Unlock()
+	sort.Slice(staged, func(i, j int) bool { return staged[i].key < staged[j].key })
+	migrated := 0
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, item := range staged {
+		if valid != nil && !valid(item.entry.scope) {
+			continue
+		}
+		if _, ok := st.entries[item.key]; ok {
+			continue
+		}
+		if len(st.entries) >= routeSessionStoreCap {
+			st.pruneExpiredLocked(now)
+			if len(st.entries) >= routeSessionStoreCap {
+				st.evictOldestLocked()
+			}
+		}
+		fresh := item.entry
+		fresh.lastUsed = now
+		st.entries[item.key] = &fresh
+		migrated++
+	}
+	return migrated
 }
 
 // deterministicJitter returns delay scaled by +/-20%, derived from
@@ -222,11 +479,13 @@ func (s *targetScheduler) noteCredentialAuthFailure(credID string) credentialCha
 	}
 }
 
-// noteTargetFailure cools one target identity for 403/429/5xx or a neutral
-// transport error. retryAfter (from a Retry-After header) takes effect only
-// when larger, and the total is capped at 5 minutes. The failure count is
-// retained after cooldown expiry for targetStaleRetention so the next failure
-// escalates; success deletes the entry.
+// noteTargetFailure cools one target identity for 403/429/5xx only.
+// Transport errors never reach this helper: they stay neutral and only
+// trigger the async proxy health verification. retryAfter (from a
+// Retry-After header) takes effect only when larger, and the total is capped
+// at 5 minutes. The failure count is retained after cooldown expiry for
+// targetStaleRetention so the next failure escalates; success deletes the
+// entry.
 func (s *targetScheduler) noteTargetFailure(identity, failureClass string, status int, retryAfter time.Duration) targetChange {
 	now := time.Now()
 	nowNanos := now.UnixNano()

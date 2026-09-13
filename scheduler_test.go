@@ -311,25 +311,42 @@ func TestStateMatrix(t *testing.T) {
 		}
 	})
 
-	t.Run("proxy_transport_marks_proxy_no_target_cool", func(t *testing.T) {
-		gateway, cand := setup()
-		gateway.applyAttemptOutcome(ctx, cand, nil, syscall.ECONNREFUSED)
-		if cand.Proxy.healthy.Load() {
-			t.Fatalf("proxy failure must mark proxy unhealthy")
-		}
-		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
-			t.Fatalf("proxy failure must not cool target")
+	t.Run("transport_neutral_no_cooldown_no_unhealthy", func(t *testing.T) {
+		for _, transportErr := range []error{syscall.ECONNREFUSED, errors.New("connection reset by peer")} {
+			gateway, cand := setup()
+			class := gateway.applyAttemptOutcome(ctx, cand, nil, transportErr)
+			if class.Class != AttemptClassTransportFailure || !class.Retryable || class.CoolsDown {
+				t.Fatalf("transport class=%+v want retryable=true coolsDown=false", class)
+			}
+			if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
+				t.Fatalf("single transport error must not cool target, got %d (%v)", got, transportErr)
+			}
+			if got := gateway.scheduler.credentialCoolUntil(cand.CredID); got != 0 {
+				t.Fatalf("transport error must not cool credential (%v)", transportErr)
+			}
+			if !cand.Proxy.healthy.Load() {
+				t.Fatalf("single transport error must not immediately mark proxy unhealthy (%v)", transportErr)
+			}
 		}
 	})
 
-	t.Run("other_transport_short_cools_target", func(t *testing.T) {
+	t.Run("async_probe_can_mark_unhealthy", func(t *testing.T) {
 		gateway, cand := setup()
-		gateway.applyAttemptOutcome(ctx, cand, nil, errors.New("connection reset by peer"))
-		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
-			t.Fatalf("neutral transport error must short-cool target")
-		}
+		// The foreground transport path above leaves the proxy healthy;
+		// only the independent probe result may flip it.
+		gateway.applyAttemptOutcome(ctx, cand, nil, syscall.ECONNREFUSED)
 		if !cand.Proxy.healthy.Load() {
-			t.Fatalf("neutral transport error must not mark proxy unhealthy")
+			t.Fatalf("foreground transport must leave proxy healthy for the probe to decide")
+		}
+		gateway.applyProxyHealthResult(proxyHealthResult{proxy: cand.Proxy, err: syscall.ECONNREFUSED, failed: true, wasHealthy: true}, "test probe", 0)
+		if cand.Proxy.healthy.Load() {
+			t.Fatalf("failed probe with isProxyFailure must mark proxy unhealthy")
+		}
+		// An inconclusive probe never flips health.
+		gateway2, cand2 := setup()
+		gateway2.applyProxyHealthResult(proxyHealthResult{proxy: cand2.Proxy, err: errors.New("connection reset by peer"), failed: false, wasHealthy: true}, "test probe", 0)
+		if !cand2.Proxy.healthy.Load() {
+			t.Fatalf("inconclusive probe must not mark proxy unhealthy")
 		}
 	})
 

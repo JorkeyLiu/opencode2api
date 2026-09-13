@@ -544,120 +544,153 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs) (*http.Response, modelRoute, error) {
-	resp, effectiveRoute, attempts, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
-	if err != nil || resp == nil || resp.StatusCode != http.StatusBadRequest {
-		return resp, effectiveRoute, err
-	}
-	origBody := resp.Body
-	errBody, readErr := io.ReadAll(io.LimitReader(origBody, 1<<20))
-	// The original network body is always closed here: the retry path below
-	// reuses the connection, otherwise downstream receives a fresh in-memory
-	// reader over the cached bytes.
-	drainAndClose(origBody)
-	if readErr != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(errBody))
-		return resp, effectiveRoute, nil
-	}
-	// Restore the body so downstream error handling still sees the original
-	// payload when no retry happens below.
-	resp.Body = io.NopCloser(bytes.NewReader(errBody))
-	if !isStaleReasoningReference(errBody) {
-		return resp, effectiveRoute, nil
-	}
-	stripped, changed := stripStaleReasoningInputs(effectiveRoute, bodies)
-	if !changed {
-		return resp, effectiveRoute, nil
-	}
-	// The referenced reasoning items belong to an upstream chain this session
-	// can no longer address (e.g. an interrupted stream). Replay once without
-	// them under a fresh upstream session instead of failing the client
-	// request outright. Attempt numbering continues from the first round so
-	// monitoring never shows duplicate attempt numbers for one request.
-	retryIDs := ids
-	retryIDs.Session = randomID("ses", 12)
-	g.logger.Info("retrying upstream without stale reasoning references", "component", "upstream", "event", "reasoning_reference_retry", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "attempt_offset", attempts)
-	retryResp, retryRoute, _, retryErr := g.doUpstreamTiers(ctx, effectiveRoute, stripped, retryIDs, attempts)
-	if retryErr != nil || retryResp == nil || retryResp.StatusCode/100 != 2 {
-		retryStatus := 0
-		if retryResp != nil {
-			retryStatus = retryResp.StatusCode
-			drainAndClose(retryResp.Body)
-		}
-		g.logger.Warn("reasoning reference retry failed; returning original error", "component", "upstream", "event", "reasoning_reference_retry_failed", "request_id", ids.Request, "model", route.ID, "tier", effectiveRoute.Tier, "error", retryErr, "retry_status", retryStatus)
-		fallback := *resp
-		fallback.Body = io.NopCloser(bytes.NewReader(errBody))
-		return &fallback, effectiveRoute, nil
-	}
-	return retryResp, retryRoute, nil
+	// Per-candidate 400 session recovery lives inside doUpstreamTiers (fixed
+	// same target, one replay with a rotated route session). No outer random
+	// session retry remains here: the client session is never rewritten and
+	// the frozen candidate order is never re-sorted.
+	resp, effectiveRoute, _, err := g.doUpstreamTiers(ctx, route, bodies, ids, 0)
+	return resp, effectiveRoute, err
 }
 
-// isStaleReasoningReference reports whether an upstream 400 body describes a
-// reasoning item/reference the server no longer recognizes, such as
-// "Referenced reasoning item 'rs_...' was not found or has expired".
-// Generic validation errors that merely mention reasoning (e.g. "unknown
-// reasoning field") must NOT match, so both the target phrase and the
-// gone/expired marker are required.
-func isStaleReasoningReference(body []byte) bool {
-	text := strings.ToLower(string(body))
-	if !strings.Contains(text, "reasoning item") && !strings.Contains(text, "reasoning reference") {
-		return false
-	}
-	for _, marker := range []string{"not found", "expir", "does not exist", "no longer"} {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// stripStaleReasoningInputs removes server-issued reasoning references from
-// Responses-protocol upstream payloads: replayed "reasoning" input items and
-// any previous_response_id chain link. Other tiers/protocols are passed
-// through untouched. It reports whether any payload actually changed.
-func stripStaleReasoningInputs(route modelRoute, bodies map[Tier][]byte) (map[Tier][]byte, bool) {
+// stripResponsesStaleRefs removes server-issued reasoning references from one
+// decoded Responses payload: any previous_response_id chain link and replayed
+// reasoning input items. It reports whether the payload changed and never
+// touches other inexpressible content.
+func stripResponsesStaleRefs(payload map[string]any) bool {
 	changed := false
-	out := make(map[Tier][]byte, len(bodies))
-	for tier, body := range bodies {
-		if len(body) == 0 || route.ProtocolFor(tier) != ProtocolResponses {
-			out[tier] = body
-			continue
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			out[tier] = body
-			continue
-		}
-		tierChanged := false
-		if _, ok := payload["previous_response_id"]; ok {
-			delete(payload, "previous_response_id")
-			tierChanged = true
-		}
-		if raw, ok := payload["input"].([]any); ok {
-			kept := make([]any, 0, len(raw))
-			for _, item := range raw {
-				if m, ok := item.(map[string]any); ok && stringAt(m, "type") == "reasoning" {
-					tierChanged = true
-					continue
-				}
-				kept = append(kept, item)
-			}
-			if tierChanged {
-				payload["input"] = kept
-			}
-		}
-		if !tierChanged {
-			out[tier] = body
-			continue
-		}
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			out[tier] = body
-			continue
-		}
-		out[tier] = encoded
+	if _, ok := payload["previous_response_id"]; ok {
+		delete(payload, "previous_response_id")
 		changed = true
 	}
-	return out, changed
+	if raw, ok := payload["input"].([]any); ok {
+		kept := make([]any, 0, len(raw))
+		stripped := false
+		for _, item := range raw {
+			if m, ok := item.(map[string]any); ok && stringAt(m, "type") == "reasoning" {
+				stripped = true
+				continue
+			}
+			kept = append(kept, item)
+		}
+		if stripped {
+			payload["input"] = kept
+			changed = true
+		}
+	}
+	return changed
+}
+
+// applyRouteSessionToBody builds one candidate-local body from the frozen
+// canonical tier body: it overwrites only already-present session fields
+// (top-level conversation_id, metadata.session_id) with the target-bound
+// route session and never invents schema-foreign fields. The canonical bytes
+// are never mutated; when nothing changes the canonical slice is returned
+// untouched. On replay for a Responses target it additionally drops
+// previous_response_id and reasoning input items. Malformed session fields
+// fail loudly instead of being silently dropped.
+func applyRouteSessionToBody(canonical []byte, routeSession string, protocol Protocol, stripStale bool) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(canonical, &payload); err != nil {
+		return nil, fmt.Errorf("route session body rewrite: %w", err)
+	}
+	changed := false
+	if _, ok := payload["conversation_id"]; ok {
+		raw := payload["conversation_id"]
+		if _, ok := raw.(string); !ok {
+			return nil, errors.New("conversation_id must be a string")
+		}
+		if payload["conversation_id"] != routeSession {
+			payload["conversation_id"] = routeSession
+			changed = true
+		}
+	}
+	if rawMD, ok := payload["metadata"]; ok && rawMD != nil {
+		md, ok := rawMD.(map[string]any)
+		if ok {
+			if _, ok := md["session_id"]; ok {
+				if _, ok := md["session_id"].(string); !ok {
+					return nil, errors.New("metadata.session_id must be a string")
+				}
+				if md["session_id"] != routeSession {
+					md["session_id"] = routeSession
+					changed = true
+				}
+			}
+		}
+		// Non-object metadata cannot carry session_id: retain it untouched.
+		// Returning an error here would reject legitimate string metadata on
+		// same-protocol passthrough, and silently dropping it would lose data.
+	}
+	if stripStale && protocol == ProtocolResponses {
+		if stripResponsesStaleRefs(payload) {
+			changed = true
+		}
+	}
+	if !changed {
+		return canonical, nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, errors.New("request contains unsupported JSON values")
+	}
+	return encoded, nil
+}
+
+// isRouteTerminalBadRequest reports the single route-terminal status: an
+// exact HTTP 400 response (no transport error). It terminates the whole
+// route: anonymous stops its remaining proxies and never enters the
+// authenticated tiers, and an authenticated tier never falls back to the
+// other tier. Ordinary 4xx (404/422, …) end the current channel/tier but may
+// still fall back to the next channel/tier; 408/425 are transient and never
+// terminal here.
+func isRouteTerminalBadRequest(resp *http.Response, err error) bool {
+	return err == nil && resp != nil && resp.StatusCode == http.StatusBadRequest
+}
+
+// isSameTargetTransient reports the same-target retry set: a headers-before
+// transport error (caller guarantees ctx is not cancelled), HTTP 408/425, or
+// HTTP 500-599. These share one per-channel transient retry token and keep
+// the same route session and the same candidate body on retry.
+func isSameTargetTransient(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	status := resp.StatusCode
+	if status == http.StatusRequestTimeout || status == 425 {
+		return true
+	}
+	return status >= 500 && status <= 599
+}
+
+// isOrdinaryClientRejection reports deterministic request-shape rejections
+// that must end the current channel/tier without a same-target retry:
+// ordinary 4xx excluding 400 (dedicated recovery), 401/403/429 (cooldown
+// fallback), and 408/425 (transient neutral fallback).
+func isOrdinaryClientRejection(resp *http.Response, err error) bool {
+	if err != nil || resp == nil {
+		return false
+	}
+	status := resp.StatusCode
+	if status < 400 || status >= 500 {
+		return false
+	}
+	switch status {
+	case http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusTooManyRequests,
+		http.StatusRequestTimeout,
+		425:
+		return false
+	}
+	return true
+}
+
+func isContextCancelled(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
 }
 
 func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, modelRoute, int, error) {
@@ -666,12 +699,39 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 	effectiveRoute := route
 	attempts := attemptOffset
 	if route.Anonymous {
-		resp, err, used := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
+		resp, err, used, recovered := g.doAnonymousUpstream(ctx, route, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, route, attempts, nil
 		}
+		if recovered {
+			// 400 session recovery is the route's last recovery action: its
+			// replay result goes directly outward without scanning remaining
+			// anonymous proxies or entering the authenticated tiers.
+			if resp != nil {
+				return resp, route, attempts, nil
+			}
+			if err == nil {
+				err = errors.New("no usable upstream route")
+			}
+			return nil, route, attempts, err
+		}
+		if isRouteTerminalBadRequest(resp, err) {
+			return resp, route, attempts, nil
+		}
 		lastResponse, lastErr = resp, err
+		// Client cancel or the shared request deadline ends the route here:
+		// never enter the authenticated tiers after a cancelled anonymous
+		// phase.
+		if isContextCancelled(ctx) {
+			if lastResponse != nil {
+				return lastResponse, route, attempts, nil
+			}
+			if lastErr == nil {
+				lastErr = ctx.Err()
+			}
+			return nil, route, attempts, lastErr
+		}
 		if len(route.KeyTiers) > 0 {
 			g.logger.Debug("anonymous request did not succeed; entering preferred key tiers", "component", "upstream", "event", "anonymous_fallback", "request_id", ids.Request, "attempts", attempts, "key_tiers", route.KeyTiers)
 		}
@@ -682,6 +742,11 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 		keyTiers = []Tier{route.Tier}
 	}
 	for _, tier := range keyTiers {
+		// A cancel observed between channels ends the route before the next
+		// tier sends or drains anything further.
+		if isContextCancelled(ctx) {
+			break
+		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -691,12 +756,31 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 		keyRoute.Anonymous = false
 		keyRoute.Protocol = route.ProtocolFor(tier)
 		effectiveRoute = keyRoute
-		resp, err, used := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
+		resp, err, used, recovered := g.doKeyUpstream(ctx, keyRoute, bodies, ids, attempts)
 		attempts += used
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			return resp, keyRoute, attempts, nil
 		}
+		if recovered {
+			// Same rule inside authenticated tiers: after the one same-target
+			// replay, do not walk remaining frozen candidates and do not fall
+			// back to the next tier.
+			if resp != nil {
+				return resp, keyRoute, attempts, nil
+			}
+			if err == nil {
+				err = errors.New("no usable upstream route")
+			}
+			return nil, keyRoute, attempts, err
+		}
+		if isRouteTerminalBadRequest(resp, err) {
+			return resp, effectiveRoute, attempts, nil
+		}
 		lastResponse, lastErr = resp, err
+		// Cancel after a tier ends the route without trying the next tier.
+		if isContextCancelled(ctx) {
+			break
+		}
 	}
 	if lastResponse != nil {
 		return lastResponse, effectiveRoute, attempts, nil
@@ -707,68 +791,237 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 	return nil, effectiveRoute, attempts, lastErr
 }
 
+// sendUpstreamOnce performs one real upstream send on a fixed candidate with
+// a fixed route session and candidate body. It builds the request, sends it,
+// applies the single state-update entry point, and records the attempt with
+// the given monitor number. A request-build error returns buildErr without
+// any send, state change, or attempt record.
+func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) (resp *http.Response, err error, duration time.Duration, class attemptClassification, buildErr error) {
+	req, err := newUpstreamRequest(ctx, baseURL, protocol, candBody, ids, cand.CredKey, routeSession)
+	if err != nil {
+		return nil, err, 0, attemptClassification{}, err
+	}
+	setRequestCredential(ctx, tier, credDisplay, channel, anonymous, cand.Proxy)
+	started := time.Now()
+	resp, err = cand.Proxy.client.Do(req)
+	duration = time.Since(started)
+	class = g.applyAttemptOutcome(ctx, cand, resp, err)
+	g.recordUpstreamAttemptWithClass(route, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class)
+	return resp, err, duration, class, nil
+}
+
+func syncAttemptMeta(ctx context.Context, tier Tier, attemptOffset, attempts int) {
+	if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+		meta.Attempts = attemptOffset + attempts
+		meta.Tier = string(tier)
+	}
+}
+
 // doAnonymousUpstream walks the frozen anonymous target list once: the fixed
-// anonymous credential x every currently available proxy. Any failure,
-// including an HTTP error response, advances to the next target. Only a
-// successful response ends the anonymous phase; exhausting the list returns
-// control to the preferred authenticated tiers. The list is never truncated
-// by retry.max_attempts.
-func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int) {
+// anonymous credential x every currently available proxy. HRW ordering uses
+// only the client session; each candidate sends its own target-bound route
+// session in headers and in the already-present body session fields. The
+// canonical tier body is never mutated. The whole channel owns one shared
+// transient retry token: the first transport error, 408/425, or 5xx re-sends
+// once on the same target with the same route session and body. The first
+// exact HTTP 400 on any candidate instead replays exactly once on the same
+// candidate with a rotated route session (same request ID, attempt +1, same
+// target/protocol/proxy, always before any client bytes); the replay result
+// is final for the whole route and never consumes the transient token.
+// Ordinary 4xx ends the anonymous channel (authenticated tiers may still
+// run); other retryable outcomes advance to the next proxy. Cancel ends the
+// channel immediately without further sends or state changes. The list is
+// never truncated by retry.max_attempts.
+func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int, bool) {
 	var lastResponse *http.Response
 	var lastErr error
 	if !g.cfg.Anonymous {
-		return nil, errors.New("anonymous channel is disabled"), 0
+		return nil, errors.New("anonymous channel is disabled"), 0, false
 	}
 	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
 	body := bodies[TierZen]
 	if len(body) == 0 {
-		return nil, errors.New("no prepared Zen request body"), 0
+		return nil, errors.New("no prepared Zen request body"), 0, false
 	}
 	now := time.Now().UnixNano()
 	cands := g.scheduler.orderCandidates(g.scheduler.buildAnonymousCandidates(pool, route.ID, now), ids.Session)
 	attempts := 0
+	transientAvailable := true
 	for _, cand := range cands {
-		attempts++
-		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
-			meta.Attempts = attemptOffset + attempts
-			meta.Tier = string(TierZen)
+		if isContextCancelled(ctx) {
+			if lastResponse != nil {
+				return lastResponse, nil, attempts, false
+			}
+			if lastErr != nil {
+				return nil, lastErr, attempts, false
+			}
+			return nil, ctx.Err(), attempts, false
 		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand.CredKey)
+		scope := routeScopeForCandidate(g.cfg.Upstream.Zen, cand, route.Protocol)
+		routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
+		candBody, err := applyRouteSessionToBody(body, routeSession, route.Protocol, false)
 		if err != nil {
-			return nil, err, attempts
+			attempts++
+			syncAttemptMeta(ctx, TierZen, attemptOffset, attempts)
+			return nil, err, attempts, false
 		}
-		setRequestCredential(ctx, TierZen, "anonymous", "anonymous", true, cand.Proxy)
-		started := time.Now()
-		resp, err := cand.Proxy.client.Do(req)
-		duration := time.Since(started)
-		class := g.applyAttemptOutcome(ctx, cand, resp, err)
-		g.recordUpstreamAttemptWithClass(route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, resp, err, duration, class)
-		if err == nil && resp.StatusCode/100 == 2 {
-			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
-			return resp, nil, attempts
+		attempts++
+		syncAttemptMeta(ctx, TierZen, attemptOffset, attempts)
+		resp, err, _, _, buildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+		if buildErr != nil {
+			return nil, buildErr, attempts, false
+		}
+		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
+			return resp, nil, attempts, false
+		}
+		if isContextCancelled(ctx) {
+			return resp, err, attempts, false
+		}
+		if isRouteTerminalBadRequest(resp, err) {
+			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, resp, attemptOffset, attempts)
+			attempts = replayed
+			if replayResp != nil || replayErr != nil {
+				return replayResp, replayErr, attempts, true
+			}
+			// Replay suppressed (cancelled context): preserve terminal 400.
+			g.logger.Debug("anonymous upstream returned route-terminal 400; stopping anonymous phase", "component", "upstream", "event", "anonymous_attempt_terminal", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
+			return resp, nil, attempts, false
+		}
+		if isSameTargetTransient(resp, err) && transientAvailable {
+			transientAvailable = false
+			if isContextCancelled(ctx) {
+				return resp, err, attempts, false
+			}
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			attempts++
+			syncAttemptMeta(ctx, TierZen, attemptOffset, attempts)
+			retryResp, retryErr, _, _, retryBuildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+			if retryBuildErr != nil {
+				return nil, retryBuildErr, attempts, false
+			}
+			if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
+				g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
+				return retryResp, nil, attempts, false
+			}
+			if isContextCancelled(ctx) {
+				return retryResp, retryErr, attempts, false
+			}
+			if isRouteTerminalBadRequest(retryResp, retryErr) {
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, retryResp, attemptOffset, attempts)
+				attempts = replayed
+				if replayResp != nil || replayErr != nil {
+					return replayResp, replayErr, attempts, true
+				}
+				return retryResp, nil, attempts, false
+			}
+			if isOrdinaryClientRejection(retryResp, retryErr) {
+				g.logger.Debug("anonymous transient retry hit ordinary rejection; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
+				return retryResp, nil, attempts, false
+			}
+			lastResponse = retryResp
+			lastErr = retryErr
+			if retryErr != nil {
+				g.logger.Debug("anonymous transient retry still failing; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", retryErr)
+			} else {
+				g.logger.Debug("anonymous transient retry returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
+			}
+			continue
+		}
+		if isOrdinaryClientRejection(resp, err) {
+			g.logger.Debug("anonymous upstream rejected a non-retryable request; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
+			return resp, nil, attempts, false
 		}
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", err)
 		} else {
-			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 		}
 	}
 	if lastResponse != nil {
-		return lastResponse, nil, attempts
+		return lastResponse, nil, attempts, false
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no healthy anonymous proxies available")
 	}
-	return nil, lastErr, attempts
+	return nil, lastErr, attempts, false
 }
 
-func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int) {
+// replayCandidate400 performs the single same-target 400 recovery replay: it
+// rotates the route session, rebuilds a fresh candidate body from the frozen
+// canonical body (overwriting present session fields and, for Responses,
+// dropping stale previous_response_id/reasoning refs), and re-sends on the
+// identical credential/proxy/protocol with the same request ID and attempt
+// number +1. The first 400 is neutral and its body is drained before the
+// replay. Recovery never runs after client bytes have been written: all
+// callers invoke it before returning the upstream response downstream.
+// It returns the replay response/error and the updated attempt count; a
+// nil/nil pair means replay was suppressed (cancelled context) and the caller
+// must preserve the original terminal 400. A body-rewrite error aborts the
+// route with that error.
+func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, canonical []byte, ids requestIDs, cand targetCandidate, scope routeSessionScope, observed string, firstResp *http.Response, attemptOffset, attempts int) (*http.Response, error, int) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, nil, attempts
+	}
+	channel := "key"
+	anonymous := false
+	credDisplay := cand.CredDisplay
+	if cand.CredID == anonymousSchedulerCredentialID || cand.CredDisplay == anonymousCredentialID {
+		channel = "anonymous"
+		anonymous = true
+		credDisplay = "anonymous"
+	}
+	newSession := g.scheduler.rotateRouteSession(ids.Session, scope, observed)
+	replayBody, err := applyRouteSessionToBody(canonical, newSession, protocol, true)
+	if err != nil {
+		if firstResp != nil {
+			drainAndClose(firstResp.Body)
+		}
+		return nil, err, attempts
+	}
+	if firstResp != nil {
+		drainAndClose(firstResp.Body)
+	}
+	attempts++
+	if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+		meta.Attempts = attemptOffset + attempts
+		meta.Tier = string(tier)
+	}
+	req, err := newUpstreamRequest(ctx, baseURL, protocol, replayBody, ids, cand.CredKey, newSession)
+	if err != nil {
+		return nil, err, attempts
+	}
+	setRequestCredential(ctx, tier, credDisplay, channel, anonymous, cand.Proxy)
+	started := time.Now()
+	resp, err := cand.Proxy.client.Do(req)
+	duration := time.Since(started)
+	class := g.applyAttemptOutcome(ctx, cand, resp, err)
+	g.recordUpstreamAttemptWithClass(route, ids, attemptOffset+attempts, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class)
+	if g.logger != nil {
+		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			g.logger.Info("upstream 400 session recovery succeeded", "component", "upstream", "event", "route_session_recovery_succeeded", "request_id", ids.Request, "tier", tier, "key_id", credDisplay, "channel", channel, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		} else if err == nil && resp != nil {
+			g.logger.Info("upstream 400 session recovery replayed", "component", "upstream", "event", "route_session_recovery_replayed", "request_id", ids.Request, "tier", tier, "key_id", credDisplay, "channel", channel, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+		} else {
+			g.logger.Info("upstream 400 session recovery replayed", "component", "upstream", "event", "route_session_recovery_replayed", "request_id", ids.Request, "tier", tier, "key_id", credDisplay, "channel", channel, "proxy", redactURL(cand.Proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+		}
+	}
+	// The replay result is final for the route: success returns normally, a
+	// second exact 400 terminates the route with that 400, and any other
+	// non-2xx/transport outcome is classified normally (cooldowns apply) but
+	// never walks remaining frozen candidates or the next tier.
+	return resp, err, attempts
+}
+
+func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int, bool) {
 	var lastResponse *http.Response
 	var lastErr error
 	var creds []credentialRef
@@ -783,65 +1036,145 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	}
 	pool := g.pools[poolName]
 	if len(creds) == 0 {
-		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
+		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0, false
 	}
 	body := bodies[route.Tier]
 	if len(body) == 0 {
-		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
+		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0, false
 	}
 	// Freeze the candidate order at request start; failover walks the frozen
-	// list without dynamic re-sorting. The tier budget is retry.max_attempts
-	// with the first attempt included.
+	// list without dynamic re-sorting. The tier budget counts real ordinary
+	// upstream sends (each candidate first send plus at most one same-target
+	// transient retry) against retry.max_attempts. The 400 route-session
+	// recovery is always allowed once extra and never consumes the transient
+	// token or the ordinary budget. HRW uses only the client session; the
+	// route session is per-candidate and target-bound.
 	now := time.Now().UnixNano()
 	cands := g.scheduler.orderCandidates(g.scheduler.buildAuthCandidates(route.Tier, creds, pool, route.ID, now), ids.Session)
-	limit := min(len(cands), g.cfg.Retry.MaxAttempts)
+	budget := g.cfg.Retry.MaxAttempts
+	if budget < 1 {
+		budget = 1
+	}
 	attempts := 0
-	for _, cand := range cands[:limit] {
-		attempts++
-		// Keep the request-level trace synchronized with the attempt that is
-		// about to be sent. Only the redacted key suffix is retained.
-		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
-			meta.Attempts = attemptOffset + attempts
-			meta.Tier = string(route.Tier)
+	ordinarySends := 0
+	transientAvailable := true
+	for _, cand := range cands {
+		if isContextCancelled(ctx) {
+			if lastResponse != nil {
+				return lastResponse, nil, attempts, false
+			}
+			if lastErr != nil {
+				return nil, lastErr, attempts, false
+			}
+			return nil, ctx.Err(), attempts, false
+		}
+		if ordinarySends >= budget {
+			break
 		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, cand.CredKey)
+		scope := routeScopeForCandidate(baseURL, cand, route.Protocol)
+		routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
+		candBody, err := applyRouteSessionToBody(body, routeSession, route.Protocol, false)
 		if err != nil {
-			return nil, err, attempts
+			attempts++
+			syncAttemptMeta(ctx, route.Tier, attemptOffset, attempts)
+			return nil, err, attempts, false
 		}
-		setRequestCredential(ctx, route.Tier, cand.CredDisplay, "key", false, cand.Proxy)
-		attemptStarted := time.Now()
-		resp, err := cand.Proxy.client.Do(req)
-		attemptDuration := time.Since(attemptStarted)
-		class := g.applyAttemptOutcome(ctx, cand, resp, err)
-		g.recordUpstreamAttemptWithClass(route, ids, attemptOffset+attempts, cand.CredDisplay, "key", false, cand.Proxy, resp, err, attemptDuration, class)
-		if err == nil && resp.StatusCode/100 == 2 {
-			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
-			return resp, nil, attempts
+		// Keep the request-level trace synchronized with the attempt that is
+		// about to be sent. Only the redacted key suffix is retained.
+		attempts++
+		syncAttemptMeta(ctx, route.Tier, attemptOffset, attempts)
+		resp, err, duration, _, buildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+		if buildErr != nil {
+			return nil, buildErr, attempts, false
 		}
-		// Request-shape errors are deterministic and must leave this tier without
-		// rotating through unrelated keys. The outer route may still try the next
-		// tier in prefer order. Authentication, throttling, server, and transport
-		// failures remain retryable inside this tier.
-		if class.Class == AttemptClassClientRejected {
-			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds())
-			return resp, nil, attempts
+		ordinarySends++
+		_ = duration
+		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
+			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
+			return resp, nil, attempts, false
+		}
+		if isContextCancelled(ctx) {
+			return resp, err, attempts, false
+		}
+		if isRouteTerminalBadRequest(resp, err) {
+			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, resp, attemptOffset, attempts)
+			attempts = replayed
+			if replayResp != nil || replayErr != nil {
+				return replayResp, replayErr, attempts, true
+			}
+			g.logger.Debug("upstream returned route-terminal 400; stopping route", "component", "upstream", "event", "attempt_terminal", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+			return resp, nil, attempts, false
+		}
+		if isSameTargetTransient(resp, err) && transientAvailable && ordinarySends < budget {
+			transientAvailable = false
+			if isContextCancelled(ctx) {
+				return resp, err, attempts, false
+			}
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			attempts++
+			syncAttemptMeta(ctx, route.Tier, attemptOffset, attempts)
+			retryResp, retryErr, _, _, retryBuildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+			if retryBuildErr != nil {
+				return nil, retryBuildErr, attempts, false
+			}
+			ordinarySends++
+			if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
+				g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
+				return retryResp, nil, attempts, false
+			}
+			if isContextCancelled(ctx) {
+				return retryResp, retryErr, attempts, false
+			}
+			if isRouteTerminalBadRequest(retryResp, retryErr) {
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, retryResp, attemptOffset, attempts)
+				attempts = replayed
+				if replayResp != nil || replayErr != nil {
+					return replayResp, replayErr, attempts, true
+				}
+				return retryResp, nil, attempts, false
+			}
+			// Request-shape rejections end this tier without rotating through
+			// unrelated keys; 408/425 stay transient-neutral and fall through
+			// to the next frozen candidate.
+			if isOrdinaryClientRejection(retryResp, retryErr) {
+				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", retryResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+				return retryResp, nil, attempts, false
+			}
+			lastResponse = retryResp
+			lastErr = retryErr
+			if retryErr != nil {
+				g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", retryErr)
+			} else {
+				g.logger.Debug("upstream transient retry returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", retryResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+			}
+			continue
+		}
+		// Request-shape errors are deterministic and must leave this tier
+		// without rotating through unrelated keys. 408/425 are transient and
+		// never end the tier here. Authentication, throttling, server, and
+		// transport failures remain retryable inside this tier via fallback.
+		if isOrdinaryClientRejection(resp, err) {
+			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+			return resp, nil, attempts, false
 		}
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
+			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", err)
 		} else {
-			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
 		}
 	}
 	if lastResponse != nil {
-		return lastResponse, nil, attempts
+		return lastResponse, nil, attempts, false
 	}
-	return nil, lastErr, attempts
+	return nil, lastErr, attempts, false
 }
 
 // applyAttemptOutcome is the single state-update entry point for every
@@ -853,9 +1186,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 //     response also restores proxy transport health.
 //   - 401: global credential cooldown; the target is not cooled twice.
 //   - 403/429/5xx: target cooldown (Retry-After wins when larger, capped).
-//   - Transport error with isProxyFailure: proxy unhealthy, no target cool.
-//   - Other transport errors: short target cool plus an async neutral check.
-//   - Ordinary 4xx (client_rejected): neutral no-op; never clears state.
+//   - Transport error (non-cancelled): neutral, no credential/target state;
+//     it only triggers the existing async neutral proxy health verification.
+//     Only that independent probe may flip proxy healthy on isProxyFailure.
+//   - Ordinary 4xx (client_rejected, including exact 400) and transient
+//     408/425 (transient_client): neutral no-op; never clears state.
 func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate, resp *http.Response, err error) attemptClassification {
 	class := classifyUpstreamAttempt(resp, err)
 	if ctx != nil && ctx.Err() != nil {
@@ -877,13 +1212,8 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 			}
 		}
 	case err != nil:
-		if isProxyFailure(err) {
-			g.markProxyUnavailable(cand.Proxy)
-			return class
-		}
-		change := g.scheduler.noteTargetFailure(cand.Identity, class.Class, 0, 0)
-		g.logTargetCooldownSet(cand, change)
 		g.verifyProxyAfterError(ctx, cand.Proxy, 0)
+		return class
 	case status == http.StatusUnauthorized:
 		change := g.scheduler.noteCredentialAuthFailure(cand.CredID)
 		g.logCredentialCooldownSet(cand, change, status)
@@ -1058,7 +1388,7 @@ func (g *Gateway) recordUpstreamAttemptWithClass(route modelRoute, ids requestID
 	})
 }
 
-func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, body []byte, ids requestIDs, key string) (*http.Request, error) {
+func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, body []byte, ids requestIDs, key, routeSession string) (*http.Request, error) {
 	endpoint := strings.TrimRight(baseURL, "/") + protocolPath(protocol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -1068,12 +1398,14 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, 
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("User-Agent", opencodeUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-session", ids.Session)
+	// Upstream route session: target-bound, never the raw client session.
+	// Request/project/parent correlation still comes from ids.
+	req.Header.Set("x-opencode-session", routeSession)
 	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
 	// prompt/session affinity. Keep the legacy x-opencode-session header too so
 	// older Zen deployments continue to recognize the request.
-	req.Header.Set("x-session-affinity", ids.Session)
-	req.Header.Set("X-Session-Id", ids.Session)
+	req.Header.Set("x-session-affinity", routeSession)
+	req.Header.Set("X-Session-Id", routeSession)
 	req.Header.Set("x-opencode-request", ids.Request)
 	req.Header.Set("x-opencode-project", ids.Project)
 	if ids.ParentSession != "" {
@@ -1090,19 +1422,22 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, 
 }
 
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
-	// Single shared classification: only client_rejected ends the tier.
-	// Behavior is unchanged; the mapping lives in classifyAttempt.
+	// Single shared classification: only ordinary client_rejected ends the
+	// channel/tier. 408/425 are transient_client and stay retryable; the
+	// mapping lives in classifyAttempt.
 	return classifyUpstreamAttempt(resp, err).Class == AttemptClassClientRejected
 }
 
 // syncProxyResult updates proxy transport health from non-refresh traffic.
-// Only timeouts and connection refusals mark a proxy unavailable; HTTP
-// statuses never change health directly. Other errors and 4xx/5xx responses
-// trigger a neutral URL check without being treated as proxy failure.
-// Scheduler (credential/target) state is never touched here. A cancelled or
-// expired request context is never a proxy signal: it returns without
-// touching healthy/checking. Model refresh paths must not call this helper
-// at all; refresh is stateless and observes healthy proxies read-only.
+// A single foreground transport error never flips proxy health directly;
+// it only triggers the async neutral verification below. Only that
+// independent probe may flip healthy on isProxyFailure. HTTP statuses never
+// change health directly. Other errors and 4xx/5xx responses trigger a
+// neutral URL check without being treated as proxy failure. Scheduler
+// (credential/target) state is never touched here. A cancelled or expired
+// request context is never a proxy signal: it returns without touching
+// healthy/checking. Model refresh paths must not call this helper at all;
+// refresh is stateless and observes healthy proxies read-only.
 func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
 	if proxy == nil {
 		return false
@@ -1110,11 +1445,7 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
-	if isProxyFailure(err) {
-		g.markProxyUnavailable(proxy)
-		return true
-	}
-	if status >= 200 && status < 400 {
+	if status >= 200 && status < 400 && err == nil {
 		wasHealthy := proxy.healthy.Swap(true)
 		if !wasHealthy && g.logger != nil {
 			g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool)
@@ -1128,6 +1459,9 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 }
 
 func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTransport, status int) {
+	if proxy == nil {
+		return
+	}
 	if ctx != nil && ctx.Err() != nil {
 		return
 	}

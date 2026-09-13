@@ -351,10 +351,15 @@ type gatewayMigrationSummary struct {
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
 // from the old Gateway to the newly built one before the atomic swap:
 // credential state matches by tier+full key, proxy health by (pool name,
-// raw proxy URL), and target state by full identity. Only still-future
-// cooldowns migrate (remaining capped at 5 minutes); new resources start at
-// zero state and removed identities are dropped. Checking flags never
-// migrate. In-flight requests keep using the old Gateway and its state.
+// raw proxy URL), target state by full identity, and route-session overrides
+// by target scope (client dimension excluded from validity). Only still-future
+// cooldowns and still-fresh route overrides migrate (remaining capped at 5
+// minutes for cooldowns, idle TTL for sessions); new resources start at
+// zero/stateless state and removed identities are dropped. Checking flags
+// never migrate. Route-session overrides are in-memory authority (not a
+// projection): they never persist across restarts and never enter logs,
+// metrics, history, or admin output. In-flight requests keep using the old
+// Gateway and its state.
 func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrationSummary {
 	var summary gatewayMigrationSummary
 	if oldGateway == nil || newGateway == nil || oldGateway.scheduler == nil || newGateway.scheduler == nil {
@@ -405,6 +410,46 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 		validPoolProxy[name] = set
 	}
 	newGateway.scheduler.retainOnly(validCreds, validPoolProxy)
+	zenAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Zen)
+	goAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Go)
+	if oldGateway.scheduler.routeSessions != nil && newGateway.scheduler.routeSessions != nil {
+		validScope := func(scope routeSessionScope) bool {
+			if !validCreds[scope.CredID] {
+				return false
+			}
+			proxies, ok := validPoolProxy[scope.Pool]
+			if !ok || !proxies[scope.ProxyRaw] {
+				return false
+			}
+			if scope.Protocol != ProtocolChat && scope.Protocol != ProtocolResponses && scope.Protocol != ProtocolAnthropic {
+				return false
+			}
+			// Target scope must still be routable: authority matches the tier
+			// upstream and the pool is still the assigned pool for that
+			// channel. Indexing by target scope (not client) keeps migration
+			// bounded.
+			switch {
+			case scope.CredID == anonymousSchedulerCredentialID:
+				if scope.Tier != TierZen || scope.Authority != zenAuthority {
+					return false
+				}
+				return scope.Pool == newGateway.cfg.ProxyRouting.Anonymous
+			case scope.Tier == TierZen:
+				if scope.Authority != zenAuthority {
+					return false
+				}
+				return scope.Pool == newGateway.cfg.ProxyRouting.Zen
+			case scope.Tier == TierGo:
+				if scope.Authority != goAuthority {
+					return false
+				}
+				return scope.Pool == newGateway.cfg.ProxyRouting.Go
+			default:
+				return false
+			}
+		}
+		newGateway.scheduler.routeSessions.migrateRouteSessionsFrom(oldGateway.scheduler.routeSessions, validScope)
+	}
 	return summary
 }
 
