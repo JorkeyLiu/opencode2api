@@ -1,0 +1,72 @@
+name: Promote Docker image to latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Verified sha-* tag to promote (e.g. sha-a1b2c3d). Only sha-* is accepted."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: promote-latest
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Copy sha-* to latest by digest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install crane
+        shell: bash
+        run: |
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.1
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      - name: Promote source tag to latest by digest
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_TAG" =~ ^sha-[0-9a-f]{7,40}$ ]]; then
+            echo "source_tag must be a verified 'sha-*' tag (e.g. sha-a1b2c3d); 'latest', 'dev' and branch names are rejected." >&2
+            exit 1
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          src_digest="$(crane digest "$image:$SOURCE_TAG")"
+          echo "Source: $image:$SOURCE_TAG @$src_digest"
+          crane copy "$image@$src_digest" "$image:latest"
+          latest_digest="$(crane digest "$image:latest")"
+          if [[ "$latest_digest" != "$src_digest" ]]; then
+            echo "Digest mismatch after promotion: source $src_digest vs latest $latest_digest" >&2
+            exit 1
+          fi
+          echo "Promoted $image:$SOURCE_TAG to $image:latest @$latest_digest (digests match)"
+          docker buildx imagetools inspect "$image:latest"

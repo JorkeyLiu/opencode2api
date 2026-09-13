@@ -147,7 +147,12 @@ go build -o opencode2api ./
 
 ## GHCR / Docker Compose 部署
 
-正式镜像发布在 `ghcr.io/jasonxu114514/opencode2api`
+正式镜像发布在 `ghcr.io/jasonxu114514/opencode2api`。
+
+- 推送到 `jorkey/integration` 会自动构建并发布不可变 `sha-<short>` 与滚动 `dev`（同一多架构 digest，可手动 `workflow_dispatch` 补构建）。
+- `latest` 只代表手动 promotion：从已验证的 `sha-*` 按 digest 复制而来，不重构建，不会自动产生。
+- `v*` 语义版本 Release 只发布预编译二进制包，不再发布任何 Docker 镜像 tag。
+- 生产建议 pin 具体的 `sha-*` 或 `@sha256:` digest；`latest`/`dev` 只用于愿意跟随浮动的跟踪环境。
 
 
 ```bash
@@ -174,13 +179,15 @@ curl http://127.0.0.1:8080/healthz
 docker compose logs -f
 ```
 
-可通过环境变量固定镜像版本和修改宿主机端口：
+可通过环境变量固定镜像版本和修改宿主机端口（生产请使用已验证的 `sha-*`，`latest` 只是最近一次手动 promotion 的可用版本）：
 
 ```bash
-OPENCODE2API_VERSION=v1.2.3 OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
+OPENCODE2API_VERSION=sha-a1b2c3d OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
 ```
 
-不使用 Compose 时也可直接运行 GHCR 镜像：
+Compose 默认使用 `latest` 并始终 `pull_policy: always` 拉取；生产如需完全 pin，可把 `image:` 改写为 `ghcr.io/jasonxu114514/opencode2api:sha-a1b2c3d` 或 `ghcr.io/jasonxu114514/opencode2api@sha256:<digest>`。
+
+不使用 Compose 时也可直接运行 GHCR 镜像（示例为 `latest`，生产请换成已验证的 `sha-*` 或 `@sha256:` digest）：
 
 ```bash
 docker volume create opencode2api-state
