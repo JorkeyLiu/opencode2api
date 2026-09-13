@@ -709,7 +709,22 @@ func (s *HistoryStore) nextSeqLocked(kind historyRecordKind, date string) int {
 	return maxSeq + 1
 }
 
+// Hot Apply keeps a short close budget so config Apply never blocks on
+// disk; process Shutdown uses the longer shutdown budget.
+const (
+	historyApplyCloseTimeout    = 2 * time.Second
+	historyShutdownCloseTimeout = 10 * time.Second
+)
+
+// historyCloseHook is a test-only injection point run at the start of
+// syncAndClose. Tests may set it to sleep to force a CloseWithTimeout
+// deadline without waiting for real IO.
+var historyCloseHook func()
+
 func (s *HistoryStore) syncAndClose() {
+	if historyCloseHook != nil {
+		historyCloseHook()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for kind, seg := range s.open {
@@ -722,25 +737,46 @@ func (s *HistoryStore) syncAndClose() {
 	}
 }
 
-// Close drains up to ~2s, flushes, and syncs. It never panics on concurrent
-// Enqueue; late records after Close are dropped. Queue is never closed;
-// idempotent via closed CAS.
+// Close drains with the hot-Apply budget (~2s), flushes, and syncs. It
+// never panics on concurrent Enqueue; late records after Close are
+// dropped. Queue is never closed; idempotent.
 func (s *HistoryStore) Close() {
+	_ = s.CloseWithTimeout(historyApplyCloseTimeout)
+}
+
+// CloseWithTimeout drains, flushes, and syncs with an explicit budget. It
+// reports true when the writer finished within timeout and false on
+// timeout. On timeout it logs one history_shutdown_timeout warn and
+// returns; the writer goroutine continues drain+sync in the background
+// (best-effort, never panics). Idempotent: concurrent or repeated calls
+// wait on the same writer without closing channels twice.
+func (s *HistoryStore) CloseWithTimeout(timeout time.Duration) bool {
 	if s == nil {
-		return
+		return true
 	}
 	if !s.closed.CompareAndSwap(false, true) {
-		return
+		if !s.active.Load() {
+			return true
+		}
+		return s.waitWriter(timeout)
 	}
 	if !s.active.Load() {
-		return
+		return true
 	}
 	select {
 	case <-s.done:
-		return
+		return true
 	default:
 		close(s.done)
 	}
+	ok := s.waitWriter(timeout)
+	if !ok && s.logger != nil {
+		s.logger.Warn("history close timed out; writer continues in background", "component", "history", "event", "history_shutdown_timeout")
+	}
+	return ok
+}
+
+func (s *HistoryStore) waitWriter(timeout time.Duration) bool {
 	finished := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -748,7 +784,9 @@ func (s *HistoryStore) Close() {
 	}()
 	select {
 	case <-finished:
-	case <-time.After(2 * time.Second):
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 

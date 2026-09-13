@@ -138,6 +138,19 @@ func (g *Gateway) uniquePools() []*transportPool {
 	return out
 }
 
+// CloseIdleConnections closes idle connections on every unique transport
+// pool. Shared routing references resolve to the same pool pointer and are
+// closed exactly once via uniquePools. Only idle connections are closed;
+// in-flight active connections are never interrupted.
+func (g *Gateway) CloseIdleConnections() {
+	if g == nil {
+		return
+	}
+	for _, pool := range g.uniquePools() {
+		pool.CloseIdleConnections()
+	}
+}
+
 func (g *Gateway) healthyClients() []*http.Client {
 	var clients []*http.Client
 	for _, pool := range g.uniquePools() {

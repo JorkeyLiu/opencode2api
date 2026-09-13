@@ -275,6 +275,12 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 	previous := m.current.Swap(next)
 	if previous != nil {
 		previous.cancel()
+		// Release idle connections held by the old Gateway pools. Only
+		// idle connections are closed; in-flight active connections on the
+		// old pools continue until their requests finish.
+		if previous.gateway != nil {
+			previous.gateway.CloseIdleConnections()
+		}
 	}
 	m.logger.Info("configuration applied", "component", "config", "event", "config_applied", "restart_required", result.RestartRequired, "restart_fields", result.RestartFields)
 	return result, nil
@@ -294,12 +300,44 @@ func (m *RuntimeManager) Reload() (ApplyResult, error) {
 }
 
 func (m *RuntimeManager) Shutdown() {
+	m.ShutdownWithTimeout(historyShutdownCloseTimeout)
+}
+
+// ShutdownWithTimeout stops background refresh, closes idle connections on
+// the current Gateway, and drains the history store within timeout. Only
+// idle connections are closed; in-flight requests are not interrupted.
+// History uses best-effort semantics: on timeout a history_shutdown_timeout
+// warn is emitted and the writer continues in the background.
+func (m *RuntimeManager) ShutdownWithTimeout(timeout time.Duration) {
 	if current := m.current.Load(); current != nil {
 		current.cancel()
+		if current.gateway != nil {
+			current.gateway.CloseIdleConnections()
+		}
 	}
 	if store := m.history.Load(); store != nil {
-		store.Close()
+		store.CloseWithTimeout(timeout)
 	}
+}
+
+// ShutdownWithContext drains history within the context deadline (capped at
+// the shutdown budget) so main can fit history drain inside the 15s server
+// shutdown budget. A nil context or no deadline falls back to the default
+// shutdown budget.
+func (m *RuntimeManager) ShutdownWithContext(ctx context.Context) {
+	timeout := historyShutdownCloseTimeout
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining < timeout {
+				timeout = remaining
+			}
+			if timeout < 0 {
+				timeout = 0
+			}
+		}
+	}
+	m.ShutdownWithTimeout(timeout)
 }
 
 // gatewayMigrationSummary counts migrated state for the Apply log summary.

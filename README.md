@@ -131,7 +131,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 {"scope": "all"}
 ```
 
-`scope` 只能是 `catalog`、`metadata` 或 `all`。探针只接受配置中实际存在的具名 pool 与合法池内 index，不接受 URL 或敏感值，因此无法被指向任意目标。探针是显式的管理健康动作：它可以改变该 proxy 的传输健康（`healthy`），但绝不读写 credential / target 调度状态；WebUI 资源页每行 proxy 的“探测”按钮即调用此接口，目录/metadata 快照旁的“刷新目录 / 刷新 metadata / 全部刷新”按钮调用刷新接口。手动刷新复用定时刷新的无状态逻辑（失败保留旧快照），不触碰 proxy 健康/检查状态与前台 credential / target 冷却；与定时刷新共享去重门，所需组件正忙时返回 HTTP `409` 而不叠加工作。探针与刷新统一返回 HTTP `200` 并内嵌结果（`result` / `refreshed` 与快照摘要，不含全量模型列表）；参数错误返回相应 `4xx`。成功与失败分别以 `info` / `warn` 记录完成事件，错误文本经过脱敏。
+`scope` 只能是 `catalog`、`metadata` 或 `all`。探针只接受已被 anonymous/zen/go 引用的运行时池与合法池内 index，不接受 URL 或敏感值，因此无法被指向任意目标；未被引用的暂存池不可探测（`unknown_pool`）。探针是显式的管理健康动作：它可以改变该 proxy 的传输健康（`healthy`），但绝不读写 credential / target 调度状态；WebUI 资源页每行 proxy 的“探测”按钮即调用此接口，目录/metadata 快照旁的“刷新目录 / 刷新 metadata / 全部刷新”按钮调用刷新接口。手动刷新复用定时刷新的无状态逻辑（失败保留旧快照），不触碰 proxy 健康/检查状态与前台 credential / target 冷却；与定时刷新共享去重门，所需组件正忙时返回 HTTP `409` 而不叠加工作。探针与刷新统一返回 HTTP `200` 并内嵌结果（`result` / `refreshed` 与快照摘要，不含全量模型列表）；参数错误返回相应 `4xx`。成功与失败分别以 `info` / `warn` 记录完成事件，错误文本经过脱敏。
 
 ## 编译
 
@@ -272,7 +272,7 @@ cp config.example.json config.json
 | `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。models.dev 判定为零成本，或模型名称包含 `free`，任一条件成立即可进入匿名通道。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时认证 Key 的尝试顺序，值为 `go` 或 `zen`，默认 `go`。首选 Tier 失败后回退另一 Tier；仅存在于某一池时只尝试该池。 |
 | `proxy_pools` | 具名代理池映射。每个 pool 有 `proxies`（上游代理列表，支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`，URL 可含认证信息）与 `proxyfile`（可选代理文件路径，相对路径以 `config.json` 所在目录为基准）。pool 名是稳定 identity，只能使用字母、数字、`_`、`-`、`.`（1–64 字符），禁止用 IP 或 URL 命名，`direct` 为保留字。 |
-| `proxy_routing` | `anonymous` / `zen` / `go` 三个通道各引用一个已存在的 pool 名，允许相同或不同。`anonymous: false` 只关闭匿名凭证，三个引用仍必须全部合法。未被引用的 pool 可保留在配置中（仍完整校验），但不构建运行时传输。 |
+| `proxy_routing` | `anonymous` / `zen` / `go` 三个通道各引用一个已存在的 pool 名，允许相同或不同。`anonymous: false` 只关闭匿名凭证，三个引用仍必须全部合法。未被 anonymous/zen/go 引用的池为暂存配置，不运行、不可探测、不计容量；仅被引用的池为运行时资源（构建传输、参与健康与容量）。暂存池仍完整校验，可随时被路由引用后热生效。 |
 
 `server_keys` 至少需要一个值。`anonymous` 为 `false` 时，`zen_keys` 和 `go_keys` 至少有一个池不能为空；启用匿名模式后两个上游 key 池可以同时为空。
 

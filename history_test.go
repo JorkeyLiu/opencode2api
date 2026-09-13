@@ -512,13 +512,100 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "renderHistChannelFilter") {
 		t.Fatal("missing hist-channel population")
 	}
-	for _, ch := range []string{"anonymous", "not_routed", "zen", "go"} {
+	for _, ch := range []string{"anonymous", "not_routed"} {
 		if !strings.Contains(html, ch) {
 			t.Fatalf("hist-channel missing %q", ch)
 		}
 	}
+	// zen/go are tiers, never channels: the staged channel seed must not
+	// contain them.
+	if strings.Contains(html, `"zen","go"`) || strings.Contains(html, `"zen", "go"`) || strings.Contains(html, `"not_routed","zen"`) {
+		t.Fatal("hist-channel must not seed zen/go tiers")
+	}
 	if !strings.Contains(html, "channel=") {
 		t.Fatal("history query must carry channel")
+	}
+	// Realtime cap copy unified to 200.
+	if !strings.Contains(html, "最多 200 条展示") {
+		t.Fatal("realtime cap must read 200")
+	}
+	if strings.Contains(html, "最多 500 条展示") {
+		t.Fatal("stale 500 cap copy must be removed")
+	}
+	// History model input states exact full-ID matching.
+	if !strings.Contains(html, "完整模型 ID 精确过滤") {
+		t.Fatal("history model input must state exact full-ID filtering")
+	}
+	// 24h/7d series must aggregate into bounded buckets, not slice(-120).
+	if !strings.Contains(html, "aggregatePersistedSeries") {
+		t.Fatal("missing bounded bucket aggregation helper")
+	}
+	if strings.Contains(html, ").slice(-120)") {
+		t.Fatal("series must not silently slice(-120) without aggregation")
+	}
+	if !strings.Contains(html, "trend-cap") {
+		t.Fatal("missing dynamic trend caption")
+	}
+	// renderTrends must not clear persistent trend DOM when range != 1h:
+	// the non-1h guard must precede any clear, 1h path clears+redraws
+	// memory trends, and 24h/7d stay owned by renderPersistedSeries.
+	rt := strings.Index(html, "function renderTrends(){")
+	if rt < 0 {
+		t.Fatal("missing renderTrends")
+	}
+	rtEnd := strings.Index(html[rt:], "function renderDists()")
+	if rtEnd < 0 {
+		t.Fatal("missing renderDists boundary")
+	}
+	body := html[rt : rt+rtEnd]
+	guard := strings.Index(body, `if(S.historyRange!=="1h")return;`)
+	if guard < 0 {
+		t.Fatal("renderTrends must early-return on non-1h range")
+	}
+	if idx := strings.Index(body, "clear(hr)"); idx >= 0 && idx < guard {
+		t.Fatal("renderTrends must not clear trend DOM before non-1h guard")
+	}
+	if idx := strings.Index(body, "clear(ht)"); idx >= 0 && idx < guard {
+		t.Fatal("renderTrends must not clear trend DOM before non-1h guard")
+	}
+	if !strings.Contains(body, "clear(hr)") || !strings.Contains(body, "clear(ht)") {
+		t.Fatal("renderTrends 1h path must clear+redraw memory trends")
+	}
+	if !strings.Contains(body, "S.metrics") {
+		t.Fatal("renderTrends 1h path must render memory series")
+	}
+	ps := strings.Index(html, "function renderPersistedSeries(items){")
+	if ps < 0 {
+		t.Fatal("missing renderPersistedSeries")
+	}
+	psEnd := strings.Index(html[ps:], "function renderPersistedRows(){")
+	if psEnd < 0 {
+		t.Fatal("missing renderPersistedRows boundary")
+	}
+	pbody := html[ps : ps+psEnd]
+	if !strings.Contains(pbody, "clear(hr)") || !strings.Contains(pbody, "clear(ht)") {
+		t.Fatal("renderPersistedSeries must still clear/redraw 24h/7d trends")
+	}
+	// SSE must probe session after consecutive failures and reset on open/log.
+	if !strings.Contains(html, "/api/auth/session") {
+		t.Fatal("missing SSE session probe")
+	}
+	if !strings.Contains(html, "logFail") {
+		t.Fatal("missing SSE failure counter")
+	}
+	// Per-page history gap must accumulate into hist-count.
+	if !strings.Contains(html, "histGap") {
+		t.Fatal("missing per-page history gap accumulation")
+	}
+	if !strings.Contains(html, "hist-count") {
+		t.Fatal("missing hist-count gap display")
+	}
+	// Staged pool semantics: badge + explicit copy.
+	if !strings.Contains(html, "pool-badge") {
+		t.Fatal("missing pool active/staged badge")
+	}
+	if !strings.Contains(html, "暂存配置，不运行、不可探测、不计容量") {
+		t.Fatal("missing staged pool copy")
 	}
 }
 

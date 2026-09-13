@@ -44,6 +44,8 @@
   channels (same or different). Top-level `proxies` / `proxyfile` are
   load-time legacy inputs only: they migrate to a `shared` pool on load and
   never persist. Pool names are operator identities, never IPs or URLs.
+  Only referenced pools are runtime resources; unreferenced pools are staged
+  config (validated, never built/probed/counted).
 - External authorities MUST NOT be duplicated into this guide or hardcoded:
   - Upstream `/v1/models` (Zen and Go) for model existence per tier.
   - The OpenCode capability directory (`models.opencode.ai`) for each model's

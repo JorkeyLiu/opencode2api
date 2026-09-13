@@ -70,6 +70,10 @@ func main() {
 			logger.Error("graceful shutdown failed", "component", "server", "event", "shutdown_failed", "address", server.Addr, "error", err)
 		}
 	}
+	// Drain history inside the same 15s budget; ShutdownWithContext caps the
+	// wait at the remaining deadline (default 10s). The deferred Shutdown
+	// remains as a best-effort fallback.
+	manager.ShutdownWithContext(shutdownCtx)
 }
 
 func serveHTTP(cancel context.CancelFunc, logger *slog.Logger, server *http.Server, component string) {

@@ -41,6 +41,34 @@ func (p *transportPool) containsProxy(proxy *proxyTransport) bool {
 	return false
 }
 
+// CloseIdleConnections closes idle connections on every unique client
+// transport without interrupting in-flight active connections
+// (http.Transport.CloseIdleConnections semantics). Transports that do not
+// expose CloseIdleConnections (custom RoundTrippers) are skipped. Safe for
+// shared pool pointers: callers must dedupe pools before invoking.
+func (p *transportPool) CloseIdleConnections() {
+	if p == nil {
+		return
+	}
+	seen := make(map[any]bool, len(p.items))
+	for _, proxy := range p.items {
+		if proxy == nil || proxy.client == nil {
+			continue
+		}
+		tr := proxy.client.Transport
+		if tr == nil {
+			continue
+		}
+		if seen[tr] {
+			continue
+		}
+		seen[tr] = true
+		if closer, ok := tr.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
+}
+
 func (p *transportPool) hasHealthy() bool {
 	for _, proxy := range p.items {
 		if proxy.healthy.Load() {

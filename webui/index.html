@@ -161,7 +161,7 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
     <section id="tab-realtime">
       <div class="section">
         <h2>实时请求</h2>
-        <div class="cap">最近请求（进程内保留，最多 500 条展示）。点击行展开该 request 的完整上游 attempt 链。</div>
+        <div class="cap">最近请求（进程内保留，最多 200 条展示）。点击行展开该 request 的完整上游 attempt 链。</div>
         <div class="filters">
           <input type="search" id="f-search" placeholder="搜索 request ID / model">
           <select id="f-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
@@ -191,9 +191,9 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       </div>
       <div class="section" id="hist-persist-wrap">
         <h2>持久历史请求</h2>
-        <div class="cap">24h / 7d 调用 history API；点击行按 request_id 拉取 attempt 链。分页加载更多；切换范围取消旧请求。</div>
+        <div class="cap">24h / 7d 调用 history API；模型输入为完整模型 ID 精确过滤（后端精确匹配）；点击行按 request_id 拉取 attempt 链。分页加载更多；切换范围取消旧请求。</div>
         <div class="filters">
-          <input type="search" id="hist-model" placeholder="模型过滤">
+          <input type="search" id="hist-model" placeholder="完整模型 ID 精确过滤">
           <select id="hist-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
           <select id="hist-channel"><option value="">全部通道</option></select>
           <button class="ghost" id="hist-more" type="button">加载更多</button>
@@ -206,7 +206,7 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       </div>
       <div class="section">
         <h2>请求与 Token 趋势</h2>
-        <div class="cap">最近 60 分钟按分钟聚合。左为请求数，右为 token 数（纯 CSS 条形，悬停查看数值）。</div>
+        <div class="cap" id="trend-cap">最近 60 分钟按分钟聚合。左为请求数，右为 token 数（纯 CSS 条形，悬停查看数值）。</div>
         <div class="grid2">
           <div><div class="mini-h">每分钟请求（深色为失败）</div><div class="bars" id="trend-req"></div></div>
           <div><div class="mini-h">每分钟 token（输入 / 输出 / 总量）</div><div class="bars" id="trend-tok"></div></div>
@@ -303,7 +303,7 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
               <div class="field full"><label>Server Keys（掩码 chip；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个 key"></textarea></div>
               <div class="field"><label>Zen Keys</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个 key"></textarea></div>
               <div class="field"><label>Go Keys</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个 key"></textarea></div>
-              <div class="field full"><label>具名代理池（pool 名为稳定 identity，禁止用 IP/URL 命名；条目仍是 proxy 节点，支持 direct、HTTP(S)、SOCKS URL；节点名≠出口 IP）</label><div id="pools-editor"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增 pool</button></div><div class="note" id="pools-error"></div></div>
+              <div class="field full"><label>具名代理池（pool 名为稳定 identity，禁止用 IP/URL 命名；条目仍是 proxy 节点，支持 direct、HTTP(S)、SOCKS URL；节点名≠出口 IP）</label><div class="note">未被 anonymous/zen/go 引用的池为暂存配置，不运行、不可探测、不计容量；仅被引用的池为运行时资源。</div><div id="pools-editor"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增 pool</button></div><div class="note" id="pools-error"></div></div>
               <div class="field"><label>Anonymous 路由池</label><select id="c-route-anon"></select></div>
               <div class="field"><label>Zen 路由池</label><select id="c-route-zen"></select></div>
               <div class="field"><label>Go 路由池</label><select id="c-route-go"></select></div>
@@ -442,8 +442,8 @@ var S = {
   realtimePaused:false,
   assocProxy:"", assocKey:"",
   historyScope:"last_hour", historyRange:"1h", history:null,
-  histItems:[], histCursor:"", histLoading:false, histSeq:0, histExpanded:"",
-  logEvents:[], logPaused:false, logGap:"",
+  histItems:[], histCursor:"", histLoading:false, histSeq:0, histExpanded:"", histGap:false, histDropped:0,
+  logEvents:[], logPaused:false, logGap:"", logFail:0,
   es:null
 };
 
@@ -585,7 +585,7 @@ function renderHistChannelFilter(){
   var cur=sel.value, seen={};
   ((S.upstream&&S.upstream.requests)||[]).forEach(function(r){ if(r.channel&&!seen[r.channel]){seen[r.channel]=1;} });
   (S.histItems||[]).forEach(function(r){ if(r.channel&&!seen[r.channel]){seen[r.channel]=1;} });
-  ["anonymous","key","not_routed","zen","go"].forEach(function(ch){ if(!seen[ch]){seen[ch]=1;} });
+  ["anonymous","key","not_routed"].forEach(function(ch){ if(!seen[ch]){seen[ch]=1;} });
   if(cur&&!seen[cur]){seen[cur]=1;}
   clear(sel);
   var o0=document.createElement("option"); o0.value=""; o0.textContent="全部通道"; sel.appendChild(o0);
@@ -695,8 +695,8 @@ function jumpToRealtime(requestId){
 
 /* ---------- history ---------- */
 $("h-scope").addEventListener("change",function(){ S.historyScope=$("h-scope").value; renderHistory(); });
-$("h-range").addEventListener("change",function(){ S.historyRange=$("h-range").value; S.histItems=[]; S.histCursor=""; S.histSeq++; renderHistory(); loadPersistedHistory(true); });
-["hist-model","hist-status","hist-channel"].forEach(function(id){ $(id).addEventListener("input",function(){ S.histItems=[]; S.histCursor=""; S.histSeq++; loadPersistedHistory(true); }); $(id).addEventListener("change",function(){ S.histItems=[]; S.histCursor=""; S.histSeq++; loadPersistedHistory(true); }); });
+$("h-range").addEventListener("change",function(){ S.historyRange=$("h-range").value; S.histItems=[]; S.histCursor=""; S.histGap=false; S.histDropped=0; S.histSeq++; renderHistory(); loadPersistedHistory(true); });
+["hist-model","hist-status","hist-channel"].forEach(function(id){ $(id).addEventListener("input",function(){ S.histItems=[]; S.histCursor=""; S.histGap=false; S.histDropped=0; S.histSeq++; loadPersistedHistory(true); }); $(id).addEventListener("change",function(){ S.histItems=[]; S.histCursor=""; S.histGap=false; S.histDropped=0; S.histSeq++; loadPersistedHistory(true); }); });
 $("hist-more").addEventListener("click",function(){ loadPersistedHistory(false); });
 function scopeLifetime(){ return S.historyScope==="lifetime"; }
 function historyRangeHours(){ return S.historyRange==="7d"?168:(S.historyRange==="24h"?24:1); }
@@ -734,6 +734,7 @@ function histQueryRange(){ var h=historyRangeHours(); var to=new Date(); var fro
 function loadPersistedHistory(reset){
   if(S.historyRange==="1h")return;
   var seq=++S.histSeq; S.histLoading=true;
+  if(reset){ S.histGap=false; S.histDropped=0; }
   var rg=histQueryRange();
   var params="from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=100";
   if(!reset&&S.histCursor)params+="&cursor="+encodeURIComponent(S.histCursor);
@@ -742,9 +743,11 @@ function loadPersistedHistory(reset){
   var ch=$("hist-channel").value; if(ch)params+="&channel="+encodeURIComponent(ch);
   api("/api/history/requests?"+params,{method:"GET"}).then(function(res){
     if(seq!==S.histSeq)return;
-    if(reset)S.histItems=[];
+    if(reset){ S.histItems=[]; S.histGap=false; S.histDropped=0; }
     (res.items||[]).forEach(function(it){S.histItems.push(it);});
     S.histCursor=res.next_cursor||"";
+    if(res.gap)S.histGap=true;
+    if(res.dropped!==undefined&&res.dropped!==null)S.histDropped=res.dropped;
     S.histLoading=false; renderPersistedRows();
   }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; var c=$("hist-count"); if(c)c.textContent="历史加载失败："+err.message; });
   api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
@@ -752,26 +755,67 @@ function loadPersistedHistory(reset){
     renderPersistedSeries(res.items||[]);
   }).catch(function(){});
 }
+function aggregatePersistedSeries(items, maxBuckets){
+  maxBuckets=maxBuckets||120;
+  var asc=(items||[]).slice().sort(function(a,b){return new Date(a.minute)-new Date(b.minute);});
+  if(asc.length<=maxBuckets)return asc;
+  var size=Math.ceil(asc.length/maxBuckets), out=[];
+  for(var i=0;i<asc.length;i+=size){
+    var slice=asc.slice(i,i+size), acc={minute:slice[0].minute,minute_end:slice[slice.length-1].minute,points:slice.length,total:0,success:0,errors:0,input_tokens:0,output_tokens:0,cached_tokens:0,reasoning_tokens:0,total_tokens:0,usage_reported:0};
+    slice.forEach(function(p){ acc.total+=(p.total||0); acc.success+=(p.success||0); acc.errors+=(p.errors||0); acc.input_tokens+=(p.input_tokens||0); acc.output_tokens+=(p.output_tokens||0); acc.cached_tokens+=(p.cached_tokens||0); acc.reasoning_tokens+=(p.reasoning_tokens||0); acc.total_tokens+=(p.total_tokens||0); acc.usage_reported+=(p.usage_reported||0); });
+    out.push(acc);
+  }
+  return out;
+}
+function persistedBucketTitle(p){
+  var start=new Date(p.minute).toLocaleString();
+  if(p.minute_end&&p.minute_end!==p.minute){
+    return start+" ~ "+new Date(p.minute_end).toLocaleString()+" · "+(p.points||1)+" 分钟点/桶 · total "+(p.total||0)+" · ok "+(p.success||0)+" · err "+(p.errors||0);
+  }
+  return start+" · total "+(p.total||0)+" · ok "+(p.success||0)+" · err "+(p.errors||0);
+}
+function persistedTokenTitle(p){
+  var start=new Date(p.minute).toLocaleString();
+  var range=(p.minute_end&&p.minute_end!==p.minute)?(start+" ~ "+new Date(p.minute_end).toLocaleString()):start;
+  return range+" · in "+(p.input_tokens||0)+" · out "+(p.output_tokens||0)+" · total "+(p.total_tokens||0);
+}
 function renderPersistedSeries(items){
   var hr=$("trend-req"), ht=$("trend-tok"); if(!hr||!ht)return; clear(hr); clear(ht);
-  if(!items.length){ hr.appendChild(el("span","该范围暂无持久分钟数据","empty")); ht.appendChild(el("span","该范围暂无持久分钟数据","empty")); return; }
-  var asc=items.slice().sort(function(a,b){return new Date(a.minute)-new Date(b.minute);}).slice(-120);
-  var maxR=1,maxT=1; asc.forEach(function(p){maxR=Math.max(maxR,p.total||0);maxT=Math.max(maxT,p.total_tokens||0);});
-  asc.forEach(function(p){
+  var cap=$("trend-cap");
+  if(!items.length){
+    hr.appendChild(el("span","该范围暂无持久分钟数据","empty")); ht.appendChild(el("span","该范围暂无持久分钟数据","empty"));
+    if(cap)cap.textContent="持久趋势（"+S.historyRange+"）：暂无分钟数据。";
+    return;
+  }
+  var asc=(items||[]).slice().sort(function(a,b){return new Date(a.minute)-new Date(b.minute);});
+  var buckets=aggregatePersistedSeries(asc,120);
+  var perBucket=Math.ceil(asc.length/Math.max(1,buckets.length));
+  if(cap){
+    var rangeLabel=(S.historyRange==="7d"?"7天":(S.historyRange==="24h"?"24小时":S.historyRange));
+    cap.textContent="持久趋势（"+rangeLabel+"）：共 "+asc.length+" 分钟点，聚合为 "+buckets.length+" 个等宽桶（约 "+perBucket+" 分钟/桶，上限 120 桶）。每桶求和 total/success/errors/tokens/usage_reported，悬停查看桶范围。";
+  }
+  var maxR=1,maxT=1; buckets.forEach(function(p){maxR=Math.max(maxR,p.total||0);maxT=Math.max(maxT,p.total_tokens||0);});
+  buckets.forEach(function(p){
     var b=document.createElement("div"); b.className="bar"+((p.errors||0)>0?" err":"");
     b.style.height=Math.max(2,Math.round(((p.total||0)/maxR)*100))+"%";
-    b.title=new Date(p.minute).toLocaleString()+" · total "+(p.total||0)+" · ok "+(p.success||0)+" · err "+(p.errors||0);
+    b.title=persistedBucketTitle(p);
     hr.appendChild(b);
     var t=document.createElement("div"); t.className="bar tok";
     t.style.height=Math.max(2,Math.round(((p.total_tokens||0)/maxT)*100))+"%";
-    t.title=new Date(p.minute).toLocaleString()+" · in "+(p.input_tokens||0)+" · out "+(p.output_tokens||0)+" · total "+(p.total_tokens||0);
+    t.title=persistedTokenTitle(p);
     ht.appendChild(t);
   });
 }
 function renderPersistedRows(){
   renderHistChannelFilter();
   var tb=$("tbody-hist"); if(!tb)return; clear(tb);
-  var c=$("hist-count"); if(c)c.textContent="共 "+S.histItems.length+" 条"+(S.histCursor?"（可加载更多）":"（已到底）")+(S.histLoading?" · 加载中…":"");
+  var c=$("hist-count");
+  if(c){
+    var text="共 "+S.histItems.length+" 条"+(S.histCursor?"（可加载更多）":"（已到底）")+(S.histLoading?" · 加载中…":"");
+    if(S.histGap)text+=" · 本次查询存在间隙（部分页 gap=true，已累积）";
+    if(S.histDropped)text+=" · 全局 dropped "+S.histDropped;
+    c.textContent=text;
+  }
   if(!S.histItems.length){emptyRow(tb,7,S.histLoading?"历史加载中…":"该范围暂无持久历史（memory-only 时为空）");return;}
   S.histItems.forEach(function(r){
     var tr=document.createElement("tr"); tr.className="clickable"+(S.histExpanded===r.request_id?" selected":"");
@@ -823,6 +867,9 @@ function loadHistAttempts(requestId, anchorRow){
   });
 }
 function renderTrends(){
+  if(S.historyRange!=="1h")return;
+  var cap=$("trend-cap");
+  if(cap)cap.textContent="最近 60 分钟按分钟聚合。左为请求数，右为 token 数（纯 CSS 条形，悬停查看数值）。";
   var series=(S.metrics&&S.metrics.series)||[];
   var hr=$("trend-req"), ht=$("trend-tok"); clear(hr); clear(ht);
   if(!series.length){ hr.appendChild(el("span","暂无数据","empty")); ht.appendChild(el("span","暂无数据","empty")); return; }
@@ -1060,6 +1107,25 @@ function poolNamesFromEditor(){
   for(var i=0;i<cards.length;i++){ names.push(cards[i].getAttribute("data-pool")); }
   return names;
 }
+function currentRoutingRefs(){
+  var a=$("c-route-anon")?$("c-route-anon").value:"", z=$("c-route-zen")?$("c-route-zen").value:"", g=$("c-route-go")?$("c-route-go").value:"";
+  return {a:a,z:z,g:g};
+}
+function refreshPoolBadges(){
+  var refs=currentRoutingRefs();
+  var cards=document.querySelectorAll("#pools-editor .pool-card");
+  for(var i=0;i<cards.length;i++){
+    var name=cards[i].getAttribute("data-pool");
+    var nameInput=cards[i].querySelector('[data-role="pool-name"]');
+    if(nameInput&&nameInput.value.trim())name=nameInput.value.trim();
+    var badge=cards[i].querySelector('[data-role="pool-badge"]');
+    if(!badge)continue;
+    var active=(name===refs.a||name===refs.z||name===refs.g);
+    clear(badge);
+    badge.appendChild(document.createTextNode(active?"active（运行中）":"staged（暂存：不运行、不可探测、不计容量）"));
+    badge.className="pill "+(active?"ok":"neutral");
+  }
+}
 function renderPoolsEditor(v){
   var host=$("pools-editor"); clear(host);
   $("pools-error").textContent="";
@@ -1070,6 +1136,7 @@ function renderPoolsEditor(v){
   if(routing.anonymous)$("c-route-anon").value=routing.anonymous;
   if(routing.zen)$("c-route-zen").value=routing.zen;
   if(routing.go)$("c-route-go").value=routing.go;
+  refreshPoolBadges();
 }
 function syncRoutingSelects(){
   var names=poolNamesFromEditor();
@@ -1099,6 +1166,7 @@ function poolCard(name, view){
   card.style.border="1px solid var(--line)"; card.style.padding="8px 10px"; card.style.marginBottom="8px";
   var head=document.createElement("div"); head.style.display="flex"; head.style.gap="8px"; head.style.alignItems="center"; head.style.flexWrap="wrap";
   var title=el("strong","pool: "+name); head.appendChild(title);
+  var badge=el("span","staged","pill neutral"); badge.setAttribute("data-role","pool-badge"); head.appendChild(badge);
   var nameInput=document.createElement("input"); nameInput.value=name; nameInput.placeholder="pool 名（字母/数字/_/-/.)"; nameInput.style.maxWidth="220px";
   nameInput.setAttribute("data-role","pool-name");
   head.appendChild(nameInput);
@@ -1107,7 +1175,7 @@ function poolCard(name, view){
     var cur=card.getAttribute("data-pool");
     var routing={a:$("c-route-anon").value,z:$("c-route-zen").value,g:$("c-route-go").value};
     if(routing.a===cur||routing.z===cur||routing.g===cur){ $("pools-error").textContent="pool "+cur+" 仍被 routing 引用（anonymous/zen/go），请先切换路由再删除。"; return; }
-    card.remove(); syncRoutingSelects(); $("pools-error").textContent="";
+    card.remove(); syncRoutingSelects(); refreshPoolBadges(); $("pools-error").textContent="";
   });
   head.appendChild(del);
   card.appendChild(head);
@@ -1139,6 +1207,7 @@ function poolCard(name, view){
     if(mapped.z)$("c-route-zen").value=mapped.z;
     if(mapped.g)$("c-route-go").value=mapped.g;
     $("pools-error").textContent="";
+    refreshPoolBadges();
   });
   return card;
 }
@@ -1147,7 +1216,10 @@ $("btn-pool-add").addEventListener("click",function(){
   var existing={}; poolNamesFromEditor().forEach(function(n){existing[n]=1;});
   while(existing[name]){ i++; name=base+i; }
   host.appendChild(poolCard(name, {proxies:[],proxyfile:""}));
-  syncRoutingSelects(); $("pools-error").textContent="";
+  syncRoutingSelects(); refreshPoolBadges(); $("pools-error").textContent="";
+});
+["c-route-anon","c-route-zen","c-route-go"].forEach(function(id){
+  var sel=$(id); if(sel)sel.addEventListener("change",refreshPoolBadges);
 });
 function poolInputs(){
   var out={}, cards=document.querySelectorAll("#pools-editor .pool-card");
@@ -1344,8 +1416,19 @@ function renderUsageFacts(){
 }
 
 /* ---------- logs ---------- */
+function resetLogFail(){
+  S.logFail=0;
+  $("log-state").textContent="已连接";
+  var g=$("log-gap"); if(g){clear(g); g.classList.add("hidden");}
+}
+function probeLogSession(){
+  fetch("/api/auth/session",{method:"GET",headers:{"Accept":"application/json"}}).then(function(resp){
+    if(resp.status===401){ showLogin(); }
+  }).catch(function(){});
+}
 function connectLogs(){
   if(S.es){try{S.es.close();}catch(e){}}
+  S.logFail=0;
   $("log-state").textContent="连接中…";
   var es=new EventSource("/api/logs/stream"); S.es=es;
   es.addEventListener("log",function(ev){
@@ -1354,6 +1437,7 @@ function connectLogs(){
       S.logEvents.push(item);
       if(S.logEvents.length>2000)S.logEvents.shift();
       if(!S.logPaused)renderLogs();
+      resetLogFail();
     }catch(e){}
   });
   es.addEventListener("gap",function(ev){
@@ -1361,8 +1445,12 @@ function connectLogs(){
     g.appendChild(document.createTextNode("日志间隙：较早事件已从内存清除（慢客户端或过期）。"));
     g.classList.remove("hidden");
   });
-  es.onopen=function(){$("log-state").textContent="已连接";};
-  es.onerror=function(){$("log-state").textContent="重连中…（保留旧日志）";};
+  es.onopen=function(){ resetLogFail(); };
+  es.onerror=function(){
+    S.logFail=(S.logFail||0)+1;
+    $("log-state").textContent="重连中…（保留旧日志）";
+    if(S.logFail>=2){ probeLogSession(); }
+  };
 }
 function renderLogs(){
   var lv=$("log-level").value, comp=$("log-component").value.toLowerCase(), q=$("log-search").value.toLowerCase();
