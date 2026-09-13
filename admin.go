@@ -239,23 +239,28 @@ type SecretView struct {
 	Display string `json:"display"`
 }
 
+type ProxyPoolView struct {
+	Proxies   []SecretView `json:"proxies"`
+	ProxyFile string       `json:"proxyfile"`
+}
+
 type ConfigView struct {
-	Listen      string            `json:"listen"`
-	ServerKeys  []SecretView      `json:"server_keys"`
-	ZenKeys     []SecretView      `json:"zen_keys"`
-	GoKeys      []SecretView      `json:"go_keys"`
-	Anonymous   bool              `json:"anonymous"`
-	Proxies     []SecretView      `json:"proxies"`
-	ProxyFile   string            `json:"proxyfile"`
-	Upstream    UpstreamConfig    `json:"upstream"`
-	Retry       RetryConfig       `json:"retry"`
-	Models      ModelsConfig      `json:"models"`
-	Performance PerformanceConfig `json:"performance"`
-	Logging     LoggingConfig     `json:"logging"`
-	Prefer      Tier              `json:"prefer"`
-	WebUI       WebUIView         `json:"webui"`
-	Effective   EffectiveView     `json:"effective"`
-	Restart     []string          `json:"restart_required_fields,omitempty"`
+	Listen       string                   `json:"listen"`
+	ServerKeys   []SecretView             `json:"server_keys"`
+	ZenKeys      []SecretView             `json:"zen_keys"`
+	GoKeys       []SecretView             `json:"go_keys"`
+	Anonymous    bool                     `json:"anonymous"`
+	ProxyPools   map[string]ProxyPoolView `json:"proxy_pools"`
+	ProxyRouting ProxyRoutingConfig       `json:"proxy_routing"`
+	Upstream     UpstreamConfig           `json:"upstream"`
+	Retry        RetryConfig              `json:"retry"`
+	Models       ModelsConfig             `json:"models"`
+	Performance  PerformanceConfig        `json:"performance"`
+	Logging      LoggingConfig            `json:"logging"`
+	Prefer       Tier                     `json:"prefer"`
+	WebUI        WebUIView                `json:"webui"`
+	Effective    EffectiveView            `json:"effective"`
+	Restart      []string                 `json:"restart_required_fields,omitempty"`
 }
 
 type EffectiveView struct {
@@ -276,21 +281,26 @@ type SecretInput struct {
 	Value string `json:"value,omitempty"`
 }
 
+type ProxyPoolInput struct {
+	Proxies   []SecretInput `json:"proxies"`
+	ProxyFile string        `json:"proxyfile"`
+}
+
 type ConfigUpdate struct {
-	Listen      string            `json:"listen"`
-	ServerKeys  []SecretInput     `json:"server_keys"`
-	ZenKeys     []SecretInput     `json:"zen_keys"`
-	GoKeys      []SecretInput     `json:"go_keys"`
-	Anonymous   bool              `json:"anonymous"`
-	Proxies     []SecretInput     `json:"proxies"`
-	ProxyFile   string            `json:"proxyfile"`
-	Upstream    UpstreamConfig    `json:"upstream"`
-	Retry       RetryConfig       `json:"retry"`
-	Models      ModelsConfig      `json:"models"`
-	Performance PerformanceConfig `json:"performance"`
-	Logging     LoggingConfig     `json:"logging"`
-	Prefer      Tier              `json:"prefer"`
-	WebUI       WebUIView         `json:"webui"`
+	Listen       string                    `json:"listen"`
+	ServerKeys   []SecretInput             `json:"server_keys"`
+	ZenKeys      []SecretInput             `json:"zen_keys"`
+	GoKeys       []SecretInput             `json:"go_keys"`
+	Anonymous    bool                      `json:"anonymous"`
+	ProxyPools   map[string]ProxyPoolInput `json:"proxy_pools"`
+	ProxyRouting ProxyRoutingConfig        `json:"proxy_routing"`
+	Upstream     UpstreamConfig            `json:"upstream"`
+	Retry        RetryConfig               `json:"retry"`
+	Models       ModelsConfig              `json:"models"`
+	Performance  PerformanceConfig         `json:"performance"`
+	Logging      LoggingConfig             `json:"logging"`
+	Prefer       Tier                      `json:"prefer"`
+	WebUI        WebUIView                 `json:"webui"`
 }
 
 func (a *AdminServer) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
@@ -320,16 +330,18 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_go_keys", err.Error())
 		return
 	}
-	proxies, err := resolveSecrets(update.Proxies, current.Proxies)
+	pools, err := resolveProxyPools(update.ProxyPools, current.ProxyPools)
 	if err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
 		return
 	}
 	candidate := Config{
-		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, Proxies: proxies, ProxyFile: update.ProxyFile,
+		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		WebUI: WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
+	candidate.proxyPoolsPresent = true
+	candidate.proxyRoutingPresent = true
 	result, err := a.manager.Apply(candidate, true)
 	if err != nil {
 		a.logger.Warn("configuration update rejected", "component", "config", "event", "config_rejected", "error", err)
@@ -363,7 +375,11 @@ func (a *AdminServer) handleReveal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("sensitive configuration revealed", "component", "auth", "event", "secrets_revealed", "client_ip", clientIP(r))
-	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxies": cfg.Proxies})
+	pools := make(map[string]any, len(cfg.ProxyPools))
+	for name, pool := range cfg.ProxyPools {
+		pools[name] = map[string]any{"proxies": pool.Proxies, "proxyfile": pool.ProxyFile}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxy_pools": pools})
 }
 
 func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
@@ -648,14 +664,93 @@ func (a *AdminServer) sessionTokenValid(token string) bool {
 func (a *AdminServer) configView() ConfigView {
 	cfg := a.manager.Config()
 	effective, restart := a.manager.RestartStatus()
+	pools := make(map[string]ProxyPoolView, len(cfg.ProxyPools))
+	for name, pool := range cfg.ProxyPools {
+		pools[name] = ProxyPoolView{Proxies: maskSecrets(pool.Proxies, true), ProxyFile: pool.ProxyFile}
+	}
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
-		Proxies: maskSecrets(cfg.Proxies, true), ProxyFile: cfg.ProxyFile, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
 		Restart:   restart,
 	}
+}
+
+func resolveProxyPools(inputs map[string]ProxyPoolInput, current map[string]ProxyPoolConfig) (map[string]ProxyPoolConfig, error) {
+	if inputs == nil {
+		return map[string]ProxyPoolConfig{}, nil
+	}
+	// Global fingerprint index across all existing pools. A rename changes
+	// only the pool key, so masked IDs must still resolve to the original
+	// values. Prefer the same-name pool; fall back to this index only when
+	// the fingerprint maps to a single consistent value. Ambiguous or
+	// unknown/stale fingerprints are rejected without exposing values.
+	global := make(map[string]string)
+	ambiguous := make(map[string]bool)
+	for _, pool := range current {
+		for _, value := range pool.Proxies {
+			fingerprint := secretFingerprint(value)
+			if ambiguous[fingerprint] {
+				continue
+			}
+			if prev, ok := global[fingerprint]; ok {
+				if prev != value {
+					ambiguous[fingerprint] = true
+					delete(global, fingerprint)
+				}
+				continue
+			}
+			global[fingerprint] = value
+		}
+	}
+	result := make(map[string]ProxyPoolConfig, len(inputs))
+	for name, input := range inputs {
+		if err := validatePoolName(name); err != nil {
+			return nil, err
+		}
+		var sameName []string
+		if pool, ok := current[name]; ok {
+			sameName = pool.Proxies
+		}
+		proxies, err := resolvePoolProxySecrets(input.Proxies, sameName, global, ambiguous)
+		if err != nil {
+			return nil, fmt.Errorf("proxy_pools[%q]: %w", name, err)
+		}
+		result[name] = ProxyPoolConfig{Proxies: proxies, ProxyFile: strings.TrimSpace(input.ProxyFile)}
+	}
+	return result, nil
+}
+
+func resolvePoolProxySecrets(inputs []SecretInput, sameName []string, global map[string]string, ambiguous map[string]bool) ([]string, error) {
+	same := make(map[string]string, len(sameName))
+	for _, value := range sameName {
+		same[secretFingerprint(value)] = value
+	}
+	result := make([]string, 0, len(inputs))
+	for _, input := range inputs {
+		switch {
+		case strings.TrimSpace(input.Value) != "":
+			result = append(result, strings.TrimSpace(input.Value))
+		case input.ID != "":
+			if value, ok := same[input.ID]; ok {
+				result = append(result, value)
+				continue
+			}
+			if ambiguous[input.ID] {
+				return nil, fmt.Errorf("unknown or stale secret id %q", input.ID)
+			}
+			value, ok := global[input.ID]
+			if !ok {
+				return nil, fmt.Errorf("unknown or stale secret id %q", input.ID)
+			}
+			result = append(result, value)
+		default:
+			return nil, errors.New("each item must contain id or value")
+		}
+	}
+	return result, nil
 }
 
 func maskSecrets(values []string, proxy bool) []SecretView {

@@ -178,8 +178,17 @@ cp config.example.json config.json
   "go_keys": [],
   "anonymous": false,
   "prefer": "go",
-  "proxyfile": "",
-  "proxies": ["direct"],
+  "proxy_pools": {
+    "shared": {
+      "proxies": ["direct"],
+      "proxyfile": ""
+    }
+  },
+  "proxy_routing": {
+    "anonymous": "shared",
+    "zen": "shared",
+    "go": "shared"
+  },
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"
@@ -224,8 +233,8 @@ cp config.example.json config.json
 | `go_keys` | OpenCode Zen Go API key 池。没有 Go key 时可以使用空数组。 |
 | `anonymous` | 是否启用 Zen 匿名模式，默认 `false`。models.dev 判定为零成本，或模型名称包含 `free`，任一条件成立即可进入匿名通道。 |
 | `prefer` | 模型同时存在于 Zen 与 Go 时认证 Key 的尝试顺序，值为 `go` 或 `zen`，默认 `go`。首选 Tier 失败后回退另一 Tier；仅存在于某一池时只尝试该池。 |
-| `proxyfile` | 可选代理池文件路径。相对路径以 `config.json` 所在目录为基准；内容会追加到 `proxies` 并去重。 |
-| `proxies` | 上游代理列表。支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`。URL 可以包含代理用户名和密码。 |
+| `proxy_pools` | 具名代理池映射。每个 pool 有 `proxies`（上游代理列表，支持 `direct`、`http://`、`https://`、`socks5://` 和 `socks5h://`，URL 可含认证信息）与 `proxyfile`（可选代理文件路径，相对路径以 `config.json` 所在目录为基准）。pool 名是稳定 identity，只能使用字母、数字、`_`、`-`、`.`（1–64 字符），禁止用 IP 或 URL 命名，`direct` 为保留字。 |
+| `proxy_routing` | `anonymous` / `zen` / `go` 三个通道各引用一个已存在的 pool 名，允许相同或不同。`anonymous: false` 只关闭匿名凭证，三个引用仍必须全部合法。未被引用的 pool 可保留在配置中（仍完整校验），但不构建运行时传输。 |
 
 `server_keys` 至少需要一个值。`anonymous` 为 `false` 时，`zen_keys` 和 `go_keys` 至少有一个池不能为空；启用匿名模式后两个上游 key 池可以同时为空。
 
@@ -238,7 +247,7 @@ OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Z
 1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用；不要求名称包含 `free`。
 2. 模型 ID 大小写不敏感地包含 `free`；即使 metadata 尚未就绪、缺少该模型或显示为付费，也仍按名称条件视为免费。
 
-免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 proxy；每个可用 proxy 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 proxy 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点，不代表或推断实际出口 IP。
+免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 proxy；每个可用 proxy 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 proxy 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点、`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
 
 只有匿名通道、且 `zen_keys` 与 `go_keys` 都为空时，`/v1/models` 只展示按上述规则可匿名使用的模型。只要配置了任一真实上游 Key，模型列表仍展示该 Key 路由可用的完整模型集合。
 
@@ -246,19 +255,29 @@ models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址�
 
 ### key 与代理分配规则
 
-只需要直连时使用：
+代理以具名池组织，`proxy_routing` 决定 anonymous / zen / go 各自使用哪个池。相同引用共享同一传输池实例，不同引用完全隔离：Zen key 只绑定 `proxy_routing.zen` 指向的池，Go key 只绑定 `.go`，匿名凭证只走 `.anonymous`；代理故障的 key 迁移与恢复只发生在同一池内，隔离模式下不会跨池移动。
+
+共享单池示例（默认，行为与旧版单代理池一致）：
 
 ```json
-"proxies": ["direct"]
+"proxy_pools": {
+  "shared": { "proxies": ["direct"], "proxyfile": "" }
+},
+"proxy_routing": { "anonymous": "shared", "zen": "shared", "go": "shared" }
 ```
 
-SOCKS5 代理示例：
+隔离示例（匿名、Zen、Go 各走不同出口）：
 
 ```json
-"proxies": ["socks5://127.0.0.1:1080"]
+"proxy_pools": {
+  "anon": { "proxies": ["socks5://127.0.0.1:1080"], "proxyfile": "" },
+  "zen": { "proxies": ["http://user:password@127.0.0.1:7890"], "proxyfile": "" },
+  "go": { "proxies": ["direct"], "proxyfile": "" }
+},
+"proxy_routing": { "anonymous": "anon", "zen": "zen", "go": "go" }
 ```
 
-多个代理示例：
+池内条目示例：
 
 ```json
 "proxies": [
@@ -267,13 +286,10 @@ SOCKS5 代理示例：
 ]
 ```
 
-也可以从文本文件加载代理池：
+也可以从文本文件加载单个池：
 
 ```json
-{
-  "proxyfile": "proxies.txt",
-  "proxies": ["direct"]
-}
+"shared": { "proxyfile": "proxies.txt", "proxies": ["direct"] }
 ```
 
 `proxies.txt` 每行填写一个代理。支持空行、以 `#`、`;` 或 `//` 开头的整行注释，也支持在代理后使用空格加这些标记写行尾注释：
@@ -284,7 +300,9 @@ http://user:password@127.0.0.1:7890
 socks5://127.0.0.1:1080  # 备用代理
 ```
 
-配置中的 `proxies` 会先加载，随后加载 `proxyfile`，重复项只保留第一次出现的位置。如果两个来源都为空，则仍使用 `direct`。`config.json` 本身支持 `//` 单行注释和 `/* ... */` 块注释；引号内的 `https://` 等内容不会被当作注释。
+每个池的 `proxies` 先加载，随后加载该池的 `proxyfile`，重复项只保留第一次出现的位置。如果两个来源都为空，则该池仍使用 `direct`。`config.json` 本身支持 `//` 单行注释和 `/* ... */` 块注释；引号内的 `https://` 等内容不会被当作注释。
+
+旧版顶层 `proxies` / `proxyfile` 仍可在启动与重载时读取：仅旧字段出现时会自动迁移为 `shared` 池并由三个路由引用（清除旧字段，行为与旧版一致）；完全没有代理字段时同样规范化为 `shared`/`direct`。旧字段与任何新字段同时出现会返回明确的校验错误。保存与 Apply 只写新格式。监控中的 `proxy_node` 表示所选代理节点，`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
 
 ### `upstream`
 
@@ -369,7 +387,7 @@ WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy；运行�
 
 WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断。
 
-keys、proxy、上游、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化，原有注释不会保留。
+keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用切换）、上游、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化为新格式（旧顶层 `proxies` / `proxyfile` 不保留），原有注释不会保留。
 
 
 ## 会话 ID

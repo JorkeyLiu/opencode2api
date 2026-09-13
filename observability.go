@@ -152,16 +152,33 @@ func (r *SecretRedactor) Replace(cfg Config) {
 			}
 		}
 	}
-	for _, value := range cfg.RuntimeProxies() {
-		if value != "direct" {
-			values = append(values, value)
-			if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
-				values = append(values, parsed.User.Username())
-				if password, ok := parsed.User.Password(); ok {
-					values = append(values, password)
-				}
+	appendProxySecrets := func(value string) {
+		if value == "" || value == "direct" {
+			return
+		}
+		values = append(values, value)
+		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
+			values = append(values, parsed.User.Username())
+			if password, ok := parsed.User.Password(); ok {
+				values = append(values, password)
 			}
 		}
+	}
+	for _, pool := range cfg.ProxyPools {
+		for _, value := range pool.Proxies {
+			appendProxySecrets(strings.TrimSpace(value))
+		}
+		for _, value := range pool.effective {
+			appendProxySecrets(value)
+		}
+	}
+	for _, value := range cfg.effectivePools {
+		for _, item := range value {
+			appendProxySecrets(item)
+		}
+	}
+	for _, value := range cfg.Proxies {
+		appendProxySecrets(strings.TrimSpace(value))
 	}
 	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
 	r.values.Store(values)
@@ -295,6 +312,7 @@ type requestMeta struct {
 	Channel       string
 	Anonymous     bool
 	Proxy         string
+	ProxyPool     string
 	Attempts      int
 	Stream        bool
 	Usage         bridgeUsage
@@ -380,6 +398,7 @@ type UpstreamAttempt struct {
 	Channel    string    `json:"channel"`
 	Anonymous  bool      `json:"anonymous"`
 	Proxy      string    `json:"proxy_node"`
+	ProxyPool  string    `json:"proxy_pool,omitempty"`
 	Status     int       `json:"status,omitempty"`
 	DurationMS int64     `json:"duration_ms"`
 	Success    bool      `json:"success"`
@@ -483,6 +502,7 @@ type UpstreamRequest struct {
 	Channel    string    `json:"channel"`
 	Anonymous  bool      `json:"anonymous"`
 	Proxy      string    `json:"proxy_node,omitempty"`
+	ProxyPool  string    `json:"proxy_pool,omitempty"`
 	Attempts   int       `json:"attempts"`
 	Status     int       `json:"status"`
 	DurationMS int64     `json:"duration_ms"`
@@ -728,7 +748,7 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		if meta.Request != "" && meta.Model != "" {
 			request := UpstreamRequest{
 				Time: time.Now().UTC(), RequestID: meta.Request, Model: meta.Model, Tier: meta.Tier,
-				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
+				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy, ProxyPool: meta.ProxyPool,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
 				Success: status >= 200 && status < 400,
 			}
@@ -832,6 +852,20 @@ func resourceCredentialID(attempt UpstreamAttempt) string {
 	return attempt.Channel + ":" + attempt.KeyID
 }
 
+func poolQualifiedProxyID(pool, proxy string) string {
+	if pool == "" {
+		return proxy
+	}
+	return pool + " @ " + proxy
+}
+
+func poolQualifiedPairID(cred, pool, proxy string) string {
+	if pool == "" {
+		return cred + " @ " + proxy
+	}
+	return cred + " @ " + pool + " @ " + proxy
+}
+
 func recordResourceBucket(bucket *resourceBucket, attempt UpstreamAttempt) {
 	durationMS := max(attempt.DurationMS, 0)
 	proxy := attempt.Proxy
@@ -848,9 +882,9 @@ func recordResourceBucket(bucket *resourceBucket, attempt UpstreamAttempt) {
 	if bucket.pairs == nil {
 		bucket.pairs = make(map[string]*ResourceCounts)
 	}
-	addResourceSample(bucket.proxies, resourceMaxProxies, proxy, attempt, durationMS)
+	addResourceSample(bucket.proxies, resourceMaxProxies, poolQualifiedProxyID(attempt.ProxyPool, proxy), attempt, durationMS)
 	addResourceSample(bucket.creds, resourceMaxCredentials, cred, attempt, durationMS)
-	addResourceSample(bucket.pairs, resourceMaxPairs, cred+" @ "+proxy, attempt, durationMS)
+	addResourceSample(bucket.pairs, resourceMaxPairs, poolQualifiedPairID(cred, attempt.ProxyPool, proxy), attempt, durationMS)
 }
 
 // addResourceSample updates one bounded dimension map. New keys beyond the

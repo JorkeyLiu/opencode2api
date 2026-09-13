@@ -151,7 +151,7 @@ func TestMonitorResourceWindowExcludesOldAttempts(t *testing.T) {
 }
 
 func TestAnonymousCooldownSnapshot(t *testing.T) {
-	transports, err := newTransportPool([]string{"direct", "direct"}, PerformanceConfig{
+	transports, err := newTransportPool("shared", []string{"direct", "direct"}, PerformanceConfig{
 		MaxIdleConns: 1, MaxIdleConnsPerHost: 1, ConnectTimeoutSeconds: 1, IdleConnTimeoutSeconds: 1,
 	}, time.Second)
 	if err != nil {
@@ -236,7 +236,7 @@ func TestObservabilityRedaction(t *testing.T) {
 }
 
 func TestKeyStatusProxyAndCooldown(t *testing.T) {
-	transports, err := newTransportPool([]string{"direct", "direct"}, PerformanceConfig{
+	transports, err := newTransportPool("shared", []string{"direct", "direct"}, PerformanceConfig{
 		MaxIdleConns: 1, MaxIdleConnsPerHost: 1, ConnectTimeoutSeconds: 1, IdleConnTimeoutSeconds: 1,
 	}, time.Second)
 	if err != nil {

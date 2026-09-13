@@ -30,11 +30,16 @@
 - `config.json` is the writable authority for operator intent. It accepts `//`
   and `/* ... */` comments; saved output is normalized and comments are not
   preserved. The on-disk example shape lives in `config.example.json`.
-- The effective Gateway state (merged proxies + proxyfile, key pools with
-  cooldowns, connection pools, model catalog snapshot) is in-memory runtime
-  state built from config. NEVER treat it as editable directly; change it only
-  by changing config (or the seed/env inputs that produce config) and letting
-  the runtime rebuild.
+- The effective Gateway state (named proxy pools with per-pool resolved
+  proxies + proxyfile, key pools with cooldowns, connection pools, model
+  catalog snapshot) is in-memory runtime state built from config. NEVER treat
+  it as editable directly; change it only by changing config (or the seed/env
+  inputs that produce config) and letting the runtime rebuild.
+- Proxy identity is two-level: `proxy_pools` names stable pool identities and
+  `proxy_routing` assigns exactly one pool each to the anonymous, zen, and go
+  channels (same or different). Top-level `proxies` / `proxyfile` are
+  load-time legacy inputs only: they migrate to a `shared` pool on load and
+  never persist. Pool names are operator identities, never IPs or URLs.
 - External authorities MUST NOT be duplicated into this guide or hardcoded:
   - Upstream `/v1/models` (Zen and Go) for model existence per tier.
   - The OpenCode capability directory (`models.opencode.ai`) for each model's
@@ -54,7 +59,7 @@
 - Inference spine (gateway). Every chat/responses/anthropic request follows:
   monitoring context → local `server_keys` auth → routing and per-tier request
   preparation (single shared preparation path, incl. thinking/tool-history
-  normalization) → anonymous Zen proxy pool (free models only) → authenticated
+  normalization) → anonymous Zen assigned pool (free models only) → authenticated
   Zen/Go key tiers in `prefer` order → same-protocol passthrough or
   cross-protocol conversion → result recording (metrics, upstream attempts,
   usage when the upstream reports it).
@@ -68,7 +73,8 @@
   to the new instance. On write or init failure the old instance MUST keep
   serving; already-started requests MUST NOT be interrupted. Saved JSON is
   normalized.
-- Hot vs. restart: keys, proxies, upstream addresses, retry, models,
+- Hot vs. restart: keys, proxies (pools, files, and routing references),
+  upstream addresses, retry, models,
   performance, preferred tier, and log level take effect immediately.
   `listen`, `webui.listen`, and `webui.enabled` are saved but REQUIRE a
   process restart. NEVER claim a listen-plane edit is live without restart.
@@ -82,7 +88,8 @@
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
   first, non-free models skip it entirely. It walks every currently available
-  proxy exactly once and is NEVER truncated by `retry.max_attempts`. Any error
+  proxy in its assigned pool exactly once and is NEVER truncated by
+  `retry.max_attempts`. Any error
   (transport, 4xx, 5xx, non-2xx) advances to the next proxy; only proxy
   exhaustion enters the authenticated tiers.
 - Authenticated tiers: each tier owns its own `retry.max_attempts` budget
@@ -99,6 +106,7 @@
   directory (manual `models.protocols` covers experiments only). Same-name
   models report metadata per actually-serving tier.
 - Identity hygiene: `proxy_node` names a proxy node, NEVER the egress IP.
+  `proxy_pool` names the owning pool; resource identities are pool-qualified.
   Real keys render as last-5-characters (or `anonymous`); config-secret
   fingerprints stay SHA-256 internal. Responses with the same model name in
   different tiers MUST keep their tier attribution.

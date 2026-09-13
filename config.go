@@ -14,23 +14,49 @@ import (
 	"strings"
 )
 
-type Config struct {
-	Listen      string            `json:"listen"`
-	ServerKeys  []string          `json:"server_keys"`
-	ZenKeys     []string          `json:"zen_keys"`
-	GoKeys      []string          `json:"go_keys"`
-	Anonymous   bool              `json:"anonymous"`
-	Proxies     []string          `json:"proxies"`
-	ProxyFile   string            `json:"proxyfile"`
-	Upstream    UpstreamConfig    `json:"upstream"`
-	Retry       RetryConfig       `json:"retry"`
-	Models      ModelsConfig      `json:"models"`
-	Performance PerformanceConfig `json:"performance"`
-	Logging     LoggingConfig     `json:"logging"`
-	WebUI       WebUIConfig       `json:"webui"`
-	Prefer      Tier              `json:"prefer"`
+var allowedConfigKeys = map[string]bool{
+	"listen": true, "server_keys": true, "zen_keys": true, "go_keys": true,
+	"anonymous": true, "proxies": true, "proxyfile": true,
+	"proxy_pools": true, "proxy_routing": true,
+	"upstream": true, "retry": true, "models": true, "performance": true,
+	"logging": true, "webui": true, "prefer": true,
+}
 
-	effectiveProxies []string
+type ProxyPoolConfig struct {
+	Proxies   []string `json:"proxies"`
+	ProxyFile string   `json:"proxyfile"`
+	effective []string
+}
+
+type ProxyRoutingConfig struct {
+	Anonymous string `json:"anonymous"`
+	Zen       string `json:"zen"`
+	Go        string `json:"go"`
+}
+
+type Config struct {
+	Listen       string                     `json:"listen"`
+	ServerKeys   []string                   `json:"server_keys"`
+	ZenKeys      []string                   `json:"zen_keys"`
+	GoKeys       []string                   `json:"go_keys"`
+	Anonymous    bool                       `json:"anonymous"`
+	ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
+	ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
+	Upstream     UpstreamConfig             `json:"upstream"`
+	Retry        RetryConfig                `json:"retry"`
+	Models       ModelsConfig               `json:"models"`
+	Performance  PerformanceConfig          `json:"performance"`
+	Logging      LoggingConfig              `json:"logging"`
+	WebUI        WebUIConfig                `json:"webui"`
+	Prefer       Tier                       `json:"prefer"`
+	Proxies      []string                   `json:"proxies,omitempty"`
+	ProxyFile    string                     `json:"proxyfile,omitempty"`
+
+	effectivePools         map[string][]string
+	legacyProxiesPresent   bool
+	legacyProxyFilePresent bool
+	proxyPoolsPresent      bool
+	proxyRoutingPresent    bool
 }
 
 type UpstreamConfig struct {
@@ -71,16 +97,8 @@ type PerformanceConfig struct {
 	FailureCooldownSeconds int `json:"failure_cooldown_seconds"`
 }
 
-func LoadConfig(path string) (Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("read %s: %w", path, err)
-	}
-	data, err = stripJSONComments(data)
-	if err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", path, err)
-	}
-	cfg := Config{
+func defaultConfig() Config {
+	return Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
@@ -90,6 +108,18 @@ func LoadConfig(path string) (Config, error) {
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
 	}
+}
+
+func LoadConfig(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	data, err = stripJSONComments(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	cfg := defaultConfig()
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
@@ -101,14 +131,175 @@ func LoadConfig(path string) (Config, error) {
 	return NormalizeConfig(path, cfg)
 }
 
+// MarshalJSON emits only the formal new proxy model. Legacy top-level
+// proxies/proxyfile are load-time inputs and never persist.
+func (cfg Config) MarshalJSON() ([]byte, error) {
+	type diskConfig struct {
+		Listen       string                     `json:"listen"`
+		ServerKeys   []string                   `json:"server_keys"`
+		ZenKeys      []string                   `json:"zen_keys"`
+		GoKeys       []string                   `json:"go_keys"`
+		Anonymous    bool                       `json:"anonymous"`
+		ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
+		ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
+		Upstream     UpstreamConfig             `json:"upstream"`
+		Retry        RetryConfig                `json:"retry"`
+		Models       ModelsConfig               `json:"models"`
+		Performance  PerformanceConfig          `json:"performance"`
+		Logging      LoggingConfig              `json:"logging"`
+		WebUI        WebUIConfig                `json:"webui"`
+		Prefer       Tier                       `json:"prefer"`
+	}
+	pools := cfg.ProxyPools
+	if pools == nil {
+		pools = map[string]ProxyPoolConfig{}
+	}
+	return json.Marshal(diskConfig{
+		Listen: cfg.Listen, ServerKeys: cfg.ServerKeys, ZenKeys: cfg.ZenKeys, GoKeys: cfg.GoKeys,
+		Anonymous: cfg.Anonymous, ProxyPools: pools, ProxyRouting: cfg.ProxyRouting,
+		Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models, Performance: cfg.Performance,
+		Logging: cfg.Logging, WebUI: cfg.WebUI, Prefer: cfg.Prefer,
+	})
+}
+
+// UnmarshalJSON enforces strict unknown-field rejection while recording
+// whether legacy or new proxy fields were explicitly present, so
+// legacy+new conflicts are reported instead of silently prioritized.
+func (cfg *Config) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for key := range raw {
+		if !allowedConfigKeys[key] {
+			return fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	def := defaultConfig()
+	*cfg = def
+	cfg.legacyProxiesPresent = hasKey(raw, "proxies")
+	cfg.legacyProxyFilePresent = hasKey(raw, "proxyfile")
+	cfg.proxyPoolsPresent = hasKey(raw, "proxy_pools")
+	cfg.proxyRoutingPresent = hasKey(raw, "proxy_routing")
+	decodeStrict := func(key string, target any) error {
+		rawValue, ok := raw[key]
+		if !ok {
+			return nil
+		}
+		dec := json.NewDecoder(bytes.NewReader(rawValue))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(target); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		if err := ensureJSONEOF(dec); err != nil {
+			return fmt.Errorf("%s: %w", key, err)
+		}
+		return nil
+	}
+	if err := decodeStrict("listen", &cfg.Listen); err != nil {
+		return err
+	}
+	if err := decodeStrict("server_keys", &cfg.ServerKeys); err != nil {
+		return err
+	}
+	if err := decodeStrict("zen_keys", &cfg.ZenKeys); err != nil {
+		return err
+	}
+	if err := decodeStrict("go_keys", &cfg.GoKeys); err != nil {
+		return err
+	}
+	if err := decodeStrict("anonymous", &cfg.Anonymous); err != nil {
+		return err
+	}
+	if err := decodeStrict("proxies", &cfg.Proxies); err != nil {
+		return err
+	}
+	if err := decodeStrict("proxyfile", &cfg.ProxyFile); err != nil {
+		return err
+	}
+	if err := decodeStrict("proxy_pools", &cfg.ProxyPools); err != nil {
+		return err
+	}
+	if err := decodeStrict("proxy_routing", &cfg.ProxyRouting); err != nil {
+		return err
+	}
+	if err := decodeStrict("upstream", &cfg.Upstream); err != nil {
+		return err
+	}
+	if err := decodeStrict("retry", &cfg.Retry); err != nil {
+		return err
+	}
+	if err := decodeStrict("models", &cfg.Models); err != nil {
+		return err
+	}
+	if err := decodeStrict("performance", &cfg.Performance); err != nil {
+		return err
+	}
+	if err := decodeStrict("logging", &cfg.Logging); err != nil {
+		return err
+	}
+	if err := decodeStrict("webui", &cfg.WebUI); err != nil {
+		return err
+	}
+	if err := decodeStrict("prefer", &cfg.Prefer); err != nil {
+		return err
+	}
+	return nil
+}
+
+func hasKey(raw map[string]json.RawMessage, key string) bool {
+	_, ok := raw[key]
+	return ok
+}
+
 // NormalizeConfig resolves external inputs and validates a Config supplied by
 // either the JSON file or the authenticated management API.
 func NormalizeConfig(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
-	cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
-	if err := resolveProxyFiles(path, &cfg); err != nil {
+	legacyExplicit := cfg.legacyProxiesPresent || cfg.legacyProxyFilePresent || len(cfg.Proxies) > 0 || strings.TrimSpace(cfg.ProxyFile) != ""
+	newExplicit := cfg.proxyPoolsPresent || cfg.proxyRoutingPresent || len(cfg.ProxyPools) > 0 ||
+		strings.TrimSpace(cfg.ProxyRouting.Anonymous) != "" || strings.TrimSpace(cfg.ProxyRouting.Zen) != "" || strings.TrimSpace(cfg.ProxyRouting.Go) != ""
+	if legacyExplicit && newExplicit {
+		return Config{}, errors.New("proxies/proxyfile (legacy) cannot be combined with proxy_pools/proxy_routing; remove the legacy fields to use named pools")
+	}
+	switch {
+	case legacyExplicit:
+		trimList(&cfg.Proxies)
+		cfg.ProxyFile = strings.TrimSpace(cfg.ProxyFile)
+		effective, err := resolvePoolProxies(path, cfg.Proxies, cfg.ProxyFile)
+		if err != nil {
+			return Config{}, err
+		}
+		if cfg.ProxyPools == nil {
+			cfg.ProxyPools = map[string]ProxyPoolConfig{}
+		}
+		cfg.ProxyPools["shared"] = ProxyPoolConfig{Proxies: append([]string(nil), cfg.Proxies...), ProxyFile: cfg.ProxyFile, effective: effective}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+		cfg.Proxies = nil
+		cfg.ProxyFile = ""
+		cfg.legacyProxiesPresent = false
+		cfg.legacyProxyFilePresent = false
+		cfg.proxyPoolsPresent = true
+		cfg.proxyRoutingPresent = true
+	case !newExplicit:
+		cfg.ProxyPools = map[string]ProxyPoolConfig{
+			"shared": {Proxies: []string{"direct"}, ProxyFile: "", effective: []string{"direct"}},
+		}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+		cfg.Proxies = nil
+		cfg.ProxyFile = ""
+		cfg.proxyPoolsPresent = true
+		cfg.proxyRoutingPresent = true
+	default:
+		// New-only: legacy inputs must already be absent.
+		cfg.Proxies = nil
+		cfg.ProxyFile = ""
+		cfg.legacyProxiesPresent = false
+		cfg.legacyProxyFilePresent = false
+	}
+	if err := normalizeNamedPools(path, &cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
@@ -168,20 +359,6 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 			return Config{}, errors.New("webui.session_ttl_minutes must be between 5 and 10080")
 		}
 	}
-	for _, raw := range cfg.RuntimeProxies() {
-		if raw == "direct" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" {
-			return Config{}, fmt.Errorf("invalid proxy URL %q", redactURL(raw))
-		}
-		switch strings.ToLower(u.Scheme) {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return Config{}, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
-		}
-	}
 	for model, protocol := range cfg.Models.Protocols {
 		if model == "" || !validProtocol(Protocol(protocol)) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
@@ -190,17 +367,155 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	return cfg, nil
 }
 
-// RuntimeProxies returns the resolved proxy list, including proxyfile entries.
-// Config.Proxies intentionally remains the list stored in config.json so a
-// save never duplicates values loaded from proxyfile.
-func (cfg Config) RuntimeProxies() []string {
-	if len(cfg.effectiveProxies) > 0 {
-		return cfg.effectiveProxies
+// normalizeNamedPools validates pool names, resolves each pool's
+// proxies+proxyfile with the legacy trim/relative/comment/dedup/direct/scheme
+// semantics, and validates that every routing reference exists.
+// Unreferenced pools are fully validated but need not be built at runtime.
+func normalizeNamedPools(path string, cfg *Config) error {
+	if len(cfg.ProxyPools) == 0 {
+		return errors.New("proxy_pools must contain at least one pool")
 	}
-	if len(cfg.Proxies) > 0 {
-		return cfg.Proxies
+	for name := range cfg.ProxyPools {
+		if err := validatePoolName(name); err != nil {
+			return err
+		}
+	}
+	routing := &cfg.ProxyRouting
+	routing.Anonymous = strings.TrimSpace(routing.Anonymous)
+	routing.Zen = strings.TrimSpace(routing.Zen)
+	routing.Go = strings.TrimSpace(routing.Go)
+	if routing.Anonymous == "" || routing.Zen == "" || routing.Go == "" {
+		return errors.New("proxy_routing.anonymous, proxy_routing.zen and proxy_routing.go must each reference an existing pool")
+	}
+	for _, ref := range []struct {
+		field string
+		name  string
+	}{{field: "proxy_routing.anonymous", name: routing.Anonymous}, {field: "proxy_routing.zen", name: routing.Zen}, {field: "proxy_routing.go", name: routing.Go}} {
+		if _, ok := cfg.ProxyPools[ref.name]; !ok {
+			return fmt.Errorf("%s references unknown pool %q", ref.field, ref.name)
+		}
+	}
+	if cfg.effectivePools == nil {
+		cfg.effectivePools = map[string][]string{}
+	}
+	for name, pool := range cfg.ProxyPools {
+		proxies := append([]string(nil), pool.Proxies...)
+		trimList(&proxies)
+		proxyfile := strings.TrimSpace(pool.ProxyFile)
+		effective, err := resolvePoolProxies(path, proxies, proxyfile)
+		if err != nil {
+			return fmt.Errorf("proxy_pools[%q]: %w", name, err)
+		}
+		for _, raw := range effective {
+			if err := validateProxyURL(raw); err != nil {
+				return fmt.Errorf("proxy_pools[%q]: %w", name, err)
+			}
+		}
+		cfg.ProxyPools[name] = ProxyPoolConfig{Proxies: proxies, ProxyFile: proxyfile, effective: effective}
+		cfg.effectivePools[name] = effective
+	}
+	return nil
+}
+
+func validatePoolName(name string) error {
+	if name == "" {
+		return errors.New("proxy pool name must not be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("invalid proxy pool name %q: must be 1-64 characters", name)
+	}
+	if strings.EqualFold(name, "direct") {
+		return fmt.Errorf("invalid proxy pool name %q: reserved word", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid proxy pool name %q: use letters, digits, '_', '-' or '.'", name)
+	}
+	return nil
+}
+
+// remapProxyRoutingForRename maps routing references from an old pool name to
+// a new one. It mirrors the WebUI rename behavior and is kept as a pure,
+// unit-testable helper.
+func remapProxyRoutingForRename(routing ProxyRoutingConfig, oldName, newName string) ProxyRoutingConfig {
+	if routing.Anonymous == oldName {
+		routing.Anonymous = newName
+	}
+	if routing.Zen == oldName {
+		routing.Zen = newName
+	}
+	if routing.Go == oldName {
+		routing.Go = newName
+	}
+	return routing
+}
+
+func validateProxyURL(raw string) error {
+	if raw == "direct" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid proxy URL %q", redactURL(raw))
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return nil
+	default:
+		return fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+	}
+}
+
+// RuntimeProxiesFor returns the resolved proxies (config + proxyfile,
+// deduped, direct default) for one named pool.
+func (cfg Config) RuntimeProxiesFor(pool string) []string {
+	if cfg.effectivePools != nil {
+		if effective, ok := cfg.effectivePools[pool]; ok && len(effective) > 0 {
+			return effective
+		}
+	}
+	if cfg.ProxyPools != nil {
+		if entry, ok := cfg.ProxyPools[pool]; ok {
+			if len(entry.effective) > 0 {
+				return entry.effective
+			}
+			if len(entry.Proxies) > 0 {
+				return entry.Proxies
+			}
+		}
 	}
 	return []string{"direct"}
+}
+
+// RuntimeProxies preserves the legacy single-pool accessor for shared-pool
+// callers that have not migrated yet. New code should use RuntimeProxiesFor.
+func (cfg Config) RuntimeProxies() []string {
+	if name := cfg.ProxyRouting.Zen; name != "" {
+		return cfg.RuntimeProxiesFor(name)
+	}
+	return cfg.RuntimeProxiesFor("shared")
+}
+
+// ReferencedPools returns routing references in anonymous/zen/go order.
+func (cfg Config) ReferencedPools() []string {
+	return []string{cfg.ProxyRouting.Anonymous, cfg.ProxyRouting.Zen, cfg.ProxyRouting.Go}
+}
+
+// UniqueActivePools returns deduplicated referenced pool names in first-use
+// order (anonymous, zen, go), skipping empty references.
+func (cfg Config) UniqueActivePools() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, name := range cfg.ReferencedPools() {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 func ensureJSONEOF(dec *json.Decoder) error {
@@ -282,27 +597,24 @@ func stripJSONComments(data []byte) ([]byte, error) {
 	return out, nil
 }
 
-func resolveProxyFiles(configPath string, cfg *Config) error {
-	trimList(&cfg.Proxies)
-	effective := append([]string(nil), cfg.Proxies...)
-	if cfg.ProxyFile != "" {
-		resolved := cfg.ProxyFile
+func resolvePoolProxies(configPath string, proxies []string, proxyfile string) ([]string, error) {
+	effective := append([]string(nil), proxies...)
+	if proxyfile != "" {
+		resolved := proxyfile
 		if !filepath.IsAbs(resolved) {
 			resolved = filepath.Join(filepath.Dir(configPath), resolved)
 		}
-		proxies, err := readProxyFile(resolved)
+		loaded, err := readProxyFile(resolved)
 		if err != nil {
-			return fmt.Errorf("load proxy file %s: %w", resolved, err)
+			return nil, fmt.Errorf("load proxy file %s: %w", resolved, err)
 		}
-		effective = append(effective, proxies...)
+		effective = append(effective, loaded...)
 	}
-
 	effective = uniqueStrings(effective)
 	if len(effective) == 0 {
 		effective = []string{"direct"}
 	}
-	cfg.effectiveProxies = effective
-	return nil
+	return effective, nil
 }
 
 // SaveConfigAtomic writes normalized JSON and keeps the preceding file as
@@ -364,7 +676,15 @@ func SaveConfigAtomic(path string, cfg Config) error {
 // PasswordForSave ensures resolved-only data is excluded. The method is kept
 // separate to make accidental persistence of effective proxy values obvious.
 func (cfg *Config) PasswordForSave() {
-	cfg.effectiveProxies = nil
+	cfg.effectivePools = nil
+	cfg.Proxies = nil
+	cfg.ProxyFile = ""
+	for name, pool := range cfg.ProxyPools {
+		pool.effective = nil
+		cfg.ProxyPools[name] = pool
+	}
+	cfg.legacyProxiesPresent = false
+	cfg.legacyProxyFilePresent = false
 }
 
 func copyFile(source, target string) error {

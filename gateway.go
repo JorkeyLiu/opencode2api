@@ -26,14 +26,14 @@ const (
 )
 
 type Gateway struct {
-	cfg        Config
-	logger     *slog.Logger
-	transports *transportPool
-	zenNodes   *nodePool
-	goNodes    *nodePool
-	anonymous  *anonymousPool
-	catalog    *modelCatalog
-	monitor    *Monitor
+	cfg       Config
+	logger    *slog.Logger
+	pools     map[string]*transportPool
+	zenNodes  *nodePool
+	goNodes   *nodePool
+	anonymous *anonymousPool
+	catalog   *modelCatalog
+	monitor   *Monitor
 }
 
 type healthResponse struct {
@@ -72,31 +72,90 @@ type healthProxies struct {
 }
 
 func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, error) {
-	transports, err := newTransportPool(cfg.RuntimeProxies(), cfg.Performance, time.Duration(cfg.Retry.TimeoutSeconds)*time.Second)
-	if err != nil {
-		return nil, err
+	timeout := time.Duration(cfg.Retry.TimeoutSeconds) * time.Second
+	pools := make(map[string]*transportPool, len(cfg.UniqueActivePools()))
+	for _, name := range cfg.UniqueActivePools() {
+		transports, err := newTransportPool(name, cfg.RuntimeProxiesFor(name), cfg.Performance, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("proxy pool %q: %w", name, err)
+		}
+		if existing, ok := pools[name]; ok && existing != nil {
+			continue
+		}
+		pools[name] = transports
+	}
+	// Same routing reference shares one transportPool pointer; different
+	// references stay isolated.
+	zenPool := pools[cfg.ProxyRouting.Zen]
+	goPool := pools[cfg.ProxyRouting.Go]
+	anonPool := pools[cfg.ProxyRouting.Anonymous]
+	if zenPool == nil || goPool == nil || anonPool == nil {
+		return nil, fmt.Errorf("proxy_routing must reference existing pools")
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := newNodePool(cfg.ZenKeys, transports, cooldown)
+	zenNodes, err := newNodePool(cfg.ZenKeys, zenPool, cooldown)
 	if err != nil {
 		return nil, fmt.Errorf("zen node pool: %w", err)
 	}
-	goNodes, err := newNodePool(cfg.GoKeys, transports, cooldown)
+	goNodes, err := newNodePool(cfg.GoKeys, goPool, cooldown)
 	if err != nil {
 		return nil, fmt.Errorf("go node pool: %w", err)
 	}
 	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	return &Gateway{
-		cfg:        cfg,
-		logger:     logger,
-		transports: transports,
-		zenNodes:   zenNodes,
-		goNodes:    goNodes,
-		anonymous:  newAnonymousPool(cfg.Anonymous, transports, cooldown),
-		catalog:    catalog,
-		monitor:    monitor,
+		cfg:       cfg,
+		logger:    logger,
+		pools:     pools,
+		zenNodes:  zenNodes,
+		goNodes:   goNodes,
+		anonymous: newAnonymousPool(cfg.Anonymous, anonPool, cooldown),
+		catalog:   catalog,
+		monitor:   monitor,
 	}, nil
+}
+
+func (g *Gateway) uniquePools() []*transportPool {
+	seen := map[*transportPool]bool{}
+	out := []*transportPool{}
+	for _, name := range g.cfg.UniqueActivePools() {
+		pool := g.pools[name]
+		if pool == nil || seen[pool] {
+			continue
+		}
+		seen[pool] = true
+		out = append(out, pool)
+	}
+	return out
+}
+
+func (g *Gateway) healthyClients() []*http.Client {
+	var clients []*http.Client
+	for _, pool := range g.uniquePools() {
+		for _, proxy := range pool.items {
+			if proxy != nil && proxy.healthy.Load() {
+				clients = append(clients, proxy.client)
+			}
+		}
+	}
+	return clients
+}
+
+func (g *Gateway) poolForProxy(proxy *proxyTransport) *transportPool {
+	if proxy == nil {
+		return nil
+	}
+	for _, pool := range g.uniquePools() {
+		if pool.containsProxy(proxy) {
+			return pool
+		}
+	}
+	// Fallback by pool name for proxies constructed outside the gateway
+	// (tests): match the named pool directly.
+	if proxy.pool != "" {
+		return g.pools[proxy.pool]
+	}
+	return nil
 }
 
 func (g *Gateway) Handler() http.Handler {
@@ -111,7 +170,12 @@ func (g *Gateway) Handler() http.Handler {
 
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	models := g.catalog.Snapshot()
-	proxyTotal, proxyHealthy := g.transports.healthCounts()
+	proxyTotal, proxyHealthy := 0, 0
+	for _, pool := range g.uniquePools() {
+		total, healthy := pool.healthCounts()
+		proxyTotal += total
+		proxyHealthy += healthy
+	}
 	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
@@ -735,8 +799,10 @@ func setRequestCredential(ctx context.Context, tier Tier, keyID, channel string,
 	meta.Channel = channel
 	meta.Anonymous = anonymous
 	meta.Proxy = ""
+	meta.ProxyPool = ""
 	if proxy != nil {
 		meta.Proxy = redactURL(proxy.name)
+		meta.ProxyPool = proxy.pool
 	}
 }
 
@@ -774,12 +840,14 @@ func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attemp
 	class := classifyUpstreamAttempt(resp, err)
 	success := class.Class == AttemptClassSuccess
 	proxyName := "unavailable"
+	proxyPool := ""
 	if proxy != nil {
 		proxyName = redactURL(proxy.name)
+		proxyPool = proxy.pool
 	}
 	g.monitor.RecordAttempt(UpstreamAttempt{
 		Time: time.Now().UTC(), RequestID: ids.Request, Model: route.ID, Tier: string(route.Tier), Attempt: attempt,
-		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, Status: status,
+		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, ProxyPool: proxyPool, Status: status,
 		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcomeFromClass(class.Class, success),
 		FailureClass: class.Class, Retryable: class.Retryable, CoolsDown: class.CoolsDown,
 	})
@@ -855,11 +923,16 @@ func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTranspo
 	if !proxy.checking.CompareAndSwap(false, true) {
 		return
 	}
+	pool := g.poolForProxy(proxy)
+	if pool == nil {
+		proxy.checking.Store(false)
+		return
+	}
 	// The client request may finish or be cancelled while the verification is
 	// running. Keep its values but give the proxy check an independent timeout.
 	checkCtx := context.WithoutCancel(ctx)
 	go func() {
-		result := g.transports.checkClaimedProxy(checkCtx, proxy, proxyHealthCheckURL, proxyHealthCheckTimeout)
+		result := pool.checkClaimedProxy(checkCtx, proxy, proxyHealthCheckURL, proxyHealthCheckTimeout)
 		g.applyProxyHealthResult(result, "upstream HTTP response", status)
 	}()
 }
@@ -873,10 +946,19 @@ func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved in
 }
 
 func (g *Gateway) rebindUnavailableProxy(proxy *proxyTransport, wasHealthy bool) (zenMoved, goMoved int) {
-	zenMoved = g.zenNodes.RebindProxy(proxy.index)
-	goMoved = g.goNodes.RebindProxy(proxy.index)
+	// Rebind/restore act only on node pools that reference this transport
+	// pool. Isolated pools never exchange index operations; a shared pool
+	// still rebinds both Zen and Go tiers.
+	if g.zenNodes != nil && g.zenNodes.transports != nil && g.zenNodes.transports.containsProxy(proxy) {
+		zenMoved = g.zenNodes.RebindProxy(proxy.index)
+	}
+	if g.goNodes != nil && g.goNodes.transports != nil && g.goNodes.transports.containsProxy(proxy) {
+		goMoved = g.goNodes.RebindProxy(proxy.index)
+	}
 	if wasHealthy || zenMoved+goMoved > 0 {
-		g.logger.Warn("proxy became unavailable", "component", "proxy", "event", "proxy_unavailable", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		if g.logger != nil {
+			g.logger.Warn("proxy became unavailable", "component", "proxy", "event", "proxy_unavailable", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		}
 	}
 	return zenMoved, goMoved
 }
@@ -885,19 +967,27 @@ func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
 	if proxy == nil {
 		return 0, 0
 	}
-	zenMoved = g.zenNodes.RestoreProxy(proxy.index)
-	goMoved = g.goNodes.RestoreProxy(proxy.index)
+	if g.zenNodes != nil && g.zenNodes.transports != nil && g.zenNodes.transports.containsProxy(proxy) {
+		zenMoved = g.zenNodes.RestoreProxy(proxy.index)
+	}
+	if g.goNodes != nil && g.goNodes.transports != nil && g.goNodes.transports.containsProxy(proxy) {
+		goMoved = g.goNodes.RestoreProxy(proxy.index)
+	}
 	if zenMoved+goMoved > 0 {
-		g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		if g.logger != nil {
+			g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
+		}
 	}
 	return zenMoved, goMoved
 }
 
 func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 	check := func() {
-		results := g.transports.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
-		for _, result := range results {
-			g.applyProxyHealthResult(result, "scheduled health check", 0)
+		for _, pool := range g.uniquePools() {
+			results := pool.CheckHealth(ctx, proxyHealthCheckURL, proxyHealthCheckTimeout)
+			for _, result := range results {
+				g.applyProxyHealthResult(result, "scheduled health check", 0)
+			}
 		}
 	}
 	go func() {
@@ -919,21 +1009,36 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 		if !result.wasHealthy {
 			g.restoreProxy(result.proxy)
 		}
-		g.logger.Debug("proxy health check passed", "component", "proxy", "event", "health_check_passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
+		if g.logger != nil {
+			g.logger.Debug("proxy health check passed", "component", "proxy", "event", "health_check_passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
+		}
 		return
 	}
 	if !result.failed {
-		g.logger.Debug("proxy health check was inconclusive", "component", "proxy", "event", "health_check_inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
+		if g.logger != nil {
+			g.logger.Debug("proxy health check was inconclusive", "component", "proxy", "event", "health_check_inconclusive", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "error", result.err)
+		}
 		return
 	}
-	if g.transports.hasHealthy() {
+	hasHealthy := false
+	for _, pool := range g.uniquePools() {
+		if pool.hasHealthy() {
+			hasHealthy = true
+			break
+		}
+	}
+	if hasHealthy {
 		zenMoved, goMoved := g.rebindUnavailableProxy(result.proxy, result.wasHealthy)
 		if result.wasHealthy || zenMoved+goMoved > 0 {
-			g.logger.Warn("proxy health check failed", "component", "proxy", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
+			if g.logger != nil {
+				g.logger.Warn("proxy health check failed", "component", "proxy", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
+			}
 			return
 		}
 	}
-	g.logger.Debug("proxy health check is still failing", "component", "proxy", "event", "health_check_still_failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "error", result.err)
+	if g.logger != nil {
+		g.logger.Debug("proxy health check is still failing", "component", "proxy", "event", "health_check_still_failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "error", result.err)
+	}
 }
 
 func protocolPath(protocol Protocol) string {
@@ -995,15 +1100,16 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 }
 
 func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (protocolCapabilities, error) {
-	if g.transports == nil || len(g.transports.items) == 0 {
-		return fetchProtocolCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, openCodeCapabilitiesURL)
+	clients := g.healthyClients()
+	if len(clients) == 0 {
+		if len(g.uniquePools()) == 0 {
+			return fetchProtocolCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, openCodeCapabilitiesURL)
+		}
+		return protocolCapabilities{}, errors.New("no healthy proxy available for OpenCode capability catalog")
 	}
 	var lastErr error
-	for _, proxy := range g.transports.items {
-		if proxy == nil || !proxy.healthy.Load() {
-			continue
-		}
-		capabilities, err := fetchProtocolCapabilities(ctx, proxy.client, openCodeCapabilitiesURL)
+	for _, client := range clients {
+		capabilities, err := fetchProtocolCapabilities(ctx, client, openCodeCapabilitiesURL)
 		if err == nil {
 			return capabilities, nil
 		}

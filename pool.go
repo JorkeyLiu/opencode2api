@@ -21,12 +21,14 @@ import (
 type proxyTransport struct {
 	index    int
 	name     string
+	pool     string
 	client   *http.Client
 	healthy  atomic.Bool
 	checking atomic.Bool
 }
 
 type transportPool struct {
+	name  string
 	items []*proxyTransport
 }
 
@@ -128,6 +130,18 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	node.cooldownUntil.Store(time.Now().Add(delay).UnixNano())
 }
 
+func (p *transportPool) containsProxy(proxy *proxyTransport) bool {
+	if p == nil || proxy == nil {
+		return false
+	}
+	for _, item := range p.items {
+		if item == proxy {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *transportPool) hasHealthy() bool {
 	for _, proxy := range p.items {
 		if proxy.healthy.Load() {
@@ -149,8 +163,8 @@ func (p *transportPool) healthCounts() (total, healthy int) {
 	return len(p.items), healthy
 }
 
-func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
-	p := &transportPool{items: make([]*proxyTransport, 0, len(proxies))}
+func newTransportPool(poolName string, proxies []string, cfg PerformanceConfig, responseHeaderTimeout time.Duration) (*transportPool, error) {
+	p := &transportPool{name: poolName, items: make([]*proxyTransport, 0, len(proxies))}
 	for _, raw := range proxies {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.MaxIdleConns = cfg.MaxIdleConns
@@ -172,7 +186,7 @@ func newTransportPool(proxies []string, cfg PerformanceConfig, responseHeaderTim
 			}
 			transport.Proxy = http.ProxyURL(u)
 		}
-		proxy := &proxyTransport{index: len(p.items), name: raw, client: &http.Client{Transport: transport}}
+		proxy := &proxyTransport{index: len(p.items), name: raw, pool: poolName, client: &http.Client{Transport: transport}}
 		proxy.healthy.Store(true)
 		p.items = append(p.items, proxy)
 	}

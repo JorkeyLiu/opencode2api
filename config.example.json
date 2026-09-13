@@ -5,8 +5,17 @@
   "go_keys": [],
   "anonymous": false,
   "prefer": "go",
-  "proxyfile": "",
-  "proxies": ["direct"],
+  "proxy_pools": {
+    "shared": {
+      "proxies": ["direct"],
+      "proxyfile": ""
+    }
+  },
+  "proxy_routing": {
+    "anonymous": "shared",
+    "zen": "shared",
+    "go": "shared"
+  },
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"

@@ -221,18 +221,18 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       </div>
       <div class="section">
         <h2>Proxy 传输健康</h2>
-        <div class="cap">节点名始终为 proxy 节点名，不代表出口 IP。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>zen keys</th><th>go keys</th><th>anonymous</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="cap">节点名始终为 proxy 节点名，不代表出口 IP。pool 为具名代理池 identity；routing 列显示该池被 anonymous / zen / go 的引用归属。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>zen keys</th><th>go keys</th><th>anonymous</th><th>routing</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
       </div>
       <div class="section">
         <h2>Key 状态</h2>
-        <div class="cap">仅显示 key 尾码与冷却剩余秒；完整 key 不会出现在任何接口与页面中。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>key 尾码</th><th>tier</th><th>index</th><th>当前 proxy</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
+        <div class="cap">仅显示 key 尾码与冷却剩余秒；完整 key 不会出现在任何接口与页面中。pool 列为该 key 绑定的代理池，index 为池内序号。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>key 尾码</th><th>tier</th><th>pool</th><th>index</th><th>当前 proxy</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
       </div>
       <div class="section">
         <h2>Anonymous proxy 冷却</h2>
-        <div class="cap">匿名通道按 proxy 独立冷却；此处为 credential 业务状态，不是传输健康。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>index</th><th>节点</th><th>传输</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-anon"></tbody></table></div>
+        <div class="cap">匿名通道按 pool 内 proxy 独立冷却；此处为 credential 业务状态，不是传输健康。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>传输</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-anon"></tbody></table></div>
       </div>
       <div class="section">
         <h2>Credential × Proxy 关联</h2>
@@ -273,8 +273,10 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
               <div class="field full"><label>Server Keys（掩码 chip；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个 key"></textarea></div>
               <div class="field"><label>Zen Keys</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个 key"></textarea></div>
               <div class="field"><label>Go Keys</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个 key"></textarea></div>
-              <div class="field full"><label>Proxy 节点（支持 direct、HTTP(S)、SOCKS URL）</label><div id="proxies-chips" class="chips"></div><textarea id="proxies-new" placeholder="每行新增一个 proxy"></textarea></div>
-              <div class="field"><label>Proxy File</label><input id="c-proxyfile" placeholder="proxies.txt"></div>
+              <div class="field full"><label>具名代理池（pool 名为稳定 identity，禁止用 IP/URL 命名；条目仍是 proxy 节点，支持 direct、HTTP(S)、SOCKS URL；节点名≠出口 IP）</label><div id="pools-editor"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增 pool</button></div><div class="note" id="pools-error"></div></div>
+              <div class="field"><label>Anonymous 路由池</label><select id="c-route-anon"></select></div>
+              <div class="field"><label>Zen 路由池</label><select id="c-route-zen"></select></div>
+              <div class="field"><label>Go 路由池</label><select id="c-route-go"></select></div>
               <div class="field"><label>Zen URL</label><input id="c-up-zen"></div>
               <div class="field"><label>Go URL</label><input id="c-up-go"></div>
               <div class="field"><label>每个 Key Tier 最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
@@ -603,7 +605,7 @@ function renderAttemptDetail(host, req){
   var wrap=document.createElement("div"); wrap.className="table-wrap";
   var t=document.createElement("table"); t.className="table attempt-chain";
   var thead=document.createElement("thead"), hr=document.createElement("tr");
-  ["attempt","tier / channel","key","proxy","status","failure_class","retryable","cools_down","duration","outcome"].forEach(function(h){ var th=document.createElement("th"); th.textContent=h; hr.appendChild(th); });
+  ["attempt","tier / channel","key","pool","proxy","status","failure_class","retryable","cools_down","duration","outcome"].forEach(function(h){ var th=document.createElement("th"); th.textContent=h; hr.appendChild(th); });
   thead.appendChild(hr); t.appendChild(thead);
   var tb=document.createElement("tbody");
   list.forEach(function(a){
@@ -611,6 +613,7 @@ function renderAttemptDetail(host, req){
     cell(tr,a.attempt===undefined?"—":a.attempt);
     cell(tr,(a.tier||"—")+" / "+(a.channel||"—"));
     cell(tr,(a.anonymous?"anonymous":(a.key_id||"—")));
+    cell(tr,a.proxy_pool||"—");
     cell(tr,a.proxy_node||a.proxy||"—");
     cell(tr,(a.status===undefined||a.status===0)?"—":a.status);
     var fc=document.createElement("td");
@@ -718,20 +721,21 @@ function renderResourcesView(){
   var tp=$("tbody-proxies"); clear(tp);
   (r.proxies||[]).forEach(function(p){
     var tr=document.createElement("tr"); tr.className="clickable"+(S.assocProxy&&S.assocProxy===p.address?" selected":"");
-    cell(tr,p.index); cell(tr,p.address,"wrap");
+    cell(tr,p.proxy_pool||p.pool||"—"); cell(tr,p.index); cell(tr,p.address,"wrap");
     var h=document.createElement("td"); h.appendChild(el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad"))); tr.appendChild(h);
     cell(tr,p.checking?"yes":"no");
     cell(tr,p.zen_keys===undefined?"—":p.zen_keys); cell(tr,p.go_keys===undefined?"—":p.go_keys);
     cell(tr,p.anonymous?"开":"关");
+    cell(tr,(p.routing||[]).join(",")||"—","wrap");
     tr.addEventListener("click",function(){ S.assocProxy=(S.assocProxy===p.address)?"":p.address; renderResourcesView(); });
     tp.appendChild(tr);
   });
-  if(!(r.proxies||[]).length)emptyRow(tp,7,"暂无 proxy");
+  if(!(r.proxies||[]).length)emptyRow(tp,9,"暂无 proxy");
   var tk=$("tbody-keys"); clear(tk);
   (r.keys||[]).forEach(function(k){
     var hl=S.assocKey&&S.assocKey===k.id;
     var tr=document.createElement("tr"); tr.className="clickable"+(hl?" selected":"");
-    cell(tr,k.id,"wrap"); cell(tr,k.tier); cell(tr,k.index);
+    cell(tr,k.id,"wrap"); cell(tr,k.tier); cell(tr,k.proxy_pool||"—"); cell(tr,k.index);
     cell(tr,k.proxy||("index "+k.proxy_index),"wrap");
     cell(tr,k.failures===undefined?"—":k.failures);
     var cd=(k.cooldown_remaining_seconds===undefined||k.cooldown_remaining_seconds===null)?"—":k.cooldown_remaining_seconds+"s";
@@ -741,18 +745,18 @@ function renderResourcesView(){
     tr.addEventListener("click",function(){ S.assocKey=(S.assocKey===k.id)?"":k.id; renderResourcesView(); });
     tk.appendChild(tr);
   });
-  if(!(r.keys||[]).length)emptyRow(tk,6,"暂无 key");
+  if(!(r.keys||[]).length)emptyRow(tk,7,"暂无 key");
   var ta=$("tbody-anon"); clear(ta);
   (r.anonymous_proxies||[]).forEach(function(a){
     var tr=document.createElement("tr");
-    cell(tr,a.index); cell(tr,a.address,"wrap");
+    cell(tr,a.proxy_pool||a.pool||"—"); cell(tr,a.index); cell(tr,a.address,"wrap");
     var h=document.createElement("td"); h.appendChild(el("span",a.healthy?"传输正常":"传输不可用","pill "+(a.healthy?"ok":"bad"))); tr.appendChild(h);
     cell(tr,a.failures===undefined?"—":a.failures);
     var cd=(a.cooldown_remaining_seconds===undefined||a.cooldown_remaining_seconds===null)?"—":a.cooldown_remaining_seconds+"s";
     var c=document.createElement("td"); c.appendChild(el("span",cd,"pill "+(cd==="—"?"ok":"warn"))); tr.appendChild(c);
     ta.appendChild(tr);
   });
-  if(!(r.anonymous_proxies||[]).length)emptyRow(ta,5,"匿名通道未启用或无节点");
+  if(!(r.anonymous_proxies||[]).length)emptyRow(ta,6,"匿名通道未启用或无节点");
   var st=$("assoc-state"); clear(st);
   st.textContent=(S.assocProxy||S.assocKey)?("已选："+(S.assocProxy?("proxy="+S.assocProxy+" "):"")+ (S.assocKey?("key="+S.assocKey):"")):"未选择关联过滤";
   var pairs=(S.attemptResources&&S.attemptResources.pairs)||{};
@@ -799,7 +803,6 @@ function fillConfig(v){
   $("c-session").value=v.webui.session_ttl_minutes||"";
   $("c-web-enabled").checked=!!v.webui.enabled;
   $("c-anonymous").checked=!!v.anonymous;
-  $("c-proxyfile").value=v.proxyfile||"";
   $("c-up-zen").value=v.upstream.zen||"";
   $("c-up-go").value=v.upstream.go||"";
   $("c-attempts").value=v.retry.max_attempts||"";
@@ -814,7 +817,8 @@ function fillConfig(v){
   $("c-cooldown").value=v.performance.failure_cooldown_seconds||"";
   $("c-level").value=v.logging.level||"info";
   $("c-ring").value=v.logging.ring_size||"";
-  ["server_keys","zen_keys","go_keys","proxies"].forEach(renderChips);
+  ["server_keys","zen_keys","go_keys"].forEach(renderChips);
+  renderPoolsEditor(v);
 }
 function renderChips(name){
   var host=$(name+"-chips"); clear(host);
@@ -833,14 +837,140 @@ function secretInputs(name){
   return kept.concat(added);
 }
 function num(id){ var v=Number($(id).value); return v; }
+function poolNamesFromEditor(){
+  var names=[], cards=document.querySelectorAll("#pools-editor .pool-card");
+  for(var i=0;i<cards.length;i++){ names.push(cards[i].getAttribute("data-pool")); }
+  return names;
+}
+function renderPoolsEditor(v){
+  var host=$("pools-editor"); clear(host);
+  $("pools-error").textContent="";
+  var pools=(v&&v.proxy_pools)||{};
+  var routing=(v&&v.proxy_routing)||{};
+  Object.keys(pools).sort().forEach(function(name){ host.appendChild(poolCard(name, pools[name])); });
+  syncRoutingSelects();
+  if(routing.anonymous)$("c-route-anon").value=routing.anonymous;
+  if(routing.zen)$("c-route-zen").value=routing.zen;
+  if(routing.go)$("c-route-go").value=routing.go;
+}
+function syncRoutingSelects(){
+  var names=poolNamesFromEditor();
+  [["c-route-anon"],["c-route-zen"],["c-route-go"]].forEach(function(pair){
+    var sel=$(pair[0]), cur=sel.value; clear(sel);
+    names.forEach(function(n){ var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o); });
+    if(cur&&names.indexOf(cur)>=0)sel.value=cur;
+  });
+}
+function mapRoutingOnRename(sel, oldName, newName){
+  var out={a:sel.a, z:sel.z, g:sel.g};
+  if(out.a===oldName)out.a=newName;
+  if(out.z===oldName)out.z=newName;
+  if(out.g===oldName)out.g=newName;
+  return out;
+}
+function duplicatePoolName(names){
+  var seen={};
+  for(var i=0;i<names.length;i++){
+    if(seen[names[i]])return names[i];
+    seen[names[i]]=1;
+  }
+  return "";
+}
+function poolCard(name, view){
+  var card=document.createElement("div"); card.className="pool-card"; card.setAttribute("data-pool",name);
+  card.style.border="1px solid var(--line)"; card.style.padding="8px 10px"; card.style.marginBottom="8px";
+  var head=document.createElement("div"); head.style.display="flex"; head.style.gap="8px"; head.style.alignItems="center"; head.style.flexWrap="wrap";
+  var title=el("strong","pool: "+name); head.appendChild(title);
+  var nameInput=document.createElement("input"); nameInput.value=name; nameInput.placeholder="pool 名（字母/数字/_/-/.)"; nameInput.style.maxWidth="220px";
+  nameInput.setAttribute("data-role","pool-name");
+  head.appendChild(nameInput);
+  var del=document.createElement("button"); del.type="button"; del.className="ghost"; del.textContent="删除 pool";
+  del.addEventListener("click",function(){
+    var cur=card.getAttribute("data-pool");
+    var routing={a:$("c-route-anon").value,z:$("c-route-zen").value,g:$("c-route-go").value};
+    if(routing.a===cur||routing.z===cur||routing.g===cur){ $("pools-error").textContent="pool "+cur+" 仍被 routing 引用（anonymous/zen/go），请先切换路由再删除。"; return; }
+    card.remove(); syncRoutingSelects(); $("pools-error").textContent="";
+  });
+  head.appendChild(del);
+  card.appendChild(head);
+  var chips=document.createElement("div"); chips.className="chips"; chips.setAttribute("data-role","chips");
+  ((view&&view.proxies)||[]).forEach(function(item){
+    var chip=document.createElement("span"); chip.className="chip"; chip.setAttribute("data-id",item.id);
+    chip.appendChild(document.createTextNode(item.display+" "));
+    var rm=document.createElement("button"); rm.type="button"; rm.textContent="移除";
+    rm.addEventListener("click",function(){chip.remove();});
+    chip.appendChild(rm); chips.appendChild(chip);
+  });
+  card.appendChild(chips);
+  var add=document.createElement("textarea"); add.placeholder="每行新增一个 proxy（direct / http(s) / socks5(h)）"; add.setAttribute("data-role","new");
+  card.appendChild(add);
+  var fileLabel=el("div","proxyfile（相对 config 目录，可空）","note"); card.appendChild(fileLabel);
+  var fileInput=document.createElement("input"); fileInput.value=(view&&view.proxyfile)||""; fileInput.placeholder="proxies.txt"; fileInput.setAttribute("data-role","proxyfile");
+  card.appendChild(fileInput);
+  nameInput.addEventListener("change",function(){
+    var cur=card.getAttribute("data-pool");
+    var next=nameInput.value.trim();
+    if(!next){ $("pools-error").textContent="pool 名不能为空"; nameInput.value=cur; return; }
+    if(next!==cur&&poolNamesFromEditor().indexOf(next)>=0){ $("pools-error").textContent="pool 名 "+next+" 已存在"; nameInput.value=cur; return; }
+    var oldSel={a:$("c-route-anon").value,z:$("c-route-zen").value,g:$("c-route-go").value};
+    card.setAttribute("data-pool",next);
+    title.textContent="pool: "+next;
+    syncRoutingSelects();
+    var mapped=mapRoutingOnRename(oldSel,cur,next);
+    if(mapped.a)$("c-route-anon").value=mapped.a;
+    if(mapped.z)$("c-route-zen").value=mapped.z;
+    if(mapped.g)$("c-route-go").value=mapped.g;
+    $("pools-error").textContent="";
+  });
+  return card;
+}
+$("btn-pool-add").addEventListener("click",function(){
+  var host=$("pools-editor"), base="pool", i=1, name=base+i;
+  var existing={}; poolNamesFromEditor().forEach(function(n){existing[n]=1;});
+  while(existing[name]){ i++; name=base+i; }
+  host.appendChild(poolCard(name, {proxies:[],proxyfile:""}));
+  syncRoutingSelects(); $("pools-error").textContent="";
+});
+function poolInputs(){
+  var out={}, cards=document.querySelectorAll("#pools-editor .pool-card");
+  for(var i=0;i<cards.length;i++){
+    var name=cards[i].getAttribute("data-pool");
+    var nameInput=cards[i].querySelector('[data-role="pool-name"]');
+    if(nameInput&&nameInput.value.trim())name=nameInput.value.trim();
+    var kept=[], chips=cards[i].querySelectorAll('[data-role="chips"] .chip');
+    for(var k=0;k<chips.length;k++){ kept.push({id:chips[k].getAttribute("data-id")}); }
+    var added=cards[i].querySelector('[data-role="new"]').value.split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean).map(function(s){return {value:s};});
+    var fileInput=cards[i].querySelector('[data-role="proxyfile"]');
+    out[name]={proxies:kept.concat(added),proxyfile:fileInput?fileInput.value:""};
+  }
+  return out;
+}
+function poolInputNames(){
+  var names=[], cards=document.querySelectorAll("#pools-editor .pool-card");
+  for(var i=0;i<cards.length;i++){
+    var name=cards[i].getAttribute("data-pool");
+    var nameInput=cards[i].querySelector('[data-role="pool-name"]');
+    if(nameInput&&nameInput.value.trim())name=nameInput.value.trim();
+    names.push(name);
+  }
+  return names;
+}
 $("config-form").addEventListener("submit",function(e){
   e.preventDefault();
   var protocols={};
   try{protocols=JSON.parse($("c-protocols").value||"{}");}catch(err){toast("模型协议覆盖 JSON 无效："+err.message,true);return;}
+  var pools=poolInputs();
+  var names=Object.keys(pools);
+  if(!names.length){ toast("至少需要一个 proxy pool",true); return; }
+  var rawNames=poolInputNames();
+  var dup=duplicatePoolName(rawNames);
+  if(dup||rawNames.length!==names.length){ toast("pool 名 "+(dup||"?")+" 重复，禁止提交（重命名后名称必须唯一）",true); $("pools-error").textContent="pool 名 "+(dup||"?")+" 重复，请先去重再保存。"; return; }
+  var anon=$("c-route-anon").value, zen=$("c-route-zen").value, go=$("c-route-go").value;
+  if(!anon||!zen||!go){ toast("anonymous / zen / go 必须各选择一个 pool",true); return; }
   var update={
     listen:$("c-listen").value, server_keys:secretInputs("server_keys"),
     zen_keys:secretInputs("zen_keys"), go_keys:secretInputs("go_keys"),
-    anonymous:$("c-anonymous").checked, proxies:secretInputs("proxies"), proxyfile:$("c-proxyfile").value,
+    anonymous:$("c-anonymous").checked, proxy_pools:pools, proxy_routing:{anonymous:anon,zen:zen,go:go},
     prefer:$("c-prefer").value,
     upstream:{zen:$("c-up-zen").value,go:$("c-up-go").value},
     retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout")},
@@ -851,7 +981,7 @@ $("config-form").addEventListener("submit",function(e){
   };
   api("/api/config",{method:"PUT",body:JSON.stringify(update)}).then(function(res){
     S.config=res.config;
-    ["server_keys","zen_keys","go_keys","proxies"].forEach(function(n){$(n+"-new").value="";});
+    ["server_keys","zen_keys","go_keys"].forEach(function(n){$(n+"-new").value="";});
     fillConfig(S.config); renderTopbar();
     toast(res.result&&res.result.restart_required?("已应用；"+(res.result.restart_fields||[]).join(", ")+" 需重启"):"配置已保存并应用");
   }).catch(function(err){toast(err.message,true);});

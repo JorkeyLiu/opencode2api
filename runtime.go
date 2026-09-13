@@ -56,16 +56,10 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 	// and fall back to the store's direct client when none are available.
 	manager.metadata.SetClientProvider(func() []*http.Client {
 		runtime := manager.current.Load()
-		if runtime == nil || runtime.gateway == nil || runtime.gateway.transports == nil {
+		if runtime == nil || runtime.gateway == nil {
 			return nil
 		}
-		clients := make([]*http.Client, 0, len(runtime.gateway.transports.items))
-		for _, proxy := range runtime.gateway.transports.items {
-			if proxy != nil && proxy.healthy.Load() {
-				clients = append(clients, proxy.client)
-			}
-		}
-		return clients
+		return runtime.gateway.healthyClients()
 	})
 	if cfg.WebUI.Password != "" {
 		hash, err := hashPassword(cfg.WebUI.Password)
@@ -157,7 +151,24 @@ func cloneConfig(cfg Config) Config {
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
 	cfg.Proxies = append([]string(nil), cfg.Proxies...)
-	cfg.effectiveProxies = append([]string(nil), cfg.effectiveProxies...)
+	if cfg.ProxyPools != nil {
+		pools := make(map[string]ProxyPoolConfig, len(cfg.ProxyPools))
+		for name, pool := range cfg.ProxyPools {
+			pools[name] = ProxyPoolConfig{
+				Proxies:   append([]string(nil), pool.Proxies...),
+				ProxyFile: pool.ProxyFile,
+				effective: append([]string(nil), pool.effective...),
+			}
+		}
+		cfg.ProxyPools = pools
+	}
+	if cfg.effectivePools != nil {
+		effective := make(map[string][]string, len(cfg.effectivePools))
+		for name, proxies := range cfg.effectivePools {
+			effective[name] = append([]string(nil), proxies...)
+		}
+		cfg.effectivePools = effective
+	}
 	if cfg.Models.Protocols != nil {
 		protocols := make(map[string]string, len(cfg.Models.Protocols))
 		for key, value := range cfg.Models.Protocols {
@@ -259,6 +270,7 @@ type KeyStatus struct {
 	Index                    int        `json:"index"`
 	ProxyIndex               int        `json:"proxy_index"`
 	Proxy                    string     `json:"proxy,omitempty"`
+	ProxyPool                string     `json:"proxy_pool,omitempty"`
 	Failures                 uint32     `json:"failures"`
 	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
 	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
@@ -269,6 +281,7 @@ type KeyStatus struct {
 // cooldown here are credential (business) state, never proxy health.
 type AnonymousProxyStatus struct {
 	Index                    int        `json:"index"`
+	Pool                     string     `json:"proxy_pool,omitempty"`
 	Address                  string     `json:"address"`
 	Healthy                  bool       `json:"healthy"`
 	Checking                 bool       `json:"checking"`
@@ -278,13 +291,15 @@ type AnonymousProxyStatus struct {
 }
 
 type ProxyStatus struct {
-	Index     int    `json:"index"`
-	Address   string `json:"address"`
-	Healthy   bool   `json:"healthy"`
-	Checking  bool   `json:"checking"`
-	ZenKeys   int    `json:"zen_keys"`
-	GoKeys    int    `json:"go_keys"`
-	Anonymous bool   `json:"anonymous"`
+	Index     int      `json:"index"`
+	Pool      string   `json:"proxy_pool,omitempty"`
+	Address   string   `json:"address"`
+	Healthy   bool     `json:"healthy"`
+	Checking  bool     `json:"checking"`
+	ZenKeys   int      `json:"zen_keys"`
+	GoKeys    int      `json:"go_keys"`
+	Anonymous bool     `json:"anonymous"`
+	Routing   []string `json:"routing,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -299,21 +314,51 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	}
 	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
 	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
-	gateway.zenNodes.bindingsMu.Lock()
-	zenBindings := append([]int(nil), gateway.zenNodes.bindingCount...)
-	gateway.zenNodes.bindingsMu.Unlock()
-	gateway.goNodes.bindingsMu.Lock()
-	goBindings := append([]int(nil), gateway.goNodes.bindingCount...)
-	gateway.goNodes.bindingsMu.Unlock()
-	for _, proxy := range gateway.transports.items {
-		status := ProxyStatus{Index: proxy.index, Address: redactURL(proxy.name), Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(), Anonymous: gateway.cfg.Anonymous}
-		if proxy.index < len(zenBindings) {
-			status.ZenKeys = zenBindings[proxy.index]
+	bindingsFor := func(pool *nodePool) []int {
+		if pool == nil {
+			return nil
 		}
-		if proxy.index < len(goBindings) {
-			status.GoKeys = goBindings[proxy.index]
+		pool.bindingsMu.Lock()
+		defer pool.bindingsMu.Unlock()
+		return append([]int(nil), pool.bindingCount...)
+	}
+	zenBindings := bindingsFor(gateway.zenNodes)
+	goBindings := bindingsFor(gateway.goNodes)
+	routingFor := func(poolName string) []string {
+		out := []string{}
+		if gateway.cfg.ProxyRouting.Anonymous == poolName {
+			out = append(out, "anonymous")
 		}
-		result.Proxies = append(result.Proxies, status)
+		if gateway.cfg.ProxyRouting.Zen == poolName {
+			out = append(out, "zen")
+		}
+		if gateway.cfg.ProxyRouting.Go == poolName {
+			out = append(out, "go")
+		}
+		return out
+	}
+	anonPool := gateway.pools[gateway.cfg.ProxyRouting.Anonymous]
+	for _, pool := range gateway.uniquePools() {
+		// Each tier counts only its own pool binding. A shared pool reports
+		// both tiers over the same index space; an isolated pool reports
+		// only the tier bound to it.
+		isZen := gateway.zenNodes != nil && gateway.zenNodes.transports == pool
+		isGo := gateway.goNodes != nil && gateway.goNodes.transports == pool
+		for _, proxy := range pool.items {
+			status := ProxyStatus{
+				Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
+				Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(),
+				Anonymous: gateway.cfg.Anonymous && anonPool == pool,
+				Routing:   routingFor(pool.name),
+			}
+			if isZen && proxy.index < len(zenBindings) {
+				status.ZenKeys = zenBindings[proxy.index]
+			}
+			if isGo && proxy.index < len(goBindings) {
+				status.GoKeys = goBindings[proxy.index]
+			}
+			result.Proxies = append(result.Proxies, status)
+		}
 	}
 	result.AnonymousProxies = anonymousProxyStatuses(gateway.anonymous)
 	return result
@@ -357,8 +402,12 @@ func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 		status := KeyStatus{ID: keyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: proxyIndex, Failures: node.failures.Load()}
 		// Current proxy name is redacted; the pool slice is immutable after
 		// build and atomics are lock-free, so no long lock is introduced.
-		if pool.transports != nil && proxyIndex >= 0 && proxyIndex < len(pool.transports.items) && pool.transports.items[proxyIndex] != nil {
-			status.Proxy = redactURL(pool.transports.items[proxyIndex].name)
+		// ProxyIndex is pool-local; ProxyPool names the owning pool.
+		if pool.transports != nil {
+			status.ProxyPool = pool.transports.name
+			if proxyIndex >= 0 && proxyIndex < len(pool.transports.items) && pool.transports.items[proxyIndex] != nil {
+				status.Proxy = redactURL(pool.transports.items[proxyIndex].name)
+			}
 		}
 		if until := node.cooldownUntil.Load(); until > now.UnixNano() {
 			value := time.Unix(0, until).UTC()
@@ -384,7 +433,7 @@ func anonymousProxyStatuses(pool *anonymousPool) []AnonymousProxyStatus {
 			continue
 		}
 		status := AnonymousProxyStatus{
-			Index: node.proxy.index, Address: redactURL(node.proxy.name),
+			Index: node.proxy.index, Pool: node.proxy.pool, Address: redactURL(node.proxy.name),
 			Healthy: node.proxy.healthy.Load(), Checking: node.proxy.checking.Load(),
 			Failures: node.failures.Load(),
 		}
