@@ -417,6 +417,7 @@ func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
 
 func (a *AdminServer) handleMonitor(w http.ResponseWriter, _ *http.Request) {
 	metrics := a.monitor.Snapshot()
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version": version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
 	})

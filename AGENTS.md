@@ -88,8 +88,11 @@
   process restart. NEVER claim a listen-plane edit is live without restart.
 - Cache refresh spine: model lists + capability directory refresh
   concurrently every `models.refresh_seconds`; `models.dev` refreshes every
-  24h with fixed timeout. Refresh uses a stateless key/proxy traversal that
-  never reads or writes foreground credential/target cooldowns. Refresh
+  24h with fixed timeout. Refresh uses a stateless key x healthy-proxy
+  traversal that never reads or writes foreground credential/target cooldowns
+  and never changes proxy healthy/checking (healthy proxies observed
+  read-only; no syncProxyResult/verifyProxyAfterError). A refresh context
+  deadline/cancel is only a refresh failure, never a proxy signal. Refresh
   failure MUST keep the previous snapshot;
   startup uses valid disk cache before the first live refresh.
 
@@ -111,7 +114,12 @@
   never change it); 401 cools the credential globally; 403/429/5xx cool the
   single (credential, proxy, model) target, so one model's rejection never
   affects another; ordinary 4xx is neutral and 2xx clears this target and
-  this credential's 401 state.
+  this credential's 401 state. Model/capability refresh is stateless and
+  touches none of the three layers.
+- Health readiness: healthz keeps all existing fields and adds additive
+  routing readiness (global credential availability plus assigned-pool health;
+  per-model target cooldowns never count). Zero globally available channels
+  degrades readiness; one model's targets all cooling never does.
 - Streaming: once bytes have been written to the client, the Gateway MUST
   NOT switch upstreams or regenerate; error-class upstream stream signals
   MUST surface as structured target-protocol error events, never as clean

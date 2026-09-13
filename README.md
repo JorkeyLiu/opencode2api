@@ -36,7 +36,7 @@
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `GET` | `/healthz` | 健康检查 |
 
-`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key、匿名开关和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、没有可暴露模型或没有健康代理时返回 HTTP `503`；使用过期磁盘快取时仍返回 `200`，但 `models.status` 为 `stale`。
+`/healthz` 无需 API key，返回服务版本以及模型目录、Zen/Go key、匿名开关和代理池的汇总状态，不会暴露 key 或代理地址。模型目录尚未完成首次刷新、没有可暴露模型、没有健康代理或全局可用路由为零（`routing.channels_available==0`）时返回 HTTP `503`；使用过期磁盘快取时仍返回 `200`，但 `models.status` 为 `stale`。新增 `routing` 对象为 additive 全局路由可用性（匿名可用性、Zen/Go 可用 credential 数、冷却 credential 数、可用通道数），只读全局 401 冷却与代理传输健康，不读取单模型 target 冷却；单模型 target 全部冷却不会触发全局 `503`，原有字段保持不变。
 
 模型目录的过期阈值为 `models.refresh_seconds` 的两倍，且不低于 60 秒。刚启动时短暂返回 `503 starting` 属于正常现象，模型列表首次刷新成功后会变为 `200 ok`。
 
@@ -259,7 +259,7 @@ models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址�
 
 每次请求按 credential×proxy×模型展开 target 候选并冻结顺序：有会话时按会话对完整 target 做 HRW（Rendezvous）降序排列，保证同会话同模型同资源下顺序稳定、节点增删只做最小扰动；无会话的后台路径使用原子 round-robin 起始偏移，不使用随机。失败后按冻结顺序走下一个，同请求内不重排。
 
-状态分三层：proxy 传输健康只由超时/拒绝等连通性失败改变，HTTP 状态从不直接改变它；HTTP 401 全局冷却该 credential；403/429/5xx 只冷却命中的单个 (credential, proxy, model) target，同 credential 同 proxy 的其他模型不受影响；普通 4xx（含 400/404/422）中性，既不冷却也不清理已有状态；2xx 只清理本 target 与本 credential 的 401 状态。冷却按 `performance.failure_cooldown_seconds` 指数退避（确定性 ±20% 抖动，总封顶 5 分钟），429/403 的 `Retry-After` 取更大值同样封顶 5 分钟。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态遍历，只受 proxy 传输健康影响，从不读写前台 credential/target 状态。
+状态分三层：proxy 传输健康只由超时/拒绝等连通性失败改变，HTTP 状态从不直接改变它；HTTP 401 全局冷却该 credential；403/429/5xx 只冷却命中的单个 (credential, proxy, model) target，同 credential 同 proxy 的其他模型不受影响；普通 4xx（含 400/404/422）中性，既不冷却也不清理已有状态；2xx 只清理本 target 与本 credential 的 401 状态。冷却按 `performance.failure_cooldown_seconds` 指数退避（确定性 ±20% 抖动，总封顶 5 分钟），429/403 的 `Retry-After` 取更大值同样封顶 5 分钟。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态 key×healthy proxy 遍历，只读 healthy 代理顺序，不读写前台 credential/target 状态，也不改变 proxy healthy/checking；刷新 context deadline/cancel 只是刷新失败，失败保留旧快照。
 
 共享单池示例（默认，行为与旧版单代理池一致）：
 

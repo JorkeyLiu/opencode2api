@@ -8,3 +8,6 @@ opencode2api.exe
 .tmp/
 .gocache/
 *.models.catalog.json
+*.bak
+*.tmp
+*.replace

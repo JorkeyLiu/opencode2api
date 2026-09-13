@@ -155,12 +155,21 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 
 // isProxyFailure deliberately recognizes only failures that say the proxy
 // route is unavailable. HTTP responses and unrelated transport/protocol errors
-// must not evict a proxy.
+// must not evict a proxy. Context cancellation is never a proxy failure: a
+// refresh deadline/cancel is only a refresh failure and must not mark a proxy
+// unavailable; the foreground inference path already treats a cancelled
+// request context as a no-op before consulting this helper.
 func isProxyFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNREFUSED) {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var timeout interface{ Timeout() bool }

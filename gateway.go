@@ -43,6 +43,7 @@ type healthResponse struct {
 	Models  healthModels  `json:"models"`
 	Keys    healthKeys    `json:"keys"`
 	Proxies healthProxies `json:"proxies"`
+	Routing healthRouting `json:"routing"`
 	Issues  []string      `json:"issues,omitempty"`
 }
 
@@ -69,6 +70,20 @@ type healthProxies struct {
 	Total     int `json:"total"`
 	Healthy   int `json:"healthy"`
 	Unhealthy int `json:"unhealthy"`
+}
+
+// healthRouting is additive global route availability. It never reads
+// per-model target cooldowns: a single model's targets all cooling must not
+// degrade global readiness. Anonymous availability is config plus assigned
+// pool transport health only. Credential availability counts global 401
+// cooldowns; channel availability additionally requires a healthy assigned
+// pool, so keys without a healthy proxy do not count as a channel.
+type healthRouting struct {
+	AnonymousAvailable      bool `json:"anonymous_available"`
+	ZenCredentialsAvailable int  `json:"zen_credentials_available"`
+	GoCredentialsAvailable  int  `json:"go_credentials_available"`
+	CredentialsCooling      int  `json:"credentials_cooling"`
+	ChannelsAvailable       int  `json:"channels_available"`
 }
 
 func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, error) {
@@ -192,12 +207,16 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	if proxyHealthy == 0 {
 		issues = append(issues, "no_healthy_proxies")
 	}
+	routing := g.routingReadiness()
+	if routing.ChannelsAvailable == 0 {
+		issues = append(issues, "no_available_routes")
+	}
 
 	status := "ok"
 	if len(issues) > 0 {
 		status = "degraded"
 	}
-	blocking := modelStatus == "pending" || modelStatus == "empty" || proxyHealthy == 0
+	blocking := modelStatus == "pending" || modelStatus == "empty" || proxyHealthy == 0 || routing.ChannelsAvailable == 0
 	httpStatus := http.StatusOK
 	ready := !blocking
 	if blocking {
@@ -227,8 +246,54 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Healthy:   proxyHealthy,
 			Unhealthy: proxyTotal - proxyHealthy,
 		},
-		Issues: issues,
+		Routing: routing,
+		Issues:  issues,
 	})
+}
+
+// routingReadiness reports additive global route availability without changing
+// any existing healthz field. It reads only config, proxy transport health,
+// and global credential 401 cooldowns; per-model target cooldowns are never
+// consulted, so one model's backoff cannot trigger a global 503. An expired
+// cooldown counts as available immediately.
+func (g *Gateway) routingReadiness() healthRouting {
+	now := time.Now().UnixNano()
+	anonPool := g.pools[g.cfg.ProxyRouting.Anonymous]
+	anonymousAvailable := g.cfg.Anonymous && anonPool != nil && anonPool.hasHealthy()
+	zenAvailable := 0
+	for _, cred := range g.zenCreds {
+		if g.scheduler == nil || g.scheduler.credentialCoolUntil(cred.id) <= now {
+			zenAvailable++
+		}
+	}
+	goAvailable := 0
+	for _, cred := range g.goCreds {
+		if g.scheduler == nil || g.scheduler.credentialCoolUntil(cred.id) <= now {
+			goAvailable++
+		}
+	}
+	cooling := (len(g.zenCreds) - zenAvailable) + (len(g.goCreds) - goAvailable)
+	channels := 0
+	if anonymousAvailable {
+		channels++
+	}
+	if len(g.zenCreds) > 0 && zenAvailable > 0 {
+		if pool := g.pools[g.cfg.ProxyRouting.Zen]; pool != nil && pool.hasHealthy() {
+			channels++
+		}
+	}
+	if len(g.goCreds) > 0 && goAvailable > 0 {
+		if pool := g.pools[g.cfg.ProxyRouting.Go]; pool != nil && pool.hasHealthy() {
+			channels++
+		}
+	}
+	return healthRouting{
+		AnonymousAvailable:      anonymousAvailable,
+		ZenCredentialsAvailable: zenAvailable,
+		GoCredentialsAvailable:  goAvailable,
+		CredentialsCooling:      cooling,
+		ChannelsAvailable:       channels,
+	}
 }
 
 func (g *Gateway) authenticate(next http.HandlerFunc) http.HandlerFunc {
@@ -915,13 +980,19 @@ func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return classifyUpstreamAttempt(resp, err).Class == AttemptClassClientRejected
 }
 
-// syncProxyResult updates proxy transport health from refresh traffic.
+// syncProxyResult updates proxy transport health from non-refresh traffic.
 // Only timeouts and connection refusals mark a proxy unavailable; HTTP
 // statuses never change health directly. Other errors and 4xx/5xx responses
 // trigger a neutral URL check without being treated as proxy failure.
-// Scheduler (credential/target) state is never touched here.
+// Scheduler (credential/target) state is never touched here. A cancelled or
+// expired request context is never a proxy signal: it returns without
+// touching healthy/checking. Model refresh paths must not call this helper
+// at all; refresh is stateless and observes healthy proxies read-only.
 func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
 	if proxy == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
 	if isProxyFailure(err) {
@@ -942,6 +1013,9 @@ func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, st
 }
 
 func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTransport, status int) {
+	if ctx != nil && ctx.Err() != nil {
+		return
+	}
 	if !proxy.checking.CompareAndSwap(false, true) {
 		return
 	}
@@ -1122,8 +1196,12 @@ func (g *Gateway) refreshZen(ctx context.Context) []string {
 
 // refreshAnonymousTier fetches the model list with the shared public
 // credential over each currently healthy proxy in the assigned pool.
-// It is stateless: foreground credential/target cooldowns are neither read
-// nor written; only proxy transport health gates and observes candidates.
+// It is stateless: foreground scheduler credential/target state is neither
+// read nor written, and proxy healthy/checking is never changed via
+// syncProxyResult/verifyProxyAfterError. Healthy proxies are observed
+// read-only to build the traversal; success/failure only decides the
+// catalog snapshot in the caller, and a context deadline/cancel is only a
+// refresh failure, never a proxy signal.
 func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []string {
 	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
 	if pool == nil {
@@ -1132,8 +1210,7 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 	healthy := healthyProxies(pool)
 	for attempt, proxy := range healthy {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, status, err := fetchModels(refreshCtx, proxy.client, base, anonymousZenKey)
-		g.syncProxyResult(refreshCtx, proxy, status, err)
+		models, _, err := fetchModels(refreshCtx, proxy.client, base, anonymousZenKey)
 		cancel()
 		if err == nil {
 			return models
@@ -1149,8 +1226,12 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 }
 
 // refreshTier fetches the model list with a stateless key x healthy-proxy
-// traversal bounded by retry.max_attempts. Foreground scheduler state is
-// never read or written here.
+// traversal bounded by retry.max_attempts. Foreground scheduler
+// credential/target state is never read or written here, and proxy
+// healthy/checking is never changed via syncProxyResult/verifyProxyAfterError.
+// Healthy proxies are observed read-only; success/failure only decides the
+// catalog snapshot in the caller, and a context deadline/cancel is only a
+// refresh failure, never a proxy signal.
 func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []string {
 	var keys []string
 	poolName := g.cfg.ProxyRouting.Zen
@@ -1179,8 +1260,7 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []str
 		key := keys[attempt%len(keys)]
 		proxy := healthy[attempt%len(healthy)]
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, status, err := fetchModels(refreshCtx, proxy.client, base, key)
-		g.syncProxyResult(refreshCtx, proxy, status, err)
+		models, _, err := fetchModels(refreshCtx, proxy.client, base, key)
 		cancel()
 		if err == nil {
 			return models
