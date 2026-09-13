@@ -64,6 +64,10 @@ type modelMetadataStore struct {
 	client         *http.Client
 	clientProvider func() []*http.Client
 	logger         *slog.Logger
+	// refreshMu is the shared manual/scheduled metadata refresh gate.
+	// Both paths use TryLock so a busy refresh reports busy instead of
+	// stacking. No new dependency is introduced.
+	refreshMu sync.Mutex
 }
 
 func newModelMetadataStore(configPath string, logger *slog.Logger) *modelMetadataStore {
@@ -121,15 +125,33 @@ func (store *modelMetadataStore) Start(ctx context.Context) {
 }
 
 func (store *modelMetadataStore) refreshAndLog(ctx context.Context) {
-	if err := store.Refresh(ctx); err != nil {
-		if store.logger != nil {
-			store.logger.Warn("models.dev metadata refresh failed", "component", "models", "event", "metadata_refresh_failed", "error", err)
-		}
-		return
+	ran, _ := store.refreshGated(ctx, "scheduled")
+	_ = ran
+}
+
+// refreshGated runs one models.dev refresh under the shared manual /
+// scheduled gate. It reports whether the gate was acquired; a busy gate
+// returns ran=false without stacking another refresh. A single
+// metadata_refresh_completed event is emitted per completed run.
+func (store *modelMetadataStore) refreshGated(ctx context.Context, source string) (ran bool, err error) {
+	if store == nil {
+		return false, errors.New("metadata store is unavailable")
 	}
+	if !store.refreshMu.TryLock() {
+		return false, nil
+	}
+	defer store.refreshMu.Unlock()
+	started := time.Now()
+	err = store.Refresh(ctx)
+	duration := time.Since(started)
 	if store.logger != nil {
-		store.logger.Info("models.dev metadata refreshed", "component", "models", "event", "metadata_refreshed", "models", store.Snapshot().Models)
+		if err != nil {
+			store.logger.Warn("models.dev metadata refresh completed", "component", "models", "event", "metadata_refresh_completed", "source", source, "duration_ms", duration.Milliseconds(), "refreshed", false, "error", err)
+		} else {
+			store.logger.Info("models.dev metadata refresh completed", "component", "models", "event", "metadata_refresh_completed", "source", source, "duration_ms", duration.Milliseconds(), "refreshed", true, "models", store.Snapshot().Models)
+		}
 	}
+	return true, err
 }
 
 func (store *modelMetadataStore) Refresh(ctx context.Context) error {

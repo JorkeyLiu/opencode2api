@@ -101,6 +101,24 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 
 诊断响应不会包含本地 Server Key、上游 Key、Cookie、密码、Authorization 或代理凭据；响应中同名敏感字段及已配置敏感值会在返回浏览器前清除。最近一次结果只保存在当前管理进程内。
 
+### 管理探针与手动刷新
+
+以下接口同样只在 `webui.listen` 上提供，受管理 Session 与 CSRF（含 Origin 校验）保护，响应禁止缓存：
+
+| 方法 | 路径 | 用途与限速 |
+| --- | --- | --- |
+| `POST` | `/api/proxies/probe` | 按具名 pool 与池内 index 探测单个 proxy 的传输健康；每客户端每分钟最多 10 次。 |
+| `POST` | `/api/models/refresh` | 手动刷新模型目录（`catalog`）、models.dev metadata（`metadata`）或两者（`all`）；每客户端每分钟最多 3 次。 |
+
+请求格式（严格 JSON，不接受多余字段）：
+
+```json
+{"pool": "shared", "index": 0}
+{"scope": "all"}
+```
+
+`scope` 只能是 `catalog`、`metadata` 或 `all`。探针只接受配置中实际存在的具名 pool 与合法池内 index，不接受 URL 或敏感值，因此无法被指向任意目标。探针是显式的管理健康动作：它可以改变该 proxy 的传输健康（`healthy`），但绝不读写 credential / target 调度状态；WebUI 资源页每行 proxy 的“探测”按钮即调用此接口，目录/metadata 快照旁的“刷新目录 / 刷新 metadata / 全部刷新”按钮调用刷新接口。手动刷新复用定时刷新的无状态逻辑（失败保留旧快照），不触碰 proxy 健康/检查状态与前台 credential / target 冷却；与定时刷新共享去重门，所需组件正忙时返回 HTTP `409` 而不叠加工作。探针与刷新统一返回 HTTP `200` 并内嵌结果（`result` / `refreshed` 与快照摘要，不含全量模型列表）；参数错误返回相应 `4xx`。成功与失败分别以 `info` / `warn` 记录完成事件，错误文本经过脱敏。
+
 ## 编译
 
 需要 Go 1.24 或更高版本。

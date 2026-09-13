@@ -33,6 +33,15 @@ const (
 
 var protocolDocEndpointPattern = regexp.MustCompile("\\|[^|]+\\|\\s*`?([^|`\\s]+)`?\\s*\\|\\s*`[^`]+/v1/(chat/completions|responses|messages)`")
 
+// Endpoint overrides for tests. Production code always uses the const
+// defaults; tests repoint these at local servers so refresh paths never
+// touch the network.
+var (
+	openCodeCapabilitiesEndpoint = openCodeCapabilitiesURL
+	openCodeZenDocsEndpoint      = openCodeZenDocsURL
+	openCodeGoDocsEndpoint       = openCodeGoDocsURL
+)
+
 func validProtocol(p Protocol) bool {
 	return p == ProtocolChat || p == ProtocolResponses || p == ProtocolAnthropic
 }
@@ -836,8 +845,8 @@ func fetchProtocolCapabilities(ctx context.Context, client *http.Client, endpoin
 		tier Tier
 		url  string
 	}{
-		{TierZen, openCodeZenDocsURL},
-		{TierGo, openCodeGoDocsURL},
+		{TierZen, openCodeZenDocsEndpoint},
+		{TierGo, openCodeGoDocsEndpoint},
 	} {
 		protocols, err := fetchProtocolDocs(ctx, client, doc.url)
 		if err != nil {

@@ -115,7 +115,10 @@
   single (credential, proxy, model) target, so one model's rejection never
   affects another; ordinary 4xx is neutral and 2xx clears this target and
   this credential's 401 state. Model/capability refresh is stateless and
-  touches none of the three layers.
+  touches none of the three layers. The admin probe is one of the explicit
+  transport-health actions: it may flip proxy healthy and nothing else;
+  manual refresh shares the scheduled stateless path and its concurrency
+  gate, so it never reads or writes proxy or foreground scheduler state.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
   per-model target cooldowns never count). Zero globally available channels

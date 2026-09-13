@@ -34,6 +34,10 @@ type Gateway struct {
 	goCreds   []credentialRef
 	catalog   *modelCatalog
 	monitor   *Monitor
+	// catalogRefreshMu is the shared manual/scheduled catalog refresh gate.
+	// Both paths use TryLock so a busy refresh returns 409 instead of
+	// stacking. No new dependency is introduced.
+	catalogRefreshMu sync.Mutex
 }
 
 type healthResponse struct {
@@ -850,8 +854,9 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 	}
 	switch {
 	case err == nil && status >= 200 && status < 300:
-		g.scheduler.noteTargetSuccess(cand.Identity)
-		g.scheduler.noteCredentialSuccess(cand.CredID)
+		targetCleared := g.scheduler.noteTargetSuccess(cand.Identity)
+		credCleared := g.scheduler.noteCredentialSuccess(cand.CredID)
+		g.logSchedulerCleared(cand, targetCleared, credCleared)
 		if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
 			wasHealthy := cand.Proxy.healthy.Swap(true)
 			if !wasHealthy && g.logger != nil {
@@ -863,21 +868,118 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 			g.markProxyUnavailable(cand.Proxy)
 			return class
 		}
-		g.scheduler.noteTargetFailure(cand.Identity, class.Class, 0, 0)
+		change := g.scheduler.noteTargetFailure(cand.Identity, class.Class, 0, 0)
+		g.logTargetCooldownSet(cand, change)
 		g.verifyProxyAfterError(ctx, cand.Proxy, 0)
 	case status == http.StatusUnauthorized:
-		g.scheduler.noteCredentialAuthFailure(cand.CredID)
+		change := g.scheduler.noteCredentialAuthFailure(cand.CredID)
+		g.logCredentialCooldownSet(cand, change, status)
 	case status == http.StatusForbidden || status == http.StatusTooManyRequests || status >= 500:
 		var retryAfter time.Duration
 		if resp != nil {
 			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 		}
-		g.scheduler.noteTargetFailure(cand.Identity, class.Class, status, retryAfter)
+		change := g.scheduler.noteTargetFailure(cand.Identity, class.Class, status, retryAfter)
+		g.logTargetCooldownSet(cand, change)
 		g.verifyProxyAfterError(ctx, cand.Proxy, status)
 	default:
 		// Ordinary 4xx and other responses: neutral, no state change.
 	}
 	return class
+}
+
+// credentialChannel names the observability channel for one candidate: the
+// shared public credential uses the anonymous literal, auth keys use "key".
+func credentialChannel(cand targetCandidate) string {
+	if cand.CredID == anonymousSchedulerCredentialID || cand.CredDisplay == anonymousCredentialID {
+		return anonymousCredentialID
+	}
+	return "key"
+}
+
+// logCredentialCooldownSet emits credential_cooldown_set only when the 401
+// actually extended the credential cooldown. The full key and its fingerprint
+// never leave the Gateway; only the suffix display is logged.
+func (g *Gateway) logCredentialCooldownSet(cand targetCandidate, change credentialChange, status int) {
+	if g.logger == nil || !change.Changed {
+		return
+	}
+	remaining := change.CooldownUntil - time.Now().UnixNano()
+	if remaining < 0 {
+		remaining = 0
+	}
+	g.logger.Warn("credential cooldown extended",
+		"component", "scheduler", "event", "credential_cooldown_set",
+		"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+		"failures", change.Failures,
+		"cooldown_until", time.Unix(0, change.CooldownUntil).UTC(),
+		"remaining_ms", time.Duration(remaining).Milliseconds(),
+		"status", status)
+}
+
+// logTargetCooldownSet emits target_cooldown_set only when the failure
+// actually extended the target cooldown. Ordinary 4xx never reaches here.
+func (g *Gateway) logTargetCooldownSet(cand targetCandidate, change targetChange) {
+	if g.logger == nil || !change.Changed {
+		return
+	}
+	remaining := change.CooldownUntil - time.Now().UnixNano()
+	if remaining < 0 {
+		remaining = 0
+	}
+	proxyNode := ""
+	poolName := cand.PoolName
+	if cand.Proxy != nil {
+		proxyNode = redactURL(cand.Proxy.name)
+		poolName = cand.Proxy.pool
+		if poolName == "" {
+			poolName = cand.PoolName
+		}
+	} else if cand.ProxyRaw != "" {
+		proxyNode = redactURL(cand.ProxyRaw)
+	}
+	g.logger.Debug("target cooldown extended",
+		"component", "scheduler", "event", "target_cooldown_set",
+		"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+		"channel", credentialChannel(cand),
+		"proxy_pool", poolName, "proxy_node", proxyNode,
+		"model", cand.Model, "failure_class", change.FailureClass,
+		"status", change.Status, "failures", change.Failures,
+		"cooldown_until", time.Unix(0, change.CooldownUntil).UTC(),
+		"remaining_ms", time.Duration(remaining).Milliseconds())
+}
+
+// logSchedulerCleared emits clear events only when 2xx actually removed
+// stored credential/target state.
+func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange) {
+	if g.logger == nil {
+		return
+	}
+	proxyNode := ""
+	poolName := cand.PoolName
+	if cand.Proxy != nil {
+		proxyNode = redactURL(cand.Proxy.name)
+		poolName = cand.Proxy.pool
+		if poolName == "" {
+			poolName = cand.PoolName
+		}
+	} else if cand.ProxyRaw != "" {
+		proxyNode = redactURL(cand.ProxyRaw)
+	}
+	if target.Changed {
+		g.logger.Debug("target cooldown cleared",
+			"component", "scheduler", "event", "target_cooldown_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"channel", credentialChannel(cand),
+			"proxy_pool", poolName, "proxy_node", proxyNode,
+			"model", cand.Model, "failures", target.Failures)
+	}
+	if cred.Changed {
+		g.logger.Debug("credential cooldown cleared",
+			"component", "scheduler", "event", "credential_cooldown_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"failures", cred.Failures, "remaining_ms", 0)
+	}
 }
 
 func setRequestCredential(ctx context.Context, tier Tier, keyID, channel string, anonymous bool, proxy *proxyTransport) {
@@ -1117,35 +1219,7 @@ func protocolPath(protocol Protocol) string {
 
 func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	refresh := func() {
-		var zen, goModels []string
-		var capabilities protocolCapabilities
-		var capabilitiesErr error
-		var wg sync.WaitGroup
-		wg.Add(3)
-		go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, TierGo) }()
-		go func() {
-			defer wg.Done()
-			capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			capabilities, capabilitiesErr = g.refreshProtocolCapabilities(capabilityCtx)
-		}()
-		wg.Wait()
-		if ctx.Err() != nil {
-			return
-		}
-		if capabilitiesErr != nil {
-			g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "error", capabilitiesErr)
-		}
-		if zen != nil || goModels != nil {
-			g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
-			if ctx.Err() == nil {
-				if err := g.catalog.SaveCache(); err != nil {
-					g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "error", err)
-				}
-			}
-			g.logger.Info("model catalog refreshed", "component", "models", "event", "catalog_refreshed", "models", len(g.catalog.List()))
-		}
+		_, _ = g.refreshCatalogGated(ctx, "scheduled")
 	}
 	go func() {
 		refresh()
@@ -1162,17 +1236,77 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	}()
 }
 
+// refreshCatalogGated runs one catalog refresh under the shared manual /
+// scheduled gate. It reports whether the gate was acquired; a busy gate
+// returns ran=false without stacking another refresh.
+func (g *Gateway) refreshCatalogGated(ctx context.Context, source string) (ran bool, refreshed bool) {
+	if g == nil {
+		return false, false
+	}
+	if !g.catalogRefreshMu.TryLock() {
+		return false, false
+	}
+	defer g.catalogRefreshMu.Unlock()
+	return true, g.runCatalogRefresh(ctx, source)
+}
+
+// runCatalogRefresh performs one Zen/Go/capability refresh pass. It reuses
+// the stateless foreground-safe traversal, keeps the previous snapshot on
+// failure, and emits a single catalog_refresh_completed event. Callers must
+// hold catalogRefreshMu.
+func (g *Gateway) runCatalogRefresh(ctx context.Context, source string) (refreshed bool) {
+	started := time.Now()
+	var zen, goModels []string
+	var capabilities protocolCapabilities
+	var capabilitiesErr error
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
+	go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, TierGo) }()
+	go func() {
+		defer wg.Done()
+		capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		capabilities, capabilitiesErr = g.refreshProtocolCapabilities(capabilityCtx)
+	}()
+	wg.Wait()
+	duration := time.Since(started)
+	if ctx.Err() != nil {
+		return false
+	}
+	if capabilitiesErr != nil && g.logger != nil {
+		g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "source", source, "error", capabilitiesErr)
+	}
+	if zen != nil || goModels != nil {
+		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+		if ctx.Err() == nil {
+			if err := g.catalog.SaveCache(); err != nil && g.logger != nil {
+				g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "source", source, "error", err)
+			}
+		}
+		refreshed = true
+	}
+	if g.logger != nil {
+		if refreshed {
+			g.logger.Info("model catalog refresh completed", "component", "models", "event", "catalog_refresh_completed", "source", source, "duration_ms", duration.Milliseconds(), "refreshed", true, "models", len(g.catalog.List()))
+		} else {
+			g.logger.Warn("model catalog refresh completed", "component", "models", "event", "catalog_refresh_completed", "source", source, "duration_ms", duration.Milliseconds(), "refreshed", false)
+		}
+	}
+	return refreshed
+}
+
 func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (protocolCapabilities, error) {
 	clients := g.healthyClients()
 	if len(clients) == 0 {
 		if len(g.uniquePools()) == 0 {
-			return fetchProtocolCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, openCodeCapabilitiesURL)
+			return fetchProtocolCapabilities(ctx, &http.Client{Timeout: 30 * time.Second}, openCodeCapabilitiesEndpoint)
 		}
 		return protocolCapabilities{}, errors.New("no healthy proxy available for OpenCode capability catalog")
 	}
 	var lastErr error
 	for _, client := range clients {
-		capabilities, err := fetchProtocolCapabilities(ctx, client, openCodeCapabilitiesURL)
+		capabilities, err := fetchProtocolCapabilities(ctx, client, openCodeCapabilitiesEndpoint)
 		if err == nil {
 			return capabilities, nil
 		}

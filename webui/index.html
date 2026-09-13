@@ -222,7 +222,8 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       <div class="section">
         <h2>Proxy 传输健康</h2>
         <div class="cap">节点名始终为 proxy 节点名，不代表出口 IP。pool 为具名代理池 identity；routing 列显示该池被 anonymous / zen / go 的引用归属；路由凭证为路由到该池的配置级凭证数（同池各行相同），不是绑定。健康仅表示传输连通性。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>路由凭证（配置级）</th><th>anonymous</th><th>routing</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>路由凭证（配置级）</th><th>anonymous</th><th>routing</th><th>操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="note">探测按钮只按 pool 名与行 index 触发管理探针（10/分钟/IP），可改变该节点传输健康但不触碰 credential / target 调度状态；繁忙时返回 409。</div>
       </div>
       <div class="section">
         <h2>Credential 状态</h2>
@@ -247,8 +248,14 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       </div>
       <div class="section">
         <h2>目录 / Metadata 快照</h2>
-        <div class="cap">模型暴露由能力目录驱动；未知能力模型不暴露。</div>
+        <div class="cap">模型暴露由能力目录驱动；未知能力模型不暴露。手动刷新无状态，不触碰 proxy 健康与前台调度状态；与定时刷新共享去重门，繁忙时返回 409。</div>
         <div class="facts" id="facts-catalog"></div>
+        <div class="actions">
+          <button class="ghost" id="btn-refresh-catalog" type="button">刷新目录</button>
+          <button class="ghost" id="btn-refresh-metadata" type="button">刷新 metadata</button>
+          <button class="ghost" id="btn-refresh-all" type="button">全部刷新</button>
+          <span class="note" id="refresh-state"></span>
+        </div>
       </div>
     </section>
 
@@ -733,10 +740,16 @@ function renderResourcesView(){
     cell(tr,p.available_credentials===undefined?"—":p.available_credentials);
     cell(tr,p.anonymous?"开":"关");
     cell(tr,(p.routing||[]).join(",")||"—","wrap");
+    var op=document.createElement("td");
+    var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost"; probeBtn.textContent="探测";
+    (function(proxy,btn){
+      btn.addEventListener("click",function(ev){ ev.stopPropagation(); probeProxy(proxy,btn); });
+    })(p,probeBtn);
+    op.appendChild(probeBtn); tr.appendChild(op);
     tr.addEventListener("click",function(){ S.assocProxy=(S.assocProxy===p.address)?"":p.address; renderResourcesView(); });
     tp.appendChild(tr);
   });
-  if(!(r.proxies||[]).length)emptyRow(tp,8,"暂无 proxy");
+  if(!(r.proxies||[]).length)emptyRow(tp,9,"暂无 proxy");
   var tk=$("tbody-keys"); clear(tk);
   (r.keys||[]).forEach(function(k){
     var hl=S.assocKey&&S.assocKey===k.id;
@@ -803,6 +816,35 @@ function renderResourcesView(){
   fact(fc,"metadata 更新", fmtDateTime(md.updated_at), md.stale?"warn":"ok");
   fact(fc,"metadata 错误", md.last_error||"无", md.last_error?"bad":"ok");
 }
+function probeProxy(p, btn){
+  var pool=p.proxy_pool||p.pool||"";
+  btn.disabled=true; var label=btn.textContent; btn.textContent="探测中…";
+  api("/api/proxies/probe",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
+    toast("探测 "+pool+"#"+p.index+": "+res.result+"（健康 "+(res.healthy?"是":"否")+"，变化 "+(res.changed?"是":"否")+"，"+res.duration_ms+"ms）");
+    refreshMonitor();
+  }).catch(function(err){ toast("探测失败："+err.message,true); })
+  .then(function(){ btn.disabled=false; btn.textContent=label; });
+}
+function manualRefresh(scope){
+  var ids=["btn-refresh-catalog","btn-refresh-metadata","btn-refresh-all"];
+  var buttons=ids.map(function(id){return $(id);});
+  buttons.forEach(function(b){ if(b)b.disabled=true; });
+  var note=$("refresh-state"); if(note)note.textContent="刷新 "+scope+" 进行中…";
+  api("/api/models/refresh",{method:"POST",body:JSON.stringify({scope:scope})}).then(function(res){
+    var parts=[];
+    var cat=res.catalog||{}, md=res.metadata||{};
+    parts.push("目录 "+(cat.refreshed?"已更新":"未更新")+(cat.error?("："+cat.error):""));
+    parts.push("metadata "+(md.refreshed?"已更新":"未更新")+(md.error?("："+md.error):""));
+    if(note)note.textContent=parts.join("；")+"（"+(res.duration_ms||0)+"ms）";
+    toast("刷新完成（"+(res.duration_ms||0)+"ms）");
+    refreshMonitor(); loadDebugModels();
+  }).catch(function(err){ if(note)note.textContent="刷新失败"; toast("刷新失败："+err.message,true); })
+  .then(function(){ buttons.forEach(function(b){ if(b)b.disabled=false; }); });
+}
+["btn-refresh-catalog","btn-refresh-metadata","btn-refresh-all"].forEach(function(id){
+  var scope=id==="btn-refresh-catalog"?"catalog":(id==="btn-refresh-metadata"?"metadata":"all");
+  var b=$(id); if(b)b.addEventListener("click",function(){manualRefresh(scope);});
+});
 function renderGuide(){
   var host=$("facts-guide"); if(!host)return; clear(host);
   var cfg=S.config, r=S.resources||{};

@@ -203,7 +203,9 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 	}
 	if current != nil {
 		next.gateway.catalog.CopyState(current.gateway.catalog)
-		migrateGatewaySchedulerState(current.gateway, next.gateway)
+		summary := migrateGatewaySchedulerState(current.gateway, next.gateway)
+		m.logger.Info("scheduler state migrated", "component", "scheduler", "event", "scheduler_state_migrated",
+			"credentials", summary.Credentials, "targets", summary.Targets, "proxies", summary.Proxies)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -256,6 +258,14 @@ func (m *RuntimeManager) Shutdown() {
 	}
 }
 
+// gatewayMigrationSummary counts migrated state for the Apply log summary.
+// No per-identity detail is included.
+type gatewayMigrationSummary struct {
+	Credentials int
+	Targets     int
+	Proxies     int
+}
+
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
 // from the old Gateway to the newly built one before the atomic swap:
 // credential state matches by tier+full key, proxy health by (pool name,
@@ -263,9 +273,10 @@ func (m *RuntimeManager) Shutdown() {
 // cooldowns migrate (remaining capped at 5 minutes); new resources start at
 // zero state and removed identities are dropped. Checking flags never
 // migrate. In-flight requests keep using the old Gateway and its state.
-func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) {
+func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrationSummary {
+	var summary gatewayMigrationSummary
 	if oldGateway == nil || newGateway == nil || oldGateway.scheduler == nil || newGateway.scheduler == nil {
-		return
+		return summary
 	}
 	for name, newPool := range newGateway.pools {
 		oldPool := oldGateway.pools[name]
@@ -284,10 +295,13 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) {
 			}
 			if healthy, ok := healthByRaw[proxy.name]; ok {
 				proxy.healthy.Store(healthy)
+				summary.Proxies++
 			}
 		}
 	}
-	newGateway.scheduler.migrateFrom(oldGateway.scheduler)
+	migrated := newGateway.scheduler.migrateFrom(oldGateway.scheduler)
+	summary.Credentials = migrated.Credentials
+	summary.Targets = migrated.Targets
 	validCreds := make(map[string]bool, len(newGateway.zenCreds)+len(newGateway.goCreds)+1)
 	for _, cred := range newGateway.zenCreds {
 		validCreds[cred.id] = true
@@ -309,6 +323,7 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) {
 		validPoolProxy[name] = set
 	}
 	newGateway.scheduler.retainOnly(validCreds, validPoolProxy)
+	return summary
 }
 
 type ResourceSnapshot struct {

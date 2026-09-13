@@ -176,19 +176,50 @@ func (s *targetScheduler) targetCoolUntil(identity string) int64 {
 	return 0
 }
 
+// credentialChange is a scheduler-owned state delta snapshot. It carries only
+// counts and deadlines; key material, fingerprints, and proxy URLs never
+// appear here. The Gateway owns log emission from these snapshots so the
+// scheduler never depends on a logger.
+type credentialChange struct {
+	Changed       bool
+	Cleared       bool
+	Failures      uint32
+	CooldownUntil int64
+	PreviousUntil int64
+}
+
+// targetChange is the per-target equivalent of credentialChange. ProxyRaw is
+// intentionally absent: callers already hold the redacted node label.
+type targetChange struct {
+	Changed       bool
+	Cleared       bool
+	Failures      uint32
+	CooldownUntil int64
+	PreviousUntil int64
+	FailureClass  string
+	Status        int
+}
+
 // noteCredentialAuthFailure applies the global 401 credential cooldown.
-func (s *targetScheduler) noteCredentialAuthFailure(credID string) {
+func (s *targetScheduler) noteCredentialAuthFailure(credID string) credentialChange {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.credState[credID]
+	var previous int64
 	if entry == nil {
 		entry = &credentialEntry{}
 		s.credState[credID] = entry
+	} else {
+		previous = entry.cooldownUntil
 	}
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, credID, 0)
 	entry.cooldownUntil = now.Add(delay).UnixNano()
+	return credentialChange{
+		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
+		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
+	}
 }
 
 // noteTargetFailure cools one target identity for 403/429/5xx or a neutral
@@ -196,12 +227,13 @@ func (s *targetScheduler) noteCredentialAuthFailure(credID string) {
 // when larger, and the total is capped at 5 minutes. The failure count is
 // retained after cooldown expiry for targetStaleRetention so the next failure
 // escalates; success deletes the entry.
-func (s *targetScheduler) noteTargetFailure(identity, failureClass string, status int, retryAfter time.Duration) {
+func (s *targetScheduler) noteTargetFailure(identity, failureClass string, status int, retryAfter time.Duration) targetChange {
 	now := time.Now()
 	nowNanos := now.UnixNano()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.targetState[identity]
+	var previous int64
 	if entry == nil {
 		if len(s.targetState) >= maxTargetStates {
 			s.pruneStaleTargetsLocked(nowNanos)
@@ -214,6 +246,8 @@ func (s *targetScheduler) noteTargetFailure(identity, failureClass string, statu
 		}
 		entry = &targetEntry{}
 		s.targetState[identity] = entry
+	} else {
+		previous = entry.cooldownUntil
 	}
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, identity, retryAfter)
@@ -223,6 +257,11 @@ func (s *targetScheduler) noteTargetFailure(identity, failureClass string, statu
 	entry.lastStatus = status
 	if retryAfter > 0 {
 		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+	}
+	return targetChange{
+		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
+		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
+		FailureClass: failureClass, Status: status,
 	}
 }
 
@@ -269,17 +308,29 @@ func (s *targetScheduler) evictOldestIdleTargetLocked(nowNanos int64) bool {
 }
 
 // noteTargetSuccess clears only the single target identity.
-func (s *targetScheduler) noteTargetSuccess(identity string) {
+func (s *targetScheduler) noteTargetSuccess(identity string) targetChange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entry := s.targetState[identity]
+	if entry == nil {
+		return targetChange{}
+	}
+	failures := entry.failures
 	delete(s.targetState, identity)
+	return targetChange{Cleared: true, Changed: true, Failures: failures}
 }
 
 // noteCredentialSuccess clears the credential 401 cooldown/failures.
-func (s *targetScheduler) noteCredentialSuccess(credID string) {
+func (s *targetScheduler) noteCredentialSuccess(credID string) credentialChange {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entry := s.credState[credID]
+	if entry == nil {
+		return credentialChange{}
+	}
+	failures := entry.failures
 	delete(s.credState, credID)
+	return credentialChange{Cleared: true, Changed: true, Failures: failures}
 }
 
 func (s *targetScheduler) backoffDelayLocked(failures uint32, identity string, retryAfter time.Duration) time.Duration {
@@ -541,9 +592,17 @@ func splitNul5(s string) []string {
 // maxTargetStates with the same deterministic policy as creation: prune
 // expired-stale first, evict oldest idle next, allow temporary overflow only
 // when every entry is in active cooldown.
-func (s *targetScheduler) migrateFrom(old *targetScheduler) {
+// migrationSummary counts migrated still-future state for the Apply log.
+// No per-identity detail is included.
+type migrationSummary struct {
+	Credentials int
+	Targets     int
+}
+
+func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
+	var summary migrationSummary
 	if old == nil || old == s {
-		return
+		return summary
 	}
 	now := time.Now().UnixNano()
 	old.mu.Lock()
@@ -578,6 +637,7 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) {
 		}
 		fresh := entry
 		s.credState[id] = &fresh
+		summary.Credentials++
 	}
 	for id, display := range displays {
 		if _, ok := s.credDisplay[id]; !ok {
@@ -601,7 +661,9 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) {
 		}
 		fresh := entry
 		s.targetState[id] = &fresh
+		summary.Targets++
 	}
+	return summary
 }
 
 // retainOnly drops credential and target state that no longer matches live
