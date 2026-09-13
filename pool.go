@@ -113,7 +113,9 @@ func (p *anonymousPool) MarkFailure(node *anonymousNode, resp *http.Response, er
 	if node == nil {
 		return
 	}
-	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+	// Shared classification; behavior unchanged (cooldown on transport,
+	// auth, rate-limit, and 5xx failures only).
+	if !classifyUpstreamAttempt(resp, err).CoolsDown {
 		return
 	}
 	failures := node.failures.Add(1)
@@ -456,7 +458,9 @@ func (p *nodePool) MarkSuccess(node *upstreamNode) {
 }
 
 func (p *nodePool) MarkFailure(node *upstreamNode, resp *http.Response, err error) {
-	if err == nil && resp != nil && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+	// Shared classification; behavior unchanged (cooldown on transport,
+	// auth, rate-limit, and 5xx failures only).
+	if !classifyUpstreamAttempt(resp, err).CoolsDown {
 		return
 	}
 	failures := node.failures.Add(1)

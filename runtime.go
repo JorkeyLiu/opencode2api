@@ -245,20 +245,36 @@ func (m *RuntimeManager) Shutdown() {
 }
 
 type ResourceSnapshot struct {
-	Models    modelCatalogSnapshot `json:"models"`
-	Keys      []KeyStatus          `json:"keys"`
-	Proxies   []ProxyStatus        `json:"proxies"`
-	Anonymous bool                 `json:"anonymous"`
-	Metadata  MetadataSnapshot     `json:"metadata"`
+	Models           modelCatalogSnapshot   `json:"models"`
+	Keys             []KeyStatus            `json:"keys"`
+	Proxies          []ProxyStatus          `json:"proxies"`
+	Anonymous        bool                   `json:"anonymous"`
+	AnonymousProxies []AnonymousProxyStatus `json:"anonymous_proxies,omitempty"`
+	Metadata         MetadataSnapshot       `json:"metadata"`
 }
 
 type KeyStatus struct {
-	ID            string     `json:"id"`
-	Tier          string     `json:"tier"`
-	Index         int        `json:"index"`
-	ProxyIndex    int        `json:"proxy_index"`
-	Failures      uint32     `json:"failures"`
-	CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	ID                       string     `json:"id"`
+	Tier                     string     `json:"tier"`
+	Index                    int        `json:"index"`
+	ProxyIndex               int        `json:"proxy_index"`
+	Proxy                    string     `json:"proxy,omitempty"`
+	Failures                 uint32     `json:"failures"`
+	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
+	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
+}
+
+// AnonymousProxyStatus exposes the per-proxy anonymous cooldown state.
+// Proxy health still means transport connectivity only; failures and
+// cooldown here are credential (business) state, never proxy health.
+type AnonymousProxyStatus struct {
+	Index                    int        `json:"index"`
+	Address                  string     `json:"address"`
+	Healthy                  bool       `json:"healthy"`
+	Checking                 bool       `json:"checking"`
+	Failures                 uint32     `json:"failures"`
+	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
+	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
 }
 
 type ProxyStatus struct {
@@ -299,6 +315,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		}
 		result.Proxies = append(result.Proxies, status)
 	}
+	result.AnonymousProxies = anonymousProxyStatuses(gateway.anonymous)
 	return result
 }
 
@@ -330,16 +347,64 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 }
 
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
+	if pool == nil {
+		return nil
+	}
+	now := time.Now()
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: keyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
-		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
+		proxyIndex := int(node.proxyIndex.Load())
+		status := KeyStatus{ID: keyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: proxyIndex, Failures: node.failures.Load()}
+		// Current proxy name is redacted; the pool slice is immutable after
+		// build and atomics are lock-free, so no long lock is introduced.
+		if pool.transports != nil && proxyIndex >= 0 && proxyIndex < len(pool.transports.items) && pool.transports.items[proxyIndex] != nil {
+			status.Proxy = redactURL(pool.transports.items[proxyIndex].name)
+		}
+		if until := node.cooldownUntil.Load(); until > now.UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value
+			status.CooldownRemainingSeconds = cooldownRemainingSeconds(until, now)
 		}
 		result = append(result, status)
 	}
 	return result
+}
+
+// anonymousProxyStatuses snapshots the per-proxy anonymous credential state
+// without taking pool or binding locks: nodes are immutable after build and
+// all counters are atomics.
+func anonymousProxyStatuses(pool *anonymousPool) []AnonymousProxyStatus {
+	if pool == nil || len(pool.nodes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	result := make([]AnonymousProxyStatus, 0, len(pool.nodes))
+	for _, node := range pool.nodes {
+		if node == nil || node.proxy == nil {
+			continue
+		}
+		status := AnonymousProxyStatus{
+			Index: node.proxy.index, Address: redactURL(node.proxy.name),
+			Healthy: node.proxy.healthy.Load(), Checking: node.proxy.checking.Load(),
+			Failures: node.failures.Load(),
+		}
+		if until := node.cooldownUntil.Load(); until > now.UnixNano() {
+			value := time.Unix(0, until).UTC()
+			status.CooldownUntil = &value
+			status.CooldownRemainingSeconds = cooldownRemainingSeconds(until, now)
+		}
+		result = append(result, status)
+	}
+	return result
+}
+
+func cooldownRemainingSeconds(untilUnixNano int64, now time.Time) *int64 {
+	remaining := untilUnixNano - now.UnixNano()
+	if remaining <= 0 {
+		return nil
+	}
+	seconds := (remaining + int64(time.Second) - 1) / int64(time.Second)
+	return &seconds
 }
 
 func secretFingerprint(value string) string {

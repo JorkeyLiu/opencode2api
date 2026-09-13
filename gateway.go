@@ -771,15 +771,8 @@ func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attemp
 	if resp != nil {
 		status = resp.StatusCode
 	}
-	success := err == nil && status >= 200 && status < 300
-	outcome := "retryable_failure"
-	if success {
-		outcome = "success"
-	} else if err != nil {
-		outcome = "transport_error"
-	} else if isNonRetryableClientResponse(resp, nil) {
-		outcome = "rejected"
-	}
+	class := classifyUpstreamAttempt(resp, err)
+	success := class.Class == AttemptClassSuccess
 	proxyName := "unavailable"
 	if proxy != nil {
 		proxyName = redactURL(proxy.name)
@@ -787,7 +780,8 @@ func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attemp
 	g.monitor.RecordAttempt(UpstreamAttempt{
 		Time: time.Now().UTC(), RequestID: ids.Request, Model: route.ID, Tier: string(route.Tier), Attempt: attempt,
 		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, Status: status,
-		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcome,
+		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcomeFromClass(class.Class, success),
+		FailureClass: class.Class, Retryable: class.Retryable, CoolsDown: class.CoolsDown,
 	})
 }
 
@@ -823,7 +817,9 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, 
 }
 
 func isNonRetryableClientResponse(resp *http.Response, err error) bool {
-	return err == nil && resp != nil && resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests
+	// Single shared classification: only client_rejected ends the tier.
+	// Behavior is unchanged; the mapping lives in classifyAttempt.
+	return classifyUpstreamAttempt(resp, err).Class == AttemptClassClientRejected
 }
 
 // syncProxyResult updates proxy health from real traffic. Only timeouts and

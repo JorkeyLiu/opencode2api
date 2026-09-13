@@ -384,6 +384,91 @@ type UpstreamAttempt struct {
 	DurationMS int64     `json:"duration_ms"`
 	Success    bool      `json:"success"`
 	Outcome    string    `json:"outcome"`
+	// FailureClass is the shared upstream attempt classification
+	// (see classifyUpstreamAttempt). It is additive for WebUI consumers;
+	// Outcome is retained for backward compatibility.
+	FailureClass string `json:"failure_class"`
+	Retryable    bool   `json:"retryable"`
+	CoolsDown    bool   `json:"cools_down"`
+}
+
+// Shared upstream attempt failure classes. The set is intentionally small
+// and stable: future schedulers treat anonymous and authenticated channels
+// as credential types and route on (tier, credential, proxy, model), while
+// proxy health continues to mean transport connectivity only.
+const (
+	AttemptClassSuccess          = "success"
+	AttemptClassTransportFailure = "transport_failure"
+	AttemptClassAuthFailure      = "auth_failure"
+	AttemptClassRateLimited      = "rate_limited"
+	AttemptClassUpstreamFailure  = "upstream_failure"
+	AttemptClassClientRejected   = "client_rejected"
+	AttemptClassOtherResponse    = "other_response"
+)
+
+// anonymousCredentialID is the stable literal used for the shared public
+// credential in all observability output. Full keys must never appear here.
+const anonymousCredentialID = "anonymous"
+
+// attemptClassification carries the current routing semantics for one
+// upstream attempt without changing control flow. Retryable mirrors the
+// authenticated tier loop (only client_rejected ends the tier); CoolsDown
+// mirrors the key/anonymous-node cooldown condition. Callers keep their
+// existing branches; they only read these flags for observability.
+type attemptClassification struct {
+	Class     string
+	Retryable bool
+	CoolsDown bool
+}
+
+// classifyAttempt is pure: it branches only on status code and transport
+// error presence, never on error text, so secrets in error strings cannot
+// leak into classification output.
+func classifyAttempt(status int, transportError bool) attemptClassification {
+	if !transportError && status >= 200 && status < 300 {
+		return attemptClassification{Class: AttemptClassSuccess}
+	}
+	if transportError {
+		return attemptClassification{Class: AttemptClassTransportFailure, Retryable: true, CoolsDown: true}
+	}
+	switch {
+	case status == 401 || status == 403:
+		return attemptClassification{Class: AttemptClassAuthFailure, Retryable: true, CoolsDown: true}
+	case status == 429:
+		return attemptClassification{Class: AttemptClassRateLimited, Retryable: true, CoolsDown: true}
+	case status >= 500:
+		return attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
+	case status >= 400 && status < 500:
+		return attemptClassification{Class: AttemptClassClientRejected}
+	default:
+		return attemptClassification{Class: AttemptClassOtherResponse, Retryable: true}
+	}
+}
+
+// classifyUpstreamAttempt is the single shared entry point for anonymous and
+// authenticated attempts. Do not copy its branching elsewhere.
+func classifyUpstreamAttempt(resp *http.Response, err error) attemptClassification {
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	return classifyAttempt(status, err != nil)
+}
+
+// outcomeFromClass preserves the historical Outcome vocabulary for existing
+// WebUI consumers while new readers use FailureClass directly.
+func outcomeFromClass(class string, success bool) string {
+	if success || class == AttemptClassSuccess {
+		return "success"
+	}
+	switch class {
+	case AttemptClassTransportFailure:
+		return "transport_error"
+	case AttemptClassClientRejected:
+		return "rejected"
+	default:
+		return "retryable_failure"
+	}
 }
 
 // UpstreamRequest is the credential route that was actually used for one
@@ -409,6 +494,45 @@ type attemptBucket struct {
 	minute    int64
 	aggregate AttemptAggregate
 }
+
+// ResourceCounts is one bounded, process-local aggregation cell for the
+// last-hour window. Proxy health is transport connectivity only; business
+// failures (429/4xx/5xx) are counted here without marking proxies unhealthy.
+type ResourceCounts struct {
+	Attempts          uint64  `json:"attempts"`
+	Success           uint64  `json:"success"`
+	Failed            uint64  `json:"failed"`
+	RateLimited       uint64  `json:"rate_limited"`
+	AuthFailures      uint64  `json:"auth_failures"`
+	ClientRejected    uint64  `json:"client_rejected"`
+	ServerFailures    uint64  `json:"server_failures"`
+	TransportFailures uint64  `json:"transport_failures"`
+	AverageMS         float64 `json:"average_ms"`
+	totalDurationMS   int64
+}
+
+// AttemptResources exposes existing attempt data along the future scheduling
+// dimensions (tier, credential, proxy, model). This unit ships the proxy,
+// credential, and credential+proxy views; tier/model remain on each attempt.
+type AttemptResources struct {
+	Proxies     map[string]ResourceCounts `json:"proxies"`
+	Credentials map[string]ResourceCounts `json:"credentials"`
+	Pairs       map[string]ResourceCounts `json:"pairs"`
+}
+
+type resourceBucket struct {
+	minute  int64
+	proxies map[string]*ResourceCounts
+	creds   map[string]*ResourceCounts
+	pairs   map[string]*ResourceCounts
+}
+
+const (
+	resourceMaxProxies     = 256
+	resourceMaxCredentials = 256
+	resourceMaxPairs       = 1024
+	resourceOtherKey       = "_other"
+)
 
 type UpstreamSnapshot struct {
 	Lifetime AttemptAggregate  `json:"lifetime"`
@@ -533,6 +657,7 @@ type Monitor struct {
 	lifetimeUsage   UsagePeriod
 	attemptLifetime AttemptAggregate
 	attemptBuckets  [60]attemptBucket
+	resourceBuckets [60]resourceBucket
 	recentRequests  upstreamRequestRing
 	recentAttempts  upstreamAttemptRing
 }
@@ -643,6 +768,26 @@ func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
 	} else {
 		attempt.Time = attempt.Time.UTC()
 	}
+	// Normalize observability identities at the single ingestion point so
+	// no caller can leak a full key, secret, or raw proxy URL. Anonymous
+	// always uses the stable literal; proxy labels stay redacted.
+	if attempt.Anonymous || attempt.Channel == anonymousCredentialID || attempt.KeyID == anonymousCredentialID {
+		attempt.Anonymous = true
+		attempt.KeyID = anonymousCredentialID
+	}
+	attempt.Proxy = normalizeProxyLabel(attempt.Proxy)
+	if attempt.FailureClass == "" {
+		class := classifyAttempt(attempt.Status, false)
+		if !attempt.Success && attempt.Status == 0 {
+			// Status 0 with a recorded failure and no explicit class comes
+			// from a transport error path; keep the shared mapping central.
+			class = classifyAttempt(0, true)
+		}
+		attempt.FailureClass, attempt.Retryable, attempt.CoolsDown = class.Class, class.Retryable, class.CoolsDown
+	}
+	if attempt.Outcome == "" {
+		attempt.Outcome = outcomeFromClass(attempt.FailureClass, attempt.Success)
+	}
 	minute := attempt.Time.Unix() / 60
 	m.mu.Lock()
 	recordAttemptAggregate(&m.attemptLifetime, attempt)
@@ -651,25 +796,149 @@ func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
 		*bucket = attemptBucket{minute: minute, aggregate: newAttemptAggregate()}
 	}
 	recordAttemptAggregate(&bucket.aggregate, attempt)
+	rbucket := &m.resourceBuckets[minute%60]
+	if rbucket.minute != minute {
+		*rbucket = resourceBucket{minute: minute}
+	}
+	recordResourceBucket(rbucket, attempt)
 	m.recentAttempts.PruneBefore(attempt.Time.Add(-time.Hour))
 	m.recentAttempts.Add(attempt)
 	m.mu.Unlock()
 }
 
+// normalizeProxyLabel keeps proxy observability labels bounded and secret
+// free. Empty becomes "unavailable"; URL credentials are stripped.
+func normalizeProxyLabel(value string) string {
+	if value == "" {
+		return "unavailable"
+	}
+	return redactURL(value)
+}
+
+// resourceCredentialID maps one attempt to its credential view key. Both
+// future credential types collapse here: the shared public credential uses
+// the stable literal, authenticated keys use their (already suffix-only)
+// display ID qualified by channel.
+func resourceCredentialID(attempt UpstreamAttempt) string {
+	if attempt.Anonymous || attempt.KeyID == anonymousCredentialID || attempt.Channel == anonymousCredentialID {
+		return anonymousCredentialID
+	}
+	if attempt.KeyID == "" {
+		return "not_routed"
+	}
+	if attempt.Channel == "" {
+		return attempt.KeyID
+	}
+	return attempt.Channel + ":" + attempt.KeyID
+}
+
+func recordResourceBucket(bucket *resourceBucket, attempt UpstreamAttempt) {
+	durationMS := max(attempt.DurationMS, 0)
+	proxy := attempt.Proxy
+	if proxy == "" {
+		proxy = "unavailable"
+	}
+	cred := resourceCredentialID(attempt)
+	if bucket.proxies == nil {
+		bucket.proxies = make(map[string]*ResourceCounts)
+	}
+	if bucket.creds == nil {
+		bucket.creds = make(map[string]*ResourceCounts)
+	}
+	if bucket.pairs == nil {
+		bucket.pairs = make(map[string]*ResourceCounts)
+	}
+	addResourceSample(bucket.proxies, resourceMaxProxies, proxy, attempt, durationMS)
+	addResourceSample(bucket.creds, resourceMaxCredentials, cred, attempt, durationMS)
+	addResourceSample(bucket.pairs, resourceMaxPairs, cred+" @ "+proxy, attempt, durationMS)
+}
+
+// addResourceSample updates one bounded dimension map. New keys beyond the
+// cap fold into "_other" to keep memory bounded under config churn.
+func addResourceSample(dst map[string]*ResourceCounts, cap int, key string, attempt UpstreamAttempt, durationMS int64) {
+	cell, ok := dst[key]
+	if !ok {
+		if len(dst) >= cap {
+			key = resourceOtherKey
+			cell, ok = dst[key]
+			if !ok {
+				cell = &ResourceCounts{}
+				dst[key] = cell
+			}
+		} else {
+			cell = &ResourceCounts{}
+			dst[key] = cell
+		}
+	}
+	cell.Attempts++
+	if attempt.Success {
+		cell.Success++
+	} else {
+		cell.Failed++
+	}
+	switch attempt.FailureClass {
+	case AttemptClassRateLimited:
+		cell.RateLimited++
+	case AttemptClassAuthFailure:
+		cell.AuthFailures++
+	case AttemptClassClientRejected:
+		cell.ClientRejected++
+	case AttemptClassUpstreamFailure:
+		cell.ServerFailures++
+	case AttemptClassTransportFailure:
+		cell.TransportFailures++
+	}
+	cell.totalDurationMS += durationMS
+}
+
+func mergeResourceMaps(target map[string]ResourceCounts, source map[string]*ResourceCounts, cap int) {
+	for key, cell := range source {
+		if cell == nil {
+			continue
+		}
+		outKey := key
+		if _, ok := target[outKey]; !ok && len(target) >= cap {
+			outKey = resourceOtherKey
+		}
+		merged := target[outKey]
+		merged.Attempts += cell.Attempts
+		merged.Success += cell.Success
+		merged.Failed += cell.Failed
+		merged.RateLimited += cell.RateLimited
+		merged.AuthFailures += cell.AuthFailures
+		merged.ClientRejected += cell.ClientRejected
+		merged.ServerFailures += cell.ServerFailures
+		merged.TransportFailures += cell.TransportFailures
+		merged.totalDurationMS += cell.totalDurationMS
+		target[outKey] = merged
+	}
+}
+
+func finalizeResourceMap(target map[string]ResourceCounts) {
+	for key, cell := range target {
+		if cell.Attempts > 0 {
+			cell.AverageMS = float64(cell.totalDurationMS) / float64(cell.Attempts)
+		}
+		cell.totalDurationMS = 0
+		target[key] = cell
+	}
+}
+
 type MonitorSnapshot struct {
-	StartedAt     time.Time         `json:"started_at"`
-	UptimeSeconds int64             `json:"uptime_seconds"`
-	Active        int64             `json:"active_requests"`
-	ActiveStreams int64             `json:"active_streams"`
-	Lifetime      MetricSummary     `json:"lifetime"`
-	Window        MetricSummary     `json:"last_hour"`
-	Series        []MetricSeries    `json:"series"`
-	Endpoints     map[string]uint64 `json:"endpoints"`
-	Models        map[string]uint64 `json:"models"`
-	Tiers         map[string]uint64 `json:"tiers"`
-	Statuses      map[string]uint64 `json:"statuses"`
-	Usage         UsageSnapshot     `json:"usage"`
-	Upstream      UpstreamSnapshot  `json:"upstream"`
+	StartedAt        time.Time         `json:"started_at"`
+	UptimeSeconds    int64             `json:"uptime_seconds"`
+	Active           int64             `json:"active_requests"`
+	ActiveStreams    int64             `json:"active_streams"`
+	Lifetime         MetricSummary     `json:"lifetime"`
+	Window           MetricSummary     `json:"last_hour"`
+	Series           []MetricSeries    `json:"series"`
+	Endpoints        map[string]uint64 `json:"endpoints"`
+	Models           map[string]uint64 `json:"models"`
+	Tiers            map[string]uint64 `json:"tiers"`
+	Statuses         map[string]uint64 `json:"statuses"`
+	Usage            UsageSnapshot     `json:"usage"`
+	Upstream         UpstreamSnapshot  `json:"upstream"`
+	AttemptResources AttemptResources  `json:"attempt_resources"`
 }
 
 type MetricSummary struct {
@@ -704,6 +973,11 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	series := make([]MetricSeries, 0, 60)
 	usageWindow := newUsagePeriod()
 	upstreamWindow := newAttemptAggregate()
+	windowResources := AttemptResources{
+		Proxies:     make(map[string]ResourceCounts),
+		Credentials: make(map[string]ResourceCounts),
+		Pairs:       make(map[string]ResourceCounts),
+	}
 	var recentRequests []UpstreamRequest
 	var recentAttempts []UpstreamAttempt
 	m.mu.Lock()
@@ -737,6 +1011,12 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 		if attemptBucket.minute == minute {
 			mergeAttemptAggregate(&upstreamWindow, attemptBucket.aggregate)
 		}
+		rbucket := &m.resourceBuckets[minute%60]
+		if rbucket.minute == minute {
+			mergeResourceMaps(windowResources.Proxies, rbucket.proxies, resourceMaxProxies)
+			mergeResourceMaps(windowResources.Credentials, rbucket.creds, resourceMaxCredentials)
+			mergeResourceMaps(windowResources.Pairs, rbucket.pairs, resourceMaxPairs)
+		}
 		series = append(series, entry)
 	}
 	usageLifetime := cloneUsagePeriod(m.lifetimeUsage)
@@ -751,6 +1031,9 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	finalizeUsagePeriod(&usageWindow)
 	finalizeAttemptAggregate(&upstreamLifetime)
 	finalizeAttemptAggregate(&upstreamWindow)
+	finalizeResourceMap(windowResources.Proxies)
+	finalizeResourceMap(windowResources.Credentials)
+	finalizeResourceMap(windowResources.Pairs)
 	if window.Total > 0 {
 		window.SuccessRate = float64(window.Success) / float64(window.Total)
 		window.AverageMS /= float64(window.Total)
@@ -766,8 +1049,9 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 		StartedAt: m.started, UptimeSeconds: int64(time.Since(m.started).Seconds()), Active: m.active.Load(),
 		ActiveStreams: m.activeStreams.Load(), Lifetime: lifetime, Window: window, Series: series,
 		Endpoints: endpoints, Models: models, Tiers: tiers, Statuses: statuses,
-		Usage:    UsageSnapshot{Lifetime: usageLifetime, Window: usageWindow},
-		Upstream: UpstreamSnapshot{Lifetime: upstreamLifetime, Window: upstreamWindow, Requests: recentRequests, Recent: recentAttempts},
+		Usage:            UsageSnapshot{Lifetime: usageLifetime, Window: usageWindow},
+		Upstream:         UpstreamSnapshot{Lifetime: upstreamLifetime, Window: upstreamWindow, Requests: recentRequests, Recent: recentAttempts},
+		AttemptResources: windowResources,
 	}
 }
 
