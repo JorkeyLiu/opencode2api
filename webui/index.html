@@ -180,12 +180,29 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
     <section id="tab-history" class="hidden">
       <div class="section">
         <h2>历史与趋势</h2>
-        <div class="cap">进程内统计，重启清空。last_hour 表示最近 60 分钟滚动窗口；lifetime 表示进程启动至今累计。</div>
+        <div class="cap">1 小时为进程内存；24 小时 / 7 天为脱敏持久历史（NDJSON 投影，重启可查；lifetime 仍进程级）。</div>
         <div class="filters">
           <select id="h-scope"><option value="last_hour">last_hour（60 分钟）</option><option value="lifetime">lifetime（累计）</option></select>
+          <select id="h-range"><option value="1h">1小时(内存)</option><option value="24h">24小时</option><option value="7d">7天</option></select>
           <span class="note" id="h-scope-note"></span>
         </div>
+        <div class="facts" id="facts-history"></div>
         <div class="grid4" id="h-kpis"></div>
+      </div>
+      <div class="section" id="hist-persist-wrap">
+        <h2>持久历史请求</h2>
+        <div class="cap">24h / 7d 调用 history API；点击行按 request_id 拉取 attempt 链。分页加载更多；切换范围取消旧请求。</div>
+        <div class="filters">
+          <input type="search" id="hist-model" placeholder="模型过滤">
+          <select id="hist-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
+          <select id="hist-channel"><option value="">全部通道</option></select>
+          <button class="ghost" id="hist-more" type="button">加载更多</button>
+          <span class="note" id="hist-count"></span>
+        </div>
+        <div class="table-wrap"><table class="table" id="tbl-hist">
+          <thead><tr><th>时间</th><th>Request ID</th><th>模型</th><th>Tier</th><th>通道</th><th>状态</th><th>耗时</th></tr></thead>
+          <tbody id="tbody-hist"></tbody>
+        </table></div>
       </div>
       <div class="section">
         <h2>请求与 Token 趋势</h2>
@@ -304,6 +321,10 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
               <div class="field"><label>Failure Cooldown（秒）</label><input id="c-cooldown" type="number"></div>
               <div class="field"><label>日志级别</label><select id="c-level"><option>debug</option><option>info</option><option>warn</option><option>error</option></select></div>
               <div class="field"><label>日志 Ring Size</label><input id="c-ring" type="number" min="100" max="50000"></div>
+              <div class="field full"><label class="check-label"><input id="c-hist-enabled" type="checkbox">启用持久历史（脱敏 NDJSON，热生效）</label></div>
+              <div class="field"><label>历史目录（空=配置目录/history）</label><input id="c-hist-dir" placeholder="history"></div>
+              <div class="field"><label>历史保留天数（1-90）</label><input id="c-hist-retention" type="number" min="1" max="90"></div>
+              <div class="field"><label>历史上限 MB（16-2048）</label><input id="c-hist-max" type="number" min="16" max="2048"></div>
             </div>
             <div class="actions">
               <button class="primary" type="submit">验证、保存并应用</button>
@@ -420,7 +441,8 @@ var S = {
   expandedRequest:"",
   realtimePaused:false,
   assocProxy:"", assocKey:"",
-  historyScope:"last_hour",
+  historyScope:"last_hour", historyRange:"1h", history:null,
+  histItems:[], histCursor:"", histLoading:false, histSeq:0, histExpanded:"",
   logEvents:[], logPaused:false, logGap:"",
   es:null
 };
@@ -508,6 +530,7 @@ function refreshMonitor(){
     S.resources=data.resources||null;
     S.upstream=(data.metrics&&data.metrics.upstream)||data.upstream||null;
     S.attemptResources=(data.metrics&&data.metrics.attempt_resources)||null;
+    S.history=data.history||null;
     S.lastRefresh=new Date().toLocaleTimeString();
     renderTopbar(); renderRealtime(); renderHistory(); renderResourcesView(); renderGuide(); renderUsageFacts(); renderChannelFilter();
   }).catch(function(err){
@@ -551,6 +574,21 @@ function renderChannelFilter(){
   clear(sel);
   var o0=document.createElement("option"); o0.value=""; o0.textContent="全部通道"; sel.appendChild(o0);
   ((S.upstream&&S.upstream.requests)||[]).forEach(function(r){ if(r.channel&&!seen[r.channel]){seen[r.channel]=1;} });
+  Object.keys(seen).sort().forEach(function(ch){
+    var o=document.createElement("option"); o.value=ch; o.textContent=ch; sel.appendChild(o);
+  });
+  sel.value=cur||"";
+  renderHistChannelFilter();
+}
+function renderHistChannelFilter(){
+  var sel=$("hist-channel"); if(!sel)return;
+  var cur=sel.value, seen={};
+  ((S.upstream&&S.upstream.requests)||[]).forEach(function(r){ if(r.channel&&!seen[r.channel]){seen[r.channel]=1;} });
+  (S.histItems||[]).forEach(function(r){ if(r.channel&&!seen[r.channel]){seen[r.channel]=1;} });
+  ["anonymous","key","not_routed","zen","go"].forEach(function(ch){ if(!seen[ch]){seen[ch]=1;} });
+  if(cur&&!seen[cur]){seen[cur]=1;}
+  clear(sel);
+  var o0=document.createElement("option"); o0.value=""; o0.textContent="全部通道"; sel.appendChild(o0);
   Object.keys(seen).sort().forEach(function(ch){
     var o=document.createElement("option"); o.value=ch; o.textContent=ch; sel.appendChild(o);
   });
@@ -657,11 +695,23 @@ function jumpToRealtime(requestId){
 
 /* ---------- history ---------- */
 $("h-scope").addEventListener("change",function(){ S.historyScope=$("h-scope").value; renderHistory(); });
+$("h-range").addEventListener("change",function(){ S.historyRange=$("h-range").value; S.histItems=[]; S.histCursor=""; S.histSeq++; renderHistory(); loadPersistedHistory(true); });
+["hist-model","hist-status","hist-channel"].forEach(function(id){ $(id).addEventListener("input",function(){ S.histItems=[]; S.histCursor=""; S.histSeq++; loadPersistedHistory(true); }); $(id).addEventListener("change",function(){ S.histItems=[]; S.histCursor=""; S.histSeq++; loadPersistedHistory(true); }); });
+$("hist-more").addEventListener("click",function(){ loadPersistedHistory(false); });
 function scopeLifetime(){ return S.historyScope==="lifetime"; }
+function historyRangeHours(){ return S.historyRange==="7d"?168:(S.historyRange==="24h"?24:1); }
 function renderHistory(){
   var m=S.metrics; if(!m)return;
   var sum=scopeLifetime()?m.lifetime:m.last_hour;
-  $("h-scope-note").textContent=scopeLifetime()?"进程启动至今累计":"最近 60 分钟滚动窗口";
+  $("h-scope-note").textContent=(S.historyRange==="1h"? (scopeLifetime()?"进程启动至今累计":"最近 60 分钟滚动窗口") : ("持久历史 "+S.historyRange+" · 内存 KPI 仅供参考"));
+  var fh=$("facts-history"); if(fh){ clear(fh); var h=S.history||{};
+    fact(fh,"持久历史",h.active?"启用写入中":(h.enabled_config?"已配置但未写入":"未启用"),h.active?"ok":"warn");
+    fact(fh,"目录",(h.directory||"—")+" · "+fmtInt(h.size_bytes||0)+" B");
+    fact(fh,"范围",(h.oldest_at?fmtDateTime(h.oldest_at):"—")+" → "+(h.newest_at?fmtDateTime(h.newest_at):"—"));
+    fact(fh,"dropped / gap",fmtInt(h.dropped||0)+" / "+(h.gap?"有间隙":"无"),(h.dropped||h.gap)?"warn":"ok");
+    if(h.last_error)fact(fh,"last_error",h.last_error,"bad");
+    if(h.enabled_config&&!h.active)fact(fh,"状态","memory-only（不可写已退化，查询为空）","warn");
+  }
   var host=$("h-kpis"); clear(host);
   var cards=[
     ["请求总数",fmtInt(sum.total),""],
@@ -675,6 +725,102 @@ function renderHistory(){
     host.appendChild(d);
   });
   renderTrends(); renderDists(); renderAttemptResources();
+  var wrap=$("hist-persist-wrap"); if(wrap)wrap.classList.toggle("hidden",S.historyRange==="1h");
+  if(S.historyRange!=="1h")renderPersistedRows();
+  else { var tb=$("tbody-hist"); if(tb){clear(tb);} var c=$("hist-count"); if(c)c.textContent="1小时使用内存实时页"; }
+  if(S.historyRange!=="1h"&&!S.histItems.length&&!S.histLoading)loadPersistedHistory(true);
+}
+function histQueryRange(){ var h=historyRangeHours(); var to=new Date(); var from=new Date(to.getTime()-h*3600*1000); return {from:from.toISOString(),to:to.toISOString()}; }
+function loadPersistedHistory(reset){
+  if(S.historyRange==="1h")return;
+  var seq=++S.histSeq; S.histLoading=true;
+  var rg=histQueryRange();
+  var params="from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=100";
+  if(!reset&&S.histCursor)params+="&cursor="+encodeURIComponent(S.histCursor);
+  var mf=$("hist-model").value.trim(); if(mf)params+="&model="+encodeURIComponent(mf);
+  var st=$("hist-status").value; if(st==="success")params+="&success=true"; else if(st==="failed")params+="&success=false";
+  var ch=$("hist-channel").value; if(ch)params+="&channel="+encodeURIComponent(ch);
+  api("/api/history/requests?"+params,{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq)return;
+    if(reset)S.histItems=[];
+    (res.items||[]).forEach(function(it){S.histItems.push(it);});
+    S.histCursor=res.next_cursor||"";
+    S.histLoading=false; renderPersistedRows();
+  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; var c=$("hist-count"); if(c)c.textContent="历史加载失败："+err.message; });
+  api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq)return;
+    renderPersistedSeries(res.items||[]);
+  }).catch(function(){});
+}
+function renderPersistedSeries(items){
+  var hr=$("trend-req"), ht=$("trend-tok"); if(!hr||!ht)return; clear(hr); clear(ht);
+  if(!items.length){ hr.appendChild(el("span","该范围暂无持久分钟数据","empty")); ht.appendChild(el("span","该范围暂无持久分钟数据","empty")); return; }
+  var asc=items.slice().sort(function(a,b){return new Date(a.minute)-new Date(b.minute);}).slice(-120);
+  var maxR=1,maxT=1; asc.forEach(function(p){maxR=Math.max(maxR,p.total||0);maxT=Math.max(maxT,p.total_tokens||0);});
+  asc.forEach(function(p){
+    var b=document.createElement("div"); b.className="bar"+((p.errors||0)>0?" err":"");
+    b.style.height=Math.max(2,Math.round(((p.total||0)/maxR)*100))+"%";
+    b.title=new Date(p.minute).toLocaleString()+" · total "+(p.total||0)+" · ok "+(p.success||0)+" · err "+(p.errors||0);
+    hr.appendChild(b);
+    var t=document.createElement("div"); t.className="bar tok";
+    t.style.height=Math.max(2,Math.round(((p.total_tokens||0)/maxT)*100))+"%";
+    t.title=new Date(p.minute).toLocaleString()+" · in "+(p.input_tokens||0)+" · out "+(p.output_tokens||0)+" · total "+(p.total_tokens||0);
+    ht.appendChild(t);
+  });
+}
+function renderPersistedRows(){
+  renderHistChannelFilter();
+  var tb=$("tbody-hist"); if(!tb)return; clear(tb);
+  var c=$("hist-count"); if(c)c.textContent="共 "+S.histItems.length+" 条"+(S.histCursor?"（可加载更多）":"（已到底）")+(S.histLoading?" · 加载中…":"");
+  if(!S.histItems.length){emptyRow(tb,7,S.histLoading?"历史加载中…":"该范围暂无持久历史（memory-only 时为空）");return;}
+  S.histItems.forEach(function(r){
+    var tr=document.createElement("tr"); tr.className="clickable"+(S.histExpanded===r.request_id?" selected":"");
+    cell(tr,fmtDateTime(r.time));
+    var idc=document.createElement("td"); idc.appendChild(el("code",r.request_id,"mono")); tr.appendChild(idc);
+    cell(tr,r.model,"wrap"); cell(tr,r.tier||"—"); cell(tr,r.channel||"—");
+    var std=document.createElement("td"); std.appendChild(el("span",r.success?("OK "+(r.status||"")):((r.status||"")+" "+(r.outcome||"")),"pill "+pillForRequest(r))); tr.appendChild(std);
+    cell(tr,(r.duration_ms===undefined?"—":r.duration_ms+" ms"));
+    tr.addEventListener("click",function(){ S.histExpanded=(S.histExpanded===r.request_id)?"":r.request_id; renderPersistedRows(); });
+    tb.appendChild(tr);
+    if(S.histExpanded===r.request_id){
+      var dr=document.createElement("tr"); dr.className="detail";
+      var dt=document.createElement("td"); dt.colSpan=7; dt.textContent="attempt 链加载中…";
+      dr.appendChild(dt); tb.appendChild(dr);
+      loadHistAttempts(r.request_id,dr);
+    }
+  });
+}
+function loadHistAttempts(requestId, anchorRow){
+  var rg=histQueryRange();
+  api("/api/history/attempts?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200&request_id="+encodeURIComponent(requestId)),{method:"GET"}).then(function(res){
+    if(S.histExpanded!==requestId)return;
+    var host=anchorRow.querySelector("td")||anchorRow;
+    clear(host);
+    var list=(res.items||[]).sort(function(a,b){return (a.attempt||0)-(b.attempt||0);});
+    if(!list.length){host.appendChild(el("div","该 request 暂无 attempt 记录","empty"));return;}
+    var wrap=document.createElement("div"); wrap.className="table-wrap";
+    var t=document.createElement("table"); t.className="table attempt-chain";
+    var thead=document.createElement("thead"), hr=document.createElement("tr");
+    ["attempt","tier / channel","key","pool","proxy","status","failure_class","duration","outcome"].forEach(function(h){var th=document.createElement("th");th.textContent=h;hr.appendChild(th);});
+    thead.appendChild(hr); t.appendChild(thead);
+    var tb=document.createElement("tbody");
+    list.forEach(function(a){
+      var tr=document.createElement("tr");
+      cell(tr,a.attempt===undefined?"—":a.attempt);
+      cell(tr,(a.tier||"—")+" / "+(a.channel||"—"));
+      cell(tr,(a.anonymous?"anonymous":(a.key_id||"—")));
+      cell(tr,a.proxy_pool||"—"); cell(tr,a.proxy_node||"—");
+      cell(tr,(a.status===undefined||a.status===0)?"—":a.status);
+      var fc=document.createElement("td"); fc.appendChild(el("span",a.failure_class||"—","pill "+pillForFailureClass(a.failure_class))); tr.appendChild(fc);
+      cell(tr,(a.duration_ms===undefined?"—":a.duration_ms+" ms")); cell(tr,a.outcome||"—");
+      tb.appendChild(tr);
+    });
+    t.appendChild(tb); wrap.appendChild(t); host.appendChild(wrap);
+  }).catch(function(err){
+    if(S.histExpanded!==requestId)return;
+    var host=anchorRow.querySelector("td")||anchorRow; clear(host);
+    host.appendChild(el("div","attempt 加载失败："+err.message,"empty"));
+  });
 }
 function renderTrends(){
   var series=(S.metrics&&S.metrics.series)||[];
@@ -884,6 +1030,11 @@ function fillConfig(v){
   $("c-cooldown").value=v.performance.failure_cooldown_seconds||"";
   $("c-level").value=v.logging.level||"info";
   $("c-ring").value=v.logging.ring_size||"";
+  var hh=(v&&v.history)||{};
+  $("c-hist-enabled").checked=hh.enabled!==false;
+  $("c-hist-dir").value=hh.directory||"";
+  $("c-hist-retention").value=hh.retention_days||7;
+  $("c-hist-max").value=hh.max_bytes_mb||128;
   ["server_keys","zen_keys","go_keys"].forEach(renderChips);
   renderPoolsEditor(v);
 }
@@ -1044,6 +1195,7 @@ $("config-form").addEventListener("submit",function(e){
     models:{refresh_seconds:num("c-refresh"),protocols:protocols},
     performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown")},
     logging:{level:$("c-level").value,ring_size:num("c-ring")},
+    history:{enabled:$("c-hist-enabled").checked,directory:$("c-hist-dir").value.trim(),retention_days:num("c-hist-retention"),max_bytes_mb:num("c-hist-max")},
     webui:{enabled:$("c-web-enabled").checked,listen:$("c-web-listen").value,username:S.config.webui.username,session_ttl_minutes:num("c-session")}
   };
   api("/api/config",{method:"PUT",body:JSON.stringify(update)}).then(function(res){

@@ -56,7 +56,7 @@ Field Manual WebUI 包含运行桌面、六步首次运行检查、接入手册�
 
 Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tier 分布。诊断页展示 models.dev 状态、模型原生协议与匿名判断来源、Key/代理状态、逐次上游尝试以及最近一次 Playground 追踪；实时日志通过 SSE 推送。所有动态管理数据都以 DOM 文本节点渲染。
 
-监控、上游尝试、最近 Playground 结果和日志仅保存在内存。**进程重启会清空全部监控与诊断历史，包括 lifetime 累计。** stdout 日志仍可由 Docker 或日志平台收集；模型目录快取与 models.dev 价格快取是独立的磁盘兼容资料，不属于监控历史。
+监控、上游尝试、最近 Playground 结果和日志仅保存在内存。**进程重启会清空全部内存监控与诊断历史，包括 lifetime 累计。** stdout 日志仍可由 Docker 或日志平台收集；模型目录快取与 models.dev 价格快取是独立的磁盘兼容资料，不属于监控历史。脱敏持久历史（`history`）独立于内存统计，重启后仍可查询 24h / 7d 请求、attempt 与分钟趋势。
 
 ### 监控字段
 
@@ -75,6 +75,20 @@ Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tie
 每个 `upstream.requests` 项对应一个已完成的推理请求，包含最终实际使用的 Tier、通道、Key 尾码（或 `anonymous`）、尝试次数、HTTP 状态、耗时、成功标记和结果分类。每个 `upstream.recent` 项则对应一次上游尝试，包含时间、Request ID、模型、Tier、尝试序号、匿名标记、通道、Key 尾码、`proxy_node`、HTTP 状态、耗时、成功标记和结果分类。真实 Key 在日志和 WebUI 中只显示最后 5 个字符；配置接口的内部 secret ID 仍使用 SHA-256 稳定指纹。代理 URL 的认证信息会被移除，字段名称明确为代理节点而非出口 IP。
 
 lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket。进程内固定保留最近 10,000 个请求路由和 20,000 次上游尝试，管理响应最多返回其中最近 500 个，WebUI 默认各显示最后 100 条。`resources.models` 额外显示模型目录来源（`none`、`disk` 或 `live`）及 `stale` 状态。数据不会写入配置、metadata 快取或其他数据库。
+
+### 持久历史
+
+`history` 为轻量内嵌脱敏投影（标准库 NDJSON，无新依赖、无独立部署），只保存请求/attempt/分钟元数据，不保存 body、headers、query、session、完整 key、指纹、原始代理 URL、错误文本或 Playground 载荷。目录为空时为配置目录下 `history`，相对路径相对配置目录，绝对路径允许；目录 `0700`、文件 `0600`。分文件 `requests-YYYYMMDD-NNN.ndjson`、`attempts-…`、`minutes-…`，单段 32MB 或跨 UTC 日轮转；按 `retention_days`（1–90）与 `max_bytes_mb`（16–2048）清理最老已封段，当前写入段不删。初始化/写入/读取失败只 warn 并退化为 memory-only，不影响 Gateway 启动、Apply、healthz 或推理；`history` 热生效。`GET /api/monitor` 增加 `history` 状态（`enabled_config/active/directory[basename]/retention_days/max_bytes_mb/dropped/gap/last_error/oldest_at/newest_at/size_bytes`）。
+
+历史查询（管理 Session，`no-store`，GET 无 CSRF，每 IP 每分钟 30 次，单请求 5s 超时）：
+
+| 方法 | 路径 | 默认范围 |
+| --- | --- | --- |
+| `GET` | `/api/history/requests?from=&to=&limit=&cursor=&model=&tier=&channel=&success=&proxy_pool=` | 24h，limit 100 cap 200 |
+| `GET` | `/api/history/attempts?…&request_id=&failure_class=` | 24h，limit 100 cap 200 |
+| `GET` | `/api/history/series?from=&to=&limit=&cursor=` | 7d，limit/cap 10080 |
+
+范围上限为 `retention_days`；`cursor` 为不透明 base64（稳定倒序分页）；禁用时返回 200 空 items 与 `active:false`；参数错 400。WebUI 历史页提供 `1小时(内存)|24小时|7天` 切换，24h/7d 显示持久趋势与请求表（分页加载更多，点 request 拉 attempt 链），memory-only 时显示清晰空状态。
 
 ### Playground 与诊断 API
 
@@ -230,6 +244,12 @@ cp config.example.json config.json
   "logging": {
     "level": "info",
     "ring_size": 2000
+  },
+  "history": {
+    "enabled": true,
+    "directory": "",
+    "retention_days": 7,
+    "max_bytes_mb": 128
   },
   "webui": {
     "enabled": true,

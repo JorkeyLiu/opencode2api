@@ -19,7 +19,7 @@ var allowedConfigKeys = map[string]bool{
 	"anonymous": true, "proxies": true, "proxyfile": true,
 	"proxy_pools": true, "proxy_routing": true,
 	"upstream": true, "retry": true, "models": true, "performance": true,
-	"logging": true, "webui": true, "prefer": true,
+	"logging": true, "webui": true, "prefer": true, "history": true,
 }
 
 type ProxyPoolConfig struct {
@@ -49,6 +49,7 @@ type Config struct {
 	Logging      LoggingConfig              `json:"logging"`
 	WebUI        WebUIConfig                `json:"webui"`
 	Prefer       Tier                       `json:"prefer"`
+	History      HistoryConfig              `json:"history"`
 	Proxies      []string                   `json:"proxies,omitempty"`
 	ProxyFile    string                     `json:"proxyfile,omitempty"`
 
@@ -97,6 +98,15 @@ type PerformanceConfig struct {
 	FailureCooldownSeconds int `json:"failure_cooldown_seconds"`
 }
 
+// HistoryConfig is a bounded, redacted, embedded projection of recent
+// inference metadata. It never affects routing, readiness, or inference.
+type HistoryConfig struct {
+	Enabled       bool   `json:"enabled"`
+	Directory     string `json:"directory"`
+	RetentionDays int    `json:"retention_days"`
+	MaxBytesMB    int    `json:"max_bytes_mb"`
+}
+
 func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
@@ -107,6 +117,7 @@ func defaultConfig() Config {
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
+		History:     HistoryConfig{Enabled: true, Directory: "", RetentionDays: 7, MaxBytesMB: 128},
 	}
 }
 
@@ -149,6 +160,7 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 		Logging      LoggingConfig              `json:"logging"`
 		WebUI        WebUIConfig                `json:"webui"`
 		Prefer       Tier                       `json:"prefer"`
+		History      HistoryConfig              `json:"history"`
 	}
 	pools := cfg.ProxyPools
 	if pools == nil {
@@ -158,7 +170,7 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 		Listen: cfg.Listen, ServerKeys: cfg.ServerKeys, ZenKeys: cfg.ZenKeys, GoKeys: cfg.GoKeys,
 		Anonymous: cfg.Anonymous, ProxyPools: pools, ProxyRouting: cfg.ProxyRouting,
 		Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models, Performance: cfg.Performance,
-		Logging: cfg.Logging, WebUI: cfg.WebUI, Prefer: cfg.Prefer,
+		Logging: cfg.Logging, WebUI: cfg.WebUI, Prefer: cfg.Prefer, History: cfg.History,
 	})
 }
 
@@ -242,6 +254,9 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := decodeStrict("prefer", &cfg.Prefer); err != nil {
+		return err
+	}
+	if err := decodeStrict("history", &cfg.History); err != nil {
 		return err
 	}
 	return nil
@@ -364,6 +379,13 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
 		}
 	}
+	if cfg.History.RetentionDays < 1 || cfg.History.RetentionDays > 90 {
+		return Config{}, errors.New("history.retention_days must be between 1 and 90")
+	}
+	if cfg.History.MaxBytesMB < 16 || cfg.History.MaxBytesMB > 2048 {
+		return Config{}, errors.New("history.max_bytes_mb must be between 16 and 2048")
+	}
+	cfg.History.Directory = strings.TrimSpace(cfg.History.Directory)
 	return cfg, nil
 }
 
@@ -770,6 +792,20 @@ func trimList(items *[]string) {
 		}
 	}
 	*items = out
+}
+
+// ResolveHistoryDir maps the history.directory field to an absolute path.
+// Empty or relative values resolve against the config file directory;
+// absolute paths are cleaned and used directly.
+func ResolveHistoryDir(configPath, dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return filepath.Join(filepath.Dir(configPath), "history")
+	}
+	if filepath.IsAbs(dir) {
+		return filepath.Clean(dir)
+	}
+	return filepath.Join(filepath.Dir(configPath), dir)
 }
 
 func redactURL(raw string) string {

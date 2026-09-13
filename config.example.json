@@ -40,6 +40,12 @@
     "level": "info",
     "ring_size": 2000
   },
+  "history": {
+    "enabled": true,
+    "directory": "",
+    "retention_days": 7,
+    "max_bytes_mb": 128
+  },
   "webui": {
     "enabled": true,
     "listen": "0.0.0.0:8081",

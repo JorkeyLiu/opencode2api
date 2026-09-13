@@ -11,3 +11,7 @@ opencode2api.exe
 *.bak
 *.tmp
 *.replace
+# Persistent history segments: bounded redacted NDJSON projection (runtime only).
+/history/
+history/*.ndjson
+history/*.tmp

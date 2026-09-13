@@ -38,6 +38,7 @@ type RuntimeManager struct {
 	updateMu   sync.Mutex
 	effective  effectiveListeners
 	metadata   *modelMetadataStore
+	history    atomic.Pointer[HistoryStore]
 }
 
 type effectiveListeners struct {
@@ -89,7 +90,41 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 	setLogLevel(manager.level, cfg.Logging.Level)
 	manager.start(runtime)
 	manager.metadata.Start(root)
+	manager.openHistory(cfg.History)
 	return manager, nil
+}
+
+// openHistory builds the durable history projection. Failures only warn and
+// leave a memory-only disabled status; Gateway startup always continues.
+func (m *RuntimeManager) openHistory(cfg HistoryConfig) {
+	store := OpenHistoryStore(m.configPath, cfg, m.logger, m.redactor)
+	m.history.Store(store)
+	m.monitor.SetHistorySink(store)
+}
+
+// History returns the active history store (possibly disabled).
+func (m *RuntimeManager) History() *HistoryStore {
+	if m == nil {
+		return nil
+	}
+	return m.history.Load()
+}
+
+// swapHistoryForApply opens the new history store when config changed,
+// reuses the old store when unchanged, and atomically switches the Monitor
+// sink before draining the old store. Failures degrade to disabled status
+// and never fail Apply.
+func (m *RuntimeManager) swapHistoryForApply(oldCfg, newCfg HistoryConfig) {
+	previous := m.history.Load()
+	if previous != nil && historyEqual(oldCfg, newCfg) {
+		return
+	}
+	next := OpenHistoryStore(m.configPath, newCfg, m.logger, m.redactor)
+	m.history.Store(next)
+	m.monitor.SetHistorySink(next)
+	if previous != nil {
+		previous.Close()
+	}
 }
 
 func (m *RuntimeManager) build(cfg Config) (*gatewayRuntime, error) {
@@ -226,6 +261,12 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 	}
 	result.RestartRequired = len(result.RestartFields) > 0
 	m.redactor.Replace(normalized)
+	// History is hot-applied: never a restart field.
+	if current != nil {
+		m.swapHistoryForApply(current.config.History, normalized.History)
+	} else {
+		m.openHistory(normalized.History)
+	}
 	setLogLevel(m.level, normalized.Logging.Level)
 	if current == nil || normalized.Logging.RingSize != current.config.Logging.RingSize {
 		m.hub.Resize(normalized.Logging.RingSize)
@@ -255,6 +296,9 @@ func (m *RuntimeManager) Reload() (ApplyResult, error) {
 func (m *RuntimeManager) Shutdown() {
 	if current := m.current.Load(); current != nil {
 		current.cancel()
+	}
+	if store := m.history.Load(); store != nil {
+		store.Close()
 	}
 }
 

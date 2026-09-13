@@ -681,6 +681,7 @@ type Monitor struct {
 	resourceBuckets [60]resourceBucket
 	recentRequests  upstreamRequestRing
 	recentAttempts  upstreamAttemptRing
+	history         atomic.Pointer[HistoryStore]
 }
 
 func NewMonitor() *Monitor {
@@ -726,6 +727,7 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 	bucket.histogram[index]++
 	bucket.endpoints[endpoint]++
 	bucket.statuses[fmt.Sprint(status)]++
+	var historyReq *UpstreamRequest
 	if meta != nil {
 		if meta.Model != "" {
 			bucket.models[meta.Model]++
@@ -762,9 +764,13 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 			request.Outcome = requestOutcome(status, request.Channel)
 			m.recentRequests.PruneBefore(request.Time.Add(-time.Hour))
 			m.recentRequests.Add(request)
+			historyReq = &request
 		}
 	}
 	m.mu.Unlock()
+	if historyReq != nil {
+		m.enqueueHistoryRequest(*historyReq)
+	}
 }
 
 func requestOutcome(status int, channel string) string {
@@ -825,6 +831,7 @@ func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
 	m.recentAttempts.PruneBefore(attempt.Time.Add(-time.Hour))
 	m.recentAttempts.Add(attempt)
 	m.mu.Unlock()
+	m.enqueueHistoryAttempt(attempt)
 }
 
 // normalizeProxyLabel keeps proxy observability labels bounded and secret
@@ -1295,6 +1302,77 @@ func setLogLevel(level *slog.LevelVar, value string) {
 	default:
 		level.Set(slog.LevelInfo)
 	}
+}
+
+// SetHistorySink atomically switches the durable history sink. Disk IO
+// never happens under Monitor.mu or on the request path; enqueue is
+// non-blocking and drops newest when the fixed queue is full.
+// The sink pointer is atomic so the enqueue hot path never blocks on a
+// lock held by Apply/rotation/retention.
+func (m *Monitor) SetHistorySink(s *HistoryStore) {
+	if m == nil {
+		return
+	}
+	m.history.Store(s)
+	if s != nil {
+		s.SetMinuteProvider(m.minuteSeriesFor)
+	}
+}
+
+func (m *Monitor) historySink() *HistoryStore {
+	if m == nil {
+		return nil
+	}
+	return m.history.Load()
+}
+
+func (m *Monitor) enqueueHistoryRequest(r UpstreamRequest) {
+	if sink := m.historySink(); sink != nil {
+		sink.EnqueueRequest(r)
+	}
+}
+
+func (m *Monitor) enqueueHistoryAttempt(a UpstreamAttempt) {
+	if sink := m.historySink(); sink != nil {
+		sink.EnqueueAttempt(a)
+	}
+}
+
+// HistoryStatus exposes the durable history runtime state for /api/monitor.
+func (m *Monitor) HistoryStatus() HistoryStatus {
+	if sink := m.historySink(); sink != nil {
+		return sink.Status()
+	}
+	return HistoryStatus{}
+}
+
+// minuteSeriesFor returns the completed per-minute MetricSeries for one
+// minute. It returns false when the minute is not covered by the in-memory
+// window so the store can skip it without writing duplicates.
+func (m *Monitor) minuteSeriesFor(minute time.Time) (MetricSeries, bool) {
+	if m == nil {
+		return MetricSeries{}, false
+	}
+	target := minute.UTC().Truncate(time.Minute).Unix() / 60
+	nowMinute := time.Now().Unix() / 60
+	if target >= nowMinute || nowMinute-target > 60 {
+		return MetricSeries{}, false
+	}
+	m.mu.Lock()
+	bucket := &m.buckets[target%60]
+	if bucket.minute != target {
+		m.mu.Unlock()
+		return MetricSeries{Minute: minute.UTC().Truncate(time.Minute)}, true
+	}
+	entry := MetricSeries{
+		Minute: time.Unix(target*60, 0).UTC(),
+		Total:  bucket.total, Success: bucket.success, Errors: bucket.errors,
+		InputTokens: bucket.tokens.Input, OutputTokens: bucket.tokens.Output,
+		CachedTokens: bucket.tokens.Cached, ReasoningTokens: bucket.tokens.Reasoning,
+		TotalTokens: bucket.tokens.Total, UsageReported: bucket.usageReported,
+	}
+	m.mu.Unlock()
+	return entry, true
 }
 
 func encodeSSE(w http.ResponseWriter, event string, id uint64, value any) error {

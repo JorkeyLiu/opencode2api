@@ -54,6 +54,7 @@ type AdminServer struct {
 	// limit windows for the management probe and manual refresh endpoints.
 	probeAttempts   map[string]loginWindow
 	refreshAttempts map[string]loginWindow
+	historyAttempts map[string]loginWindow
 	lastInference   *DebugInferenceResult
 }
 
@@ -62,6 +63,7 @@ func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, log
 		manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession),
 		attempts: make(map[string]loginWindow), debugAttempts: make(map[string]loginWindow),
 		probeAttempts: make(map[string]loginWindow), refreshAttempts: make(map[string]loginWindow),
+		historyAttempts: make(map[string]loginWindow),
 	}
 }
 
@@ -82,6 +84,9 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.Handle("GET /api/logs/stream", a.authenticate(http.HandlerFunc(a.handleLogStream)))
 	mux.Handle("POST /api/proxies/probe", a.authenticate(a.csrf(http.HandlerFunc(a.handleProxyProbe))))
 	mux.Handle("POST /api/models/refresh", a.authenticate(a.csrf(http.HandlerFunc(a.handleModelsRefresh))))
+	mux.Handle("GET /api/history/requests", a.authenticate(http.HandlerFunc(a.handleHistoryRequests)))
+	mux.Handle("GET /api/history/attempts", a.authenticate(http.HandlerFunc(a.handleHistoryAttempts)))
+	mux.Handle("GET /api/history/series", a.authenticate(http.HandlerFunc(a.handleHistorySeries)))
 	mux.Handle("/", a.staticHandler())
 	return a.securityHeaders(recoveryMiddleware(a.logger, mux))
 }
@@ -265,6 +270,7 @@ type ConfigView struct {
 	Performance  PerformanceConfig        `json:"performance"`
 	Logging      LoggingConfig            `json:"logging"`
 	Prefer       Tier                     `json:"prefer"`
+	History      HistoryConfig            `json:"history"`
 	WebUI        WebUIView                `json:"webui"`
 	Effective    EffectiveView            `json:"effective"`
 	Restart      []string                 `json:"restart_required_fields,omitempty"`
@@ -307,6 +313,7 @@ type ConfigUpdate struct {
 	Performance  PerformanceConfig         `json:"performance"`
 	Logging      LoggingConfig             `json:"logging"`
 	Prefer       Tier                      `json:"prefer"`
+	History      HistoryConfig             `json:"history"`
 	WebUI        WebUIView                 `json:"webui"`
 }
 
@@ -345,7 +352,8 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate := Config{
 		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
-		WebUI: WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
+		History: update.History,
+		WebUI:   WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
 	candidate.proxyPoolsPresent = true
 	candidate.proxyRoutingPresent = true
@@ -427,6 +435,7 @@ func (a *AdminServer) handleMonitor(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version": version, "metrics": metrics, "usage": metrics.Usage, "upstream": metrics.Upstream, "resources": a.manager.Resources(),
+		"history": a.monitor.HistoryStatus(),
 	})
 }
 
@@ -679,7 +688,7 @@ func (a *AdminServer) configView() ConfigView {
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
 		ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
-		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer,
+		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, History: cfg.History,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
 		Restart:   restart,

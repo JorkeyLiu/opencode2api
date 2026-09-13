@@ -52,9 +52,11 @@
     case-insensitive `free` in the model ID, qualifies for anonymous routing).
 - Projections (never authoritative): in-memory request/token/upstream metrics,
   recent attempts, Playground results, stdout JSON logs, the memory log ring,
-  and the on-disk model/metadata caches (`<config>.models.catalog.json`,
-  `models.dev.json` compat cache). They reflect or accelerate authority; they
-  MUST NOT be edited to change behavior.
+  the on-disk model/metadata caches (`<config>.models.catalog.json`,
+  `models.dev.json` compat cache), and the bounded redacted persistent
+  history (`history/*.ndjson`: request/attempt/minute metadata only, never
+  body/secrets). History never affects routing or readiness; it MUST NOT be
+  edited to change behavior.
 - Config parsing MUST use strict validation (unknown fields rejected). Any new
   config surface MUST follow the same rule.
 
@@ -187,7 +189,13 @@
   it (plain, same-protocol SSE, and cross-protocol SSE alike) — NEVER
   estimate. Lifetime is process-start scoped; last-hour is 60 one-minute
   buckets; bounded retention (recent requests/attempts capped, admin caps
-  response size). Restart clearing in-memory history is expected behavior.
+  response size). Restart clearing in-memory history is expected behavior;
+  the durable history projection is independent and survives restarts.
+- Persistent history is a bounded redacted projection only: NDJSON
+  request/attempt/minute metadata, never bodies or secrets; directory 0700
+  and files 0600; failures never affect routing or readiness. Container
+  read-only posture is unchanged; the history directory must be a writable
+  volume when enabled.
 
 ## 7. Validation and Done
 
