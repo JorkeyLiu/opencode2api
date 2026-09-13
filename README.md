@@ -143,11 +143,11 @@ go build -o opencode2api ./
 
 ## 下载
 
-预编译的 Windows、Linux 和 macOS 可执行文件可从 [GitHub Releases](https://github.com/jasonxu114514/opencode2api/releases) 下载。
+预编译的 Windows、Linux 和 macOS 可执行文件可从 [GitHub Releases](https://github.com/JorkeyLiu/opencode2api/releases) 下载。
 
 ## GHCR / Docker Compose 部署
 
-正式镜像发布在 `ghcr.io/jasonxu114514/opencode2api`。
+正式镜像发布在 `ghcr.io/jorkeyliu/opencode2api`。
 
 - 推送到 `jorkey/integration` 会自动构建并发布不可变 `sha-<short>` 与滚动 `dev`（同一多架构 digest，可手动 `workflow_dispatch` 补构建）。
 - `latest` 只代表手动 promotion：从已验证的 `sha-*` 按 digest 复制而来，不重构建，不会自动产生。
@@ -156,7 +156,7 @@ go build -o opencode2api ./
 
 
 ```bash
-git clone https://github.com/jasonxu114514/opencode2api.git
+git clone https://github.com/JorkeyLiu/opencode2api.git
 cd opencode2api
 cp config.example.json config.json
 # 编辑 server_keys、zen_keys/go_keys，并修改 webui.password
@@ -185,7 +185,7 @@ docker compose logs -f
 OPENCODE2API_VERSION=sha-a1b2c3d OPENCODE2API_PORT=18080 OPENCODE2API_WEBUI_PORT=18081 docker compose up -d
 ```
 
-Compose 默认使用 `latest` 并始终 `pull_policy: always` 拉取；生产如需完全 pin，可把 `image:` 改写为 `ghcr.io/jasonxu114514/opencode2api:sha-a1b2c3d` 或 `ghcr.io/jasonxu114514/opencode2api@sha256:<digest>`。
+Compose 默认使用 `latest` 并始终 `pull_policy: always` 拉取；生产如需完全 pin，可把 `image:` 改写为 `ghcr.io/jorkeyliu/opencode2api:sha-a1b2c3d` 或 `ghcr.io/jorkeyliu/opencode2api@sha256:<digest>`。
 
 不使用 Compose 时也可直接运行 GHCR 镜像（示例为 `latest`，生产请换成已验证的 `sha-*` 或 `@sha256:` digest）：
 
@@ -196,7 +196,7 @@ docker run -d --name opencode2api --restart unless-stopped \
   -e CONFIG_SEED_PATH=/run/config/opencode2api.json \
   -v "$(pwd)/config.json:/run/config/opencode2api.json:ro" \
   -v opencode2api-state:/var/lib/opencode2api \
-  ghcr.io/jasonxu114514/opencode2api:latest
+  ghcr.io/jorkeyliu/opencode2api:latest
 ```
 
 ## 配置
