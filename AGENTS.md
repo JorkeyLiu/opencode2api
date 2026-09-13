@@ -31,10 +31,14 @@
   and `/* ... */` comments; saved output is normalized and comments are not
   preserved. The on-disk example shape lives in `config.example.json`.
 - The effective Gateway state (named proxy pools with per-pool resolved
-  proxies + proxyfile, key pools with cooldowns, connection pools, model
-  catalog snapshot) is in-memory runtime state built from config. NEVER treat
+  proxies + proxyfile, unified credential×proxy target scheduler state,
+  connection pools, model catalog snapshot) is in-memory runtime state built
+  from config. NEVER treat
   it as editable directly; change it only by changing config (or the seed/env
-  inputs that produce config) and letting the runtime rebuild.
+  inputs that produce config) and letting the runtime rebuild. Scheduler
+  state has three layers: proxy transport health (connectivity only),
+  per-credential global 401 cooldowns, and per-(credential, proxy, model)
+  target cooldowns. There is no static key→proxy binding.
 - Proxy identity is two-level: `proxy_pools` names stable pool identities and
   `proxy_routing` assigns exactly one pool each to the anonymous, zen, and go
   channels (same or different). Top-level `proxies` / `proxyfile` are
@@ -65,10 +69,14 @@
   usage when the upstream reports it).
 - Session affinity spine: explicit client session headers or
   `metadata.session_id` win; otherwise the first user message derives a stable
-  session hash. Affinity binds key/proxy; node failure falls back without
+  session hash. Affinity orders the frozen credential×proxy×model target list
+  with session-stable Rendezvous/HRW; failure walks the next target without
   breaking in-flight streams.
 - Config change spine (save / Apply / reload-from-disk): parse and validate
-  the full candidate → build new pools and Gateway instance → atomically write
+  the full candidate → build new pools and Gateway instance → migrate
+  still-future scheduler cooldowns and proxy health by identity (credential by
+  tier+key, proxy by pool+URL, target by full identity; new resources start at
+  zero, removed ones drop) → atomically write
   (temp file + `config.json.bak` + replace) → atomically switch new requests
   to the new instance. On write or init failure the old instance MUST keep
   serving; already-started requests MUST NOT be interrupted. Saved JSON is
@@ -80,7 +88,9 @@
   process restart. NEVER claim a listen-plane edit is live without restart.
 - Cache refresh spine: model lists + capability directory refresh
   concurrently every `models.refresh_seconds`; `models.dev` refreshes every
-  24h with fixed timeout. Refresh failure MUST keep the previous snapshot;
+  24h with fixed timeout. Refresh uses a stateless key/proxy traversal that
+  never reads or writes foreground credential/target cooldowns. Refresh
+  failure MUST keep the previous snapshot;
   startup uses valid disk cache before the first live refresh.
 
 ## 4. Invariants (MUST Preserve)
@@ -94,9 +104,14 @@
   exhaustion enters the authenticated tiers.
 - Authenticated tiers: each tier owns its own `retry.max_attempts` budget
   (first attempt included). Inside a tier, only network errors, 401/403, 429,
-  and 5xx rotate nodes; any other 4xx MUST end that tier. A failed tier falls
+  and 5xx rotate targets; any other 4xx MUST end that tier. A failed tier falls
   back to the other tier that actually serves the model and has keys,
   ordered by `prefer` (`go` default: Go → Zen).
+- Scheduler state: proxy health is transport connectivity only (HTTP statuses
+  never change it); 401 cools the credential globally; 403/429/5xx cool the
+  single (credential, proxy, model) target, so one model's rejection never
+  affects another; ordinary 4xx is neutral and 2xx clears this target and
+  this credential's 401 state.
 - Streaming: once bytes have been written to the client, the Gateway MUST
   NOT switch upstreams or regenerate; error-class upstream stream signals
   MUST surface as structured target-protocol error events, never as clean
@@ -195,7 +210,7 @@
   ports, healthcheck, volume/seed wiring.
 - `.github/workflows/release.yml` — CI gate (`go test ./...`) and release
   build matrix.
-- Source of truth for behavior: `gateway.go`, `convert.go`, `stream.go`,
+- Source of truth for behavior: `gateway.go`, `scheduler.go`, `convert.go`, `stream.go`,
   `models.go`, `model_metadata.go`, `pool.go`, `runtime.go`, `config.go`,
   `admin.go`, `observability.go`, `password.go`, `ids.go`, `main.go`
   (read them; this guide states relationships, not code locations).

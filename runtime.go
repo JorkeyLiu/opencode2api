@@ -203,6 +203,7 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 	}
 	if current != nil {
 		next.gateway.catalog.CopyState(current.gateway.catalog)
+		migrateGatewaySchedulerState(current.gateway, next.gateway)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -255,51 +256,133 @@ func (m *RuntimeManager) Shutdown() {
 	}
 }
 
+// migrateGatewaySchedulerState moves scheduler and proxy-transport state
+// from the old Gateway to the newly built one before the atomic swap:
+// credential state matches by tier+full key, proxy health by (pool name,
+// raw proxy URL), and target state by full identity. Only still-future
+// cooldowns migrate (remaining capped at 5 minutes); new resources start at
+// zero state and removed identities are dropped. Checking flags never
+// migrate. In-flight requests keep using the old Gateway and its state.
+func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) {
+	if oldGateway == nil || newGateway == nil || oldGateway.scheduler == nil || newGateway.scheduler == nil {
+		return
+	}
+	for name, newPool := range newGateway.pools {
+		oldPool := oldGateway.pools[name]
+		if oldPool == nil || newPool == nil {
+			continue
+		}
+		healthByRaw := make(map[string]bool, len(oldPool.items))
+		for _, proxy := range oldPool.items {
+			if proxy != nil {
+				healthByRaw[proxy.name] = proxy.healthy.Load()
+			}
+		}
+		for _, proxy := range newPool.items {
+			if proxy == nil {
+				continue
+			}
+			if healthy, ok := healthByRaw[proxy.name]; ok {
+				proxy.healthy.Store(healthy)
+			}
+		}
+	}
+	newGateway.scheduler.migrateFrom(oldGateway.scheduler)
+	validCreds := make(map[string]bool, len(newGateway.zenCreds)+len(newGateway.goCreds)+1)
+	for _, cred := range newGateway.zenCreds {
+		validCreds[cred.id] = true
+	}
+	for _, cred := range newGateway.goCreds {
+		validCreds[cred.id] = true
+	}
+	if newGateway.cfg.Anonymous {
+		validCreds[anonymousSchedulerCredentialID] = true
+	}
+	validPoolProxy := make(map[string]map[string]bool, len(newGateway.pools))
+	for name, pool := range newGateway.pools {
+		set := make(map[string]bool, len(pool.items))
+		for _, proxy := range pool.items {
+			if proxy != nil {
+				set[proxy.name] = true
+			}
+		}
+		validPoolProxy[name] = set
+	}
+	newGateway.scheduler.retainOnly(validCreds, validPoolProxy)
+}
+
 type ResourceSnapshot struct {
 	Models           modelCatalogSnapshot   `json:"models"`
 	Keys             []KeyStatus            `json:"keys"`
 	Proxies          []ProxyStatus          `json:"proxies"`
 	Anonymous        bool                   `json:"anonymous"`
 	AnonymousProxies []AnonymousProxyStatus `json:"anonymous_proxies,omitempty"`
+	Targets          []TargetStatus         `json:"targets,omitempty"`
+	TargetsTotal     int                    `json:"targets_total,omitempty"`
+	TargetsTruncated bool                   `json:"targets_truncated,omitempty"`
 	Metadata         MetadataSnapshot       `json:"metadata"`
 }
 
 type KeyStatus struct {
-	ID                       string     `json:"id"`
-	Tier                     string     `json:"tier"`
-	Index                    int        `json:"index"`
-	ProxyIndex               int        `json:"proxy_index"`
-	Proxy                    string     `json:"proxy,omitempty"`
-	ProxyPool                string     `json:"proxy_pool,omitempty"`
+	ID    string `json:"id"`
+	Tier  string `json:"tier"`
+	Index int    `json:"index"`
+	// Deprecated: the static key->proxy binding no longer exists.
+	// ProxyIndex is always zero and Proxy always empty; ProxyPool names the
+	// assigned named pool (config identity, not a binding).
+	ProxyIndex int    `json:"proxy_index,omitempty"`
+	Proxy      string `json:"proxy,omitempty"`
+	ProxyPool  string `json:"proxy_pool,omitempty"`
+	// Failures/CooldownUntil describe the global credential (401) state.
 	Failures                 uint32     `json:"failures"`
 	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
 	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
+	// AvailableTargets/TotalTargets are transport+credential level counts
+	// over the assigned pool (model-agnostic); per-model target cooldowns
+	// live in the targets list.
+	AvailableTargets int `json:"available_targets,omitempty"`
+	TotalTargets     int `json:"total_targets,omitempty"`
 }
 
-// AnonymousProxyStatus exposes the per-proxy anonymous cooldown state.
-// Proxy health still means transport connectivity only; failures and
-// cooldown here are credential (business) state, never proxy health.
+// AnonymousProxyStatus is the per-proxy anonymous target summary. Transport
+// fields (Healthy/Checking) still mean proxy connectivity only; the cooldown
+// fields summarize per-(proxy, model) target state across models.
+// Failures/CooldownUntil/CooldownRemainingSeconds are a deprecated
+// model-agnostic aggregate (sums / latest deadline); prefer ActiveCooldowns,
+// NextAvailableAt, and LastFailureClass.
 type AnonymousProxyStatus struct {
 	Index                    int        `json:"index"`
 	Pool                     string     `json:"proxy_pool,omitempty"`
 	Address                  string     `json:"address"`
 	Healthy                  bool       `json:"healthy"`
 	Checking                 bool       `json:"checking"`
+	ActiveCooldowns          int        `json:"active_cooldowns,omitempty"`
+	NextAvailableAt          *time.Time `json:"next_available_at,omitempty"`
+	LastFailureClass         string     `json:"last_failure_class,omitempty"`
 	Failures                 uint32     `json:"failures"`
 	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
 	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
 }
 
 type ProxyStatus struct {
-	Index     int      `json:"index"`
-	Pool      string   `json:"proxy_pool,omitempty"`
-	Address   string   `json:"address"`
-	Healthy   bool     `json:"healthy"`
-	Checking  bool     `json:"checking"`
+	Index    int    `json:"index"`
+	Pool     string `json:"proxy_pool,omitempty"`
+	Address  string `json:"address"`
+	Healthy  bool   `json:"healthy"`
+	Checking bool   `json:"checking"`
+	// ZenKeys/GoKeys are pool-level routed config credential counts: the
+	// number of configured keys of that tier whose assigned pool is this
+	// pool. Every proxy row in the same pool shows the same pool-level
+	// count. They are NOT bindings; no key is bound to any single proxy.
 	ZenKeys   int      `json:"zen_keys"`
 	GoKeys    int      `json:"go_keys"`
 	Anonymous bool     `json:"anonymous"`
 	Routing   []string `json:"routing,omitempty"`
+	// AvailableCredentials is the pool-level routed config credential count:
+	// zen keys + go keys routed to this pool, plus one when the anonymous
+	// credential is routed here. Same value as ZenKeys+GoKeys(+1); kept for
+	// compatibility with consumers reading a single field.
+	AvailableCredentials int `json:"available_credentials,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -312,18 +395,8 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	if gateway.catalog.metadata != nil {
 		result.Metadata = gateway.catalog.metadata.Snapshot()
 	}
-	result.Keys = append(result.Keys, keyStatuses("zen", gateway.zenNodes)...)
-	result.Keys = append(result.Keys, keyStatuses("go", gateway.goNodes)...)
-	bindingsFor := func(pool *nodePool) []int {
-		if pool == nil {
-			return nil
-		}
-		pool.bindingsMu.Lock()
-		defer pool.bindingsMu.Unlock()
-		return append([]int(nil), pool.bindingCount...)
-	}
-	zenBindings := bindingsFor(gateway.zenNodes)
-	goBindings := bindingsFor(gateway.goNodes)
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.zenCreds, gateway.cfg.ProxyRouting.Zen)...)
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "go", gateway.goCreds, gateway.cfg.ProxyRouting.Go)...)
 	routingFor := func(poolName string) []string {
 		out := []string{}
 		if gateway.cfg.ProxyRouting.Anonymous == poolName {
@@ -338,29 +411,43 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		return out
 	}
 	anonPool := gateway.pools[gateway.cfg.ProxyRouting.Anonymous]
+	credsForPool := func(poolName string) int {
+		count := 0
+		if gateway.cfg.ProxyRouting.Zen == poolName {
+			count += len(gateway.zenCreds)
+		}
+		if gateway.cfg.ProxyRouting.Go == poolName {
+			count += len(gateway.goCreds)
+		}
+		if gateway.cfg.Anonymous && gateway.cfg.ProxyRouting.Anonymous == poolName {
+			count++
+		}
+		return count
+	}
 	for _, pool := range gateway.uniquePools() {
-		// Each tier counts only its own pool binding. A shared pool reports
-		// both tiers over the same index space; an isolated pool reports
-		// only the tier bound to it.
-		isZen := gateway.zenNodes != nil && gateway.zenNodes.transports == pool
-		isGo := gateway.goNodes != nil && gateway.goNodes.transports == pool
+		zenRouted, goRouted := 0, 0
+		if gateway.cfg.ProxyRouting.Zen == pool.name {
+			zenRouted = len(gateway.zenCreds)
+		}
+		if gateway.cfg.ProxyRouting.Go == pool.name {
+			goRouted = len(gateway.goCreds)
+		}
 		for _, proxy := range pool.items {
 			status := ProxyStatus{
 				Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
 				Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(),
+				ZenKeys: zenRouted, GoKeys: goRouted,
 				Anonymous: gateway.cfg.Anonymous && anonPool == pool,
-				Routing:   routingFor(pool.name),
-			}
-			if isZen && proxy.index < len(zenBindings) {
-				status.ZenKeys = zenBindings[proxy.index]
-			}
-			if isGo && proxy.index < len(goBindings) {
-				status.GoKeys = goBindings[proxy.index]
+				Routing:   routingFor(pool.name), AvailableCredentials: credsForPool(pool.name),
 			}
 			result.Proxies = append(result.Proxies, status)
 		}
 	}
-	result.AnonymousProxies = anonymousProxyStatuses(gateway.anonymous)
+	result.AnonymousProxies = gateway.anonymousTargetSummaries()
+	targets, total := gateway.scheduler.snapshotTargets()
+	result.Targets = targets
+	result.TargetsTotal = total
+	result.TargetsTruncated = total > len(targets)
 	return result
 }
 
@@ -391,25 +478,37 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous)
 }
 
-func keyStatuses(tier string, pool *nodePool) []KeyStatus {
-	if pool == nil {
-		return nil
-	}
+// keyStatusesForTier snapshots credential-level state for one tier without
+// taking pool locks: credential lists are immutable after build and all
+// scheduler counters are mutex-guarded snapshots.
+func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, poolName string) []KeyStatus {
 	now := time.Now()
-	result := make([]KeyStatus, 0, len(pool.nodes))
-	for _, node := range pool.nodes {
-		proxyIndex := int(node.proxyIndex.Load())
-		status := KeyStatus{ID: keyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: proxyIndex, Failures: node.failures.Load()}
-		// Current proxy name is redacted; the pool slice is immutable after
-		// build and atomics are lock-free, so no long lock is introduced.
-		// ProxyIndex is pool-local; ProxyPool names the owning pool.
-		if pool.transports != nil {
-			status.ProxyPool = pool.transports.name
-			if proxyIndex >= 0 && proxyIndex < len(pool.transports.items) && pool.transports.items[proxyIndex] != nil {
-				status.Proxy = redactURL(pool.transports.items[proxyIndex].name)
+	var total, healthy int
+	if pool := gateway.pools[poolName]; pool != nil {
+		total = len(pool.items)
+		for _, proxy := range pool.items {
+			if proxy != nil && proxy.healthy.Load() {
+				healthy++
 			}
 		}
-		if until := node.cooldownUntil.Load(); until > now.UnixNano() {
+	}
+	result := make([]KeyStatus, 0, len(creds))
+	for _, cred := range creds {
+		failures, until := gateway.scheduler.credentialSnapshot(cred.id)
+		status := KeyStatus{
+			ID: cred.display, Tier: tier, Index: cred.index,
+			ProxyPool: poolName, Failures: failures,
+			TotalTargets: total,
+		}
+		// Only an unexpired credential (401) cooldown hides targets. An
+		// expired cooldown with failures>0 (backoff memory) must report the
+		// same transport-level availability as buildAuthCandidates sees.
+		if until > now.UnixNano() {
+			status.AvailableTargets = 0
+		} else {
+			status.AvailableTargets = healthy
+		}
+		if until > now.UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value
 			status.CooldownRemainingSeconds = cooldownRemainingSeconds(until, now)
@@ -419,28 +518,34 @@ func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	return result
 }
 
-// anonymousProxyStatuses snapshots the per-proxy anonymous credential state
-// without taking pool or binding locks: nodes are immutable after build and
-// all counters are atomics.
-func anonymousProxyStatuses(pool *anonymousPool) []AnonymousProxyStatus {
-	if pool == nil || len(pool.nodes) == 0 {
+// anonymousTargetSummaries snapshots the per-proxy anonymous target state
+// without taking pool locks: transports are immutable after build and all
+// scheduler counters are mutex-guarded snapshots.
+func (g *Gateway) anonymousTargetSummaries() []AnonymousProxyStatus {
+	if !g.cfg.Anonymous {
+		return nil
+	}
+	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
+	if pool == nil || len(pool.items) == 0 {
 		return nil
 	}
 	now := time.Now()
-	result := make([]AnonymousProxyStatus, 0, len(pool.nodes))
-	for _, node := range pool.nodes {
-		if node == nil || node.proxy == nil {
+	result := make([]AnonymousProxyStatus, 0, len(pool.items))
+	for _, proxy := range pool.items {
+		if proxy == nil {
 			continue
 		}
+		active, nextAvailable, lastClass, failures := g.scheduler.proxyTargetSummary(pool.name, proxy.name)
 		status := AnonymousProxyStatus{
-			Index: node.proxy.index, Pool: node.proxy.pool, Address: redactURL(node.proxy.name),
-			Healthy: node.proxy.healthy.Load(), Checking: node.proxy.checking.Load(),
-			Failures: node.failures.Load(),
+			Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
+			Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(),
+			ActiveCooldowns: active, NextAvailableAt: nextAvailable,
+			LastFailureClass: lastClass, Failures: failures,
 		}
-		if until := node.cooldownUntil.Load(); until > now.UnixNano() {
-			value := time.Unix(0, until).UTC()
+		if nextAvailable != nil {
+			value := *nextAvailable
 			status.CooldownUntil = &value
-			status.CooldownRemainingSeconds = cooldownRemainingSeconds(until, now)
+			status.CooldownRemainingSeconds = cooldownRemainingSeconds(value.UnixNano(), now)
 		}
 		result = append(result, status)
 	}

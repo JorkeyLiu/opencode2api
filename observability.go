@@ -412,8 +412,8 @@ type UpstreamAttempt struct {
 }
 
 // Shared upstream attempt failure classes. The set is intentionally small
-// and stable: future schedulers treat anonymous and authenticated channels
-// as credential types and route on (tier, credential, proxy, model), while
+// and stable: the scheduler treats anonymous and authenticated channels
+// as credential types and routes on (tier, credential, proxy, model), while
 // proxy health continues to mean transport connectivity only.
 const (
 	AttemptClassSuccess          = "success"
@@ -432,8 +432,9 @@ const anonymousCredentialID = "anonymous"
 // attemptClassification carries the current routing semantics for one
 // upstream attempt without changing control flow. Retryable mirrors the
 // authenticated tier loop (only client_rejected ends the tier); CoolsDown
-// mirrors the key/anonymous-node cooldown condition. Callers keep their
-// existing branches; they only read these flags for observability.
+// mirrors whether the attempt class can cool scheduler state (credential or
+// target). The scheduler itself branches on status codes for ownership;
+// callers only read these flags for observability.
 type attemptClassification struct {
 	Class     string
 	Retryable bool

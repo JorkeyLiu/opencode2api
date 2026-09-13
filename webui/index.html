@@ -216,23 +216,29 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
     <section id="tab-resources" class="hidden">
       <div class="section">
         <h2>资源与关联</h2>
-        <div class="cap">proxy 健康仅表示传输连通性；业务失败（429 / 4xx / 5xx）不改变 proxy 健康。点击 proxy 或 key 可做客户端侧关联过滤 / 高亮，再次点击取消。</div>
+        <div class="cap">proxy 健康仅表示传输连通性；业务失败（401 / 403 / 429 / 5xx）只冷却 credential 或 target，不改变 proxy 健康，也不存在 key 与 proxy 的静态绑定。点击 proxy 或 key 可做客户端侧关联过滤 / 高亮，再次点击取消。</div>
         <div class="filters"><span class="note" id="assoc-state">未选择关联过滤</span><button class="ghost" id="assoc-clear" type="button">清除选择</button></div>
       </div>
       <div class="section">
         <h2>Proxy 传输健康</h2>
-        <div class="cap">节点名始终为 proxy 节点名，不代表出口 IP。pool 为具名代理池 identity；routing 列显示该池被 anonymous / zen / go 的引用归属。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>zen keys</th><th>go keys</th><th>anonymous</th><th>routing</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="cap">节点名始终为 proxy 节点名，不代表出口 IP。pool 为具名代理池 identity；routing 列显示该池被 anonymous / zen / go 的引用归属；路由凭证为路由到该池的配置级凭证数（同池各行相同），不是绑定。健康仅表示传输连通性。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>健康</th><th>检查中</th><th>路由凭证（配置级）</th><th>anonymous</th><th>routing</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
       </div>
       <div class="section">
-        <h2>Key 状态</h2>
-        <div class="cap">仅显示 key 尾码与冷却剩余秒；完整 key 不会出现在任何接口与页面中。pool 列为该 key 绑定的代理池，index 为池内序号。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>key 尾码</th><th>tier</th><th>pool</th><th>index</th><th>当前 proxy</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
+        <h2>Credential 状态</h2>
+        <div class="cap">仅显示 key 尾码与全局 401 冷却剩余秒；完整 key 不会出现在任何接口与页面中。pool 列为该 credential 的指派代理池。可用 target 为该池内传输健康且未被 credential 冷却排除的代理数（模型无关）；单模型的 target 冷却见下表，不存在静态绑定。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>key 尾码</th><th>tier</th><th>代理池</th><th>可用 target</th><th>全部 target</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
       </div>
       <div class="section">
-        <h2>Anonymous proxy 冷却</h2>
-        <div class="cap">匿名通道按 pool 内 proxy 独立冷却；此处为 credential 业务状态，不是传输健康。</div>
-        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>传输</th><th>failures</th><th>cooldown 剩余</th></tr></thead><tbody id="tbody-anon"></tbody></table></div>
+        <h2>Anonymous proxy target 汇总</h2>
+        <div class="cap">匿名通道为固定 public 凭证 × 指派池代理 × 模型的 target 组合；此处按 proxy 聚合各模型的活跃冷却数与下次可用时间，不是传输健康。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>pool</th><th>index</th><th>节点</th><th>传输</th><th>活跃冷却</th><th>下次可用</th><th>失败分类</th></tr></thead><tbody id="tbody-anon"></tbody></table></div>
+      </div>
+      <div class="section">
+        <h2>活跃 Target 冷却</h2>
+        <div class="cap">仅列出有失败记录的 credential × proxy × 模型组合（最多 512 条，超出截断以总数为准）。调度按会话对完整 target 做 HRW 稳定排序，同 credential 同 proxy 在不同模型之间互不污染。</div>
+        <div class="table-wrap"><table class="table"><thead><tr><th>tier</th><th>credential</th><th>pool</th><th>proxy</th><th>模型</th><th>failures</th><th>剩余</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-targets"></tbody></table></div>
+        <div class="note" id="targets-note"></div>
       </div>
       <div class="section">
         <h2>Credential × Proxy 关联</h2>
@@ -724,19 +730,20 @@ function renderResourcesView(){
     cell(tr,p.proxy_pool||p.pool||"—"); cell(tr,p.index); cell(tr,p.address,"wrap");
     var h=document.createElement("td"); h.appendChild(el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad"))); tr.appendChild(h);
     cell(tr,p.checking?"yes":"no");
-    cell(tr,p.zen_keys===undefined?"—":p.zen_keys); cell(tr,p.go_keys===undefined?"—":p.go_keys);
+    cell(tr,p.available_credentials===undefined?"—":p.available_credentials);
     cell(tr,p.anonymous?"开":"关");
     cell(tr,(p.routing||[]).join(",")||"—","wrap");
     tr.addEventListener("click",function(){ S.assocProxy=(S.assocProxy===p.address)?"":p.address; renderResourcesView(); });
     tp.appendChild(tr);
   });
-  if(!(r.proxies||[]).length)emptyRow(tp,9,"暂无 proxy");
+  if(!(r.proxies||[]).length)emptyRow(tp,8,"暂无 proxy");
   var tk=$("tbody-keys"); clear(tk);
   (r.keys||[]).forEach(function(k){
     var hl=S.assocKey&&S.assocKey===k.id;
     var tr=document.createElement("tr"); tr.className="clickable"+(hl?" selected":"");
-    cell(tr,k.id,"wrap"); cell(tr,k.tier); cell(tr,k.proxy_pool||"—"); cell(tr,k.index);
-    cell(tr,k.proxy||("index "+k.proxy_index),"wrap");
+    cell(tr,k.id,"wrap"); cell(tr,k.tier); cell(tr,k.proxy_pool||"—");
+    cell(tr,k.available_targets===undefined?"—":k.available_targets);
+    cell(tr,k.total_targets===undefined?"—":k.total_targets);
     cell(tr,k.failures===undefined?"—":k.failures);
     var cd=(k.cooldown_remaining_seconds===undefined||k.cooldown_remaining_seconds===null)?"—":k.cooldown_remaining_seconds+"s";
     var c=document.createElement("td");
@@ -751,12 +758,30 @@ function renderResourcesView(){
     var tr=document.createElement("tr");
     cell(tr,a.proxy_pool||a.pool||"—"); cell(tr,a.index); cell(tr,a.address,"wrap");
     var h=document.createElement("td"); h.appendChild(el("span",a.healthy?"传输正常":"传输不可用","pill "+(a.healthy?"ok":"bad"))); tr.appendChild(h);
-    cell(tr,a.failures===undefined?"—":a.failures);
-    var cd=(a.cooldown_remaining_seconds===undefined||a.cooldown_remaining_seconds===null)?"—":a.cooldown_remaining_seconds+"s";
-    var c=document.createElement("td"); c.appendChild(el("span",cd,"pill "+(cd==="—"?"ok":"warn"))); tr.appendChild(c);
+    cell(tr,a.active_cooldowns===undefined?"—":a.active_cooldowns);
+    cell(tr,a.next_available_at?fmtDateTime(a.next_available_at):"—");
+    cell(tr,a.last_failure_class||"—");
     ta.appendChild(tr);
   });
-  if(!(r.anonymous_proxies||[]).length)emptyRow(ta,6,"匿名通道未启用或无节点");
+  if(!(r.anonymous_proxies||[]).length)emptyRow(ta,7,"匿名通道未启用或无节点");
+  var tt=$("tbody-targets"); clear(tt);
+  (r.targets||[]).forEach(function(t){
+    var tr=document.createElement("tr");
+    cell(tr,t.tier); cell(tr,t.credential,"wrap"); cell(tr,t.proxy_pool||"—");
+    cell(tr,t.proxy_node||"—","wrap"); cell(tr,t.model||"—","wrap");
+    cell(tr,t.failures===undefined?"—":t.failures);
+    var cd=(t.remaining_seconds===undefined||t.remaining_seconds===null)?"—":t.remaining_seconds+"s";
+    var c=document.createElement("td");
+    c.appendChild(el("span",cd,"pill "+(cd==="—"?"neutral":"warn")));
+    tr.appendChild(c);
+    cell(tr,t.last_failure_class||"—");
+    cell(tr,(t.last_status===undefined||t.last_status===0)?"—":t.last_status);
+    tt.appendChild(tr);
+  });
+  if(!(r.targets||[]).length)emptyRow(tt,9,"暂无活跃 target 冷却");
+  var tn=$("targets-note"); clear(tn);
+  var total=(r.targets_total===undefined||r.targets_total===null)?((r.targets||[]).length):r.targets_total;
+  tn.textContent=r.targets_truncated?("共 "+total+" 个活跃 target，仅展示前 "+(r.targets||[]).length+"（已截断）"):("共 "+total+" 个活跃 target");
   var st=$("assoc-state"); clear(st);
   st.textContent=(S.assocProxy||S.assocKey)?("已选："+(S.assocProxy?("proxy="+S.assocProxy+" "):"")+ (S.assocKey?("key="+S.assocKey):"")):"未选择关联过滤";
   var pairs=(S.attemptResources&&S.attemptResources.pairs)||{};

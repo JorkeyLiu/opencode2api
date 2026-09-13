@@ -256,20 +256,25 @@ func TestSharedRefsSharePointer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gateway.zenNodes.transports != gateway.goNodes.transports {
-		t.Fatalf("shared refs must share transport pointer")
-	}
-	if gateway.pools["shared"] != gateway.zenNodes.transports {
-		t.Fatalf("pools map must hold the shared instance")
+	if gateway.pools["shared"] == nil {
+		t.Fatalf("shared pool missing")
 	}
 	if len(gateway.pools) != 1 {
 		t.Fatalf("pools=%d want 1", len(gateway.pools))
 	}
-	if gateway.anonymous.Len() != 2 || gateway.zenNodes.Len() != 1 || gateway.goNodes.Len() != 1 {
-		t.Fatalf("lengths anon=%d zen=%d go=%d", gateway.anonymous.Len(), gateway.zenNodes.Len(), gateway.goNodes.Len())
+	// Credential x proxy candidates come from the shared pool for both tiers.
+	now := time.Now().UnixNano()
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["shared"], "m", now)
+	if len(zen) != 2 || len(goCands) != 2 {
+		t.Fatalf("shared candidates zen=%d go=%d want 2/2", len(zen), len(goCands))
 	}
-	if gateway.zenNodes.transports.items[0].pool != "shared" {
-		t.Fatalf("pool identity=%q", gateway.zenNodes.transports.items[0].pool)
+	anon := gateway.scheduler.buildAnonymousCandidates(gateway.pools["shared"], "m", now)
+	if len(anon) != 2 {
+		t.Fatalf("anon candidates=%d want 2", len(anon))
+	}
+	if gateway.pools["shared"].items[0].pool != "shared" {
+		t.Fatalf("pool identity=%q", gateway.pools["shared"].items[0].pool)
 	}
 }
 
@@ -282,26 +287,35 @@ func TestSeparateRefsIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gateway.zenNodes.transports == gateway.goNodes.transports {
+	if gateway.pools["z"] == gateway.pools["g"] {
 		t.Fatalf("isolated pools must not share pointer")
 	}
 	if len(gateway.pools) != 3 {
 		t.Fatalf("pools=%d want 3", len(gateway.pools))
 	}
-	if gateway.zenNodes.transports.name != "z" || gateway.goNodes.transports.name != "g" {
-		t.Fatalf("pool names zen=%q go=%q", gateway.zenNodes.transports.name, gateway.goNodes.transports.name)
+	if gateway.pools["z"].name != "z" || gateway.pools["g"].name != "g" {
+		t.Fatalf("pool names zen=%q go=%q", gateway.pools["z"].name, gateway.pools["g"].name)
 	}
-	if gateway.anonymous.nodes[0].proxy.pool != "a" {
-		t.Fatalf("anon pool=%q", gateway.anonymous.nodes[0].proxy.pool)
+	now := time.Now().UnixNano()
+	anon := gateway.scheduler.buildAnonymousCandidates(gateway.pools["a"], "m", now)
+	if len(anon) != 1 || anon[0].PoolName != "a" {
+		t.Fatalf("anon pool=%+v", anon)
+	}
+	// Pool isolation: zen candidates only use pool z, go only pool g.
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["z"], "m", now)
+	for _, cand := range zen {
+		if cand.PoolName != "z" {
+			t.Fatalf("zen candidate leaked across pools: %+v", cand)
+		}
 	}
 }
 
-func TestRebindIsolation(t *testing.T) {
+func TestTargetIsolationAcrossPools(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"z": {"direct", "http://127.0.0.1:8081"}, "g": {"direct", "http://127.0.0.1:8082"}, "a": {"direct"}},
 		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
 	)
-	// Give each tier a key so bindings exist.
+	// Give each tier a key so candidates exist.
 	cfg.ZenKeys = []string{"zen-key-12345"}
 	cfg.GoKeys = []string{"go-key-12345"}
 	normalized, err := NormalizeConfig("config.json", cfg)
@@ -312,18 +326,25 @@ func TestRebindIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	zenProxy := gateway.zenNodes.transports.items[0]
-	goProxyBefore := int(gateway.goNodes.nodes[0].proxyIndex.Load())
-	gateway.rebindUnavailableProxy(zenProxy, true)
-	if got := int(gateway.zenNodes.nodes[0].proxyIndex.Load()); got == 0 {
-		t.Fatalf("zen key must move off failed proxy")
+	// Cooling a zen target must not remove the go candidate on its own pool.
+	zenPool := gateway.pools["z"]
+	zenProxy := zenPool.items[0]
+	identity := targetIdentity(TierZen, gateway.zenCreds[0].id, "z", zenProxy.name, "model-a")
+	gateway.scheduler.noteTargetFailure(identity, AttemptClassUpstreamFailure, 500, 0)
+	now := time.Now().UnixNano()
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, zenPool, "model-a", now)
+	for _, cand := range zen {
+		if cand.Identity == identity {
+			t.Fatalf("cooling target must be filtered: %s", identity)
+		}
 	}
-	if got := int(gateway.goNodes.nodes[0].proxyIndex.Load()); got != goProxyBefore {
-		t.Fatalf("go key must not move on zen-pool failure, got %d want %d", got, goProxyBefore)
+	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["g"], "model-a", now)
+	if len(goCands) != 2 {
+		t.Fatalf("go candidates must be unaffected, got %d", len(goCands))
 	}
 }
 
-func TestSharedDualRebind(t *testing.T) {
+func TestSharedPoolTargetFanout(t *testing.T) {
 	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
 	cfg.ZenKeys = []string{"zen-key-12345"}
 	cfg.GoKeys = []string{"go-key-12345"}
@@ -335,10 +356,12 @@ func TestSharedDualRebind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := gateway.zenNodes.transports.items[0]
-	zenMoved, goMoved := gateway.rebindUnavailableProxy(proxy, true)
-	if zenMoved != 1 || goMoved != 1 {
-		t.Fatalf("shared failure must rebind both tiers, got zen=%d go=%d", zenMoved, goMoved)
+	// One key x two proxies per tier over the shared pool.
+	now := time.Now().UnixNano()
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["shared"], "m", now)
+	if len(zen) != 2 || len(goCands) != 2 {
+		t.Fatalf("shared fanout zen=%d go=%d want 2/2", len(zen), len(goCands))
 	}
 }
 
@@ -401,11 +424,19 @@ func TestResourcesPoolAttribution(t *testing.T) {
 	for _, p := range snap.Proxies {
 		byPool[p.Pool] = p
 	}
+	// ZenKeys/GoKeys are pool-level routed config counts, not bindings:
+	// pool z carries the 1 zen key, pool g the 1 go key, pool a none.
 	if byPool["z"].ZenKeys != 1 || byPool["z"].GoKeys != 0 {
-		t.Fatalf("z attribution=%+v", byPool["z"])
+		t.Fatalf("pool z routed counts wrong: %+v", byPool["z"])
 	}
 	if byPool["g"].GoKeys != 1 || byPool["g"].ZenKeys != 0 {
-		t.Fatalf("g attribution=%+v", byPool["g"])
+		t.Fatalf("pool g routed counts wrong: %+v", byPool["g"])
+	}
+	if byPool["a"].ZenKeys != 0 || byPool["a"].GoKeys != 0 {
+		t.Fatalf("pool a routed counts wrong: %+v", byPool["a"])
+	}
+	if byPool["z"].AvailableCredentials != 1 || byPool["g"].AvailableCredentials != 1 || byPool["a"].AvailableCredentials != 1 {
+		t.Fatalf("available credentials wrong: a=%+v z=%+v g=%+v", byPool["a"], byPool["z"], byPool["g"])
 	}
 	if !byPool["a"].Anonymous || byPool["z"].Anonymous {
 		t.Fatalf("anonymous attribution a=%v z=%v", byPool["a"].Anonymous, byPool["z"].Anonymous)
@@ -446,34 +477,39 @@ func TestAttemptPoolQualifiedAggregates(t *testing.T) {
 }
 
 func TestClientRejectedNeutral(t *testing.T) {
-	transports, err := newTransportPool("shared", []string{"direct"}, PerformanceConfig{MaxIdleConns: 1, MaxIdleConnsPerHost: 1, ConnectTimeoutSeconds: 1, IdleConnTimeoutSeconds: 1}, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	anon := newAnonymousPool(true, transports, 15*time.Second)
-	anon.MarkFailure(anon.nodes[0], responseWithStatus(400), nil)
-	if got := anon.nodes[0].cooldownUntil.Load(); got != 0 {
-		t.Fatalf("400 must not cool anonymous node")
-	}
-	nodes, err := newNodePool([]string{"k"}, transports, 15*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nodes.MarkFailure(nodes.nodes[0], responseWithStatus(400), nil)
-	if got := nodes.nodes[0].cooldownUntil.Load(); got != 0 {
-		t.Fatalf("400 must not cool key node")
-	}
 	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	gateway, err := NewGateway(cfg, nil, NewMonitor())
+	cfg.ZenKeys = []string{"k"}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := NewGateway(normalized, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
 	}
 	proxy := gateway.pools["shared"].items[0]
+	cand := targetCandidate{
+		Tier: TierZen, CredKey: "k", CredID: credentialIDForKey(TierZen, "k"),
+		CredDisplay: "k", PoolName: "shared", Proxy: proxy, ProxyRaw: proxy.name,
+		Model: "m", Identity: targetIdentity(TierZen, credentialIDForKey(TierZen, "k"), "shared", proxy.name, "m"),
+	}
+	before := gateway.scheduler.targetCoolUntil(cand.Identity)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != before {
+		t.Fatalf("400 must not cool target")
+	}
 	if gateway.syncProxyResult(t.Context(), proxy, 400, nil) {
 		t.Fatalf("400 must not count as proxy failure")
 	}
 	if !proxy.healthy.Load() {
 		t.Fatalf("400 must not change health")
+	}
+	// 400 must not clear pre-existing target state either.
+	gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
+	cooled := gateway.scheduler.targetCoolUntil(cand.Identity)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != cooled {
+		t.Fatalf("400 must not clear existing target state")
 	}
 }
 

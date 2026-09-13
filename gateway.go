@@ -29,9 +29,9 @@ type Gateway struct {
 	cfg       Config
 	logger    *slog.Logger
 	pools     map[string]*transportPool
-	zenNodes  *nodePool
-	goNodes   *nodePool
-	anonymous *anonymousPool
+	scheduler *targetScheduler
+	zenCreds  []credentialRef
+	goCreds   []credentialRef
 	catalog   *modelCatalog
 	monitor   *Monitor
 }
@@ -85,31 +85,21 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		pools[name] = transports
 	}
 	// Same routing reference shares one transportPool pointer; different
-	// references stay isolated.
-	zenPool := pools[cfg.ProxyRouting.Zen]
-	goPool := pools[cfg.ProxyRouting.Go]
-	anonPool := pools[cfg.ProxyRouting.Anonymous]
-	if zenPool == nil || goPool == nil || anonPool == nil {
+	// references stay isolated. A referenced pool resolves to the same
+	// instance when two channels name the same pool.
+	if pools[cfg.ProxyRouting.Zen] == nil || pools[cfg.ProxyRouting.Go] == nil || pools[cfg.ProxyRouting.Anonymous] == nil {
 		return nil, fmt.Errorf("proxy_routing must reference existing pools")
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	zenNodes, err := newNodePool(cfg.ZenKeys, zenPool, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("zen node pool: %w", err)
-	}
-	goNodes, err := newNodePool(cfg.GoKeys, goPool, cooldown)
-	if err != nil {
-		return nil, fmt.Errorf("go node pool: %w", err)
-	}
 	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	return &Gateway{
 		cfg:       cfg,
 		logger:    logger,
 		pools:     pools,
-		zenNodes:  zenNodes,
-		goNodes:   goNodes,
-		anonymous: newAnonymousPool(cfg.Anonymous, anonPool, cooldown),
+		scheduler: newTargetScheduler(cooldown),
+		zenCreds:  credentialsForKeys(TierZen, cfg.ZenKeys),
+		goCreds:   credentialsForKeys(TierGo, cfg.GoKeys),
 		catalog:   catalog,
 		monitor:   monitor,
 	}, nil
@@ -176,7 +166,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		proxyTotal += total
 		proxyHealthy += healthy
 	}
-	zenKeys, goKeys := g.zenNodes.Len(), g.goNodes.Len()
+	zenKeys, goKeys := len(g.zenCreds), len(g.goCreds)
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
@@ -635,25 +625,27 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 	return nil, effectiveRoute, attempts, lastErr
 }
 
-// doAnonymousUpstream tries every currently available proxy at most once. Any
-// failure, including an HTTP error response, advances to the next proxy. Only a
-// successful response ends the anonymous phase; exhausting the proxy cursor
-// returns control to the preferred authenticated tiers.
+// doAnonymousUpstream walks the frozen anonymous target list once: the fixed
+// anonymous credential x every currently available proxy. Any failure,
+// including an HTTP error response, advances to the next target. Only a
+// successful response ends the anonymous phase; exhausting the list returns
+// control to the preferred authenticated tiers. The list is never truncated
+// by retry.max_attempts.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
-	cursor := g.anonymous.CursorFor(ids.Session)
-	limit := g.anonymous.Len()
-	attempts := 0
+	if !g.cfg.Anonymous {
+		return nil, errors.New("anonymous channel is disabled"), 0
+	}
+	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
 	body := bodies[TierZen]
 	if len(body) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
 	}
-	for attempts < limit {
-		node := cursor.Next()
-		if node == nil {
-			break
-		}
+	now := time.Now().UnixNano()
+	cands := g.scheduler.orderCandidates(g.scheduler.buildAnonymousCandidates(pool, route.ID, now), ids.Session)
+	attempts := 0
+	for _, cand := range cands {
 		attempts++
 		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
 			meta.Attempts = attemptOffset + attempts
@@ -663,32 +655,26 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, anonymousZenKey)
+		req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand.CredKey)
 		if err != nil {
 			return nil, err, attempts
 		}
-		setRequestCredential(ctx, TierZen, "anonymous", "anonymous", true, node.proxy)
+		setRequestCredential(ctx, TierZen, "anonymous", "anonymous", true, cand.Proxy)
 		started := time.Now()
-		resp, err := node.proxy.client.Do(req)
+		resp, err := cand.Proxy.client.Do(req)
 		duration := time.Since(started)
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-		}
-		g.syncProxyResult(ctx, node.proxy, status, err)
-		g.recordUpstreamAttempt(route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+		class := g.applyAttemptOutcome(ctx, cand, resp, err)
+		g.recordUpstreamAttemptWithClass(route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, resp, err, duration, class)
 		if err == nil && resp.StatusCode/100 == 2 {
-			g.anonymous.MarkSuccess(node)
-			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			return resp, nil, attempts
 		}
-		g.anonymous.MarkFailure(node, resp, err)
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+			g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+			g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
@@ -703,26 +689,32 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
-	nodes := g.zenNodes
+	var creds []credentialRef
+	poolName := g.cfg.ProxyRouting.Zen
 	baseURL := g.cfg.Upstream.Zen
 	if route.Tier == TierGo {
-		nodes = g.goNodes
+		creds = g.goCreds
+		poolName = g.cfg.ProxyRouting.Go
 		baseURL = g.cfg.Upstream.Go
+	} else {
+		creds = g.zenCreds
 	}
-	cursor := nodes.CursorFor(ids.Session)
-	if nodes.Len() == 0 {
+	pool := g.pools[poolName]
+	if len(creds) == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0
 	}
-	attempts := 0
 	body := bodies[route.Tier]
 	if len(body) == 0 {
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0
 	}
-	for attempts < g.cfg.Retry.MaxAttempts {
-		node := cursor.Next()
-		if node == nil {
-			break
-		}
+	// Freeze the candidate order at request start; failover walks the frozen
+	// list without dynamic re-sorting. The tier budget is retry.max_attempts
+	// with the first attempt included.
+	now := time.Now().UnixNano()
+	cands := g.scheduler.orderCandidates(g.scheduler.buildAuthCandidates(route.Tier, creds, pool, route.ID, now), ids.Session)
+	limit := min(len(cands), g.cfg.Retry.MaxAttempts)
+	attempts := 0
+	for _, cand := range cands[:limit] {
 		attempts++
 		// Keep the request-level trace synchronized with the attempt that is
 		// about to be sent. Only the redacted key suffix is retained.
@@ -734,59 +726,93 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
-		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, node.key)
+		req, err := newUpstreamRequest(ctx, baseURL, route.Protocol, body, ids, cand.CredKey)
 		if err != nil {
 			return nil, err, attempts
 		}
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			lastErr = errors.New("upstream key has no proxy binding")
-			break
-		}
-		keyID := keyDisplayID(node.key)
-		setRequestCredential(ctx, route.Tier, keyID, "key", false, proxy)
+		setRequestCredential(ctx, route.Tier, cand.CredDisplay, "key", false, cand.Proxy)
 		attemptStarted := time.Now()
-		resp, err := proxy.client.Do(req)
+		resp, err := cand.Proxy.client.Do(req)
 		attemptDuration := time.Since(attemptStarted)
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-		}
-		proxyFailed := g.syncProxyResult(ctx, proxy, status, err)
-		g.recordUpstreamAttempt(route, ids, attemptOffset+attempts, keyID, "key", false, proxy, resp, err, attemptDuration)
+		class := g.applyAttemptOutcome(ctx, cand, resp, err)
+		g.recordUpstreamAttemptWithClass(route, ids, attemptOffset+attempts, cand.CredDisplay, "key", false, cand.Proxy, resp, err, attemptDuration, class)
 		if err == nil && resp.StatusCode/100 == 2 {
-			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", redactURL(proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode, "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
 		}
 		// Request-shape errors are deterministic and must leave this tier without
 		// rotating through unrelated keys. The outer route may still try the next
 		// tier in prefer order. Authentication, throttling, server, and transport
 		// failures remain retryable inside this tier.
-		if isNonRetryableClientResponse(resp, err) {
-			nodes.MarkSuccess(node)
-			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+		if class.Class == AttemptClassClientRejected {
+			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds())
 			return resp, nil, attempts
-		}
-		if proxyFailed {
-			if nodes.Proxy(node) == proxy {
-				nodes.MarkFailure(node, resp, err)
-			}
-		} else {
-			nodes.MarkFailure(node, resp, err)
 		}
 		lastResponse = resp
 		lastErr = err
 		if err != nil {
-			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
+			g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds(), "error", err)
 		} else {
-			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", keyID, "status", resp.StatusCode, "proxy", redactURL(proxy.name), "duration_ms", attemptDuration.Milliseconds())
+			g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name), "duration_ms", attemptDuration.Milliseconds())
 		}
 	}
 	if lastResponse != nil {
 		return lastResponse, nil, attempts
 	}
 	return nil, lastErr, attempts
+}
+
+// applyAttemptOutcome is the single state-update entry point for every
+// upstream attempt. It classifies once, updates the three state layers, and
+// returns the classification so recordUpstreamAttempt reuses the same result.
+//
+//   - Downstream cancellation (request ctx done): no state is touched.
+//   - 2xx: clears this target and the credential 401 state; a healthy
+//     response also restores proxy transport health.
+//   - 401: global credential cooldown; the target is not cooled twice.
+//   - 403/429/5xx: target cooldown (Retry-After wins when larger, capped).
+//   - Transport error with isProxyFailure: proxy unhealthy, no target cool.
+//   - Other transport errors: short target cool plus an async neutral check.
+//   - Ordinary 4xx (client_rejected): neutral no-op; never clears state.
+func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate, resp *http.Response, err error) attemptClassification {
+	class := classifyUpstreamAttempt(resp, err)
+	if ctx != nil && ctx.Err() != nil {
+		return class
+	}
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	switch {
+	case err == nil && status >= 200 && status < 300:
+		g.scheduler.noteTargetSuccess(cand.Identity)
+		g.scheduler.noteCredentialSuccess(cand.CredID)
+		if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
+			wasHealthy := cand.Proxy.healthy.Swap(true)
+			if !wasHealthy && g.logger != nil {
+				g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(cand.Proxy.name), "proxy_pool", cand.Proxy.pool)
+			}
+		}
+	case err != nil:
+		if isProxyFailure(err) {
+			g.markProxyUnavailable(cand.Proxy)
+			return class
+		}
+		g.scheduler.noteTargetFailure(cand.Identity, class.Class, 0, 0)
+		g.verifyProxyAfterError(ctx, cand.Proxy, 0)
+	case status == http.StatusUnauthorized:
+		g.scheduler.noteCredentialAuthFailure(cand.CredID)
+	case status == http.StatusForbidden || status == http.StatusTooManyRequests || status >= 500:
+		var retryAfter time.Duration
+		if resp != nil {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+		g.scheduler.noteTargetFailure(cand.Identity, class.Class, status, retryAfter)
+		g.verifyProxyAfterError(ctx, cand.Proxy, status)
+	default:
+		// Ordinary 4xx and other responses: neutral, no state change.
+	}
+	return class
 }
 
 func setRequestCredential(ctx context.Context, tier Tier, keyID, channel string, anonymous bool, proxy *proxyTransport) {
@@ -829,7 +855,7 @@ func extractResponseUsage(protocol Protocol, body []byte) (bridgeUsage, bool) {
 	return decodeOpenAIUsage(usage), true
 }
 
-func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration) {
+func (g *Gateway) recordUpstreamAttemptWithClass(route modelRoute, ids requestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration, class attemptClassification) {
 	if g.monitor == nil {
 		return
 	}
@@ -837,7 +863,6 @@ func (g *Gateway) recordUpstreamAttempt(route modelRoute, ids requestIDs, attemp
 	if resp != nil {
 		status = resp.StatusCode
 	}
-	class := classifyUpstreamAttempt(resp, err)
 	success := class.Class == AttemptClassSuccess
 	proxyName := "unavailable"
 	proxyPool := ""
@@ -890,30 +915,27 @@ func isNonRetryableClientResponse(resp *http.Response, err error) bool {
 	return classifyUpstreamAttempt(resp, err).Class == AttemptClassClientRejected
 }
 
-// syncProxyResult updates proxy health from real traffic. Only timeouts and
-// connection refusals mark a proxy unavailable. Other errors and 4xx/5xx
-// responses trigger a neutral URL check without being treated as proxy failure.
+// syncProxyResult updates proxy transport health from refresh traffic.
+// Only timeouts and connection refusals mark a proxy unavailable; HTTP
+// statuses never change health directly. Other errors and 4xx/5xx responses
+// trigger a neutral URL check without being treated as proxy failure.
+// Scheduler (credential/target) state is never touched here.
 func (g *Gateway) syncProxyResult(ctx context.Context, proxy *proxyTransport, status int, err error) bool {
 	if proxy == nil {
 		return false
 	}
 	if isProxyFailure(err) {
-		g.rebindFailedProxy(proxy)
-		g.verifyProxyAfterError(ctx, proxy, status)
+		g.markProxyUnavailable(proxy)
 		return true
 	}
 	if status >= 200 && status < 400 {
 		wasHealthy := proxy.healthy.Swap(true)
-		if !wasHealthy {
-			g.restoreProxy(proxy)
+		if !wasHealthy && g.logger != nil {
+			g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool)
 		}
 		return false
 	}
-	if err != nil {
-		g.verifyProxyAfterError(ctx, proxy, status)
-		return false
-	}
-	if status >= 400 && status < 600 {
+	if err != nil || status >= 400 && status < 600 {
 		g.verifyProxyAfterError(ctx, proxy, status)
 	}
 	return false
@@ -937,48 +959,14 @@ func (g *Gateway) verifyProxyAfterError(ctx context.Context, proxy *proxyTranspo
 	}()
 }
 
-func (g *Gateway) rebindFailedProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
+func (g *Gateway) markProxyUnavailable(proxy *proxyTransport) {
 	if proxy == nil {
-		return 0, 0
+		return
 	}
 	wasHealthy := proxy.healthy.Swap(false)
-	return g.rebindUnavailableProxy(proxy, wasHealthy)
-}
-
-func (g *Gateway) rebindUnavailableProxy(proxy *proxyTransport, wasHealthy bool) (zenMoved, goMoved int) {
-	// Rebind/restore act only on node pools that reference this transport
-	// pool. Isolated pools never exchange index operations; a shared pool
-	// still rebinds both Zen and Go tiers.
-	if g.zenNodes != nil && g.zenNodes.transports != nil && g.zenNodes.transports.containsProxy(proxy) {
-		zenMoved = g.zenNodes.RebindProxy(proxy.index)
+	if wasHealthy && g.logger != nil {
+		g.logger.Warn("proxy became unavailable", "component", "proxy", "event", "proxy_unavailable", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool)
 	}
-	if g.goNodes != nil && g.goNodes.transports != nil && g.goNodes.transports.containsProxy(proxy) {
-		goMoved = g.goNodes.RebindProxy(proxy.index)
-	}
-	if wasHealthy || zenMoved+goMoved > 0 {
-		if g.logger != nil {
-			g.logger.Warn("proxy became unavailable", "component", "proxy", "event", "proxy_unavailable", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
-		}
-	}
-	return zenMoved, goMoved
-}
-
-func (g *Gateway) restoreProxy(proxy *proxyTransport) (zenMoved, goMoved int) {
-	if proxy == nil {
-		return 0, 0
-	}
-	if g.zenNodes != nil && g.zenNodes.transports != nil && g.zenNodes.transports.containsProxy(proxy) {
-		zenMoved = g.zenNodes.RestoreProxy(proxy.index)
-	}
-	if g.goNodes != nil && g.goNodes.transports != nil && g.goNodes.transports.containsProxy(proxy) {
-		goMoved = g.goNodes.RestoreProxy(proxy.index)
-	}
-	if zenMoved+goMoved > 0 {
-		if g.logger != nil {
-			g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(proxy.name), "proxy_pool", proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved)
-		}
-	}
-	return zenMoved, goMoved
 }
 
 func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
@@ -1007,7 +995,10 @@ func (g *Gateway) StartProxyHealthChecks(ctx context.Context) {
 func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string, upstreamStatus int) {
 	if result.err == nil {
 		if !result.wasHealthy {
-			g.restoreProxy(result.proxy)
+			wasHealthy := result.proxy.healthy.Swap(true)
+			if !wasHealthy && g.logger != nil {
+				g.logger.Info("proxy connectivity restored", "component", "proxy", "event", "proxy_restored", "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool)
+			}
 		}
 		if g.logger != nil {
 			g.logger.Debug("proxy health check passed", "component", "proxy", "event", "health_check_passed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name))
@@ -1028,13 +1019,11 @@ func (g *Gateway) applyProxyHealthResult(result proxyHealthResult, source string
 		}
 	}
 	if hasHealthy {
-		zenMoved, goMoved := g.rebindUnavailableProxy(result.proxy, result.wasHealthy)
-		if result.wasHealthy || zenMoved+goMoved > 0 {
-			if g.logger != nil {
-				g.logger.Warn("proxy health check failed", "component", "proxy", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "zen_keys_moved", zenMoved, "go_keys_moved", goMoved, "error", result.err)
-			}
-			return
+		g.markProxyUnavailable(result.proxy)
+		if g.logger != nil {
+			g.logger.Warn("proxy health check failed", "component", "proxy", "event", "health_check_failed", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "error", result.err)
 		}
+		return
 	}
 	if g.logger != nil {
 		g.logger.Debug("proxy health check is still failing", "component", "proxy", "event", "health_check_still_failing", "source", source, "upstream_status", upstreamStatus, "proxy", redactURL(result.proxy.name), "proxy_pool", result.proxy.pool, "error", result.err)
@@ -1060,7 +1049,7 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 		var wg sync.WaitGroup
 		wg.Add(3)
 		go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, g.goNodes) }()
+		go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, TierGo) }()
 		go func() {
 			defer wg.Done()
 			capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1122,7 +1111,7 @@ func (g *Gateway) refreshProtocolCapabilities(ctx context.Context) (protocolCapa
 }
 
 func (g *Gateway) refreshZen(ctx context.Context) []string {
-	if models := g.refreshTier(ctx, g.cfg.Upstream.Zen, g.zenNodes); models != nil {
+	if models := g.refreshTier(ctx, g.cfg.Upstream.Zen, TierZen); models != nil {
 		return models
 	}
 	if !g.cfg.Anonymous {
@@ -1131,54 +1120,93 @@ func (g *Gateway) refreshZen(ctx context.Context) []string {
 	return g.refreshAnonymousTier(ctx, g.cfg.Upstream.Zen)
 }
 
+// refreshAnonymousTier fetches the model list with the shared public
+// credential over each currently healthy proxy in the assigned pool.
+// It is stateless: foreground credential/target cooldowns are neither read
+// nor written; only proxy transport health gates and observes candidates.
 func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []string {
-	cursor := g.anonymous.CursorFor("")
-	limit := g.anonymous.Len()
-	for attempt := 1; attempt <= limit; attempt++ {
-		node := cursor.Next()
-		if node == nil {
-			break
-		}
-		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, status, err := fetchModels(refreshCtx, node.proxy.client, base, anonymousZenKey)
-		g.syncProxyResult(refreshCtx, node.proxy, status, err)
-		cancel()
-		if err == nil {
-			g.anonymous.MarkSuccess(node)
-			return models
-		}
-		g.anonymous.MarkFailure(node, nil, err)
-		g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt, "proxy", redactURL(node.proxy.name), "error", err)
+	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
+	if pool == nil {
+		return nil
 	}
-	g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactURL(base))
-	return nil
-}
-
-func (g *Gateway) refreshTier(ctx context.Context, base string, nodes *nodePool) []string {
-	cursor := nodes.Cursor()
-	for attempt := 0; attempt < g.cfg.Retry.MaxAttempts; attempt++ {
-		node := cursor.Next()
-		if node == nil {
-			return nil
-		}
+	healthy := healthyProxies(pool)
+	for attempt, proxy := range healthy {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		proxy := nodes.Proxy(node)
-		if proxy == nil {
-			cancel()
-			return nil
-		}
-		models, status, err := fetchModels(refreshCtx, proxy.client, base, node.key)
+		models, status, err := fetchModels(refreshCtx, proxy.client, base, anonymousZenKey)
 		g.syncProxyResult(refreshCtx, proxy, status, err)
 		cancel()
 		if err == nil {
-			nodes.MarkSuccess(node)
 			return models
 		}
-		nodes.MarkFailure(node, nil, err)
-		g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt+1, "error", err)
+		if g.logger != nil {
+			g.logger.Debug("anonymous model catalog refresh attempt failed", "component", "models", "event", "anonymous_refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt+1, "proxy", redactURL(proxy.name), "error", err)
+		}
 	}
-	g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", redactURL(base))
+	if g.logger != nil {
+		g.logger.Warn("anonymous model catalog refresh failed", "component", "models", "event", "anonymous_refresh_failed", "upstream", redactURL(base))
+	}
 	return nil
+}
+
+// refreshTier fetches the model list with a stateless key x healthy-proxy
+// traversal bounded by retry.max_attempts. Foreground scheduler state is
+// never read or written here.
+func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []string {
+	var keys []string
+	poolName := g.cfg.ProxyRouting.Zen
+	if tier == TierGo {
+		keys = g.cfg.GoKeys
+		poolName = g.cfg.ProxyRouting.Go
+	} else {
+		keys = g.cfg.ZenKeys
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	pool := g.pools[poolName]
+	if pool == nil {
+		return nil
+	}
+	healthy := healthyProxies(pool)
+	if len(healthy) == 0 {
+		return nil
+	}
+	budget := min(g.cfg.Retry.MaxAttempts, len(keys)*len(healthy))
+	if budget < 1 {
+		budget = 1
+	}
+	for attempt := 0; attempt < budget; attempt++ {
+		key := keys[attempt%len(keys)]
+		proxy := healthy[attempt%len(healthy)]
+		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		models, status, err := fetchModels(refreshCtx, proxy.client, base, key)
+		g.syncProxyResult(refreshCtx, proxy, status, err)
+		cancel()
+		if err == nil {
+			return models
+		}
+		if g.logger != nil {
+			g.logger.Debug("model catalog refresh attempt failed", "component", "models", "event", "refresh_attempt_failed", "upstream", redactURL(base), "attempt", attempt+1, "error", err)
+		}
+	}
+	if g.logger != nil {
+		g.logger.Warn("model catalog refresh failed", "component", "models", "event", "refresh_failed", "upstream", redactURL(base))
+	}
+	return nil
+}
+
+// healthyProxies returns the currently healthy transports in config order.
+func healthyProxies(pool *transportPool) []*proxyTransport {
+	if pool == nil {
+		return nil
+	}
+	out := make([]*proxyTransport, 0, len(pool.items))
+	for _, proxy := range pool.items {
+		if proxy != nil && proxy.healthy.Load() {
+			out = append(out, proxy)
+		}
+	}
+	return out
 }
 
 func copyErrorResponse(w http.ResponseWriter, protocol Protocol, resp *http.Response, requestID string) {

@@ -150,46 +150,57 @@ func TestMonitorResourceWindowExcludesOldAttempts(t *testing.T) {
 	}
 }
 
-func TestAnonymousCooldownSnapshot(t *testing.T) {
-	transports, err := newTransportPool("shared", []string{"direct", "direct"}, PerformanceConfig{
-		MaxIdleConns: 1, MaxIdleConnsPerHost: 1, ConnectTimeoutSeconds: 1, IdleConnTimeoutSeconds: 1,
-	}, time.Second)
+func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg.Anonymous = true
+	gateway, err := NewGateway(cfg, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool := newAnonymousPool(true, transports, 15*time.Second)
-	if pool.Len() != 2 {
-		t.Fatalf("pool len=%d", pool.Len())
+	pool := gateway.pools["shared"]
+	proxy := pool.items[0]
+	cand := targetCandidate{
+		Tier: TierZen, CredKey: anonymousZenKey, CredID: anonymousSchedulerCredentialID,
+		CredDisplay: anonymousCredentialID, PoolName: "shared", Proxy: proxy,
+		ProxyRaw: proxy.name, Model: "m", Identity: targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", proxy.name, "m"),
 	}
-	node := pool.nodes[0]
-	pool.MarkFailure(node, responseWithStatus(400), nil)
-	if got := node.cooldownUntil.Load(); got != 0 {
+	// client_rejected is neutral: no cooldown, no state.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 		t.Fatalf("client_rejected must not cool down, got %d", got)
 	}
-	pool.MarkFailure(node, responseWithStatus(429), nil)
-	if got := node.cooldownUntil.Load(); got <= time.Now().UnixNano() {
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("rate_limited must cool down")
 	}
-	pool.MarkSuccess(node)
-	if got := node.cooldownUntil.Load(); got != 0 {
+	// Success clears only this target.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(200), nil)
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 		t.Fatalf("success must clear cooldown, got %d", got)
 	}
-	pool.MarkFailure(node, nil, errors.New("dial timeout"))
-	if got := node.cooldownUntil.Load(); got <= time.Now().UnixNano() {
+	// Non-proxy transport errors cool the target without marking the proxy.
+	gateway.applyAttemptOutcome(t.Context(), cand, nil, errors.New("connection reset by peer"))
+	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("transport failure must cool down")
 	}
-	statuses := anonymousProxyStatuses(pool)
+	if !proxy.healthy.Load() {
+		t.Fatalf("neutral transport error must not mark proxy unhealthy")
+	}
+	statuses := gateway.anonymousTargetSummaries()
 	if len(statuses) != 2 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
 	found := false
 	for _, st := range statuses {
-		if st.Failures > 0 {
+		if st.ActiveCooldowns > 0 {
 			found = true
-			if st.CooldownUntil == nil || st.CooldownRemainingSeconds == nil {
+			if st.NextAvailableAt == nil || st.CooldownUntil == nil || st.CooldownRemainingSeconds == nil {
 				t.Fatalf("cooling proxy must expose cooldown: %+v", st)
 			}
-		} else if st.CooldownUntil != nil {
+			if st.LastFailureClass == "" {
+				t.Fatalf("cooling proxy must expose failure class: %+v", st)
+			}
+		} else if st.NextAvailableAt != nil {
 			t.Fatalf("idle proxy must not expose cooldown: %+v", st)
 		}
 		if st.Address == "" || strings.Contains(st.Address, "://") && strings.Contains(st.Address, "@") && strings.Contains(st.Address, "***") == false {
@@ -235,36 +246,58 @@ func TestObservabilityRedaction(t *testing.T) {
 	}
 }
 
-func TestKeyStatusProxyAndCooldown(t *testing.T) {
-	transports, err := newTransportPool("shared", []string{"direct", "direct"}, PerformanceConfig{
-		MaxIdleConns: 1, MaxIdleConnsPerHost: 1, ConnectTimeoutSeconds: 1, IdleConnTimeoutSeconds: 1,
-	}, time.Second)
+func TestKeyStatusCredentialAndCooldown(t *testing.T) {
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg.ZenKeys = []string{"sk-live-1234567890"}
+	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pool, err := newNodePool([]string{"sk-live-1234567890"}, transports, 15*time.Second)
+	gateway, err := NewGateway(normalized, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
 	}
-	statuses := keyStatuses("zen", pool)
+	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
 	if len(statuses) != 1 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
 	if statuses[0].ID != "67890" {
 		t.Fatalf("key id=%q", statuses[0].ID)
 	}
-	if statuses[0].Proxy == "" {
-		t.Fatalf("key proxy missing: %+v", statuses[0])
+	// No static binding: proxy fields stay empty, pool names the assignment.
+	if statuses[0].Proxy != "" || statuses[0].ProxyIndex != 0 {
+		t.Fatalf("key must not expose a static proxy: %+v", statuses[0])
+	}
+	if statuses[0].ProxyPool != "shared" {
+		t.Fatalf("key pool=%q", statuses[0].ProxyPool)
 	}
 	if statuses[0].CooldownUntil != nil || statuses[0].CooldownRemainingSeconds != nil {
 		t.Fatalf("fresh key must not expose cooldown: %+v", statuses[0])
 	}
-	pool.MarkFailure(pool.nodes[0], responseWithStatus(500), nil)
-	statuses = keyStatuses("zen", pool)
+	if statuses[0].TotalTargets != 1 || statuses[0].AvailableTargets != 1 {
+		t.Fatalf("fresh key targets=%+v", statuses[0])
+	}
+	// Only 401 cools the credential; 500 cools the target, not the credential.
+	proxy := gateway.pools["shared"].items[0]
+	cand := targetCandidate{
+		Tier: TierZen, CredKey: "sk-live-1234567890", CredID: gateway.zenCreds[0].id,
+		CredDisplay: "67890", PoolName: "shared", Proxy: proxy, ProxyRaw: proxy.name,
+		Model: "m", Identity: targetIdentity(TierZen, gateway.zenCreds[0].id, "shared", proxy.name, "m"),
+	}
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(500), nil)
+	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	if statuses[0].CooldownUntil != nil {
+		t.Fatalf("5xx must not cool the credential: %+v", statuses[0])
+	}
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(401), nil)
+	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
 	if statuses[0].CooldownUntil == nil || statuses[0].CooldownRemainingSeconds == nil {
-		t.Fatalf("cooling key must expose cooldown: %+v", statuses[0])
+		t.Fatalf("401 must cool the credential: %+v", statuses[0])
 	}
 	if *statuses[0].CooldownRemainingSeconds <= 0 {
 		t.Fatalf("cooldown remaining=%d", *statuses[0].CooldownRemainingSeconds)
+	}
+	if statuses[0].AvailableTargets != 0 {
+		t.Fatalf("cooling credential must report zero available targets: %+v", statuses[0])
 	}
 }

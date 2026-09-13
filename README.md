@@ -16,10 +16,10 @@
 - 支持直连、HTTP、HTTPS、SOCKS5 和 SOCKS5H 代理
 - 支持从文本文件读取代理池，并与配置内的代理合并、去重
 - `config.json` 支持 `//` 和 `/* ... */` 注释
-- 将 key 自动均衡绑定到代理，保持连接亲和性
-- 使用稳定会话哈希保持同一会话的 key/proxy 亲和性，并在节点故障时自动回退
-- 代理失败后自动迁移绑定，key 失败后进行短时冷却
-- 根据真实上游流量识别代理故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
+- 将 key 与代理组织为统一的 credential×proxy×model target 调度，不存在静态绑定
+- 使用稳定会话哈希对完整 target 做 HRW 排序保持同一会话的亲和性，并在 target 失败时自动走下一个
+- 代理传输故障只影响传输健康；401 全局冷却 credential，403/429/5xx 只冷却单个 target，普通 4xx 中性
+- 根据真实上游流量识别代理传输故障，并每 15 分钟通过 Cloudflare trace 并行复查异常代理
 - 为不同会话生成不同的 OpenCode 会话 ID，并支持 `x-opencode-session`、`x-session-id` 和 `conversation-id` 显式指定会话
 - 内置独立端口 Field Manual WebUI，可管理配置、查看 Token/上游指标、诊断路由、运行三协议 Playground 与订阅实时日志
 - WebUI 使用账号密码、服务端 session、HttpOnly Cookie、CSRF 与登录限速保护
@@ -247,15 +247,19 @@ OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Z
 1. models.dev 已知输入、输出成本都为 `0`，且模型未弃用；不要求名称包含 `free`。
 2. 模型 ID 大小写不敏感地包含 `free`；即使 metadata 尚未就绪、缺少该模型或显示为付费，也仍按名称条件视为免费。
 
-免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 proxy；每个可用 proxy 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 proxy 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点、`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
+免费模型先走匿名 Zen，非免费模型完全跳过匿名通道。匿名请求遇到任何错误——包括传输错误、4xx、5xx 或其他非 2xx 响应——都会继续切换下一个当前可用的 target（固定 public 凭证 × 指派池代理 × 本次模型）；每个可用 target 最多尝试一次。anonymous 阶段不受 `retry.max_attempts` 提前截断，只有可用 target 全部耗尽后才进入认证 Key 阶段。认证 Tier 按 `prefer` 排序：`prefer: "go"` 为 Go key → Zen key，`prefer: "zen"` 为 Zen key → Go key；首选 Tier 仍不成功时才尝试另一个实际提供该模型且配置了 Key 的 Tier。Zen/Go Key 阶段各自拥有 `retry.max_attempts` 预算。监控中的 `proxy_node` 表示所选代理节点、`proxy_pool` 表示其所属池，两者都不代表或推断实际出口 IP。
 
 只有匿名通道、且 `zen_keys` 与 `go_keys` 都为空时，`/v1/models` 只展示按上述规则可匿名使用的模型。只要配置了任一真实上游 Key，模型列表仍展示该 Key 路由可用的完整模型集合。
 
 models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址为 `https://models.dev/api.json`；规范化后的 OpenCode 模型成本缓存在 `config.json.models.dev.json`，以 `0600` 权限和同目录临时文件原子替换。启动会先读取可用快取，再尝试联网更新；更新失败不会丢弃旧资料，错误、更新时间与过期状态可在监控资源和诊断页查看。
 
-### key 与代理分配规则
+### key、代理与 target 调度规则
 
-代理以具名池组织，`proxy_routing` 决定 anonymous / zen / go 各自使用哪个池。相同引用共享同一传输池实例，不同引用完全隔离：Zen key 只绑定 `proxy_routing.zen` 指向的池，Go key 只绑定 `.go`，匿名凭证只走 `.anonymous`；代理故障的 key 迁移与恢复只发生在同一池内，隔离模式下不会跨池移动。
+代理以具名池组织，`proxy_routing` 决定 anonymous / zen / go 各自使用哪个池。相同引用共享同一传输池实例，不同引用完全隔离：Zen credential 只使用 `proxy_routing.zen` 指向的池，Go credential 只使用 `.go`，匿名凭证只走 `.anonymous`；隔离模式下各通道的候选互不相见。
+
+每次请求按 credential×proxy×模型展开 target 候选并冻结顺序：有会话时按会话对完整 target 做 HRW（Rendezvous）降序排列，保证同会话同模型同资源下顺序稳定、节点增删只做最小扰动；无会话的后台路径使用原子 round-robin 起始偏移，不使用随机。失败后按冻结顺序走下一个，同请求内不重排。
+
+状态分三层：proxy 传输健康只由超时/拒绝等连通性失败改变，HTTP 状态从不直接改变它；HTTP 401 全局冷却该 credential；403/429/5xx 只冷却命中的单个 (credential, proxy, model) target，同 credential 同 proxy 的其他模型不受影响；普通 4xx（含 400/404/422）中性，既不冷却也不清理已有状态；2xx 只清理本 target 与本 credential 的 401 状态。冷却按 `performance.failure_cooldown_seconds` 指数退避（确定性 ±20% 抖动，总封顶 5 分钟），429/403 的 `Retry-After` 取更大值同样封顶 5 分钟。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态遍历，只受 proxy 传输健康影响，从不读写前台 credential/target 状态。
 
 共享单池示例（默认，行为与旧版单代理池一致）：
 
@@ -315,7 +319,7 @@ socks5://127.0.0.1:1080  # 备用代理
 
 | 字段 | 含义 |
 | --- | --- |
-| `retry.max_attempts` | 每个认证 Key Tier 的最大尝试次数，包含第一次请求。Tier 内部遇到网络错误、认证失败、限流或 5xx 会切换节点；其他 4xx 会结束当前 Tier。只要还有另一个可用 Tier，当前 Tier 的最终失败会继续按 `prefer` 顺序回退。anonymous 不使用此上限，而是将每个当前可用 proxy 各尝试一次。 |
+| `retry.max_attempts` | 每个认证 Key Tier 的最大尝试次数，包含第一次请求。Tier 内部遇到网络错误、401/403、限流或 5xx 按冻结的 target 顺序切换；其他 4xx 会结束当前 Tier。只要还有另一个可用 Tier，当前 Tier 的最终失败会继续按 `prefer` 顺序回退。anonymous 不使用此上限，而是将每个当前可用 target 各尝试一次。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
@@ -359,7 +363,7 @@ socks5://127.0.0.1:1080  # 备用代理
 | `performance.max_conns_per_host` | 每个主机的最大并发连接数。`0` 表示不设置上限。 |
 | `performance.idle_conn_timeout_seconds` | 空闲连接在连接池中保留的时间。 |
 | `performance.connect_timeout_seconds` | 与上游或代理建立 TCP 连接的超时时间。 |
-| `performance.failure_cooldown_seconds` | 连接失败、认证失败、限流或 5xx 后节点的基础冷却时间。连续失败会指数增加冷却时间。 |
+| `performance.failure_cooldown_seconds` | credential/target 冷却的基础时间。401 按此对 credential 全局指数退避，403/429/5xx 按此对单个 target 指数退避，均带确定性 ±20% 抖动、总封顶 5 分钟；429/403 的 `Retry-After` 取更大值同样封顶。 |
 
 ### `logging`
 
@@ -385,7 +389,7 @@ WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy；运行�
 
 ### 配置保存与热重载
 
-WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断。
+WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后将旧 Gateway 仍在未来的 credential/target 冷却与 proxy 传输健康按 identity 迁移到新实例（credential 按 tier+key、proxy 按池+URL、target 按完整 identity；新增从零开始、删除即丢弃，剩余时间封顶 5 分钟），再写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断，仍使用旧状态。
 
 keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用切换）、上游、重试、模型、性能、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化为新格式（旧顶层 `proxies` / `proxyfile` 不保留），原有注释不会保留。
 
@@ -396,7 +400,7 @@ keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用
 
 - 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
 - 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成会话 ID。
-- 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致。
+- 没有显式会话标识时，使用第一条用户消息生成稳定会话 ID，使同一段多轮对话保持一致；会话用于对 credential×proxy×模型 target 做 HRW 稳定排序，同会话的各轮落在同一 target，失败时按序回退。
 - 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
 - 上游请求同时发送 `x-session-affinity`、`X-Session-Id` 和可选的 `x-parent-session-id`，以兼容 OpenCode 近期的会话关联要求。
 
