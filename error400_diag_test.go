@@ -323,6 +323,11 @@ func TestError400HistoryWebUICompat(t *testing.T) {
 			t.Fatalf("webui missing %q", needle)
 		}
 	}
+	for _, needle := range []string{"hintLabel", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "分组指纹", "HTTP 400 诊断", "类型 ", "代码 "} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("webui missing localized 400 label %q", needle)
+		}
+	}
 	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"} {
 		if strings.Contains(html, sink) {
 			t.Fatalf("forbidden sink %q", sink)

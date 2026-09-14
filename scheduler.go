@@ -82,6 +82,7 @@ func targetIdentity(tier Tier, credID, pool, proxyRaw, model string) string {
 type credentialEntry struct {
 	failures      uint32
 	cooldownUntil int64 // unix nanos
+	lastStatus    int
 }
 
 type targetEntry struct {
@@ -101,6 +102,7 @@ type targetScheduler struct {
 	credDisplay   map[string]string
 	roundRobin    atomic.Uint64
 	routeSessions *routeSessionStore
+	pins          *sessionPinStore
 }
 
 func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
@@ -113,6 +115,7 @@ func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
 		targetState:   make(map[string]*targetEntry),
 		credDisplay:   make(map[string]string),
 		routeSessions: newRouteSessionStore(),
+		pins:          newSessionPinStore(),
 	}
 }
 
@@ -473,10 +476,46 @@ func (s *targetScheduler) noteCredentialAuthFailure(credID string) credentialCha
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, credID, 0)
 	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.lastStatus = 401
 	return credentialChange{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
 		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
 	}
+}
+
+// credentialCooldownStatus reports an active credential cooldown with its
+// sanitized HTTP status (401; legacy entries without a stored status also
+// report 401). It returns ok=false when no cooldown is active.
+func (s *targetScheduler) credentialCooldownStatus(credID string) (until int64, status int, ok bool) {
+	now := time.Now().UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.credState[credID]
+	if entry == nil || entry.cooldownUntil <= now {
+		return 0, 0, false
+	}
+	status = entry.lastStatus
+	if status == 0 {
+		status = 401
+	}
+	return entry.cooldownUntil, status, true
+}
+
+// targetCooldownStatus reports an active per-target cooldown with its stored
+// sanitized HTTP status. It returns ok=false when no cooldown is active.
+func (s *targetScheduler) targetCooldownStatus(identity string) (until int64, status int, ok bool) {
+	now := time.Now().UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.targetState[identity]
+	if entry == nil || entry.cooldownUntil <= now {
+		return 0, 0, false
+	}
+	status = entry.lastStatus
+	if status == 0 {
+		status = 502
+	}
+	return entry.cooldownUntil, status, true
 }
 
 // noteTargetFailure cools one target identity for 403/429/5xx only.
@@ -1019,4 +1058,264 @@ func credentialDisplayForID(credID string) string {
 		return anonymousCredentialID
 	}
 	return "•••••"
+}
+
+// Session-affinity pin layer: derived client session + model ID binds to one
+// full target identity. In-memory Gateway authority only: no persistence,
+// no log/admin/history projection. Strict process-lifetime semantics: once
+// pinned, a binding never expires and is never evicted during the process
+// lifetime. Memory stays bounded by sessionPinStoreCap entries; at the cap a
+// new unpinned session+model fails closed locally before any upstream send
+// and existing pins keep serving. Restart clears pins (map lives in the
+// Gateway); no disk persistence.
+
+const sessionPinStoreCap = 4096
+
+// sessionPin is the bound target for one derived session + model. It carries
+// the full target identity (tier, internal credential identity, proxy pool,
+// raw proxy identity, model) plus the target protocol and normalized upstream
+// authority needed to validate the pin against the current route/config.
+// Raw client signals, key material, and pin state never leave this struct.
+type sessionPin struct {
+	Tier      Tier
+	CredID    string
+	Pool      string
+	ProxyRaw  string
+	Model     string
+	Protocol  Protocol
+	Authority string
+}
+
+func sessionPinKey(session, model string) string {
+	return session + "\x00" + model
+}
+
+type sessionPinStore struct {
+	mu      sync.Mutex
+	entries map[string]*sessionPin
+	// claimMu guards the bounded in-flight establishment map and the reserved
+	// capacity count. It is never held over network I/O, so pin lookup/bind,
+	// migration, and Apply cannot deadlock against establishment waits.
+	// Lock order when both mutexes are needed is always claimMu -> mu; no
+	// path takes them in the opposite order.
+	claimMu  sync.Mutex
+	inflight map[string]*pinEstablishmentClaim
+	reserved int
+}
+
+// pinEstablishmentClaim is the single-owner gate for one session+model key.
+// done is closed exactly once when the owner releases; followers wait on it
+// without retaining any map state after release. reserved reports whether
+// this owner holds one capacity reservation against sessionPinStoreCap.
+type pinEstablishmentClaim struct {
+	done     chan struct{}
+	reserved bool
+}
+
+func newSessionPinStore() *sessionPinStore {
+	return &sessionPinStore{entries: make(map[string]*sessionPin)}
+}
+
+// pinGet returns a copy of the pinned target for session+model. Pins never
+// expire: lookup is read-only and never mutates or prunes state.
+func (s *targetScheduler) pinGet(session, model string) (sessionPin, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" {
+		return sessionPin{}, false
+	}
+	return s.pins.get(session, model)
+}
+
+func (st *sessionPinStore) get(session, model string) (sessionPin, bool) {
+	if st == nil {
+		return sessionPin{}, false
+	}
+	key := sessionPinKey(session, model)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	entry, ok := st.entries[key]
+	if !ok || entry == nil {
+		return sessionPin{}, false
+	}
+	return *entry, true
+}
+
+// pinBind binds session+model to the successful target on first success.
+// The first pin wins and is never overwritten, never expires, and is never
+// evicted. A new key at the cap is dropped without evicting an existing pin.
+// Callers establishing via pinClaim already hold a capacity reservation, so
+// their bind always has space; the drop path only triggers for unreserved
+// inserts at a full store.
+func (s *targetScheduler) pinBind(session, model string, pin sessionPin) {
+	if s == nil || s.pins == nil || session == "" || model == "" {
+		return
+	}
+	pin.Model = model
+	s.pins.bind(session, model, pin)
+}
+
+func (st *sessionPinStore) bind(session, model string, pin sessionPin) {
+	if st == nil {
+		return
+	}
+	key := sessionPinKey(session, model)
+	if pin.Model == "" {
+		pin.Model = model
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if existing, ok := st.entries[key]; ok && existing != nil {
+		return
+	}
+	if len(st.entries) >= sessionPinStoreCap {
+		return
+	}
+	if st.entries == nil {
+		st.entries = make(map[string]*sessionPin)
+	}
+	fresh := pin
+	st.entries[key] = &fresh
+}
+
+func (st *sessionPinStore) count() int {
+	if st == nil {
+		return 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return len(st.entries)
+}
+
+// pinClaim attempts to become the establishment owner for session+model.
+// It returns the live claim and owned=true for the single owner, or the
+// owner's claim and owned=false for a follower. The third return reports
+// capacity: false means the store plus reservations are at the cap and a new
+// unpinned session+model must fail closed before any send. Different keys
+// never block each other except through the shared cap. Empty session/model
+// never coordinates: callers treat a nil claim with owned=true and ok=true
+// as an immediate unguarded owner. A nil claim with owned=false and ok=true
+// means the pin appeared concurrently: the caller must re-check pinGet.
+func (s *targetScheduler) pinClaim(session, model string) (*pinEstablishmentClaim, bool, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" {
+		return nil, true, true
+	}
+	return s.pins.claim(session, model)
+}
+
+func (st *sessionPinStore) claim(session, model string) (*pinEstablishmentClaim, bool, bool) {
+	if st == nil {
+		return nil, true, true
+	}
+	key := sessionPinKey(session, model)
+	st.claimMu.Lock()
+	defer st.claimMu.Unlock()
+	if st.inflight == nil {
+		st.inflight = make(map[string]*pinEstablishmentClaim)
+	}
+	if existing, ok := st.inflight[key]; ok && existing != nil {
+		return existing, false, true
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if _, ok := st.entries[key]; ok {
+		return nil, false, true
+	}
+	if len(st.entries)+st.reserved >= sessionPinStoreCap {
+		return nil, false, false
+	}
+	claim := &pinEstablishmentClaim{done: make(chan struct{}), reserved: true}
+	st.inflight[key] = claim
+	st.reserved++
+	return claim, true, true
+}
+
+// pinRelease removes the claim and notifies followers. It runs on every
+// owner return path via defer, so it is panic-safe and never retains waiter
+// state: the map entry is deleted and only the closed channel remains
+// briefly in follower locals. A reserved owner releases its capacity slot:
+// on success the slot is consumed by the new pin entry (entries grew by one
+// while reserved shrinks by one, net unchanged); on failure without a pin
+// the slot is freed so a later request can retry establishment.
+func (s *targetScheduler) pinRelease(session, model string, claim *pinEstablishmentClaim) {
+	if s == nil || s.pins == nil || claim == nil || session == "" || model == "" {
+		return
+	}
+	s.pins.release(session, model, claim)
+}
+
+func (st *sessionPinStore) release(session, model string, claim *pinEstablishmentClaim) {
+	if st == nil || claim == nil {
+		return
+	}
+	key := sessionPinKey(session, model)
+	st.claimMu.Lock()
+	defer st.claimMu.Unlock()
+	if stored, ok := st.inflight[key]; ok && stored == claim {
+		delete(st.inflight, key)
+		if stored.reserved {
+			st.reserved--
+			if st.reserved < 0 {
+				st.reserved = 0
+			}
+		}
+		close(stored.done)
+	}
+}
+
+func (st *sessionPinStore) inflightCount() int {
+	if st == nil {
+		return 0
+	}
+	st.claimMu.Lock()
+	defer st.claimMu.Unlock()
+	return len(st.inflight)
+}
+
+func (st *sessionPinStore) reservedCount() int {
+	if st == nil {
+		return 0
+	}
+	st.claimMu.Lock()
+	defer st.claimMu.Unlock()
+	return st.reserved
+}
+
+// migratePinsFrom carries all existing pin identities up to the cap without
+// validity filtering. Removed or changed targets migrate as unresolved
+// tombstone-like bindings: the pinned resolver still matches them and fails
+// locally with 502 rather than re-establishing or falling back. Insertion is
+// deterministic key order and stops at the cap without evicting. Restart
+// remains the only clearing boundary (fresh store starts empty).
+func (st *sessionPinStore) migratePinsFrom(old *sessionPinStore) int {
+	if st == nil || old == nil || st == old {
+		return 0
+	}
+	old.mu.Lock()
+	type copied struct {
+		key   string
+		entry sessionPin
+	}
+	staged := make([]copied, 0, len(old.entries))
+	for key, entry := range old.entries {
+		if entry == nil {
+			continue
+		}
+		staged = append(staged, copied{key: key, entry: *entry})
+	}
+	old.mu.Unlock()
+	sort.Slice(staged, func(i, j int) bool { return staged[i].key < staged[j].key })
+	migrated := 0
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, item := range staged {
+		if _, ok := st.entries[item.key]; ok {
+			continue
+		}
+		if len(st.entries) >= sessionPinStoreCap {
+			break
+		}
+		fresh := item.entry
+		st.entries[item.key] = &fresh
+		migrated++
+	}
+	return migrated
 }

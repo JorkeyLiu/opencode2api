@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +20,12 @@ type stubRoundTripper struct {
 }
 
 func (s *stubRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	// Probe-aware: async neutral proxy health checks (GET) must never count
+	// as upstream sends nor consume stub sequencing. Only POSTs are real
+	// inference sends; GETs return 200 without invoking the stub fn.
+	if r.Method == http.MethodGet {
+		return responseWithBody(200, `{}`), nil
+	}
 	s.calls.Add(1)
 	return s.fn(r)
 }
@@ -423,6 +430,330 @@ func TestAuth400ReplayNon400DoesNotFallback(t *testing.T) {
 	if attempts != 2 {
 		t.Fatalf("attempts=%d want 2", attempts)
 	}
+}
+
+// Auth unbound 400 replay with 429/transport is likewise final: exactly one
+// same-target replay, no transient retry, no later candidate, no Go fallback.
+func TestAuth400Replay429AndTransportUnboundIsFinal(t *testing.T) {
+	t.Run("replay429", func(t *testing.T) {
+		monitor := NewMonitor()
+		gateway := routing400Gateway(t, monitor)
+		calls := 0
+		zen := stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return responseWithBody(400, `{"error":"bad"}`), nil
+			}
+			return responseWithBody(429, `{"error":"throttled"}`), nil
+		})
+		goStub := stubProxy(t, gateway, "g", 0, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+		resp, _, attempts, err := gateway.doUpstreamTiers(ctx, authOnlyRoute(), routeBodies(), clientSessionIDs("ses_client_auth_429"), 0)
+		if err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		if resp == nil || resp.StatusCode != 429 {
+			t.Fatalf("status=%v want replay 429 as final", resp)
+		}
+		drainAndClose(resp.Body)
+		if zen.count() != 2 || goStub.count() != 0 {
+			t.Fatalf("replay 429 must not fallback: zen=%d go=%d", zen.count(), goStub.count())
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts=%d want 2", attempts)
+		}
+		if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
+			t.Fatalf("recorded=%d want 2", got)
+		}
+	})
+	t.Run("replayTransport", func(t *testing.T) {
+		monitor := NewMonitor()
+		gateway := routing400Gateway(t, monitor)
+		calls := 0
+		zen := stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return responseWithBody(400, `{"error":"bad"}`), nil
+			}
+			return nil, errors.New("dial timeout")
+		})
+		goStub := stubProxy(t, gateway, "g", 0, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+		resp, _, attempts, err := gateway.doUpstreamTiers(ctx, authOnlyRoute(), routeBodies(), clientSessionIDs("ses_client_auth_trans"), 0)
+		if err == nil {
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			t.Fatalf("replay transport must return error, got resp=%v", resp)
+		}
+		if zen.count() != 2 || goStub.count() != 0 {
+			t.Fatalf("replay transport must not fallback: zen=%d go=%d", zen.count(), goStub.count())
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts=%d want 2", attempts)
+		}
+		if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
+			t.Fatalf("recorded=%d want 2", got)
+		}
+	})
+}
+
+// Anonymous unbound 400 replay with 500/429/transport is final for the whole
+// route: exactly 2 POSTs on one anon proxy, no other proxy, no auth tiers.
+func TestAnonymous400ReplayNon400UnboundIsFinal(t *testing.T) {
+	cases := []struct {
+		name      string
+		replay    func() (*http.Response, error)
+		wantCheck func(t *testing.T, resp *http.Response, err error)
+	}{
+		{name: "replay500", replay: func() (*http.Response, error) { return responseWithBody(500, `{"error":"boom"}`), nil }, wantCheck: func(t *testing.T, resp *http.Response, err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if resp == nil || resp.StatusCode != 500 {
+				t.Fatalf("status=%v want replay 500", resp)
+			}
+		}},
+		{name: "replay429", replay: func() (*http.Response, error) { return responseWithBody(429, `{"error":"throttled"}`), nil }, wantCheck: func(t *testing.T, resp *http.Response, err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("err=%v", err)
+			}
+			if resp == nil || resp.StatusCode != 429 {
+				t.Fatalf("status=%v want replay 429", resp)
+			}
+		}},
+		{name: "replayTransport", replay: func() (*http.Response, error) { return nil, errors.New("dial timeout") }, wantCheck: func(t *testing.T, resp *http.Response, err error) {
+			t.Helper()
+			if err == nil {
+				if resp != nil {
+					drainAndClose(resp.Body)
+				}
+				t.Fatalf("replay transport must return error, got resp=%v", resp)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			monitor := NewMonitor()
+			gateway := routing400Gateway(t, monitor)
+			var calls atomic.Int32
+			anonFn := func(*http.Request) (*http.Response, error) {
+				if calls.Add(1) == 1 {
+					return responseWithBody(400, `{"error":"bad"}`), nil
+				}
+				return tc.replay()
+			}
+			anon0 := stubProxy(t, gateway, "a", 0, anonFn)
+			anon1 := stubProxy(t, gateway, "a", 1, anonFn)
+			zen := stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			goStub := stubProxy(t, gateway, "g", 0, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+			resp, _, attempts, err := gateway.doUpstreamTiers(ctx, anonAuthRoute(), routeBodies(), clientSessionIDs("ses_client_anon_replay_"+tc.name), 0)
+			tc.wantCheck(t, resp, err)
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			if total := anon0.count() + anon1.count(); total != 2 || (anon0.count() != 2 && anon1.count() != 2) {
+				t.Fatalf("anon calls=%d/%d want 2 on one proxy", anon0.count(), anon1.count())
+			}
+			if zen.count() != 0 || goStub.count() != 0 {
+				t.Fatalf("replay must not enter auth: zen=%d go=%d", zen.count(), goStub.count())
+			}
+			if attempts != 2 {
+				t.Fatalf("attempts=%d want 2", attempts)
+			}
+			if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
+				t.Fatalf("recorded=%d want 2", got)
+			}
+		})
+	}
+}
+
+// Pinned 400 replay stays final on the pinned target only: exactly 2 pinned
+// POSTs, no other proxy, no tier fallback. Covers auth and anonymous pins
+// with 500/429/transport replay outcomes.
+func TestPinned400ReplayNon400IsFinal(t *testing.T) {
+	establishAnonPin := func(t *testing.T, gateway *Gateway, session string) sessionPin {
+		t.Helper()
+		stubProxy(t, gateway, "a", 0, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		stubProxy(t, gateway, "a", 1, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+		resp, _, _, err := gateway.doUpstreamTiers(ctx, anonAuthRoute(), routeBodies(), requestIDs{Session: session, Request: "req-pin-estab", Project: "prj-test"}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainAndClose(resp.Body)
+		pin, ok := gateway.scheduler.pinGet(session, "m")
+		if !ok {
+			t.Fatalf("must pin anon success")
+		}
+		return pin
+	}
+	establishAuthPin := func(t *testing.T, gateway *Gateway, session string) sessionPin {
+		t.Helper()
+		stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+		route := authOnlyRoute()
+		route.KeyTiers = []Tier{TierZen}
+		resp, _, _, err := gateway.doUpstreamTiers(ctx, route, routeBodies(), requestIDs{Session: session, Request: "req-pin-estab", Project: "prj-test"}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainAndClose(resp.Body)
+		pin, ok := gateway.scheduler.pinGet(session, "m")
+		if !ok {
+			t.Fatalf("must pin auth success")
+		}
+		return pin
+	}
+	t.Run("pinnedAuth", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			replay func() (*http.Response, error)
+		}{
+			{"replay500", func() (*http.Response, error) { return responseWithBody(500, `{"error":"boom"}`), nil }},
+			{"replay429", func() (*http.Response, error) { return responseWithBody(429, `{"error":"throttled"}`), nil }},
+			{"replayTransport", func() (*http.Response, error) { return nil, errors.New("dial timeout") }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				monitor := NewMonitor()
+				gateway := routing400Gateway(t, monitor)
+				session := "ses_pin_auth_replay_" + tc.name
+				_ = establishAuthPin(t, gateway, session)
+				var calls atomic.Int32
+				zen := stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+					if calls.Add(1) == 1 {
+						return responseWithBody(400, `{"error":"bad"}`), nil
+					}
+					return tc.replay()
+				})
+				goStub := stubProxy(t, gateway, "g", 0, func(*http.Request) (*http.Response, error) {
+					return responseWithBody(200, `{"ok":true}`), nil
+				})
+				ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+				route := authOnlyRoute()
+				route.KeyTiers = []Tier{TierZen}
+				resp, _, attempts, err := gateway.doUpstreamTiers(ctx, route, routeBodies(), requestIDs{Session: session, Request: "req-pin-replay", Project: "prj-test"}, 0)
+				if tc.name == "replayTransport" {
+					if err == nil {
+						if resp != nil {
+							drainAndClose(resp.Body)
+						}
+						t.Fatalf("pinned replay transport must return error")
+					}
+				} else {
+					want := 500
+					if tc.name == "replay429" {
+						want = 429
+					}
+					if err != nil {
+						t.Fatalf("err=%v", err)
+					}
+					if resp == nil || resp.StatusCode != want {
+						t.Fatalf("status=%v want pinned replay %d", resp, want)
+					}
+					drainAndClose(resp.Body)
+				}
+				if zen.count() != 2 || goStub.count() != 0 {
+					t.Fatalf("pinned replay must stay same-target: zen=%d go=%d", zen.count(), goStub.count())
+				}
+				if attempts != 2 {
+					t.Fatalf("attempts=%d want 2", attempts)
+				}
+			})
+		}
+	})
+	t.Run("pinnedAnon", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			replay func() (*http.Response, error)
+		}{
+			{"replay500", func() (*http.Response, error) { return responseWithBody(500, `{"error":"boom"}`), nil }},
+			{"replay429", func() (*http.Response, error) { return responseWithBody(429, `{"error":"throttled"}`), nil }},
+			{"replayTransport", func() (*http.Response, error) { return nil, errors.New("dial timeout") }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				monitor := NewMonitor()
+				gateway := routing400Gateway(t, monitor)
+				session := "ses_pin_anon_replay_" + tc.name
+				pin := establishAnonPin(t, gateway, session)
+				pool := gateway.pools["a"]
+				pinnedIdx := -1
+				for i, proxy := range pool.items {
+					if proxy != nil && proxy.name == pin.ProxyRaw {
+						pinnedIdx = i
+					}
+				}
+				if pinnedIdx < 0 {
+					t.Fatalf("pinned proxy not found: %+v", pin)
+				}
+				otherIdx := 1 - pinnedIdx
+				var calls atomic.Int32
+				pinned := stubProxy(t, gateway, "a", pinnedIdx, func(*http.Request) (*http.Response, error) {
+					if calls.Add(1) == 1 {
+						return responseWithBody(400, `{"error":"bad"}`), nil
+					}
+					return tc.replay()
+				})
+				other := stubProxy(t, gateway, "a", otherIdx, func(*http.Request) (*http.Response, error) {
+					return responseWithBody(200, `{"ok":true}`), nil
+				})
+				zen := stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+					return responseWithBody(200, `{"ok":true}`), nil
+				})
+				goStub := stubProxy(t, gateway, "g", 0, func(*http.Request) (*http.Response, error) {
+					return responseWithBody(200, `{"ok":true}`), nil
+				})
+				ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+				resp, _, attempts, err := gateway.doUpstreamTiers(ctx, anonAuthRoute(), routeBodies(), requestIDs{Session: session, Request: "req-pin-replay", Project: "prj-test"}, 0)
+				if tc.name == "replayTransport" {
+					if err == nil {
+						if resp != nil {
+							drainAndClose(resp.Body)
+						}
+						t.Fatalf("pinned anon replay transport must return error")
+					}
+				} else {
+					want := 500
+					if tc.name == "replay429" {
+						want = 429
+					}
+					if err != nil {
+						t.Fatalf("err=%v", err)
+					}
+					if resp == nil || resp.StatusCode != want {
+						t.Fatalf("status=%v want pinned anon replay %d", resp, want)
+					}
+					drainAndClose(resp.Body)
+				}
+				if pinned.count() != 2 || other.count() != 0 {
+					t.Fatalf("pinned anon replay must stay same-target: pinned=%d other=%d", pinned.count(), other.count())
+				}
+				if zen.count() != 0 || goStub.count() != 0 {
+					t.Fatalf("pinned anon replay must not enter auth: zen=%d go=%d", zen.count(), goStub.count())
+				}
+				if attempts != 2 {
+					t.Fatalf("attempts=%d want 2", attempts)
+				}
+			})
+		}
+	})
 }
 
 // The next client request with the same client session reuses the rotated

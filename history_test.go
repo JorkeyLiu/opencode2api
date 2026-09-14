@@ -488,63 +488,153 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(data)
+	// Dependency-free text-node rendering still holds.
 	for _, needle := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"} {
 		if strings.Contains(html, needle) {
 			t.Fatalf("forbidden DOM sink %q", needle)
 		}
 	}
-	for _, id := range []string{"h-range", "tbody-hist", "hist-more", "facts-history", "c-hist-enabled", "c-hist-retention", "c-hist-max", "hist-channel"} {
+	// New IA: four tabs only.
+	for _, tab := range []string{`data-tab="realtime"`, `data-tab="usage"`, `data-tab="health"`, `data-tab="config"`} {
+		if !strings.Contains(html, tab) {
+			t.Fatalf("missing new IA tab %q", tab)
+		}
+	}
+	for _, label := range []string{"实时请求", "使用统计", "健康诊断", ">配置<"} {
+		if !strings.Contains(html, label) {
+			t.Fatalf("missing new IA label %q", label)
+		}
+	}
+	for _, stale := range []string{"历史与趋势", "资源/关联", "配置与诊断"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("stale IA label must be removed: %q", stale)
+		}
+	}
+	// Required element IDs across the four tabs.
+	for _, id := range []string{"h-range", "tbody-hist", "hist-more", "facts-history", "c-hist-enabled", "c-hist-retention", "c-hist-max", "hist-proxy", "f-proxy", "tbody-attempts", "h-kpis", "trend-req", "trend-tok", "tbody-usage-model", "tbody-usage-tier", "facts-readiness", "tbody-proxies", "tbody-keys", "tbody-targets", "targets-note", "facts-catalog", "log-list", "c-web-enabled", "pools-editor"} {
 		if !strings.Contains(html, id) {
 			t.Fatalf("missing webui id %q", id)
 		}
 	}
-	if !strings.Contains(html, "/api/history/requests") || !strings.Contains(html, "/api/history/series") {
-		t.Fatal("missing history API wiring")
+	if !strings.Contains(html, "/api/history/requests") || !strings.Contains(html, "/api/history/series") || !strings.Contains(html, "/api/history/attempts") {
+		t.Fatal("missing history API wiring (requests/series/attempts)")
 	}
-	// History expand must issue exactly one attempt fetch mounted to the
-	// current DOM detail row; no duplicate call on the click path.
-	if n := strings.Count(html, "loadHistAttempts("); n != 2 {
-		t.Fatalf("loadHistAttempts call sites=%d want 2 (def + single detail-row invoke)", n)
+	// No expandable rows: no per-row attempt fetch, no expand state.
+	if strings.Contains(html, "loadHistAttempts(") {
+		t.Fatal("flat attempt rows must not fetch attempts on expand")
 	}
-	if strings.Contains(html, "renderPersistedRows(); if(S.histExpanded)loadHistAttempts") {
-		t.Fatal("duplicate attempt fetch on click path")
-	}
-	if !strings.Contains(html, "renderHistChannelFilter") {
-		t.Fatal("missing hist-channel population")
-	}
-	for _, ch := range []string{"anonymous", "not_routed"} {
-		if !strings.Contains(html, ch) {
-			t.Fatalf("hist-channel missing %q", ch)
+	for _, stale := range []string{"expandedRequest", "histExpanded", "renderHistChannelFilter", "hist-channel"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("expandable/channel state must be removed: %q", stale)
 		}
 	}
-	// zen/go are tiers, never channels: the staged channel seed must not
-	// contain them.
-	if strings.Contains(html, `"zen","go"`) || strings.Contains(html, `"zen", "go"`) || strings.Contains(html, `"not_routed","zen"`) {
-		t.Fatal("hist-channel must not seed zen/go tiers")
+	// Removed columns: channel, cache-miss, session column (hash stays searchable only).
+	for _, stale := range []string{"<th>通道</th>", "全部通道", "<th>缓存未命中</th>", "cache_miss_tokens", "<th>客户端会话hash</th>", "<th>会话</th>"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("removed column must stay removed: %q", stale)
+		}
 	}
-	if !strings.Contains(html, "channel=") {
-		t.Fatal("history query must carry channel")
+	// Flat attempt rows with Request ID copy + search over request and session.
+	if !strings.Contains(html, "attempt-row") {
+		t.Fatal("missing flat attempt-row rendering")
 	}
-	// Realtime cap copy unified to 200.
-	if !strings.Contains(html, "最多 200 条展示") {
-		t.Fatal("realtime cap must read 200")
+	if !strings.Contains(html, "<th>Request ID</th>") || !strings.Contains(html, "<th>代理</th>") {
+		t.Fatal("flat rows must carry compact Request ID and 代理 columns")
 	}
-	if strings.Contains(html, "最多 500 条展示") {
-		t.Fatal("stale 500 cap copy must be removed")
+	if !strings.Contains(html, "<th>上游</th>") || !strings.Contains(html, "<th>密钥</th>") {
+		t.Fatal("flat rows must carry localized 上游 and 密钥 columns")
 	}
-	// History model input states exact full-ID matching.
-	if !strings.Contains(html, "完整模型 ID 精确过滤") {
-		t.Fatal("history model input must state exact full-ID filtering")
+	if !strings.Contains(html, "复制") {
+		t.Fatal("rows must offer direct Request ID copy")
 	}
-	// 24h/7d series must aggregate into bounded buckets, not slice(-120).
-	if !strings.Contains(html, "aggregatePersistedSeries") {
-		t.Fatal("missing bounded bucket aggregation helper")
+	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
+		t.Fatal("search must match both Request ID and client session hash")
+	}
+	// Token attribution: usage_reported gating, never estimated.
+	if !strings.Contains(html, "usage_reported") || !strings.Contains(html, "不估算") {
+		t.Fatal("missing usage_reported token attribution")
+	}
+	if !strings.Contains(html, "最终") {
+		t.Fatal("tokens must be scoped to the final request-result row")
+	}
+	if strings.Count(html, "emptyRow(tb,14") < 2 {
+		t.Fatal("realtime and persisted flat tables must cover 14 columns")
+	}
+	// F1: hidden WebUI enabled preserves backend via safe preservedEnabled; submit must not dereference null S.config.
+	if !strings.Contains(html, "hidden-enabled-preserved") {
+		t.Fatal("hidden enabled control must preserve the backend value")
+	}
+	if !strings.Contains(html, "preservedEnabled") || !strings.Contains(html, "webui:{enabled:preservedEnabled") {
+		t.Fatal("config submit must use safe preservedEnabled for webui.enabled")
+	}
+	if strings.Contains(html, "webui:{enabled:S.config.webui.enabled") {
+		t.Fatal("config submit must not dereference S.config.webui.enabled directly")
+	}
+	if strings.Contains(html, "username:S.config.webui.username") {
+		t.Fatal("config submit must not dereference null S.config.webui.username")
+	}
+	// F2: lifetime dimensional calls are window-only, never invented (localized).
+	if !strings.Contains(html, "维度调用数仅最近一小时") {
+		t.Fatal("lifetime dimensional calls must be captioned window-only")
+	}
+	if !strings.Contains(html, "进程累计显示") && !strings.Contains(html, "进程累计不估算") {
+		t.Fatal("lifetime calls must display as unknown without estimation")
+	}
+	if !strings.Contains(html, "var isLife=scopeLifetime()") {
+		t.Fatal("usage tables must branch on lifetime scope")
+	}
+	if strings.Contains(html, "var calls=(scopeLifetime") {
+		t.Fatal("usage tables must not pair lifetime totals with stale call cache")
+	}
+	// F3: realtime proxy filter preserves selection even when temporarily absent.
+	if strings.Count(html, "if(cur)seen[cur]=1") < 2 {
+		t.Fatal("realtime and history proxy filters must preserve selection")
+	}
+	// F4: strict final usage equality for old history records.
+	if !strings.Contains(html, "req.attempts!==undefined&&a.attempt!==undefined&&req.attempts===a.attempt") {
+		t.Fatal("history final usage must require both counts known and equal")
+	}
+	if !strings.Contains(html, "if(req.attempts===undefined||attempt.attempt===undefined)return null") {
+		t.Fatal("realtime final usage must require both counts known and equal")
+	}
+	if strings.Contains(html, "(req.attempts===undefined||req.attempts===a.attempt)") {
+		t.Fatal("loose final usage equality must be removed")
+	}
+	// F5: server-side proxy_pool, coherent reset/join, bounded state.
+	if strings.Count(html, "&proxy_pool=") < 2 {
+		t.Fatal("history requests+attempts must use server-side proxy_pool query")
+	}
+	if !strings.Contains(html, "poolSel") || !strings.Contains(html, "pxSel.split") {
+		t.Fatal("history proxy_pool must derive from selected proxy filter")
+	}
+	if !strings.Contains(html, `S.histCursor=""; S.histAttCursor=""`) {
+		t.Fatal("history cursors must reset coherently on filter change")
+	}
+	if !strings.Contains(html, "S.histItems.length>500") || !strings.Contains(html, "S.histAttempts.length>500") {
+		t.Fatal("history client state must stay bounded across pages")
+	}
+	if !strings.Contains(html, "reqById") {
+		t.Fatal("history rows must join requests/attempts across loaded pages")
+	}
+	// F6: persisted history flat table has its own scroll bound outside realtime.
+	if !strings.Contains(html, `<div class="table-wrap scroll-bound"><table class="table" id="tbl-hist"`) {
+		t.Fatal("persisted history flat table must carry scroll-bound")
+	}
+	// Checkbox-label spacing and scroll bounds.
+	if !strings.Contains(html, ".check-label input") {
+		t.Fatal("missing checkbox-label alignment rule")
+	}
+	if !strings.Contains(html, "scroll-bound") {
+		t.Fatal("missing bounded internal scroll")
+	}
+	// Charts, KPIs, caps, filters.
+	for _, needle := range []string{"缓存命中率", "P50", "trend-cap", "aggregatePersistedSeries", "完整模型 ID 精确过滤", "最多展示 200"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing usage/chart label %q", needle)
+		}
 	}
 	if strings.Contains(html, ").slice(-120)") {
 		t.Fatal("series must not silently slice(-120) without aggregation")
-	}
-	if !strings.Contains(html, "trend-cap") {
-		t.Fatal("missing dynamic trend caption")
 	}
 	// renderTrends must not clear persistent trend DOM when range != 1h:
 	// the non-1h guard must precede any clear, 1h path clears+redraws
@@ -553,9 +643,9 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if rt < 0 {
 		t.Fatal("missing renderTrends")
 	}
-	rtEnd := strings.Index(html[rt:], "function renderDists()")
+	rtEnd := strings.Index(html[rt:], "function renderHealth()")
 	if rtEnd < 0 {
-		t.Fatal("missing renderDists boundary")
+		t.Fatal("missing renderHealth boundary")
 	}
 	body := html[rt : rt+rtEnd]
 	guard := strings.Index(body, `if(S.historyRange!=="1h")return;`)
@@ -594,7 +684,7 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		t.Fatal("missing SSE failure counter")
 	}
 	// Per-page history gap must accumulate into hist-count.
-	if !strings.Contains(html, "histGap") {
+	if !strings.Contains(html, "S.histGap") {
 		t.Fatal("missing per-page history gap accumulation")
 	}
 	if !strings.Contains(html, "hist-count") {
@@ -604,8 +694,41 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "pool-badge") {
 		t.Fatal("missing pool active/staged badge")
 	}
-	if !strings.Contains(html, "暂存配置，不运行、不可探测、不计容量") {
+	if !strings.Contains(html, "暂存：不运行") {
 		t.Fatal("missing staged pool copy")
+	}
+	// Config tab stays configuration-focused: no playground/access/usage/model/account blocks.
+	for _, stale := range []string{"play-model", "access-base", "tbody-models", "facts-usage", "account-form", "tbody-res-proxy", "tbody-pairs"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("config/health split must remove %q from the bundle", stale)
+		}
+	}
+	// Localization: key Chinese labels present. Replay uses 重放; genuine fallback uses 回退.
+	for _, needle := range []string{"运行时长", "活跃请求", "活跃流", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>重放</th>", "匿名", "凭证", "目标", "元数据", "尝试", "重放", "已重放", "无重放", "HTTP 400 同目标重放一次", "回退", "回退请求行", "失败回退", "请求级回退行", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "活跃目标冷却", "匿名目标汇总", "凭证状态", "代理健康", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "HTTP 400 诊断", "单次尝试一行", "最多展示 200", "WebUI 是否启用", "未知（", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "分组指纹", "类型 ", "代码 ", "调试", "信息", "警告", "错误", "小时", "分钟", "秒", "毫秒"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing localized label %q", needle)
+		}
+	}
+	// Localization: required proper-case technical terms preserved.
+	for _, needle := range []string{"Request ID", "HTTP", "API", "WebUI", "CSRF", "SSE", "Responses", "Anthropic", "Zen", "Go", "JSON", "NDJSON", "URL", "IP", "SOCKS5", "HRW", "P50", "Token", "Chat Completions", "protoLabel"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing proper-case term %q", needle)
+		}
+	}
+	// Localization: stale visible English/raw headers and mixed phrases must be gone (static text only).
+	for _, stale := range []string{"<th>Tier</th>", "<th>Proxy</th>", "<th>Key</th>", "<th>pool</th>", "<th>index</th>", "<th>anonymous</th>", "<th>routing</th>", "<th>credential</th>", ">uptime <", ">active <", ">streams <", "Max Idle", "Max Conns", "Idle Timeout", "Connect Timeout", "Failure Cooldown", "Ring Size", "proxyfile（", "pool 名", "Key Tier", "Proxy 健康", "Metadata 快照", "Attempt 资源统计", "last_hour 窗口", "pool: ", "删除 pool", ">debug<", ">info<", ">warn<", ">error<", "dropped / gap", "\"last_error\"", "memory-only", "flat attempt-row", "UpstreamAttempt", ">anonymous<", "usage_reported=false", "route_session_replay=", "<th>回退</th>", "已回退", "无回退", "同目标回退", "后端保留值", "表单隐藏", `return c||"核心"`, `return e||"—"`} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("stale visible string must be localized: %q", stale)
+		}
+	}
+	// Localization: centralized display mapping helpers cover known values.
+	for _, needle := range []string{"function protoLabel", "function tierLabel", "function failureLabel", "function hintLabel", "function logLevelLabel", "function logComponentLabel", "function logEventLabel", "function cacheSourceLabel", "function refreshScopeLabel", "function scopeLabel", "function rangeLabel", "function replayLabel", "function routingRefsLabel", "function restartFieldLabel", "function tierLabel", "上下文长度", "陈旧响应引用", "会话被拒绝", "最近一小时", "进程累计", "实时拉取", "磁盘缓存", "传输失败", "认证失败", "限流", "上游失败", "客户端拒绝", "已更新", "未更新"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing mapping helper/label %q", needle)
+		}
+	}
+	if !strings.Contains(html, "tierLabel(") || !strings.Contains(html, "protoLabel(") || !strings.Contains(html, "failureLabel(") || !strings.Contains(html, "hintLabel(") {
+		t.Fatal("tables must use centralized protocol/tier/failure/hint mapping helpers")
 	}
 }
 

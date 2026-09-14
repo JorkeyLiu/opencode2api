@@ -240,7 +240,7 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 		next.gateway.catalog.CopyState(current.gateway.catalog)
 		summary := migrateGatewaySchedulerState(current.gateway, next.gateway)
 		m.logger.Info("scheduler state migrated", "component", "scheduler", "event", "scheduler_state_migrated",
-			"credentials", summary.Credentials, "targets", summary.Targets, "proxies", summary.Proxies)
+			"credentials", summary.Credentials, "targets", summary.Targets, "proxies", summary.Proxies, "pins", summary.Pins)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -346,6 +346,7 @@ type gatewayMigrationSummary struct {
 	Credentials int
 	Targets     int
 	Proxies     int
+	Pins        int
 }
 
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
@@ -355,8 +356,11 @@ type gatewayMigrationSummary struct {
 // by target scope (client dimension excluded from validity). Only still-future
 // cooldowns and still-fresh route overrides migrate (remaining capped at 5
 // minutes for cooldowns, idle TTL for sessions); new resources start at
-// zero/stateless state and removed identities are dropped. Checking flags
-// never migrate. Route-session overrides are in-memory authority (not a
+// zero/stateless state and removed identities are dropped. Session-affinity
+// pins migrate without validity filtering up to the pin cap as
+// tombstone-like bindings: removed/changed targets still resolve to the
+// pinned path and fail locally with 502. Checking flags never migrate.
+// Route-session overrides and pins are in-memory authority (not a
 // projection): they never persist across restarts and never enter logs,
 // metrics, history, or admin output. In-flight requests keep using the old
 // Gateway and its state.
@@ -449,6 +453,9 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 			}
 		}
 		newGateway.scheduler.routeSessions.migrateRouteSessionsFrom(oldGateway.scheduler.routeSessions, validScope)
+	}
+	if oldGateway.scheduler.pins != nil && newGateway.scheduler.pins != nil {
+		summary.Pins = newGateway.scheduler.pins.migratePinsFrom(oldGateway.scheduler.pins)
 	}
 	return summary
 }
