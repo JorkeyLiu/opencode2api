@@ -80,6 +80,19 @@ func stableID(prefix, value string) string {
 	return prefix + "_" + hex.EncodeToString(sum[:12])
 }
 
+// clientSessionHash is the bounded, privacy-safe diagnostic correlator for
+// the internally derived client session (ids.Session). It is domain-separated
+// (csh namespace, disjoint from ses_/rss_) and derived only from ids.Session,
+// never from raw client signals, bodies, or secrets. The output makes clear
+// it is a hash, not the raw session; empty input stays empty so missing
+// sessions are omitted from diagnostics.
+func clientSessionHash(session string) string {
+	if session == "" {
+		return ""
+	}
+	return stableID("csh", session)
+}
+
 func randomID(prefix string, size int) string {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {

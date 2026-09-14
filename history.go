@@ -77,46 +77,66 @@ type historyEnvelope struct {
 }
 
 // historyRequestLine carries the safe subset of UpstreamRequest.
+// Per-request cache fields are additive schema v1: UsageReported false means
+// unknown (old lines decode the same way); hit/miss follow the shared
+// cacheHitMiss semantics (miss bundles cache-write plus ordinary uncached).
 type historyRequestLine struct {
-	V          int    `json:"v"`
-	Kind       string `json:"kind"`
-	Time       string `json:"time"`
-	RequestID  string `json:"request_id"`
-	Model      string `json:"model"`
-	Tier       string `json:"tier,omitempty"`
-	KeyID      string `json:"key_id,omitempty"`
-	Channel    string `json:"channel"`
-	Anonymous  bool   `json:"anonymous"`
-	ProxyPool  string `json:"proxy_pool,omitempty"`
-	ProxyNode  string `json:"proxy_node,omitempty"`
-	Attempts   int    `json:"attempts"`
-	Status     int    `json:"status"`
-	DurationMS int64  `json:"duration_ms"`
-	Success    bool   `json:"success"`
-	Outcome    string `json:"outcome,omitempty"`
+	V                 int    `json:"v"`
+	Kind              string `json:"kind"`
+	Time              string `json:"time"`
+	RequestID         string `json:"request_id"`
+	Model             string `json:"model"`
+	Tier              string `json:"tier,omitempty"`
+	Protocol          string `json:"protocol,omitempty"`
+	ClientSessionHash string `json:"client_session_hash,omitempty"`
+	KeyID             string `json:"key_id,omitempty"`
+	Channel           string `json:"channel"`
+	Anonymous         bool   `json:"anonymous"`
+	ProxyPool         string `json:"proxy_pool,omitempty"`
+	ProxyNode         string `json:"proxy_node,omitempty"`
+	Attempts          int    `json:"attempts"`
+	Status            int    `json:"status"`
+	DurationMS        int64  `json:"duration_ms"`
+	Success           bool   `json:"success"`
+	Outcome           string `json:"outcome,omitempty"`
+	UsageReported     bool   `json:"usage_reported,omitempty"`
+	InputTokens       int    `json:"input_tokens,omitempty"`
+	OutputTokens      int    `json:"output_tokens,omitempty"`
+	CacheHitTokens    int    `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens   int    `json:"cache_miss_tokens,omitempty"`
 }
 
 // historyAttemptLine carries the safe subset of UpstreamAttempt.
 type historyAttemptLine struct {
-	V            int    `json:"v"`
-	Kind         string `json:"kind"`
-	Time         string `json:"time"`
-	RequestID    string `json:"request_id"`
-	Model        string `json:"model"`
-	Tier         string `json:"tier,omitempty"`
-	Attempt      int    `json:"attempt"`
-	KeyID        string `json:"key_id,omitempty"`
-	Channel      string `json:"channel"`
-	Anonymous    bool   `json:"anonymous"`
-	ProxyPool    string `json:"proxy_pool,omitempty"`
-	ProxyNode    string `json:"proxy_node,omitempty"`
-	Status       int    `json:"status,omitempty"`
-	DurationMS   int64  `json:"duration_ms"`
-	Success      bool   `json:"success"`
-	Outcome      string `json:"outcome,omitempty"`
-	FailureClass string `json:"failure_class,omitempty"`
-	Retryable    bool   `json:"retryable"`
-	CoolsDown    bool   `json:"cools_down"`
+	V                         int    `json:"v"`
+	Kind                      string `json:"kind"`
+	Time                      string `json:"time"`
+	RequestID                 string `json:"request_id"`
+	Model                     string `json:"model"`
+	Tier                      string `json:"tier,omitempty"`
+	Protocol                  string `json:"protocol,omitempty"`
+	ClientSessionHash         string `json:"client_session_hash,omitempty"`
+	Attempt                   int    `json:"attempt"`
+	KeyID                     string `json:"key_id,omitempty"`
+	Channel                   string `json:"channel"`
+	Anonymous                 bool   `json:"anonymous"`
+	ProxyPool                 string `json:"proxy_pool,omitempty"`
+	ProxyNode                 string `json:"proxy_node,omitempty"`
+	Status                    int    `json:"status,omitempty"`
+	DurationMS                int64  `json:"duration_ms"`
+	Success                   bool   `json:"success"`
+	Outcome                   string `json:"outcome,omitempty"`
+	FailureClass              string `json:"failure_class,omitempty"`
+	Retryable                 bool   `json:"retryable"`
+	CoolsDown                 bool   `json:"cools_down"`
+	RouteSessionReplay        bool   `json:"route_session_replay,omitempty"`
+	DroppedPreviousResponseID bool   `json:"dropped_previous_response_id,omitempty"`
+	DroppedReasoningRefs      bool   `json:"dropped_reasoning_refs,omitempty"`
+	// Bounded 400 diagnostic (exact 400 only, additive schema v1).
+	ErrorHint        string `json:"error_hint,omitempty"`
+	ErrorType        string `json:"error_type,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
 }
 
 // historyMinuteLine carries MetricSeries numeric fields only.
@@ -422,10 +442,13 @@ func (s *HistoryStore) EnqueueRequest(r UpstreamRequest) {
 	line := historyRequestLine{
 		V: historySchemaV, Kind: string(historyKindRequest), Time: r.Time.UTC().Format(time.RFC3339Nano),
 		RequestID: r.RequestID, Model: r.Model, Tier: r.Tier,
+		Protocol: r.Protocol, ClientSessionHash: r.ClientSessionHash,
 		KeyID: historyKeySuffix(r.KeyID, r.Anonymous), Channel: r.Channel, Anonymous: r.Anonymous,
 		ProxyPool: r.ProxyPool, ProxyNode: redactURL(r.Proxy),
 		Attempts: r.Attempts, Status: r.Status, DurationMS: max(r.DurationMS, 0),
 		Success: r.Success, Outcome: r.Outcome,
+		UsageReported: r.UsageReported, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+		CacheHitTokens: r.CacheHitTokens, CacheMissTokens: r.CacheMissTokens,
 	}
 	if line.Channel == "" {
 		line.Channel = "not_routed"
@@ -448,12 +471,43 @@ func (s *HistoryStore) EnqueueAttempt(a UpstreamAttempt) {
 	}
 	line := historyAttemptLine{
 		V: historySchemaV, Kind: string(historyKindAttempt), Time: a.Time.UTC().Format(time.RFC3339Nano),
-		RequestID: a.RequestID, Model: a.Model, Tier: a.Tier, Attempt: a.Attempt,
+		RequestID: a.RequestID, Model: a.Model, Tier: a.Tier, Protocol: a.Protocol,
+		ClientSessionHash: a.ClientSessionHash, Attempt: a.Attempt,
 		KeyID: historyKeySuffix(a.KeyID, a.Anonymous), Channel: a.Channel, Anonymous: a.Anonymous,
 		ProxyPool: a.ProxyPool, ProxyNode: redactURL(a.Proxy),
 		Status: a.Status, DurationMS: max(a.DurationMS, 0),
 		Success: a.Success, Outcome: a.Outcome,
 		FailureClass: a.FailureClass, Retryable: a.Retryable, CoolsDown: a.CoolsDown,
+		RouteSessionReplay:        a.RouteSessionReplay,
+		DroppedPreviousResponseID: a.DroppedPreviousResponseID,
+		DroppedReasoningRefs:      a.DroppedReasoningRefs,
+	}
+	// Bounded 400 diagnostic: exact 400 only, sanitized at the Monitor
+	// ingestion point; re-enforce omission for non-400 and unsafe values so
+	// direct Enqueue callers cannot persist raw metadata.
+	if a.Status != 400 {
+		// omit all four
+	} else {
+		hint := a.ErrorHint
+		if !validErrorHint(hint) {
+			hint = ""
+			if a.ErrorFingerprint != "" {
+				hint = ErrorHintUnknown
+			}
+		}
+		if hint == "" && a.ErrorType == "" && a.ErrorCode == "" && a.ErrorFingerprint == "" {
+			// omit
+		} else {
+			if hint == "" {
+				hint = ErrorHintUnknown
+			}
+			line.ErrorHint = hint
+			line.ErrorType = sanitizeErrorAttr(a.ErrorType)
+			line.ErrorCode = sanitizeErrorAttr(a.ErrorCode)
+			if isErrorFingerprint(a.ErrorFingerprint) {
+				line.ErrorFingerprint = a.ErrorFingerprint
+			}
+		}
 	}
 	if line.Anonymous {
 		line.KeyID = anonymousCredentialID

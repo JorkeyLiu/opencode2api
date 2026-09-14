@@ -305,18 +305,20 @@ func (h *hubHandler) addAttr(fields map[string]any, attr slog.Attr) {
 }
 
 type requestMeta struct {
-	Model         string
-	Tier          string
-	Request       string
-	KeyID         string
-	Channel       string
-	Anonymous     bool
-	Proxy         string
-	ProxyPool     string
-	Attempts      int
-	Stream        bool
-	Usage         bridgeUsage
-	UsageReported bool
+	Model             string
+	Tier              string
+	Protocol          string
+	ClientSessionHash string
+	Request           string
+	KeyID             string
+	Channel           string
+	Anonymous         bool
+	Proxy             string
+	ProxyPool         string
+	Attempts          int
+	Stream            bool
+	Usage             bridgeUsage
+	UsageReported     bool
 }
 
 type requestMetaKey struct{}
@@ -389,26 +391,44 @@ type AttemptAggregate struct {
 }
 
 type UpstreamAttempt struct {
-	Time       time.Time `json:"time"`
-	RequestID  string    `json:"request_id"`
-	Model      string    `json:"model"`
-	Tier       string    `json:"tier"`
-	Attempt    int       `json:"attempt"`
-	KeyID      string    `json:"key_id"`
-	Channel    string    `json:"channel"`
-	Anonymous  bool      `json:"anonymous"`
-	Proxy      string    `json:"proxy_node"`
-	ProxyPool  string    `json:"proxy_pool,omitempty"`
-	Status     int       `json:"status,omitempty"`
-	DurationMS int64     `json:"duration_ms"`
-	Success    bool      `json:"success"`
-	Outcome    string    `json:"outcome"`
+	Time              time.Time `json:"time"`
+	RequestID         string    `json:"request_id"`
+	Model             string    `json:"model"`
+	Tier              string    `json:"tier"`
+	Protocol          string    `json:"protocol,omitempty"`
+	ClientSessionHash string    `json:"client_session_hash,omitempty"`
+	Attempt           int       `json:"attempt"`
+	KeyID             string    `json:"key_id"`
+	Channel           string    `json:"channel"`
+	Anonymous         bool      `json:"anonymous"`
+	Proxy             string    `json:"proxy_node"`
+	ProxyPool         string    `json:"proxy_pool,omitempty"`
+	Status            int       `json:"status,omitempty"`
+	DurationMS        int64     `json:"duration_ms"`
+	Success           bool      `json:"success"`
+	Outcome           string    `json:"outcome"`
 	// FailureClass is the shared upstream attempt classification
 	// (see classifyUpstreamAttempt). It is additive for WebUI consumers;
 	// Outcome is retained for backward compatibility.
 	FailureClass string `json:"failure_class"`
 	Retryable    bool   `json:"retryable"`
 	CoolsDown    bool   `json:"cools_down"`
+	// RouteSessionReplay marks the exact-400 same-target replay attempt.
+	// Dropped flags are true only when the replay actually removed that
+	// category of stale Responses refs; all three are omitted (false) on
+	// first/non-replay attempts.
+	RouteSessionReplay        bool `json:"route_session_replay,omitempty"`
+	DroppedPreviousResponseID bool `json:"dropped_previous_response_id,omitempty"`
+	DroppedReasoningRefs      bool `json:"dropped_reasoning_refs,omitempty"`
+	// Bounded 400 diagnostic (exact 400 only, additive schema v1).
+	// error_hint is the fixed enum, error_type/code are sanitized short
+	// allowlist values (omitted when unsafe), error_fingerprint is the
+	// short domain-separated grouping hash. Raw message/body/param/IDs are
+	// never stored. Non-400 attempts omit all four.
+	ErrorHint        string `json:"error_hint,omitempty"`
+	ErrorType        string `json:"error_type,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
 }
 
 // Shared upstream attempt failure classes. The set is intentionally small
@@ -502,21 +522,45 @@ func outcomeFromClass(class string, success bool) string {
 // UpstreamRequest is the credential route that was actually used for one
 // client inference request. It is kept separately from UpstreamAttempt,
 // because a single request can try several keys before it succeeds.
+// Per-request cache tokens are populated only after upstream reports usage:
+// UsageReported false means unknown (WebUI shows —), never zero-as-known.
+// Cache hit is bridgeUsage.Cached; cache miss is
+// max(bridgeUsage.Input-bridgeUsage.Cached, 0) and therefore includes cache
+// creation/write plus ordinary uncached prompt tokens (not an exact
+// uncached-vs-creation split). Attempts never receive request-final usage.
 type UpstreamRequest struct {
-	Time       time.Time `json:"time"`
-	RequestID  string    `json:"request_id"`
-	Model      string    `json:"model"`
-	Tier       string    `json:"tier,omitempty"`
-	KeyID      string    `json:"key_id,omitempty"`
-	Channel    string    `json:"channel"`
-	Anonymous  bool      `json:"anonymous"`
-	Proxy      string    `json:"proxy_node,omitempty"`
-	ProxyPool  string    `json:"proxy_pool,omitempty"`
-	Attempts   int       `json:"attempts"`
-	Status     int       `json:"status"`
-	DurationMS int64     `json:"duration_ms"`
-	Success    bool      `json:"success"`
-	Outcome    string    `json:"outcome"`
+	Time              time.Time `json:"time"`
+	RequestID         string    `json:"request_id"`
+	Model             string    `json:"model"`
+	Tier              string    `json:"tier,omitempty"`
+	Protocol          string    `json:"protocol,omitempty"`
+	ClientSessionHash string    `json:"client_session_hash,omitempty"`
+	KeyID             string    `json:"key_id,omitempty"`
+	Channel           string    `json:"channel"`
+	Anonymous         bool      `json:"anonymous"`
+	Proxy             string    `json:"proxy_node,omitempty"`
+	ProxyPool         string    `json:"proxy_pool,omitempty"`
+	Attempts          int       `json:"attempts"`
+	Status            int       `json:"status"`
+	DurationMS        int64     `json:"duration_ms"`
+	Success           bool      `json:"success"`
+	Outcome           string    `json:"outcome"`
+	UsageReported     bool      `json:"usage_reported"`
+	InputTokens       int       `json:"input_tokens,omitempty"`
+	OutputTokens      int       `json:"output_tokens,omitempty"`
+	CacheHitTokens    int       `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens   int       `json:"cache_miss_tokens,omitempty"`
+}
+
+// cacheHitMiss derives the per-request cache display pair from reported
+// bridge usage. Hit is the reported cached read volume; miss is the residual
+// max(Input-Cached, 0) and therefore bundles cache creation/write with
+// ordinary uncached prompt tokens. Negative inputs clamp to zero; a
+// cached-greater-than-input anomaly clamps miss to zero while preserving hit.
+func cacheHitMiss(usage bridgeUsage) (hit, miss int) {
+	hit = max(usage.Cached, 0)
+	miss = max(usage.Input-usage.Cached, 0)
+	return hit, miss
 }
 
 type attemptBucket struct {
@@ -759,9 +803,18 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		if meta.Request != "" && meta.Model != "" {
 			request := UpstreamRequest{
 				Time: time.Now().UTC(), RequestID: meta.Request, Model: meta.Model, Tier: meta.Tier,
+				Protocol: meta.Protocol, ClientSessionHash: meta.ClientSessionHash,
 				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy, ProxyPool: meta.ProxyPool,
 				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
 				Success: status >= 200 && status < 400,
+			}
+			if meta.UsageReported {
+				hit, miss := cacheHitMiss(meta.Usage)
+				request.UsageReported = true
+				request.InputTokens = max(meta.Usage.Input, 0)
+				request.OutputTokens = max(meta.Usage.Output, 0)
+				request.CacheHitTokens = hit
+				request.CacheMissTokens = miss
 			}
 			if request.Channel == "" {
 				request.Channel = "not_routed"
@@ -811,6 +864,33 @@ func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
 		attempt.KeyID = anonymousCredentialID
 	}
 	attempt.Proxy = normalizeProxyLabel(attempt.Proxy)
+	// Bounded 400 diagnostic hygiene at the single ingestion point: only
+	// exact 400 retains hint/type/code/fingerprint, type/code are
+	// re-sanitized, hint is restricted to the fixed enum, and fingerprint
+	// must look like the short e400_ domain hash. Anything else is omitted
+	// so non-400 attempts never carry fields and unsafe values never persist.
+	if attempt.Status != http.StatusBadRequest {
+		attempt.ErrorHint, attempt.ErrorType, attempt.ErrorCode, attempt.ErrorFingerprint = "", "", "", ""
+	} else {
+		if !validErrorHint(attempt.ErrorHint) {
+			attempt.ErrorHint = ""
+			// Exact 400 without a valid hint still groups as unknown when a
+			// fingerprint exists; a bare attempt without either stays omitted.
+			if attempt.ErrorFingerprint != "" {
+				attempt.ErrorHint = ErrorHintUnknown
+			}
+		}
+		attempt.ErrorType = sanitizeErrorAttr(attempt.ErrorType)
+		attempt.ErrorCode = sanitizeErrorAttr(attempt.ErrorCode)
+		if attempt.ErrorFingerprint != "" && !isErrorFingerprint(attempt.ErrorFingerprint) {
+			attempt.ErrorFingerprint = ""
+		}
+		if attempt.ErrorHint == "" && attempt.ErrorType == "" && attempt.ErrorCode == "" && attempt.ErrorFingerprint == "" {
+			// keep omitted
+		} else if attempt.ErrorHint == "" {
+			attempt.ErrorHint = ErrorHintUnknown
+		}
+	}
 	if attempt.FailureClass == "" {
 		class := classifyAttempt(attempt.Status, false)
 		if !attempt.Success && attempt.Status == 0 {
@@ -1284,16 +1364,34 @@ func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler)
 			}
 			duration := time.Since(started)
 			monitor.Record(r.URL.Path, status, duration, meta)
-			if meta.Channel != "" {
-				logger.Info("request routed", "component", "http", "event", "request_routed", "method", r.Method,
-					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
-					"model", meta.Model, "tier", meta.Tier, "key_id", meta.KeyID, "channel", meta.Channel,
-					"anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream)
+			// Reported token fields ride only on upstream-reported usage.
+			// Unknown usage omits token counts; usage_reported marks the gap.
+			usageArgs := []any{"usage_reported", meta.UsageReported}
+			if meta.UsageReported {
+				hit, miss := cacheHitMiss(meta.Usage)
+				usageArgs = append(usageArgs,
+					"input_tokens", max(meta.Usage.Input, 0),
+					"output_tokens", max(meta.Usage.Output, 0),
+					"cache_hit_tokens", hit,
+					"cache_miss_tokens", miss,
+				)
 			}
-			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
+			if meta.Channel != "" {
+				args := []any{"component", "http", "event", "request_routed", "method", r.Method,
+					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
+					"model", meta.Model, "tier", meta.Tier, "protocol", meta.Protocol, "client_session_hash", meta.ClientSessionHash,
+					"key_id", meta.KeyID, "channel", meta.Channel,
+					"anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream}
+				args = append(args, usageArgs...)
+				logger.Info("request routed", args...)
+			}
+			args := []any{"component", "http", "event", "request_complete", "method", r.Method,
 				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
-				"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "key_id", meta.KeyID,
-				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream)
+				"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "protocol", meta.Protocol, "client_session_hash", meta.ClientSessionHash,
+				"key_id", meta.KeyID,
+				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream}
+			args = append(args, usageArgs...)
+			logger.Debug("request completed", args...)
 		}()
 		next.ServeHTTP(writer, r)
 	})

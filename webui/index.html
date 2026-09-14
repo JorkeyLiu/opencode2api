@@ -161,16 +161,16 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
     <section id="tab-realtime">
       <div class="section">
         <h2>实时请求</h2>
-        <div class="cap">最近请求（进程内保留，最多 200 条展示）。点击行展开该 request 的完整上游 attempt 链。</div>
+        <div class="cap">最近请求（进程内保留，最多 200 条展示）。主列为客户端会话hash（诊断用哈希，非原始会话；相同值表示同一客户端会话；旧记录无hash显示“— 无hash”）。点击行展开查看完整 Request ID（含复制）与该 request 的完整上游 attempt 链。协议为目标协议。缓存命中=上游报告的缓存读取；缓存未命中=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词（非精确拆分）；上游未报告时显示“—”。</div>
         <div class="filters">
-          <input type="search" id="f-search" placeholder="搜索 request ID / model">
+          <input type="search" id="f-search" placeholder="搜索 request ID / model / 会话hash / 协议">
           <select id="f-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
           <select id="f-channel"><option value="">全部通道</option></select>
           <button class="ghost" id="f-pause" type="button">暂停更新</button>
           <span class="note" id="f-count"></span>
         </div>
         <div class="table-wrap"><table class="table" id="tbl-requests">
-          <thead><tr><th>时间</th><th>Request ID</th><th>模型</th><th>Tier</th><th>通道</th><th>Key</th><th>尝试</th><th>状态</th><th>耗时</th></tr></thead>
+          <thead><tr><th>时间</th><th>客户端会话hash</th><th>模型</th><th>Tier</th><th>协议</th><th>缓存命中</th><th>缓存未命中</th><th>输入/输出</th><th>通道</th><th>Key</th><th>尝试</th><th>状态</th><th>耗时</th></tr></thead>
           <tbody id="tbody-requests"></tbody>
         </table></div>
       </div>
@@ -191,7 +191,7 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
       </div>
       <div class="section" id="hist-persist-wrap">
         <h2>持久历史请求</h2>
-        <div class="cap">24h / 7d 调用 history API；模型输入为完整模型 ID 精确过滤（后端精确匹配）；点击行按 request_id 拉取 attempt 链。分页加载更多；切换范围取消旧请求。</div>
+        <div class="cap">24h / 7d 调用 history API；模型输入为完整模型 ID 精确过滤（后端精确匹配）；主列为客户端会话hash（非原始会话，旧记录显示“— 无hash”），点击行展开查看完整 Request ID（含复制）并按 request_id 拉取 attempt 链。缓存命中=缓存读取；缓存未命中=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词；未报告显示“—”。分页加载更多；切换范围取消旧请求。</div>
         <div class="filters">
           <input type="search" id="hist-model" placeholder="完整模型 ID 精确过滤">
           <select id="hist-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
@@ -200,7 +200,7 @@ details.ops .body{padding:0 12px 12px;border-top:1px solid var(--line)}
           <span class="note" id="hist-count"></span>
         </div>
         <div class="table-wrap"><table class="table" id="tbl-hist">
-          <thead><tr><th>时间</th><th>Request ID</th><th>模型</th><th>Tier</th><th>通道</th><th>状态</th><th>耗时</th></tr></thead>
+          <thead><tr><th>时间</th><th>客户端会话hash</th><th>模型</th><th>Tier</th><th>协议</th><th>缓存命中</th><th>缓存未命中</th><th>输入/输出</th><th>通道</th><th>状态</th><th>耗时</th></tr></thead>
           <tbody id="tbody-hist"></tbody>
         </table></div>
       </div>
@@ -483,6 +483,22 @@ function pillForFailureClass(fc){
 function cell(tr, text, cls){
   var td=document.createElement("td"); td.textContent=(text===undefined||text===null||text==="")?"—":String(text); if(cls)td.className=cls; tr.appendChild(td); return td;
 }
+function diag400Cell(tr,a){
+  var td=document.createElement("td");
+  if(!a.error_hint&&!a.error_fingerprint&&!a.error_type&&!a.error_code){
+    td.textContent="—";
+    td.title="非 400 attempt 无诊断；仅 exact 400 携带 error_hint/type/code/fingerprint";
+  } else {
+    var hint=a.error_hint||"unknown";
+    var tc=((a.error_type||a.error_code)?((a.error_type||"—")+" / "+(a.error_code||"—")):"type/code —");
+    var fp=a.error_fingerprint||"—";
+    var l1=document.createElement("div"); l1.textContent=hint; l1.className="mono"; td.appendChild(l1);
+    var l2=document.createElement("div"); l2.textContent=tc; l2.className="note"; td.appendChild(l2);
+    var l3=document.createElement("div"); l3.textContent=fp; l3.className="mono"; td.appendChild(l3);
+    td.title="error_hint="+hint+"，error_type="+(a.error_type||"—")+"，error_code="+(a.error_code||"—")+"，error_fingerprint="+(a.error_fingerprint||"—")+"（仅诊断用分组哈希，非原始错误内容）";
+  }
+  tr.appendChild(td); return td;
+}
 function emptyRow(tbody, cols, msg){
   var tr=document.createElement("tr"), td=document.createElement("td");
   td.colSpan=cols; td.className="empty"; td.textContent=msg; tr.appendChild(td); tbody.appendChild(tr);
@@ -602,7 +618,7 @@ function filteredRequests(){
     if(st==="success"&&!r.success)return false;
     if(st==="failed"&&r.success)return false;
     if(ch&&r.channel!==ch)return false;
-    if(q&&(String(r.request_id||"").toLowerCase().indexOf(q)<0&&String(r.model||"").toLowerCase().indexOf(q)<0))return false;
+    if(q&&(String(r.request_id||"").toLowerCase().indexOf(q)<0&&String(r.model||"").toLowerCase().indexOf(q)<0&&String(r.client_session_hash||"").toLowerCase().indexOf(q)<0&&String(r.protocol||"").toLowerCase().indexOf(q)<0))return false;
     return true;
   }).slice(0,200);
 }
@@ -614,13 +630,28 @@ function renderRealtime(){
   var tb=$("tbody-requests"); clear(tb);
   var rows=filteredRequests();
   $("f-count").textContent="共 "+rows.length+" 条（最多展示 200）";
-  if(!rows.length){ emptyRow(tb,9,"暂无匹配请求"); return; }
+  if(!rows.length){ emptyRow(tb,13,"暂无匹配请求"); return; }
   rows.forEach(function(r){
     var tr=document.createElement("tr"); tr.className="clickable"+(S.expandedRequest===r.request_id?" selected":"");
     cell(tr,fmtTime(r.time));
-    var idCell=document.createElement("td");
-    var code=el("code",r.request_id,"mono"); idCell.appendChild(code); tr.appendChild(idCell);
-    cell(tr,r.model,"wrap"); cell(tr,r.tier||"—"); cell(tr,r.channel||"—");
+    (function(){
+      var td=document.createElement("td");
+      if(r.client_session_hash){
+        var code=document.createElement("code"); code.className="mono"; code.textContent=r.client_session_hash;
+        code.title="客户端会话hash（诊断用哈希，非原始会话；相同值表示同一客户端会话，可跨 request 关联）";
+        td.appendChild(code);
+      } else {
+        td.textContent="— 无hash";
+        td.title="旧记录无客户端会话hash；Request ID 仅在展开详情中查看";
+      }
+      tr.appendChild(td);
+    })();
+    cell(tr,r.model,"wrap"); cell(tr,r.tier||"—");
+    (function(){ var td=document.createElement("td"); td.textContent=(r.protocol||"—"); td.title=r.protocol?("目标协议："+r.protocol):"目标协议未知"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?String(r.cache_hit_tokens||0):"—"; td.title="缓存命中输入=上游报告的缓存读取（cache_read）；上游未报告时为—"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?String(r.cache_miss_tokens||0):"—"; td.title="缓存未命中输入=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词（非精确拆分）；上游未报告时为—"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?((r.input_tokens||0)+" / "+(r.output_tokens||0)):"—"; td.title=r.usage_reported?"总输入 / 总输出（上游报告）":"上游未报告 usage，未估算"; tr.appendChild(td); })();
+    cell(tr,r.channel||"—");
     cell(tr,(r.anonymous?"anonymous":(r.key_id||"—")));
     cell(tr,r.attempts===undefined?"—":r.attempts);
     var st=document.createElement("td");
@@ -634,7 +665,7 @@ function renderRealtime(){
     tb.appendChild(tr);
     if(S.expandedRequest===r.request_id){
       var dr=document.createElement("tr"); dr.className="detail";
-      var dt=document.createElement("td"); dt.colSpan=9;
+      var dt=document.createElement("td"); dt.colSpan=13;
       renderAttemptDetail(dt,r);
       dr.appendChild(dt); tb.appendChild(dr);
     }
@@ -643,6 +674,12 @@ function renderRealtime(){
 function renderAttemptDetail(host, req){
   var title=el("div",null); host.appendChild(title);
   var label=el("strong","request "+req.request_id+" · "); title.appendChild(label);
+  if(req.client_session_hash){ var sh=el("span","客户端会话hash "+req.client_session_hash+" · ","note"); sh.title="诊断用客户端会话hash（非原始会话），相同值可跨 request 关联同一客户端会话"; title.appendChild(sh); }
+  else { var nosh=el("span","无客户端会话hash（旧记录） · ","note"); nosh.title="旧记录无客户端会话hash；主列不展示 Request ID"; title.appendChild(nosh); }
+  if(req.protocol){ var pr=el("span","协议 "+req.protocol+" · ","note"); pr.title="目标协议"; title.appendChild(pr); }
+  var usageLine=el("span",req.usage_reported?("缓存命中 "+(req.cache_hit_tokens||0)+" · 缓存未命中 "+(req.cache_miss_tokens||0)+" · 输入/输出 "+(req.input_tokens||0)+"/"+(req.output_tokens||0)+" · "):"tokens 未报告（—） · ","note");
+  usageLine.title="缓存命中=上游报告的缓存读取；缓存未命中=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词（非精确拆分）；上游未报告时不估算";
+  title.appendChild(usageLine);
   var copyBtn=el("button","复制 request ID","link"); title.appendChild(copyBtn);
   copyBtn.addEventListener("click",function(ev){
     ev.stopPropagation();
@@ -656,13 +693,14 @@ function renderAttemptDetail(host, req){
   var wrap=document.createElement("div"); wrap.className="table-wrap";
   var t=document.createElement("table"); t.className="table attempt-chain";
   var thead=document.createElement("thead"), hr=document.createElement("tr");
-  ["attempt","tier / channel","key","pool","proxy","status","failure_class","retryable","cools_down","duration","outcome"].forEach(function(h){ var th=document.createElement("th"); th.textContent=h; hr.appendChild(th); });
+  ["attempt","tier / channel","proto","key","pool","proxy","status","failure_class","retryable","cools_down","replay","400_diag","duration","outcome"].forEach(function(h){ var th=document.createElement("th"); th.textContent=h; if(h==="proto")th.title="目标协议：chat / responses / anthropic"; if(h==="replay")th.title="400 同目标重放标记：replay 表示 route_session_replay，+prev/+rsn 表示实际丢弃的 Responses 陈旧引用"; if(h==="400_diag")th.title="400 诊断：error_hint · type/code · fingerprint（仅 exact 400 有值，其余显示—；原始错误内容不展示）"; hr.appendChild(th); });
   thead.appendChild(hr); t.appendChild(thead);
   var tb=document.createElement("tbody");
   list.forEach(function(a){
     var tr=document.createElement("tr");
     cell(tr,a.attempt===undefined?"—":a.attempt);
     cell(tr,(a.tier||"—")+" / "+(a.channel||"—"));
+    (function(){ var td=document.createElement("td"); td.textContent=(a.protocol||"—"); td.title=a.protocol?("目标协议："+a.protocol):"目标协议未知"; tr.appendChild(td); })();
     cell(tr,(a.anonymous?"anonymous":(a.key_id||"—")));
     cell(tr,a.proxy_pool||"—");
     cell(tr,a.proxy_node||a.proxy||"—");
@@ -673,12 +711,14 @@ function renderAttemptDetail(host, req){
     tr.appendChild(fc);
     cell(tr,a.retryable?"yes":"no");
     cell(tr,a.cools_down?"yes":"no");
+    (function(){ var td=document.createElement("td"); var tag=a.route_session_replay?("replay"+(a.dropped_previous_response_id?"+prev":"")+(a.dropped_reasoning_refs?"+rsn":"")):"—"; var sp=document.createElement("span"); sp.textContent=tag; sp.className="pill "+(a.route_session_replay?"warn":""); sp.title="route_session_replay="+(a.route_session_replay?"true":"false")+"，dropped_previous_response_id="+(a.dropped_previous_response_id?"true":"false")+"，dropped_reasoning_refs="+(a.dropped_reasoning_refs?"true":"false"); td.appendChild(sp); tr.appendChild(td); })();
+    diag400Cell(tr,a);
     cell(tr,(a.duration_ms===undefined?"—":a.duration_ms+" ms"));
     cell(tr,a.outcome||"—");
     tb.appendChild(tr);
   });
   t.appendChild(tb); wrap.appendChild(t); host.appendChild(wrap);
-  host.appendChild(el("div","client_rejected 为请求侧拒绝（中性），不代表 proxy 不健康。","note"));
+  host.appendChild(el("div","client_rejected 为请求侧拒绝（中性），不代表 proxy 不健康。replay 列仅在 400 同目标重放的 attempt 上标记，+prev/+rsn 表示实际丢弃的陈旧引用。400_diag 仅在 exact 400 上显示 error_hint/type/code/fingerprint（分组哈希，非原始内容）。","note"));
 }
 function copyText(text){
   if(navigator.clipboard&&navigator.clipboard.writeText){
@@ -816,19 +856,35 @@ function renderPersistedRows(){
     if(S.histDropped)text+=" · 全局 dropped "+S.histDropped;
     c.textContent=text;
   }
-  if(!S.histItems.length){emptyRow(tb,7,S.histLoading?"历史加载中…":"该范围暂无持久历史（memory-only 时为空）");return;}
+  if(!S.histItems.length){emptyRow(tb,11,S.histLoading?"历史加载中…":"该范围暂无持久历史（memory-only 时为空）");return;}
   S.histItems.forEach(function(r){
     var tr=document.createElement("tr"); tr.className="clickable"+(S.histExpanded===r.request_id?" selected":"");
     cell(tr,fmtDateTime(r.time));
-    var idc=document.createElement("td"); idc.appendChild(el("code",r.request_id,"mono")); tr.appendChild(idc);
-    cell(tr,r.model,"wrap"); cell(tr,r.tier||"—"); cell(tr,r.channel||"—");
+    (function(){
+      var td=document.createElement("td");
+      if(r.client_session_hash){
+        var code=document.createElement("code"); code.className="mono"; code.textContent=r.client_session_hash;
+        code.title="客户端会话hash（诊断用哈希，非原始会话；相同值表示同一客户端会话，可跨 request 关联）";
+        td.appendChild(code);
+      } else {
+        td.textContent="— 无hash";
+        td.title="旧记录无客户端会话hash；Request ID 仅在展开详情中查看";
+      }
+      tr.appendChild(td);
+    })();
+    cell(tr,r.model,"wrap"); cell(tr,r.tier||"—");
+    (function(){ var td=document.createElement("td"); td.textContent=(r.protocol||"—"); td.title=r.protocol?("目标协议："+r.protocol):"目标协议未知"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?String(r.cache_hit_tokens||0):"—"; td.title="缓存命中输入=上游报告的缓存读取（cache_read）；上游未报告时为—"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?String(r.cache_miss_tokens||0):"—"; td.title="缓存未命中输入=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词（非精确拆分）；上游未报告时为—"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=r.usage_reported?((r.input_tokens||0)+" / "+(r.output_tokens||0)):"—"; td.title=r.usage_reported?"总输入 / 总输出（上游报告）":"上游未报告 usage，未估算"; tr.appendChild(td); })();
+    cell(tr,r.channel||"—");
     var std=document.createElement("td"); std.appendChild(el("span",r.success?("OK "+(r.status||"")):((r.status||"")+" "+(r.outcome||"")),"pill "+pillForRequest(r))); tr.appendChild(std);
     cell(tr,(r.duration_ms===undefined?"—":r.duration_ms+" ms"));
     tr.addEventListener("click",function(){ S.histExpanded=(S.histExpanded===r.request_id)?"":r.request_id; renderPersistedRows(); });
     tb.appendChild(tr);
     if(S.histExpanded===r.request_id){
       var dr=document.createElement("tr"); dr.className="detail";
-      var dt=document.createElement("td"); dt.colSpan=7; dt.textContent="attempt 链加载中…";
+      var dt=document.createElement("td"); dt.colSpan=11; dt.textContent="attempt 链加载中…";
       dr.appendChild(dt); tb.appendChild(dr);
       loadHistAttempts(r.request_id,dr);
     }
@@ -840,22 +896,34 @@ function loadHistAttempts(requestId, anchorRow){
     if(S.histExpanded!==requestId)return;
     var host=anchorRow.querySelector("td")||anchorRow;
     clear(host);
+    var req=null;
+    (S.histItems||[]).forEach(function(it){ if(it.request_id===requestId)req=it; });
+    var head=el("div",null); host.appendChild(head);
+    head.appendChild(el("strong","request "+requestId+" · "));
+    if(req&&req.client_session_hash){ var hsh=el("span","客户端会话hash "+req.client_session_hash+" · ","note"); hsh.title="诊断用客户端会话hash（非原始会话），相同值可跨 request 关联同一客户端会话"; head.appendChild(hsh); }
+    else { var nh=el("span","无客户端会话hash（旧记录） · ","note"); nh.title="旧记录无客户端会话hash；主列不展示 Request ID"; head.appendChild(nh); }
+    if(req){ var uh=el("span",req.usage_reported?("缓存命中 "+(req.cache_hit_tokens||0)+" · 缓存未命中 "+(req.cache_miss_tokens||0)+" · 输入/输出 "+(req.input_tokens||0)+"/"+(req.output_tokens||0)+" · "):"tokens 未报告（—） · ","note"); uh.title="缓存命中=上游报告的缓存读取；缓存未命中=max(总输入-缓存命中,0)，包含缓存写入与普通未缓存提示词（非精确拆分）；上游未报告时不估算"; head.appendChild(uh); }
+    var cp=el("button","复制 request ID","link"); head.appendChild(cp);
+    cp.addEventListener("click",function(ev){ ev.stopPropagation(); copyText(requestId); });
     var list=(res.items||[]).sort(function(a,b){return (a.attempt||0)-(b.attempt||0);});
     if(!list.length){host.appendChild(el("div","该 request 暂无 attempt 记录","empty"));return;}
     var wrap=document.createElement("div"); wrap.className="table-wrap";
     var t=document.createElement("table"); t.className="table attempt-chain";
     var thead=document.createElement("thead"), hr=document.createElement("tr");
-    ["attempt","tier / channel","key","pool","proxy","status","failure_class","duration","outcome"].forEach(function(h){var th=document.createElement("th");th.textContent=h;hr.appendChild(th);});
+    ["attempt","tier / channel","proto","key","pool","proxy","status","failure_class","replay","400_diag","duration","outcome"].forEach(function(h){var th=document.createElement("th");th.textContent=h;if(h==="proto")th.title="目标协议：chat / responses / anthropic";if(h==="replay")th.title="400 同目标重放标记：replay 表示 route_session_replay，+prev/+rsn 表示实际丢弃的 Responses 陈旧引用";if(h==="400_diag")th.title="400 诊断：error_hint · type/code · fingerprint（仅 exact 400 有值，其余显示—；原始错误内容不展示）";hr.appendChild(th);});
     thead.appendChild(hr); t.appendChild(thead);
     var tb=document.createElement("tbody");
     list.forEach(function(a){
       var tr=document.createElement("tr");
       cell(tr,a.attempt===undefined?"—":a.attempt);
       cell(tr,(a.tier||"—")+" / "+(a.channel||"—"));
+      (function(){ var td=document.createElement("td"); td.textContent=(a.protocol||"—"); td.title=a.protocol?("目标协议："+a.protocol):"目标协议未知"; tr.appendChild(td); })();
       cell(tr,(a.anonymous?"anonymous":(a.key_id||"—")));
       cell(tr,a.proxy_pool||"—"); cell(tr,a.proxy_node||"—");
       cell(tr,(a.status===undefined||a.status===0)?"—":a.status);
       var fc=document.createElement("td"); fc.appendChild(el("span",a.failure_class||"—","pill "+pillForFailureClass(a.failure_class))); tr.appendChild(fc);
+      (function(){ var td=document.createElement("td"); var tag=a.route_session_replay?("replay"+(a.dropped_previous_response_id?"+prev":"")+(a.dropped_reasoning_refs?"+rsn":"")):"—"; var sp=document.createElement("span"); sp.textContent=tag; sp.className="pill "+(a.route_session_replay?"warn":""); sp.title="route_session_replay="+(a.route_session_replay?"true":"false")+"，dropped_previous_response_id="+(a.dropped_previous_response_id?"true":"false")+"，dropped_reasoning_refs="+(a.dropped_reasoning_refs?"true":"false"); td.appendChild(sp); tr.appendChild(td); })();
+      diag400Cell(tr,a);
       cell(tr,(a.duration_ms===undefined?"—":a.duration_ms+" ms")); cell(tr,a.outcome||"—");
       tb.appendChild(tr);
     });

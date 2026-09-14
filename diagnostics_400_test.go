@@ -1,0 +1,412 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestClientSessionHashStabilitySeparation(t *testing.T) {
+	a := clientSessionHash("ses_client_abc")
+	b := clientSessionHash("ses_client_abc")
+	if a == "" || a != b {
+		t.Fatalf("hash must be stable non-empty: %q vs %q", a, b)
+	}
+	if !strings.HasPrefix(a, "csh_") {
+		t.Fatalf("hash must use diagnostic csh_ namespace, got %q", a)
+	}
+	other := clientSessionHash("ses_client_other")
+	if a == other {
+		t.Fatalf("different sessions must differ")
+	}
+	if got := clientSessionHash(""); got != "" {
+		t.Fatalf("empty session must stay empty, got %q", got)
+	}
+	// Domain separation from ses_/rss_ namespaces.
+	if strings.HasPrefix(a, "ses_") || strings.HasPrefix(a, "rss_") {
+		t.Fatalf("hash must not reuse ses_/rss_ prefix: %q", a)
+	}
+	// No raw leakage: hash must not contain the raw signal or raw ids.
+	raw := "super-secret-client-signal-123"
+	ses := stableID("ses", raw)
+	h := clientSessionHash(ses)
+	for _, needle := range []string{raw, ses, "rss_"} {
+		if needle != "" && strings.Contains(h, needle) {
+			t.Fatalf("hash leaks raw material %q in %q", needle, h)
+		}
+	}
+	if strings.Contains(h, raw) {
+		t.Fatalf("hash leaks raw signal")
+	}
+}
+
+func TestStaleCleanupReportsIndependently(t *testing.T) {
+	// previous_response_id only.
+	p1 := map[string]any{"model": "m", "previous_response_id": "resp_old"}
+	dPrev, dRsn := stripResponsesStaleRefs(p1)
+	if !dPrev || dRsn {
+		t.Fatalf("prev-only got prev=%v rsn=%v", dPrev, dRsn)
+	}
+	if _, ok := p1["previous_response_id"]; ok {
+		t.Fatalf("prev must be removed")
+	}
+	// reasoning only.
+	p2 := map[string]any{"model": "m", "input": []any{map[string]any{"type": "reasoning"}, map[string]any{"type": "message"}}}
+	dPrev, dRsn = stripResponsesStaleRefs(p2)
+	if dPrev || !dRsn {
+		t.Fatalf("reasoning-only got prev=%v rsn=%v", dPrev, dRsn)
+	}
+	// both.
+	p3 := map[string]any{"model": "m", "previous_response_id": "x", "input": []any{map[string]any{"type": "reasoning"}}}
+	dPrev, dRsn = stripResponsesStaleRefs(p3)
+	if !dPrev || !dRsn {
+		t.Fatalf("both got prev=%v rsn=%v", dPrev, dRsn)
+	}
+	// neither.
+	p4 := map[string]any{"model": "m"}
+	dPrev, dRsn = stripResponsesStaleRefs(p4)
+	if dPrev || dRsn {
+		t.Fatalf("neither got prev=%v rsn=%v", dPrev, dRsn)
+	}
+	// Non-Responses protocol never reports drops even with stale content.
+	raw, _ := json.Marshal(map[string]any{"model": "m", "previous_response_id": "x", "input": []any{map[string]any{"type": "reasoning"}}})
+	out, report, err := applyRouteSessionToBodyWithReport(raw, "rss_new", ProtocolChat, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.DroppedPreviousResponseID || report.DroppedReasoningRefs {
+		t.Fatalf("chat must not report drops: %+v", report)
+	}
+	if string(out) != string(raw) {
+		t.Fatalf("chat replay must preserve stale refs byte-identically")
+	}
+	// Responses with no stale refs: report both false, body behavior unchanged.
+	raw2, _ := json.Marshal(map[string]any{"model": "m"})
+	out2, report2, err := applyRouteSessionToBodyWithReport(raw2, "rss_new", ProtocolResponses, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report2.DroppedPreviousResponseID || report2.DroppedReasoningRefs {
+		t.Fatalf("no-stale report must be false/false: %+v", report2)
+	}
+	if string(out2) != string(raw2) {
+		t.Fatalf("no-stale body must stay byte-identical")
+	}
+	// Legacy wrapper preserves exact body behavior.
+	legacyOut, err := applyRouteSessionToBody(raw, "rss_new", ProtocolChat, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacyOut) != string(out) {
+		t.Fatalf("legacy wrapper diverged")
+	}
+}
+
+func TestReplayFlagsNoStaleRefBothFalse(t *testing.T) {
+	monitor := NewMonitor()
+	gateway := routing400Gateway(t, monitor)
+	calls := 0
+	stubProxy(t, gateway, "z", 0, func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return responseWithBody(400, `{"error":"bad"}`), nil
+		}
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	route := modelRoute{
+		ID: "m", Tier: TierZen, Protocol: ProtocolResponses,
+		Protocols: map[Tier]Protocol{TierZen: ProtocolResponses},
+		Anonymous: false, KeyTiers: []Tier{TierZen},
+	}
+	// Canonical Responses body without any stale refs.
+	encoded, _ := json.Marshal(map[string]any{"model": "m", "input": "hi"})
+	bodies := map[Tier][]byte{TierZen: encoded}
+	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+	ids := clientSessionIDs("ses_diag_nostale_1")
+	resp, _, err := gateway.doUpstream(ctx, route, bodies, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("status=%v", resp)
+	}
+	drainAndClose(resp.Body)
+	if calls != 2 {
+		t.Fatalf("calls=%d want 2", calls)
+	}
+	recent := monitor.Snapshot().Upstream.Recent
+	if len(recent) != 2 {
+		t.Fatalf("attempts=%d want 2", len(recent))
+	}
+	first, replay := recent[0], recent[1]
+	if first.RouteSessionReplay || first.DroppedPreviousResponseID || first.DroppedReasoningRefs {
+		t.Fatalf("first attempt must be non-replay: %+v", first)
+	}
+	if !replay.RouteSessionReplay {
+		t.Fatalf("replay must set route_session_replay: %+v", replay)
+	}
+	if replay.DroppedPreviousResponseID || replay.DroppedReasoningRefs {
+		t.Fatalf("no-stale replay must be false/false: %+v", replay)
+	}
+	if replay.Protocol != string(ProtocolResponses) {
+		t.Fatalf("replay protocol=%q want responses", replay.Protocol)
+	}
+	wantHash := clientSessionHash(ids.Session)
+	if replay.ClientSessionHash != wantHash || first.ClientSessionHash != wantHash {
+		t.Fatalf("session hash mismatch: %+v", recent)
+	}
+	// Canonical body immutability.
+	var canonical map[string]any
+	if err := json.Unmarshal(bodies[TierZen], &canonical); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := canonical["previous_response_id"]; ok {
+		t.Fatalf("canonical polluted")
+	}
+}
+
+func TestReplayFlagsDistinguishCategories(t *testing.T) {
+	cases := []struct {
+		name       string
+		payload    map[string]any
+		wantPrev   bool
+		wantReason bool
+	}{
+		{"prev_only", map[string]any{"model": "m", "previous_response_id": "resp_old", "input": "hi"}, true, false},
+		{"reason_only", map[string]any{"model": "m", "input": []any{map[string]any{"type": "reasoning"}, map[string]any{"type": "message", "role": "user"}}}, false, true},
+		{"both", map[string]any{"model": "m", "previous_response_id": "resp_old", "input": []any{map[string]any{"type": "reasoning"}}}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			monitor := NewMonitor()
+			gateway := routing400Gateway(t, monitor)
+			calls := 0
+			stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					return responseWithBody(400, `{"error":"bad"}`), nil
+				}
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			route := modelRoute{
+				ID: "m", Tier: TierZen, Protocol: ProtocolResponses,
+				Protocols: map[Tier]Protocol{TierZen: ProtocolResponses},
+				Anonymous: false, KeyTiers: []Tier{TierZen},
+			}
+			encoded, _ := json.Marshal(tc.payload)
+			bodies := map[Tier][]byte{TierZen: encoded}
+			ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+			ids := clientSessionIDs("ses_diag_" + tc.name)
+			resp, _, err := gateway.doUpstream(ctx, route, bodies, ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+			drainAndClose(resp.Body)
+			recent := monitor.Snapshot().Upstream.Recent
+			if len(recent) != 2 {
+				t.Fatalf("attempts=%d", len(recent))
+			}
+			replay := recent[1]
+			if !replay.RouteSessionReplay {
+				t.Fatalf("missing replay flag")
+			}
+			if replay.DroppedPreviousResponseID != tc.wantPrev || replay.DroppedReasoningRefs != tc.wantReason {
+				t.Fatalf("got prev=%v rsn=%v want prev=%v rsn=%v (%+v)", replay.DroppedPreviousResponseID, replay.DroppedReasoningRefs, tc.wantPrev, tc.wantReason, replay)
+			}
+		})
+	}
+}
+
+func TestRequestAttemptHistoryPropagationAndCompat(t *testing.T) {
+	m := NewMonitor()
+	now := time.Now().UTC()
+	m.RecordAttempt(UpstreamAttempt{
+		Time: now, RequestID: "req-diag-1", Model: "m", Tier: "zen", Protocol: "chat",
+		ClientSessionHash: clientSessionHash("ses_diag_prop"), Attempt: 1,
+		KeyID: "KKKKK", Channel: "key", Proxy: "direct", Status: 200, DurationMS: 5,
+		Success: true, FailureClass: AttemptClassSuccess,
+	})
+	snap := m.Snapshot()
+	if len(snap.Upstream.Recent) != 1 {
+		t.Fatalf("recent=%d", len(snap.Upstream.Recent))
+	}
+	got := snap.Upstream.Recent[0]
+	if got.Protocol != "chat" || got.ClientSessionHash != clientSessionHash("ses_diag_prop") {
+		t.Fatalf("attempt propagation failed: %+v", got)
+	}
+	if got.RouteSessionReplay || got.DroppedPreviousResponseID || got.DroppedReasoningRefs {
+		t.Fatalf("non-replay must be false: %+v", got)
+	}
+
+	// Request-level propagation via meta.
+	meta := &requestMeta{Model: "m", Tier: "zen", Protocol: "responses", ClientSessionHash: clientSessionHash("ses_diag_prop"), Request: "req-diag-2", Channel: "key", KeyID: "KKKKK", Attempts: 1}
+	m.Record("/v1/responses", 200, 5*time.Millisecond, meta)
+	snap2 := m.Snapshot()
+	found := false
+	for _, r := range snap2.Upstream.Requests {
+		if r.RequestID == "req-diag-2" {
+			found = true
+			if r.Protocol != "responses" || r.ClientSessionHash != clientSessionHash("ses_diag_prop") {
+				t.Fatalf("request propagation failed: %+v", r)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("request missing")
+	}
+
+	// Persistent history: new fields round-trip; old lines decode with zero values.
+	dir := t.TempDir()
+	cfgPath := dir + "/config.json"
+	_ = os.WriteFile(cfgPath, []byte("{}"), 0600)
+	store := OpenHistoryStore(cfgPath, HistoryConfig{Enabled: true, Directory: "h", RetentionDays: 7, MaxBytesMB: 128}, nil, NewSecretRedactor())
+	defer store.Close()
+	store.EnqueueRequest(UpstreamRequest{Time: now, RequestID: "hr1", Model: "m", Tier: "zen", Protocol: "anthropic", ClientSessionHash: clientSessionHash("ses_hist"), KeyID: "K", Channel: "key", Attempts: 1, Status: 200, DurationMS: 1, Success: true, Outcome: "success"})
+	store.EnqueueAttempt(UpstreamAttempt{Time: now, RequestID: "hr1", Model: "m", Tier: "zen", Protocol: "anthropic", ClientSessionHash: clientSessionHash("ses_hist"), Attempt: 2, KeyID: "K", Channel: "key", Proxy: "direct", Status: 400, DurationMS: 1, Success: false, FailureClass: AttemptClassClientRejected, Outcome: "rejected", RouteSessionReplay: true, DroppedPreviousResponseID: true})
+	// Old-format lines (no new fields) must decode with zero values.
+	var oldReq historyRequestLine
+	if err := json.Unmarshal([]byte(`{"v":1,"kind":"request","time":"`+now.UTC().Format(time.RFC3339Nano)+`","request_id":"old1","model":"m","channel":"key","attempts":1,"status":200,"duration_ms":1,"success":true}`), &oldReq); err != nil {
+		t.Fatal(err)
+	}
+	if oldReq.Protocol != "" || oldReq.ClientSessionHash != "" {
+		t.Fatalf("old request must zero-fill: %+v", oldReq)
+	}
+	var oldAtt historyAttemptLine
+	if err := json.Unmarshal([]byte(`{"v":1,"kind":"attempt","time":"`+now.UTC().Format(time.RFC3339Nano)+`","request_id":"old1","model":"m","attempt":1,"channel":"key","duration_ms":1,"success":false}`), &oldAtt); err != nil {
+		t.Fatal(err)
+	}
+	if oldAtt.RouteSessionReplay || oldAtt.DroppedPreviousResponseID || oldAtt.DroppedReasoningRefs || oldAtt.Protocol != "" {
+		t.Fatalf("old attempt must zero-fill: %+v", oldAtt)
+	}
+	// New fields ignored by old readers: decode new line into minimal struct.
+	type oldAttemptReader struct {
+		V         int    `json:"v"`
+		RequestID string `json:"request_id"`
+		Attempt   int    `json:"attempt"`
+	}
+	newLine, _ := json.Marshal(historyAttemptLine{V: 1, Kind: "attempt", Time: now.UTC().Format(time.RFC3339Nano), RequestID: "new1", Model: "m", Protocol: "chat", ClientSessionHash: "csh_abc", Attempt: 2, Channel: "key", RouteSessionReplay: true, DroppedPreviousResponseID: true, DroppedReasoningRefs: true})
+	var minimal oldAttemptReader
+	if err := json.Unmarshal(newLine, &minimal); err != nil {
+		t.Fatal(err)
+	}
+	if minimal.RequestID != "new1" || minimal.Attempt != 2 {
+		t.Fatalf("old reader failed: %+v", minimal)
+	}
+	// Redaction: hash/proxy handling retains privacy (no raw session in lines).
+	store.EnqueueAttempt(UpstreamAttempt{Time: now, RequestID: "sec1", Model: "m", Tier: "zen", Protocol: "chat", ClientSessionHash: clientSessionHash("ses_secret_raw_session_value"), Attempt: 1, KeyID: "sk-live-99999", Channel: "key", Proxy: "http://user:hunter2@127.0.0.1:8080", Status: 200, DurationMS: 1, Success: true, FailureClass: AttemptClassSuccess})
+	_ = io.Discard
+}
+
+func TestDiagnosticsWebUIStatic(t *testing.T) {
+	data, err := os.ReadFile("webui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	for _, needle := range []string{"client_session_hash", "route_session_replay", "dropped_previous_response_id", "dropped_reasoning_refs", "客户端会话hash", "replay", "cache_hit_tokens", "cache_miss_tokens", "usage_reported"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("webui missing %q", needle)
+		}
+	}
+	for _, proto := range []string{"chat", "responses", "anthropic"} {
+		if !strings.Contains(html, proto) {
+			t.Fatalf("webui missing protocol %q", proto)
+		}
+	}
+	// Main column is the privacy-safe session hash; Request ID lives only in
+	// the expanded detail header plus copy action. Search still matches both.
+	if !strings.Contains(html, "<th>客户端会话hash</th>") {
+		t.Fatalf("realtime/history main column must be client session hash")
+	}
+	if strings.Contains(html, "<th>Request ID</th>") {
+		t.Fatalf("main table must not expose a Request ID column")
+	}
+	if !strings.Contains(html, "复制 request ID") {
+		t.Fatalf("detail must retain Request ID copy action")
+	}
+	if !strings.Contains(html, `String(r.request_id||"")`) || !strings.Contains(html, `String(r.client_session_hash||"")`) {
+		t.Fatalf("search must match both session hash and Request ID")
+	}
+	// Old records without a hash show a fallback marker, never the Request ID.
+	if !strings.Contains(html, "— 无hash") {
+		t.Fatalf("webui missing no-hash fallback marker")
+	}
+	// Cache labels must state that miss bundles cache-write plus ordinary uncached.
+	for _, needle := range []string{"缓存命中", "缓存未命中", "包含缓存写入", "普通未缓存", "上游未报告"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("webui missing cache label %q", needle)
+		}
+	}
+	// Dependency-free text-node rendering still holds.
+	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"} {
+		if strings.Contains(html, sink) {
+			t.Fatalf("forbidden sink %q", sink)
+		}
+	}
+	// Column counts stay consistent with headers.
+	if !strings.Contains(html, "emptyRow(tb,13,") {
+		t.Fatalf("realtime emptyRow must cover 13 columns")
+	}
+	if !strings.Contains(html, "emptyRow(tb,11,") {
+		t.Fatalf("history emptyRow must cover 11 columns")
+	}
+	if strings.Count(html, "dt.colSpan=13") != 1 {
+		t.Fatalf("realtime detail colspan must be 13")
+	}
+	if strings.Count(html, "dt.colSpan=11") != 1 {
+		t.Fatalf("history detail colspan must be 11")
+	}
+}
+
+func TestNonReplayAttemptsOmitReplayFlagsJSON(t *testing.T) {
+	a := UpstreamAttempt{RequestID: "r", Model: "m", Tier: "zen", Protocol: "chat", Attempt: 1, Channel: "key", Success: true, FailureClass: AttemptClassSuccess}
+	data, _ := json.Marshal(a)
+	if strings.Contains(string(data), "route_session_replay") || strings.Contains(string(data), "dropped_") {
+		t.Fatalf("non-replay must omit replay flags: %s", data)
+	}
+	r := UpstreamAttempt{RequestID: "r", Model: "m", Tier: "zen", Protocol: "responses", Attempt: 2, Channel: "key", Success: true, FailureClass: AttemptClassSuccess, RouteSessionReplay: true}
+	data2, _ := json.Marshal(r)
+	if !strings.Contains(string(data2), `"route_session_replay":true`) {
+		t.Fatalf("replay must serialize: %s", data2)
+	}
+	if strings.Contains(string(data2), "dropped_previous_response_id") || strings.Contains(string(data2), "dropped_reasoning_refs") {
+		t.Fatalf("false drops must be omitted: %s", data2)
+	}
+	// Request without protocol/hash omits them (additive).
+	req := UpstreamRequest{RequestID: "r", Model: "m", Channel: "not_routed", Attempts: 0, Status: 400, Success: false, Outcome: "not_routed"}
+	data3, _ := json.Marshal(req)
+	if strings.Contains(string(data3), "client_session_hash") || strings.Contains(string(data3), `"protocol"`) {
+		t.Fatalf("empty diagnostics must be omitted: %s", data3)
+	}
+}
+
+func TestAttemptProtocolFollowsTier(t *testing.T) {
+	monitor := NewMonitor()
+	gateway := routing400Gateway(t, monitor)
+	stubProxy(t, gateway, "z", 0, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	route := authOnlyRoute()
+	route.Protocols = map[Tier]Protocol{TierZen: ProtocolChat, TierGo: ProtocolAnthropic}
+	route.Protocol = ProtocolChat
+	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{ClientSessionHash: clientSessionHash("ses_proto_tier")})
+	ids := clientSessionIDs("ses_proto_tier")
+	resp, eff, _, err := gateway.doUpstreamTiers(ctx, route, routeBodies(), ids, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainAndClose(resp.Body)
+	recent := monitor.Snapshot().Upstream.Recent
+	if len(recent) == 0 {
+		t.Fatalf("no attempts")
+	}
+	if recent[0].Protocol != string(eff.Protocol) {
+		t.Fatalf("attempt protocol=%q want %q", recent[0].Protocol, eff.Protocol)
+	}
+	_ = http.StatusOK
+}
