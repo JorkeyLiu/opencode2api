@@ -511,9 +511,14 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		}
 	}
 	// Required element IDs across the four tabs (new period model).
-	for _, id := range []string{"h-period", "tbody-hist", "hist-more", "usage-avail", "c-hist-enabled", "c-hist-retention", "c-hist-max", "hist-proxy", "f-proxy", "tbody-attempts", "h-kpis", "trend-req", "trend-tok", "tbody-usage-model", "tbody-usage-tier", "facts-readiness", "tbody-proxies", "tbody-keys", "tbody-targets", "targets-note", "facts-catalog", "log-list", "c-web-enabled", "pools-editor"} {
+	for _, id := range []string{"h-period", "tbody-proxy-stats", "tbl-proxy-stats", "proxy-stats-note", "usage-avail", "c-hist-enabled", "c-hist-retention", "c-hist-max", "f-proxy", "tbody-attempts", "h-kpis", "trend-req", "trend-tok", "tbody-usage-model", "tbody-usage-tier", "facts-readiness", "tbody-proxies", "tbody-keys", "tbody-targets", "targets-note", "facts-catalog", "log-list", "c-web-enabled", "pools-editor"} {
 		if !strings.Contains(html, id) {
 			t.Fatalf("missing webui id %q", id)
+		}
+	}
+	for _, stale := range []string{"tbody-hist", "hist-more", "hist-count", "hist-model", "hist-status", "hist-proxy", "tbl-hist", "hist-persist-wrap"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("duplicate persisted request-history table must stay removed: %q", stale)
 		}
 	}
 	// Single h-period selector carries the four labels/values; old controls gone.
@@ -530,8 +535,11 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 			t.Fatalf("old h-scope/h-range controls must stay removed: %q", stale)
 		}
 	}
-	if !strings.Contains(html, "/api/history/requests") || !strings.Contains(html, "/api/history/series") || !strings.Contains(html, "/api/history/attempts") {
-		t.Fatal("missing history API wiring (requests/series/attempts)")
+	if !strings.Contains(html, "/api/history/proxy-stats") || !strings.Contains(html, "/api/history/series") {
+		t.Fatal("missing history API wiring (proxy-stats/series)")
+	}
+	if strings.Contains(html, "/api/history/requests?") || strings.Contains(html, "/api/history/attempts?") {
+		t.Fatal("usage page must not aggregate client pages via requests/attempts; use /api/history/proxy-stats")
 	}
 	// No expandable rows: no per-row attempt fetch, no expand state.
 	if strings.Contains(html, "loadHistAttempts(") {
@@ -548,12 +556,12 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 			t.Fatalf("removed column must stay removed: %q", stale)
 		}
 	}
-	// Flat attempt rows: 11-column headers omit Request ID/replay/HTTP400 diagnosis.
+	// Flat attempt rows: realtime 11-column header omits Request ID/replay/HTTP400 diagnosis.
 	if !strings.Contains(html, "attempt-row") {
 		t.Fatal("missing flat attempt-row rendering")
 	}
-	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
-		t.Fatal("live and persisted tables must share the header without Request ID")
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 1 {
+		t.Fatal("realtime table must keep the header without Request ID")
 	}
 	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "400_diag", "diag400Cell", "diag400Text", "复制完整 Request ID"} {
 		if strings.Contains(html, stale) {
@@ -567,7 +575,7 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		t.Fatal("flat rows must carry localized 上游/密钥/状态/耗时 columns")
 	}
 	if !strings.Contains(html, "attemptRowCells") {
-		t.Fatal("persisted table must reuse shared attemptRowCells")
+		t.Fatal("realtime table must reuse shared attemptRowCells")
 	}
 	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
 		t.Fatal("search must match both Request ID and client session hash")
@@ -588,17 +596,26 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "最终") {
 		t.Fatal("tokens must be scoped to the final request-result row")
 	}
-	if strings.Count(html, "emptyRow(tb,11") < 2 {
-		t.Fatal("realtime and persisted flat tables must cover 11 columns")
+	if strings.Count(html, "emptyRow(tb,11") < 1 {
+		t.Fatal("realtime flat table must cover 11 columns")
+	}
+	if strings.Count(html, "emptyRow(tb,15") < 1 {
+		t.Fatal("proxy stats table must cover 15 columns")
 	}
 	if strings.Contains(html, "emptyRow(tb,14") {
 		t.Fatal("stale 14-column empty rows must be removed")
 	}
-	// Sidebar + responsive layout hooks.
-	for _, needle := range []string{`class="layout"`, `class="nav"`, `class="main"`, `id="main-nav"`, ".layout", "@media"} {
+	// Sidebar + responsive layout hooks (bounded redesign).
+	for _, needle := range []string{`class="layout"`, `class="nav"`, `class="main"`, `id="main-nav"`, ".layout", "@media", ".nav button:hover", ".nav button:focus-visible", ".nav button.active"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing sidebar/responsive hook %q", needle)
 		}
+	}
+	if !strings.Contains(html, "box-shadow:2px 0 6px") {
+		t.Fatal("sidebar must carry a restrained right divider/shadow")
+	}
+	if !strings.Contains(html, "outline:2px solid var(--accent)") {
+		t.Fatal("sidebar must carry keyboard-focus state")
 	}
 	// F1: hidden WebUI enabled preserves backend via safe preservedEnabled; submit must not dereference null S.config.
 	if !strings.Contains(html, "hidden-enabled-preserved") {
@@ -625,38 +642,41 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		}
 	}
 	// F3: realtime proxy filter preserves selection even when temporarily absent.
-	if strings.Count(html, "if(cur)seen[cur]=1") < 2 {
-		t.Fatal("realtime and history proxy filters must preserve selection")
+	if strings.Count(html, "if(cur)seen[cur]=1") < 1 {
+		t.Fatal("realtime proxy filter must preserve selection")
 	}
-	// F4: strict final usage equality for old history records.
-	if !strings.Contains(html, "req.attempts!==undefined&&a.attempt!==undefined&&req.attempts===a.attempt") {
-		t.Fatal("history final usage must require both counts known and equal")
+	if strings.Contains(html, "renderHistProxyFilter") {
+		t.Fatal("duplicate history proxy filter must stay removed")
 	}
+	// F4: strict final usage equality for realtime only.
 	if !strings.Contains(html, "if(req.attempts===undefined||attempt.attempt===undefined)return null") {
 		t.Fatal("realtime final usage must require both counts known and equal")
 	}
 	if strings.Contains(html, "(req.attempts===undefined||req.attempts===a.attempt)") {
 		t.Fatal("loose final usage equality must be removed")
 	}
-	// F5: server-side proxy_pool, coherent reset/join, bounded state.
-	if strings.Count(html, "&proxy_pool=") < 2 {
-		t.Fatal("history requests+attempts must use server-side proxy_pool query")
+	// F5: bounded server aggregate replaces client cursor paging.
+	if strings.Contains(html, "&proxy_pool=") {
+		t.Fatal("usage page must not use client-side proxy_pool paging; use /api/history/proxy-stats")
 	}
-	if !strings.Contains(html, "poolSel") || !strings.Contains(html, "pxSel.split") {
-		t.Fatal("history proxy_pool must derive from selected proxy filter")
+	if strings.Contains(html, "poolSel") || strings.Contains(html, "pxSel.split") {
+		t.Fatal("client proxy_pool derivation must stay removed")
 	}
-	if !strings.Contains(html, `S.histCursor=""; S.histAttCursor=""`) {
-		t.Fatal("history cursors must reset coherently on filter change")
+	if strings.Contains(html, `S.histCursor=""; S.histAttCursor=""`) || strings.Contains(html, "S.histCursor") || strings.Contains(html, "S.histAttCursor") {
+		t.Fatal("client history cursors must stay removed")
 	}
-	if !strings.Contains(html, "S.histItems.length>500") || !strings.Contains(html, "S.histAttempts.length>500") {
-		t.Fatal("history client state must stay bounded across pages")
+	if strings.Contains(html, "S.histItems.length>500") || strings.Contains(html, "S.histAttempts.length>500") {
+		t.Fatal("client paged history state must stay removed")
+	}
+	if !strings.Contains(html, "renderProxyStats") || !strings.Contains(html, "/api/history/proxy-stats") {
+		t.Fatal("usage page must render bounded server proxy stats")
 	}
 	if !strings.Contains(html, "reqById") {
-		t.Fatal("history rows must join requests/attempts across loaded pages")
+		t.Fatal("realtime rows must join requests/attempts")
 	}
-	// F6: persisted history flat table has its own scroll bound outside realtime.
-	if !strings.Contains(html, `<div class="table-wrap scroll-bound"><table class="table" id="tbl-hist"`) {
-		t.Fatal("persisted history flat table must carry scroll-bound")
+	// F6: proxy stats table has its own scroll bound.
+	if !strings.Contains(html, `<div class="table-wrap scroll-bound"><table class="table" id="tbl-proxy-stats"`) {
+		t.Fatal("proxy stats table must carry scroll-bound")
 	}
 	// Checkbox-label spacing and scroll bounds.
 	if !strings.Contains(html, ".check-label input") {
@@ -666,9 +686,14 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		t.Fatal("missing bounded internal scroll")
 	}
 	// Charts, KPIs, caps, filters (period model + overflow guards).
-	for _, needle := range []string{"缓存命中率", "trend-cap", "aggregatePersistedSeries", "完整模型 ID 精确过滤", "最多显示 200 条", "历史记录", "今天", "本月"} {
+	for _, needle := range []string{"缓存命中率", "trend-cap", "aggregatePersistedSeries", "上游尝试", "代理统计", "已返回用量请求", "今天", "本月"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing usage/chart label %q", needle)
+		}
+	}
+	for _, stale := range []string{"完整模型 ID 精确过滤", "hist-model", "hist-status", "hist-proxy", "hist-more", "hist-count", "renderPersistedRows"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("duplicate history-table control must stay removed: %q", stale)
 		}
 	}
 	for _, stale := range []string{"P50", "最多展示 200", "单次尝试一行", ").slice(-120)", "function renderTrends", "S.historyRange", "分组指纹"} {
@@ -686,9 +711,9 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if ps < 0 {
 		t.Fatal("missing renderPersistedSeries")
 	}
-	psEnd := strings.Index(html[ps:], "function renderPersistedRows(){")
+	psEnd := strings.Index(html[ps:], "function renderProxyStats(){")
 	if psEnd < 0 {
-		t.Fatal("missing renderPersistedRows boundary")
+		t.Fatal("missing renderProxyStats boundary")
 	}
 	pbody := html[ps : ps+psEnd]
 	if !strings.Contains(pbody, "clear(hr)") || !strings.Contains(pbody, "clear(ht)") {
@@ -701,12 +726,15 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "logFail") {
 		t.Fatal("missing SSE failure counter")
 	}
-	// Persisted history count + cursors stay coherent across pages.
-	if !strings.Contains(html, "hist-count") {
-		t.Fatal("missing hist-count display")
+	// Proxy stats loading/truncation state stays bounded server-side.
+	if !strings.Contains(html, "proxy-stats-note") {
+		t.Fatal("missing proxy-stats-note display")
 	}
-	if !strings.Contains(html, "S.histCursor") || !strings.Contains(html, "S.histAttCursor") {
-		t.Fatal("missing persisted history cursors")
+	if !strings.Contains(html, "S.proxyStats") || !strings.Contains(html, "S.proxyTruncated") {
+		t.Fatal("missing bounded proxy stats state")
+	}
+	if strings.Contains(html, "S.histCursor") || strings.Contains(html, "S.histAttCursor") {
+		t.Fatal("stale persisted history cursors must stay removed")
 	}
 	// Staged pool semantics: badge + explicit copy.
 	if !strings.Contains(html, "pool-badge") {
@@ -753,6 +781,93 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	}
 	if !strings.Contains(html, "tierLabel(") || !strings.Contains(html, "protoLabel(") || !strings.Contains(html, "failureLabel(") || !strings.Contains(html, "hintLabel(") {
 		t.Fatal("tables must use centralized protocol/tier/failure/hint mapping helpers")
+	}
+}
+
+func TestHistoryWebUICompletedJoinStability(t *testing.T) {
+	data, err := os.ReadFile("webui/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	// Completed-join stability for realtime: unfinished unmatched attempts
+	// never render, so a visible — means the completed upstream response did
+	// not provide usage.
+	if got := strings.Count(html, "if(!reqById[a.request_id])return"); got < 1 {
+		t.Fatalf("realtime join must skip unmatched attempts, got %d", got)
+	}
+	if strings.Contains(html, "req.attempts!==undefined&&a.attempt!==undefined&&req.attempts===a.attempt") {
+		t.Fatal("duplicate persisted join must stay removed")
+	}
+	// Realtime retains request-only fallback for completed rows.
+	if got := strings.Count(html, "fallback:true"); got < 1 {
+		t.Fatalf("completed request-only fallback must be retained, got %d", got)
+	}
+	if !strings.Contains(html, "tokenReq:(r.usage_reported?r:null)") {
+		t.Fatal("request-only fallback must carry immutable request usage only")
+	}
+	// Usage — stability: token cells derive only from the immutable parent
+	// request via strict final-attempt equality; no client merging converts — later.
+	if !strings.Contains(html, "function finalUsageFor(attempt, reqById){") {
+		t.Fatal("missing finalUsageFor join helper")
+	}
+	if !strings.Contains(html, "if(req.attempts===undefined||attempt.attempt===undefined)return null") {
+		t.Fatal("final usage must require both counts known")
+	}
+	// Completed captions: realtime stability plus proxy-stats mixed grain.
+	for _, needle := range []string{"已完成请求的尝试记录，未完成的暂不显示", "已完成的上游响应未提供用量", "不做估算"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing completed-join copy %q", needle)
+		}
+	}
+	if strings.Contains(html, "已完成请求的历史记录，未匹配到请求的不显示") {
+		t.Fatal("duplicate history-table copy must stay removed")
+	}
+	// Proxy stats mixed grain is explained once, concisely.
+	for _, needle := range []string{"代理统计", "上游尝试", "请求级已上报用量"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing proxy-stats grain copy %q", needle)
+		}
+	}
+	// Precise operator label: request-count ratio, never token ratio; — means upstream gave nothing.
+	if !strings.Contains(html, "上游用量返回率") {
+		t.Fatal("missing 上游用量返回率 label")
+	}
+	if strings.Contains(html, "用量上报率") {
+		t.Fatal("stale 用量上报率 label must be renamed")
+	}
+	for _, needle := range []string{"已返回用量的请求 / 请求数", "按请求数统计", "非 Token 占比", "— 表示上游未返回用量"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing usage-return-rate description %q", needle)
+		}
+	}
+	for _, stale := range []string{"projection", "coverage", "已上报/请求"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("implementation term must stay out of WebUI: %q", stale)
+		}
+	}
+	if strings.Contains(html, "var cover=") {
+		t.Fatal("stale cover variable must be renamed")
+	}
+	// Realtime search lists only user-facing fields; hidden IDs stay as searchable identifiers.
+	if !strings.Contains(html, `placeholder="搜索模型、代理、密钥或请求标识"`) {
+		t.Fatal("realtime search placeholder must list user-facing fields")
+	}
+	if strings.Contains(html, "搜索 Request ID / 会话标识") {
+		t.Fatal("stale search placeholder must be removed")
+	}
+	// Single period label: selector keeps it, adjacent duplicate is gone.
+	if strings.Contains(html, `id="h-scope-note"`) || strings.Contains(html, `$("h-scope-note")`) {
+		t.Fatal("duplicate period label next to #h-period must be removed")
+	}
+	if strings.Count(html, `id="h-period"`) != 1 {
+		t.Fatal("exactly one h-period selector required")
+	}
+	// Changed text stays DOM-safe.
+	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"} {
+		if strings.Contains(html, sink) {
+			t.Fatalf("forbidden sink %q", sink)
+		}
 	}
 }
 

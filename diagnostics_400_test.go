@@ -318,11 +318,10 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 			t.Fatalf("webui missing protocol %q", proto)
 		}
 	}
-	// New contract: 11-column headers shared by live and persisted tables.
-	// Request ID / replay / HTTP400-diagnosis columns are removed; search still
-	// covers request and session identifiers without a dedicated column.
-	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
-		t.Fatal("live and persisted tables must share the 11-column header without Request ID")
+	// New contract: realtime keeps the 11-column header; the duplicate
+	// persisted request-history table is replaced by the proxy-stats aggregate.
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 1 {
+		t.Fatal("realtime table must keep the 11-column header without Request ID")
 	}
 	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "400_diag", "diag400Cell", "diag400Text", "error_hint", "error_fingerprint", "分组指纹", "HTTP 400 同目标重放一次", "单次尝试一行", "回退请求行", "请求级回退行"} {
 		if strings.Contains(html, stale) {
@@ -344,7 +343,7 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 		t.Fatal("webui must render flat attempt rows")
 	}
 	if !strings.Contains(html, "attemptRowCells") {
-		t.Fatal("live and persisted tables must share attemptRowCells")
+		t.Fatal("realtime table must keep attemptRowCells")
 	}
 	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
 		t.Fatal("search must match both session hash and Request ID")
@@ -377,9 +376,12 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 			t.Fatalf("forbidden sink %q", sink)
 		}
 	}
-	// Column counts stay consistent with headers (11 flat columns).
-	if strings.Count(html, "emptyRow(tb,11") < 2 {
-		t.Fatal("realtime and persisted flat tables must cover 11 columns")
+	// Column counts stay consistent with headers (11 realtime columns + 15 proxy-stats columns).
+	if strings.Count(html, "emptyRow(tb,11") < 1 {
+		t.Fatal("realtime flat table must cover 11 columns")
+	}
+	if strings.Count(html, "emptyRow(tb,15") < 1 {
+		t.Fatal("proxy stats table must cover 15 columns")
 	}
 	if strings.Contains(html, "emptyRow(tb,14") {
 		t.Fatal("stale 14-column empty rows must be removed")

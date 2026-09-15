@@ -87,6 +87,7 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.Handle("GET /api/history/requests", a.authenticate(http.HandlerFunc(a.handleHistoryRequests)))
 	mux.Handle("GET /api/history/attempts", a.authenticate(http.HandlerFunc(a.handleHistoryAttempts)))
 	mux.Handle("GET /api/history/series", a.authenticate(http.HandlerFunc(a.handleHistorySeries)))
+	mux.Handle("GET /api/history/proxy-stats", a.authenticate(http.HandlerFunc(a.handleHistoryProxyStats)))
 	mux.Handle("/", a.staticHandler())
 	return a.securityHeaders(recoveryMiddleware(a.logger, mux))
 }

@@ -325,8 +325,8 @@ func TestError400HistoryWebUICompat(t *testing.T) {
 			t.Fatalf("removed HTTP400 diagnosis UI must stay removed: %q", stale)
 		}
 	}
-	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
-		t.Fatal("live and persisted tables must share the header without HTTP400 diagnosis")
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 1 {
+		t.Fatal("realtime table must keep the header without HTTP400 diagnosis")
 	}
 	for _, needle := range []string{"attemptRowCells", "pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+" ms"`} {
 		if !strings.Contains(html, needle) {

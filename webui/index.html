@@ -35,9 +35,11 @@ button{cursor:pointer}
 .topbar button{background:transparent;color:#fff;border:1px solid #ffffff55;padding:5px 10px;font-size:12.5px}
 .topbar button:hover{background:#ffffff18}
 .layout{display:flex;align-items:stretch;min-height:calc(100vh - 52px)}
-.nav{background:var(--card);border-right:1px solid var(--line);display:flex;flex-direction:column;gap:6px;padding:12px;width:212px;flex:none;position:sticky;top:52px;align-self:flex-start;min-height:calc(100vh - 52px);z-index:15}
-.nav button{border:1px solid var(--line2);background:#fff;padding:8px 12px;font-size:13.5px;text-align:left;width:100%}
-.nav button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.nav{background:var(--chip);border-right:1px solid var(--line2);box-shadow:2px 0 6px rgba(28,36,32,.06);display:flex;flex-direction:column;gap:8px;padding:14px 12px;width:212px;flex:none;position:sticky;top:52px;align-self:flex-start;min-height:calc(100vh - 52px);z-index:15}
+.nav button{border:1px solid var(--line2);background:#fff;padding:9px 12px;font-size:13.5px;text-align:left;width:100%}
+.nav button:hover{background:#e2e8e2}
+.nav button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.nav button.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;box-shadow:inset 3px 0 0 #0f2822}
 .main{flex:1;min-width:0;max-width:1280px;margin:0 auto;padding:18px;width:100%}
 .notice{background:#fff8e6;border:1px solid #e3c46a;color:#5c4a00;padding:9px 12px;font-size:13px;margin-bottom:12px}
 .banner{background:#fff;border:1px solid var(--line2);padding:8px 12px;font-size:12.5px;color:var(--muted);margin-bottom:12px}
@@ -111,7 +113,7 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 @media (max-width:1100px){
   .grid2,.grid3,.grid4,.form-grid,.facts,.trend-grid{grid-template-columns:1fr}
   .layout{flex-direction:column;min-height:auto}
-  .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line)}
+  .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
   .main{padding:12px}
   .topbar{position:static}
@@ -157,9 +159,9 @@ table.table td.wrap{white-space:normal;word-break:break-all}
     <section id="tab-realtime">
        <div class="section">
          <h2>实时请求</h2>
-         <div class="cap">按时间倒序显示上游尝试记录。Token 仅在最终尝试且上游已上报时显示，否则为“—”，不做估算。支持搜索模型、代理、密钥与请求标识。</div>
+         <div class="cap">按时间倒序显示已完成请求的尝试记录，未完成的暂不显示。Token 仅在最终尝试且上游已返回时显示，否则为“—”（已完成的上游响应未提供用量），不做估算。支持搜索模型、代理、密钥与请求标识。</div>
          <div class="filters">
-           <input type="search" id="f-search" placeholder="搜索 Request ID / 会话标识 / 模型 / 代理 / 密钥">
+           <input type="search" id="f-search" placeholder="搜索模型、代理、密钥或请求标识">
            <select id="f-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
            <select id="f-proxy"><option value="">全部代理</option></select>
            <button class="ghost" id="f-pause" type="button">暂停更新</button>
@@ -179,7 +181,6 @@ table.table td.wrap{white-space:normal;word-break:break-all}
         <div class="cap">用量仅统计上游实际回报，不做估算，未知显示“—”。所选时间同时决定指标、趋势与历史记录。</div>
         <div class="filters">
           <select id="h-period"><option value="today">今天</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="month">本月</option></select>
-          <span class="note" id="h-scope-note"></span>
         </div>
         <div class="note" id="usage-avail"></div>
         <div class="grid4" id="h-kpis"></div>
@@ -202,19 +203,13 @@ table.table td.wrap{white-space:normal;word-break:break-all}
         <div class="cap">按上游汇总已上报用量，未上报显示“—”。调用数为最近一小时窗口。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>上游</th><th>调用</th><th>输入</th><th>输出</th><th>缓存</th><th>推理</th><th>总量</th></tr></thead><tbody id="tbody-usage-tier"></tbody></table></div>
       </div>
-      <div class="section" id="hist-persist-wrap">
-        <h2>历史记录</h2>
-        <div class="cap">按时间倒序显示历史尝试记录。Token 仅在最终尝试且已上报时显示，否则为“—”。模型需输入完整 ID 精确过滤，可分页加载更多。</div>
-        <div class="filters">
-          <input type="search" id="hist-model" placeholder="完整模型 ID 精确过滤">
-          <select id="hist-status"><option value="">全部结果</option><option value="success">成功</option><option value="failed">失败</option></select>
-          <select id="hist-proxy"><option value="">全部代理</option></select>
-          <button class="ghost" id="hist-more" type="button">加载更多</button>
-          <span class="note" id="hist-count"></span>
-        </div>
-        <div class="table-wrap scroll-bound"><table class="table" id="tbl-hist">
-          <thead><tr><th>时间</th><th>模型</th><th>上游</th><th title="目标协议：Chat Completions / Responses / Anthropic">协议</th><th>代理</th><th>密钥</th><th>尝试</th><th>状态</th><th>缓存命中</th><th>输入/输出</th><th>耗时</th></tr></thead>
-          <tbody id="tbody-hist"></tbody>
+      <div class="section" id="proxy-stats-wrap">
+        <h2>代理统计</h2>
+        <div class="cap">所选时间内的上游尝试按代理池 / 节点汇总。调用、成功、失败与成功率来自上游尝试（含重试与失败分类）；平均耗时为尝试耗时。输入 / 输出 / 缓存与已返回用量请求数为请求级已上报用量，上游未返回时显示“—”，不做估算。</div>
+        <div class="note" id="proxy-stats-note"></div>
+        <div class="table-wrap scroll-bound"><table class="table" id="tbl-proxy-stats">
+          <thead><tr><th>代理池</th><th>节点</th><th>上游尝试</th><th>成功</th><th>成功率</th><th>失败</th><th>限流</th><th>认证失败</th><th>上游失败</th><th>传输失败</th><th>其他失败</th><th>平均耗时</th><th>输入/输出</th><th>缓存命中</th><th>已返回用量请求</th></tr></thead>
+          <tbody id="tbody-proxy-stats"></tbody>
         </table></div>
       </div>
     </section>
@@ -382,7 +377,7 @@ var S = {
   monitorError:false, lastRefresh:"",
   realtimePaused:false,
   historyPeriod:"today", history:null, persistedSeries:[],
-  histItems:[], histAttempts:[], histCursor:"", histAttCursor:"", histLoading:false, histSeq:0,
+  proxyStats:[], proxyTruncated:false, proxyTotal:0, histLoading:false, histSeq:0,
   logEvents:[], logPaused:false, logGap:"", logFail:0,
   es:null, timer:null
 };
@@ -524,21 +519,6 @@ function renderProxyFilter(){
     var o=document.createElement("option"); o.value=k; o.textContent=k; sel.appendChild(o);
   });
   sel.value=cur||"";
-  renderHistProxyFilter();
-}
-function renderHistProxyFilter(){
-  var sel=$("hist-proxy"); if(!sel)return;
-  var cur=sel.value, seen={};
-  (S.histAttempts||[]).forEach(function(a){ var k=proxyLabel(a.proxy_pool,a.proxy_node); if(k&&k!=="—")seen[k]=1; });
-  (S.histItems||[]).forEach(function(r){ var k=proxyLabel(r.proxy_pool,r.proxy_node); if(k&&k!=="—")seen[k]=1; });
-  ((S.upstream&&S.upstream.recent)||[]).forEach(function(a){ var k=proxyLabel(a.proxy_pool,a.proxy_node||a.proxy); if(k&&k!=="—")seen[k]=1; });
-  if(cur)seen[cur]=1;
-  clear(sel);
-  var o0=document.createElement("option"); o0.value=""; o0.textContent="全部代理"; sel.appendChild(o0);
-  Object.keys(seen).sort().forEach(function(k){
-    var o=document.createElement("option"); o.value=k; o.textContent=k; sel.appendChild(o);
-  });
-  sel.value=cur||"";
 }
 /* shared single-attempt row builder. Token only on final request-result row
    where request-level reported usage is true and both request.attempts and
@@ -596,7 +576,10 @@ function renderRealtime(){
   reqs.forEach(function(r){ reqById[r.request_id]=r; });
   var seenReq={};
   var rows=[];
+  /* 显示稳定性：只渲染已有完成请求记录的尝试，未完成的暂不显示；
+     可见 — 即已完成的上游响应未提供用量，而非直播流未结束。 */
   attempts.forEach(function(a){
+    if(!reqById[a.request_id])return;
     seenReq[a.request_id]=1;
     var tokenReq=finalUsageFor(a,reqById);
     rows.push({a:a,tokenReq:tokenReq,fallback:false});
@@ -632,9 +615,7 @@ function copyText(text){
 }
 
 /* ---------- usage ---------- */
-(function(){ var sel=$("h-period"); if(sel){ sel.value=S.historyPeriod; sel.addEventListener("change",function(){ S.historyPeriod=sel.value; S.histItems=[]; S.histAttempts=[]; S.histCursor=""; S.histAttCursor=""; S.persistedSeries=[]; S.histSeq++; renderUsage(); loadPersistedHistory(true); }); } })();
-["hist-model","hist-status","hist-proxy"].forEach(function(id){ $(id).addEventListener("input",function(){ S.histItems=[]; S.histAttempts=[]; S.histCursor=""; S.histAttCursor=""; S.histSeq++; loadPersistedHistory(true); }); $(id).addEventListener("change",function(){ S.histItems=[]; S.histAttempts=[]; S.histCursor=""; S.histAttCursor=""; S.histSeq++; loadPersistedHistory(true); }); });
-$("hist-more").addEventListener("click",function(){ loadPersistedHistory(false); });
+(function(){ var sel=$("h-period"); if(sel){ sel.value=S.historyPeriod; sel.addEventListener("change",function(){ S.historyPeriod=sel.value; S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.histSeq++; renderUsage(); loadPersistedHistory(true); }); } })();
 function periodStart(kind){
   var now=new Date();
   if(kind==="today"){ var s=new Date(now); s.setHours(0,0,0,0); return s; }
@@ -659,12 +640,11 @@ function renderUsage(){
   var m=S.metrics; if(!m)return;
   var use=((m.usage&&m.usage.last_hour)||{});
   var avail=usageAvailability();
-  var note=$("h-scope-note"); if(note)note.textContent=periodLabel(S.historyPeriod);
   var ua=$("usage-avail"); if(ua){ clear(ua); if(!avail.ok||avail.partial||avail.text)ua.appendChild(document.createTextNode(avail.text)); }
   renderPersistedKPIs();
   renderUsageTables(use);
-  renderPersistedRows();
-  if(!S.histItems.length&&!S.histAttempts.length&&!S.persistedSeries.length&&!S.histLoading)loadPersistedHistory(true);
+  renderProxyStats();
+  if(!S.persistedSeries.length&&!S.proxyStats.length&&!S.histLoading)loadPersistedHistory(true);
   else if(S.persistedSeries.length)renderPersistedSeries(S.persistedSeries);
 }
 function renderPersistedKPIs(){
@@ -676,8 +656,8 @@ function renderPersistedKPIs(){
     kpi("成功率","—","所选时间无历史数据");
     kpi("输入 / 输出","—","所选时间无历史数据");
     kpi("缓存命中率","—","所选时间无历史数据");
-    kpi("平均耗时","—","所选时间无历史数据");
-    kpi("用量上报率","—","所选时间无历史数据");
+    kpi("上游尝试平均耗时","—","所选时间无历史数据");
+    kpi("上游用量返回率","—","所选时间无历史数据；— 表示上游未返回用量");
     return;
   }
   var items=S.persistedSeries||[];
@@ -687,28 +667,28 @@ function renderPersistedKPIs(){
     kpi("成功率",S.histLoading?"加载中…":"—",loading);
     kpi("输入 / 输出",S.histLoading?"加载中…":"—",loading);
     kpi("缓存命中率",S.histLoading?"加载中…":"—",loading);
-    kpi("平均耗时",S.histLoading?"加载中…":"—",loading);
-    kpi("用量上报率",S.histLoading?"加载中…":"—",loading);
+    kpi("上游尝试平均耗时",S.histLoading?"加载中…":"—",loading);
+    kpi("上游用量返回率",S.histLoading?"加载中…":"—",S.histLoading?"加载中…":"暂无数据；— 表示上游未返回用量");
     return;
   }
   var total=0,success=0,errors=0,it=0,ot=0,ct=0,rt=0,rep=0;
   items.forEach(function(p){ total+=(p.total||0); success+=(p.success||0); errors+=(p.errors||0); it+=(p.input_tokens||0); ot+=(p.output_tokens||0); ct+=(p.cached_tokens||0); rt+=(p.reasoning_tokens||0); rep+=(p.usage_reported||0); });
   var rate=total>0?((success/total*100).toFixed(1)+"%"):"—";
   var hit=it>0?((ct/it*100).toFixed(1)+"%"):"—";
-  var cover=total>0?((rep/total*100).toFixed(1)+"%"):"—";
+  var retRate=total>0?((rep/total*100).toFixed(1)+"%"):"—";
   var avg="—";
-  if((S.histItems||[]).length){
+  if((S.proxyStats||[]).length){
     var sum=0,n=0;
-    S.histItems.forEach(function(r){ var d=(r.duration_ms===undefined?r.DurationMS:r.duration_ms); if(d!==undefined&&d!==null){ sum+=Number(d); n++; } });
+    S.proxyStats.forEach(function(p){ var a=Number(p.attempts||0); var d=Number(p.avg_duration_ms||0); if(a>0){ sum+=d*a; n+=a; } });
     if(n)avg=(sum/n).toFixed(1)+" ms";
-  }
+  } else if(S.histLoading) avg="加载中…";
   var sub=avail.partial?"仅保留期内数据":"已上报才计数";
   kpi("请求数",fmtInt(total),"成功 "+fmtInt(success)+" · 失败 "+fmtInt(errors));
   kpi("成功率",rate,"成功 "+fmtInt(success)+" / 共 "+fmtInt(total));
   kpi("输入 / 输出",fmtInt(it)+" / "+fmtInt(ot),"缓存 "+fmtInt(ct)+" · 推理 "+fmtInt(rt));
   kpi("缓存命中率",hit,"缓存/输入，"+sub);
-  kpi("平均耗时",avg,"已加载记录平均");
-  kpi("用量上报率",fmtInt(rep)+" / "+cover,"已上报/请求");
+  kpi("上游尝试平均耗时",avg,"尝试耗时加权平均");
+  kpi("上游用量返回率",fmtInt(rep)+" / "+retRate,"已返回用量的请求 / 请求数，按请求数统计，非 Token 占比；— 表示上游未返回用量");
 }
 function renderUsageTables(use){
   var m=S.metrics||{};
@@ -744,45 +724,23 @@ function renderUsageTables(use){
 function histQueryRange(){ var to=new Date(); var from=periodStart(S.historyPeriod||"today"); return {from:from.toISOString(),to:to.toISOString()}; }
 function loadPersistedHistory(reset){
   var seq=++S.histSeq; S.histLoading=true;
-  if(reset){ S.histItems=[]; S.histAttempts=[]; S.histCursor=""; S.histAttCursor=""; S.persistedSeries=[]; }
+  if(reset){ S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; }
+  renderProxyStats(); renderPersistedKPIs();
   var rg=histQueryRange();
-  var base="from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=100";
-  var mf=$("hist-model").value.trim();
-  var st=$("hist-status").value;
-  var pxSel=$("hist-proxy").value||"";
-  var poolSel=pxSel?pxSel.split("/")[0]:"";
-  var params=base;
-  if(!reset&&S.histCursor)params+="&cursor="+encodeURIComponent(S.histCursor);
-  if(mf)params+="&model="+encodeURIComponent(mf);
-  if(st==="success")params+="&success=true"; else if(st==="failed")params+="&success=false";
-  if(poolSel)params+="&proxy_pool="+encodeURIComponent(poolSel);
-  api("/api/history/requests?"+params,{method:"GET"}).then(function(res){
-    if(seq!==S.histSeq)return;
-    if(reset){ S.histItems=[]; }
-    (res.items||[]).forEach(function(it){S.histItems.push(it);});
-    if(S.histItems.length>500)S.histItems.splice(0,S.histItems.length-500);
-    S.histCursor=res.next_cursor||"";
-    S.histLoading=false; renderPersistedRows(); renderPersistedKPIs(); renderHistProxyFilter();
-  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; var c=$("hist-count"); if(c)c.textContent="历史加载失败："+err.message; renderPersistedKPIs(); });
-  var aparams=base;
-  if(!reset&&S.histAttCursor)aparams+="&cursor="+encodeURIComponent(S.histAttCursor);
-  if(mf)aparams+="&model="+encodeURIComponent(mf);
-  if(st==="success")aparams+="&success=true"; else if(st==="failed")aparams+="&success=false";
-  if(poolSel)aparams+="&proxy_pool="+encodeURIComponent(poolSel);
-  api("/api/history/attempts?"+aparams,{method:"GET"}).then(function(res){
-    if(seq!==S.histSeq)return;
-    if(reset)S.histAttempts=[];
-    (res.items||[]).forEach(function(it){S.histAttempts.push(it);});
-    if(S.histAttempts.length>500)S.histAttempts.splice(0,S.histAttempts.length-500);
-    S.histAttCursor=res.next_cursor||"";
-    renderPersistedRows(); renderPersistedKPIs(); renderHistProxyFilter();
-  }).catch(function(){});
   api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
     if(seq!==S.histSeq)return;
     S.persistedSeries=res.items||[];
     renderPersistedSeries(S.persistedSeries);
     renderPersistedKPIs();
   }).catch(function(){ if(seq!==S.histSeq)return; S.persistedSeries=[]; renderPersistedSeries([]); renderPersistedKPIs(); });
+  api("/api/history/proxy-stats?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq)return;
+    S.proxyStats=res.items||[];
+    S.proxyTruncated=!!res.truncated;
+    S.proxyTotal=(res.total_proxies===undefined||res.total_proxies===null)?S.proxyStats.length:res.total_proxies;
+    S.histLoading=false;
+    renderProxyStats(); renderPersistedKPIs();
+  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; renderProxyStats(); renderPersistedKPIs(); });
 }
 function aggregatePersistedSeries(items, maxBuckets){
   maxBuckets=maxBuckets||120;
@@ -841,46 +799,43 @@ function renderPersistedSeries(items){
     ht.appendChild(t);
   });
 }
-function renderPersistedRows(){
-  var tb=$("tbody-hist"); if(!tb)return; clear(tb);
-  var c=$("hist-count");
+function renderProxyStats(){
+  var tb=$("tbody-proxy-stats"); if(!tb)return; clear(tb);
+  var note=$("proxy-stats-note");
   var avail=usageAvailability();
-  if(!avail.ok){ if(c)c.textContent=avail.text; emptyRow(tb,11,"历史记录未启用"); return; }
-  var reqById={};
-  (S.histItems||[]).forEach(function(r){ reqById[r.request_id]=r; });
-  var seenReq={};
-  var rows=[];
-  (S.histAttempts||[]).slice().sort(function(a,b){ return new Date(b.time)-new Date(a.time); }).forEach(function(a){
-    seenReq[a.request_id]=1;
-    var tokenReq=null;
-    var req=reqById[a.request_id];
-    if(req&&req.usage_reported&&req.attempts!==undefined&&a.attempt!==undefined&&req.attempts===a.attempt)tokenReq=req;
-    rows.push({a:a,tokenReq:tokenReq,fallback:false});
-  });
-  (S.histItems||[]).slice().sort(function(a,b){ return new Date(b.time)-new Date(a.time); }).forEach(function(r){
-    if(seenReq[r.request_id])return;
-    rows.push({a:{time:r.time,request_id:r.request_id,client_session_hash:r.client_session_hash,model:r.model,tier:r.tier,protocol:r.protocol,proxy_pool:r.proxy_pool,proxy_node:r.proxy_node,key_id:r.key_id,anonymous:r.anonymous,attempt:r.attempts,status:r.status,success:r.success,duration_ms:r.duration_ms},tokenReq:(r.usage_reported?r:null),fallback:true});
-  });
-  var px=$("hist-proxy").value, st=$("hist-status").value;
-  var mf=$("hist-model").value.trim();
-  var filtered=rows.filter(function(row){
-    var a=row.a;
-    if(mf&&String(a.model||"")!==mf)return false;
-    var ok=a.success;
-    if(st==="success"&&!ok)return false;
-    if(st==="failed"&&ok)return false;
-    if(px&&proxyLabel(a.proxy_pool,a.proxy_node)!==px)return false;
-    return true;
-  }).slice(0,200);
-  if(c){
-    var text="共 "+filtered.length+" 条，最多显示 200 条"+((S.histCursor||S.histAttCursor)?"（可加载更多）":"")+(S.histLoading?" · 加载中…":"");
-    if(avail.partial)text+=" · "+avail.text;
-    c.textContent=text;
-  }
-  if(!filtered.length){emptyRow(tb,11,S.histLoading?"历史加载中…":"暂无数据");return;}
-  filtered.forEach(function(row){
-    var tr=document.createElement("tr"); tr.className="attempt-row"+(row.fallback?" fallback":"");
-    attemptRowCells(tr,row.a,row.tokenReq,row.fallback);
+  function setNote(text){ if(note){ clear(note); if(text)note.appendChild(document.createTextNode(text)); } }
+  if(!avail.ok){ setNote(avail.text); emptyRow(tb,15,"历史记录未启用"); return; }
+  var rows=S.proxyStats||[];
+  if(!rows.length){ setNote(S.histLoading?"代理统计加载中…":("暂无数据（"+periodLabel(S.historyPeriod)+"内无代理尝试）"+(avail.partial?" · "+avail.text:""))); emptyRow(tb,15,S.histLoading?"代理统计加载中…":"暂无数据"); return; }
+  var text="共 "+rows.length+" 个代理"+(S.proxyTruncated?("，仅展示前 "+rows.length+"（共 "+S.proxyTotal+"，已截断）"):"")+(S.histLoading?" · 加载中…":"")+(avail.partial?" · "+avail.text:"");
+  setNote(text);
+  rows.forEach(function(p){
+    var tr=document.createElement("tr");
+    cell(tr,p.proxy_pool||"—");
+    (function(){ var td=document.createElement("td"); var v=p.proxy_node||"—"; td.textContent=v; td.title="节点："+v; td.className="wrap"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=fmtInt(p.attempts); td.title="所选时间内的上游尝试数（含重试）"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=fmtInt(p.success); td.title="成功的上游尝试"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var r=(p.attempts>0)?((Number(p.success||0)/Number(p.attempts)*100).toFixed(1)+"%"):"—"; td.textContent=r; td.title="成功 / 上游尝试"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=fmtInt(p.failed); td.title="失败的上游尝试"; tr.appendChild(td); })();
+    cell(tr,fmtInt(p.rate_limited));
+    cell(tr,fmtInt(p.auth_failures));
+    cell(tr,fmtInt(p.upstream_failures));
+    cell(tr,fmtInt(p.transport_failures));
+    cell(tr,fmtInt(p.other_failures));
+    (function(){ var td=document.createElement("td"); var d=p.avg_duration_ms; td.textContent=(d===undefined||d===null)?"—":(Number(d).toFixed(1)+" ms"); td.title="尝试耗时平均"; tr.appendChild(td); })();
+    (function(){
+      var td=document.createElement("td");
+      if(p.has_usage||Number(p.usage_requests||0)>0){ var iv=fmtInt(p.input_tokens); var ov=fmtInt(p.output_tokens); td.textContent=iv+" / "+ov; td.title="请求级已上报用量：总输入 / 总输出"; }
+      else { td.textContent="—"; td.title="该代理在所选时间内无已上报用量的请求，不做估算"; }
+      tr.appendChild(td);
+    })();
+    (function(){
+      var td=document.createElement("td");
+      if(p.has_usage||Number(p.usage_requests||0)>0){ td.textContent=fmtInt(p.cache_hit_tokens); td.title="请求级已上报缓存命中"; }
+      else { td.textContent="—"; td.title="该代理在所选时间内无已上报用量的请求，不做估算"; }
+      tr.appendChild(td);
+    })();
+    (function(){ var td=document.createElement("td"); var v=Number(p.usage_requests||0); if(p.has_usage||v>0){ td.textContent=fmtInt(v); td.title="已返回用量的请求数（请求级）"; } else { td.textContent="—"; td.title="无已上报用量的请求，不做估算"; } tr.appendChild(td); })();
     tb.appendChild(tr);
   });
 }
