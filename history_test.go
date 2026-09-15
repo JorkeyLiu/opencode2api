@@ -510,10 +510,24 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 			t.Fatalf("stale IA label must be removed: %q", stale)
 		}
 	}
-	// Required element IDs across the four tabs.
-	for _, id := range []string{"h-range", "tbody-hist", "hist-more", "facts-history", "c-hist-enabled", "c-hist-retention", "c-hist-max", "hist-proxy", "f-proxy", "tbody-attempts", "h-kpis", "trend-req", "trend-tok", "tbody-usage-model", "tbody-usage-tier", "facts-readiness", "tbody-proxies", "tbody-keys", "tbody-targets", "targets-note", "facts-catalog", "log-list", "c-web-enabled", "pools-editor"} {
+	// Required element IDs across the four tabs (new period model).
+	for _, id := range []string{"h-period", "tbody-hist", "hist-more", "usage-avail", "c-hist-enabled", "c-hist-retention", "c-hist-max", "hist-proxy", "f-proxy", "tbody-attempts", "h-kpis", "trend-req", "trend-tok", "tbody-usage-model", "tbody-usage-tier", "facts-readiness", "tbody-proxies", "tbody-keys", "tbody-targets", "targets-note", "facts-catalog", "log-list", "c-web-enabled", "pools-editor"} {
 		if !strings.Contains(html, id) {
 			t.Fatalf("missing webui id %q", id)
+		}
+	}
+	// Single h-period selector carries the four labels/values; old controls gone.
+	for _, needle := range []string{`<select id="h-period">`, `value="today">今天`, `value="24h">最近 24 小时`, `value="7d">最近 7 天`, `value="month">本月`, "periodStart", "periodLabel", "historyPeriod", "usageAvailability"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing h-period contract %q", needle)
+		}
+	}
+	if strings.Count(html, `id="h-period"`) != 1 {
+		t.Fatal("exactly one h-period selector required")
+	}
+	for _, stale := range []string{`id="h-range"`, `id="h-scope"`, "historyRange", "scopeLifetime", "historyRangeHours", "renderTrends", "S.histGap"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("old h-scope/h-range controls must stay removed: %q", stale)
 		}
 	}
 	if !strings.Contains(html, "/api/history/requests") || !strings.Contains(html, "/api/history/series") || !strings.Contains(html, "/api/history/attempts") {
@@ -534,31 +548,57 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 			t.Fatalf("removed column must stay removed: %q", stale)
 		}
 	}
-	// Flat attempt rows with Request ID copy + search over request and session.
+	// Flat attempt rows: 11-column headers omit Request ID/replay/HTTP400 diagnosis.
 	if !strings.Contains(html, "attempt-row") {
 		t.Fatal("missing flat attempt-row rendering")
 	}
-	if !strings.Contains(html, "<th>Request ID</th>") || !strings.Contains(html, "<th>代理</th>") {
-		t.Fatal("flat rows must carry compact Request ID and 代理 columns")
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
+		t.Fatal("live and persisted tables must share the header without Request ID")
 	}
-	if !strings.Contains(html, "<th>上游</th>") || !strings.Contains(html, "<th>密钥</th>") {
-		t.Fatal("flat rows must carry localized 上游 and 密钥 columns")
+	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "400_diag", "diag400Cell", "diag400Text", "复制完整 Request ID"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("removed Request ID/replay/HTTP400 UI must stay removed: %q", stale)
+		}
 	}
-	if !strings.Contains(html, "复制") {
-		t.Fatal("rows must offer direct Request ID copy")
+	if !strings.Contains(html, "<th>代理</th>") {
+		t.Fatal("flat rows must carry 代理 column")
+	}
+	if !strings.Contains(html, "<th>上游</th>") || !strings.Contains(html, "<th>密钥</th>") || !strings.Contains(html, "<th>状态</th>") || !strings.Contains(html, "<th>耗时</th>") {
+		t.Fatal("flat rows must carry localized 上游/密钥/状态/耗时 columns")
+	}
+	if !strings.Contains(html, "attemptRowCells") {
+		t.Fatal("persisted table must reuse shared attemptRowCells")
 	}
 	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
 		t.Fatal("search must match both Request ID and client session hash")
 	}
+	// Shared row: compact status code with title detail; duration uses ` ms`.
+	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+" ms"`} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
+		}
+	}
+	if strings.Contains(html, "毫秒") {
+		t.Fatal("stale duration unit 毫秒 must be removed")
+	}
 	// Token attribution: usage_reported gating, never estimated.
-	if !strings.Contains(html, "usage_reported") || !strings.Contains(html, "不估算") {
+	if !strings.Contains(html, "usage_reported") || !strings.Contains(html, "不做估算") {
 		t.Fatal("missing usage_reported token attribution")
 	}
 	if !strings.Contains(html, "最终") {
 		t.Fatal("tokens must be scoped to the final request-result row")
 	}
-	if strings.Count(html, "emptyRow(tb,14") < 2 {
-		t.Fatal("realtime and persisted flat tables must cover 14 columns")
+	if strings.Count(html, "emptyRow(tb,11") < 2 {
+		t.Fatal("realtime and persisted flat tables must cover 11 columns")
+	}
+	if strings.Contains(html, "emptyRow(tb,14") {
+		t.Fatal("stale 14-column empty rows must be removed")
+	}
+	// Sidebar + responsive layout hooks.
+	for _, needle := range []string{`class="layout"`, `class="nav"`, `class="main"`, `id="main-nav"`, ".layout", "@media"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing sidebar/responsive hook %q", needle)
+		}
 	}
 	// F1: hidden WebUI enabled preserves backend via safe preservedEnabled; submit must not dereference null S.config.
 	if !strings.Contains(html, "hidden-enabled-preserved") {
@@ -573,18 +613,16 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if strings.Contains(html, "username:S.config.webui.username") {
 		t.Fatal("config submit must not dereference null S.config.webui.username")
 	}
-	// F2: lifetime dimensional calls are window-only, never invented (localized).
-	if !strings.Contains(html, "维度调用数仅最近一小时") {
-		t.Fatal("lifetime dimensional calls must be captioned window-only")
+	// F2: selected period drives KPIs/trends/history; no invented lifetime scope.
+	for _, needle := range []string{"historyPeriod", "periodStart", "periodLabel", "histQueryRange", "usageAvailability"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing period contract %q", needle)
+		}
 	}
-	if !strings.Contains(html, "进程累计显示") && !strings.Contains(html, "进程累计不估算") {
-		t.Fatal("lifetime calls must display as unknown without estimation")
-	}
-	if !strings.Contains(html, "var isLife=scopeLifetime()") {
-		t.Fatal("usage tables must branch on lifetime scope")
-	}
-	if strings.Contains(html, "var calls=(scopeLifetime") {
-		t.Fatal("usage tables must not pair lifetime totals with stale call cache")
+	for _, stale := range []string{"scopeLifetime", "historyRangeHours", "var isLife", "var calls=(scopeLifetime", "维度调用数仅最近一小时"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("old lifetime-scope UI must stay removed: %q", stale)
+		}
 	}
 	// F3: realtime proxy filter preserves selection even when temporarily absent.
 	if strings.Count(html, "if(cur)seen[cur]=1") < 2 {
@@ -627,42 +665,22 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "scroll-bound") {
 		t.Fatal("missing bounded internal scroll")
 	}
-	// Charts, KPIs, caps, filters.
-	for _, needle := range []string{"缓存命中率", "P50", "trend-cap", "aggregatePersistedSeries", "完整模型 ID 精确过滤", "最多展示 200"} {
+	// Charts, KPIs, caps, filters (period model + overflow guards).
+	for _, needle := range []string{"缓存命中率", "trend-cap", "aggregatePersistedSeries", "完整模型 ID 精确过滤", "最多显示 200 条", "历史记录", "今天", "本月"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing usage/chart label %q", needle)
 		}
 	}
-	if strings.Contains(html, ").slice(-120)") {
-		t.Fatal("series must not silently slice(-120) without aggregation")
+	for _, stale := range []string{"P50", "最多展示 200", "单次尝试一行", ").slice(-120)", "function renderTrends", "S.historyRange", "分组指纹"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("stale chart/polluted phrase must stay removed: %q", stale)
+		}
 	}
-	// renderTrends must not clear persistent trend DOM when range != 1h:
-	// the non-1h guard must precede any clear, 1h path clears+redraws
-	// memory trends, and 24h/7d stay owned by renderPersistedSeries.
-	rt := strings.Index(html, "function renderTrends(){")
-	if rt < 0 {
-		t.Fatal("missing renderTrends")
-	}
-	rtEnd := strings.Index(html[rt:], "function renderHealth()")
-	if rtEnd < 0 {
-		t.Fatal("missing renderHealth boundary")
-	}
-	body := html[rt : rt+rtEnd]
-	guard := strings.Index(body, `if(S.historyRange!=="1h")return;`)
-	if guard < 0 {
-		t.Fatal("renderTrends must early-return on non-1h range")
-	}
-	if idx := strings.Index(body, "clear(hr)"); idx >= 0 && idx < guard {
-		t.Fatal("renderTrends must not clear trend DOM before non-1h guard")
-	}
-	if idx := strings.Index(body, "clear(ht)"); idx >= 0 && idx < guard {
-		t.Fatal("renderTrends must not clear trend DOM before non-1h guard")
-	}
-	if !strings.Contains(body, "clear(hr)") || !strings.Contains(body, "clear(ht)") {
-		t.Fatal("renderTrends 1h path must clear+redraw memory trends")
-	}
-	if !strings.Contains(body, "S.metrics") {
-		t.Fatal("renderTrends 1h path must render memory series")
+	// Chart overflow guards: bars and trend grid stay bounded.
+	for _, needle := range []string{".bars", "trend-grid", "overflow-x:auto", "min-width:0", "max-width:100%", "overflow:hidden", "scroll-bound"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing chart overflow guard %q", needle)
+		}
 	}
 	ps := strings.Index(html, "function renderPersistedSeries(items){")
 	if ps < 0 {
@@ -674,7 +692,7 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	}
 	pbody := html[ps : ps+psEnd]
 	if !strings.Contains(pbody, "clear(hr)") || !strings.Contains(pbody, "clear(ht)") {
-		t.Fatal("renderPersistedSeries must still clear/redraw 24h/7d trends")
+		t.Fatal("renderPersistedSeries must still clear/redraw period trends")
 	}
 	// SSE must probe session after consecutive failures and reset on open/log.
 	if !strings.Contains(html, "/api/auth/session") {
@@ -683,12 +701,12 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, "logFail") {
 		t.Fatal("missing SSE failure counter")
 	}
-	// Per-page history gap must accumulate into hist-count.
-	if !strings.Contains(html, "S.histGap") {
-		t.Fatal("missing per-page history gap accumulation")
-	}
+	// Persisted history count + cursors stay coherent across pages.
 	if !strings.Contains(html, "hist-count") {
-		t.Fatal("missing hist-count gap display")
+		t.Fatal("missing hist-count display")
+	}
+	if !strings.Contains(html, "S.histCursor") || !strings.Contains(html, "S.histAttCursor") {
+		t.Fatal("missing persisted history cursors")
 	}
 	// Staged pool semantics: badge + explicit copy.
 	if !strings.Contains(html, "pool-badge") {
@@ -703,14 +721,20 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 			t.Fatalf("config/health split must remove %q from the bundle", stale)
 		}
 	}
-	// Localization: key Chinese labels present. Replay uses 重放; genuine fallback uses 回退.
-	for _, needle := range []string{"运行时长", "活跃请求", "活跃流", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>重放</th>", "匿名", "凭证", "目标", "元数据", "尝试", "重放", "已重放", "无重放", "HTTP 400 同目标重放一次", "回退", "回退请求行", "失败回退", "请求级回退行", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "活跃目标冷却", "匿名目标汇总", "凭证状态", "代理健康", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "HTTP 400 诊断", "单次尝试一行", "最多展示 200", "WebUI 是否启用", "未知（", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "分组指纹", "类型 ", "代码 ", "调试", "信息", "警告", "错误", "小时", "分钟", "秒", "毫秒"} {
+	// Localization: key Chinese labels present for the new contract.
+	for _, needle := range []string{"运行时长", "活跃请求", "活跃流", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>状态</th>", "<th>耗时</th>", "匿名", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "今天", "本月", "历史记录", "活跃目标冷却", "匿名目标汇总", "凭证状态", "代理健康", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "最多显示 200 条", "WebUI 是否启用", "未知（", "上下文长度", "调试", "信息", "警告", "错误", "小时", "分钟", "秒"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing localized label %q", needle)
 		}
 	}
+	// Polluted/removed copy must stay absent.
+	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "分组指纹", "单次尝试一行", "回退请求行", "请求级回退行", "最多展示 200", "毫秒", "P50", "400_diag", "diag400Cell", "diag400Text", "error_hint"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("polluted phrase must stay removed: %q", stale)
+		}
+	}
 	// Localization: required proper-case technical terms preserved.
-	for _, needle := range []string{"Request ID", "HTTP", "API", "WebUI", "CSRF", "SSE", "Responses", "Anthropic", "Zen", "Go", "JSON", "NDJSON", "URL", "IP", "SOCKS5", "HRW", "P50", "Token", "Chat Completions", "protoLabel"} {
+	for _, needle := range []string{"Request ID", "HTTP", "API", "WebUI", "CSRF", "Responses", "Anthropic", "Zen", "Go", "JSON", "URL", "IP", "SOCKS5", "Token", "Chat Completions", "protoLabel"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing proper-case term %q", needle)
 		}

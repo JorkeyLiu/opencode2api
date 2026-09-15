@@ -318,16 +318,22 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 			t.Fatalf("webui missing protocol %q", proto)
 		}
 	}
-	// Flat attempt rows: compact Request ID + 代理 columns, no session-main,
-	// channel, or cache-miss columns, no expandable detail rows.
-	if !strings.Contains(html, "<th>Request ID</th>") {
-		t.Fatal("flat attempt rows must carry a compact Request ID column")
+	// New contract: 11-column headers shared by live and persisted tables.
+	// Request ID / replay / HTTP400-diagnosis columns are removed; search still
+	// covers request and session identifiers without a dedicated column.
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
+		t.Fatal("live and persisted tables must share the 11-column header without Request ID")
+	}
+	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "400_diag", "diag400Cell", "diag400Text", "error_hint", "error_fingerprint", "分组指纹", "HTTP 400 同目标重放一次", "单次尝试一行", "回退请求行", "请求级回退行"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("removed Request ID/replay/HTTP400 diagnosis UI must stay removed: %q", stale)
+		}
 	}
 	if !strings.Contains(html, "<th>代理</th>") {
 		t.Fatal("flat attempt rows must carry a 代理 column")
 	}
-	if !strings.Contains(html, "<th>上游</th>") || !strings.Contains(html, "HTTP 400 诊断") {
-		t.Fatal("flat rows must carry localized 上游 and HTTP 400 诊断 columns")
+	if !strings.Contains(html, "<th>上游</th>") || !strings.Contains(html, "<th>密钥</th>") || !strings.Contains(html, "<th>状态</th>") || !strings.Contains(html, "<th>耗时</th>") {
+		t.Fatal("flat rows must carry localized 上游/密钥/状态/耗时 columns")
 	}
 	for _, stale := range []string{"<th>客户端会话hash</th>", "<th>会话</th>", "<th>通道</th>", "<th>缓存未命中</th>", "cache_miss_tokens", "loadHistAttempts(", "expandedRequest", "histExpanded"} {
 		if strings.Contains(html, stale) {
@@ -337,8 +343,8 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 	if !strings.Contains(html, "attempt-row") {
 		t.Fatal("webui must render flat attempt rows")
 	}
-	if !strings.Contains(html, "复制") {
-		t.Fatal("flat rows must retain a direct Request ID copy action")
+	if !strings.Contains(html, "attemptRowCells") {
+		t.Fatal("live and persisted tables must share attemptRowCells")
 	}
 	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
 		t.Fatal("search must match both session hash and Request ID")
@@ -347,8 +353,20 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 	if strings.Contains(html, "— 无hash") {
 		t.Fatal("stale no-hash copy must be removed")
 	}
-	// Cache labels: hit only, miss derived in caption, unknown stays a dash.
-	for _, needle := range []string{"缓存命中", "上游未报告", "不估算"} {
+	// Shared row: compact status code with title detail; duration uses ` ms`.
+	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", "上游：", "目标协议：", "代理池/节点：", "密钥尾码："} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
+		}
+	}
+	if !strings.Contains(html, `+" ms"`) {
+		t.Fatal("duration must use ` ms`")
+	}
+	if strings.Contains(html, "毫秒") {
+		t.Fatal("stale duration unit 毫秒 must be removed")
+	}
+	// Cache labels: hit only, unknown stays a dash, never estimated.
+	for _, needle := range []string{"缓存命中", "不做估算", "上游已上报", "非最终尝试或上游未上报"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("webui missing cache label %q", needle)
 		}
@@ -359,13 +377,15 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 			t.Fatalf("forbidden sink %q", sink)
 		}
 	}
-	// Column counts stay consistent with headers (14 flat columns).
-	if strings.Count(html, "emptyRow(tb,14") < 2 {
-		t.Fatal("realtime and persisted flat tables must cover 14 columns")
+	// Column counts stay consistent with headers (11 flat columns).
+	if strings.Count(html, "emptyRow(tb,11") < 2 {
+		t.Fatal("realtime and persisted flat tables must cover 11 columns")
+	}
+	if strings.Contains(html, "emptyRow(tb,14") {
+		t.Fatal("stale 14-column empty rows must be removed")
 	}
 	// Localization: protocol/tier/failure/hint/log/routing/cache mappings present, proper casing kept.
-	// Replay (route_session_replay) uses 重放; genuine fallback (anonymous/tier failover, fallback rows) uses 回退.
-	for _, needle := range []string{"protoLabel", "tierLabel", "failureLabel", "hintLabel", "Chat Completions", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "分组指纹", "已重放", "无重放", "<th>重放</th>", "HTTP 400 同目标重放一次", "传输失败", "认证失败", "限流", "上游失败", "客户端拒绝", "调试", "信息", "警告", "错误", "最近一小时", "进程累计", "上游", "代理", "密钥", "凭证", "目标", "元数据", "尝试", "重放", "回退", "回退请求行", "失败回退", "请求级回退行", "Token"} {
+	for _, needle := range []string{"protoLabel", "tierLabel", "failureLabel", "hintLabel", "Chat Completions", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "传输失败", "认证失败", "限流", "上游失败", "客户端拒绝", "调试", "信息", "警告", "错误", "最近一小时", "进程累计", "上游", "代理", "密钥", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "Token"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing localized mapping/label %q", needle)
 		}

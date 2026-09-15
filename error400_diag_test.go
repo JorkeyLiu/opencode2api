@@ -312,21 +312,29 @@ func TestError400HistoryWebUICompat(t *testing.T) {
 	store := OpenHistoryStore(cfgPath, HistoryConfig{Enabled: true, Directory: "h", RetentionDays: 7, MaxBytesMB: 128}, nil, NewSecretRedactor())
 	defer store.Close()
 	store.EnqueueAttempt(UpstreamAttempt{Time: now, RequestID: "h400", Model: "m", Tier: "zen", Protocol: "chat", ClientSessionHash: clientSessionHash("ses_hist_400"), Attempt: 1, KeyID: "K", Channel: "key", Proxy: "direct", Status: 400, DurationMS: 1, Success: false, FailureClass: AttemptClassClientRejected, ErrorHint: d.Hint, ErrorType: d.Type, ErrorCode: d.Code, ErrorFingerprint: d.Fingerprint})
-	// WebUI propagation: static bundle shows hint/type/code/fingerprint compactly, text nodes only.
+	// WebUI contract: backend keeps error_hint/type/code/fingerprint fields, but
+	// the static bundle no longer renders Request ID / replay / HTTP400-diagnosis
+	// columns. Tables share the compact 11-column header and status cell.
 	htmlBytes, err := os.ReadFile("webui/index.html")
 	if err != nil {
 		t.Fatal(err)
 	}
 	html := string(htmlBytes)
-	for _, needle := range []string{"error_hint", "error_type", "error_code", "error_fingerprint", "400_diag", "diag400Cell"} {
-		if !strings.Contains(html, needle) {
-			t.Fatalf("webui missing %q", needle)
+	for _, stale := range []string{"<th>Request ID</th>", "<th>重放</th>", "HTTP 400 诊断", "400_diag", "diag400Cell", "diag400Text", "error_hint", "error_fingerprint", "分组指纹"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("removed HTTP400 diagnosis UI must stay removed: %q", stale)
 		}
 	}
-	for _, needle := range []string{"hintLabel", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "分组指纹", "HTTP 400 诊断", "类型 ", "代码 "} {
+	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 2 {
+		t.Fatal("live and persisted tables must share the header without HTTP400 diagnosis")
+	}
+	for _, needle := range []string{"attemptRowCells", "pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+" ms"`} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("webui missing localized 400 label %q", needle)
+			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
 		}
+	}
+	if strings.Contains(html, "毫秒") {
+		t.Fatal("stale duration unit 毫秒 must be removed")
 	}
 	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"} {
 		if strings.Contains(html, sink) {
