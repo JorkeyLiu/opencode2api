@@ -240,7 +240,7 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 		next.gateway.catalog.CopyState(current.gateway.catalog)
 		summary := migrateGatewaySchedulerState(current.gateway, next.gateway)
 		m.logger.Info("scheduler state migrated", "component", "scheduler", "event", "scheduler_state_migrated",
-			"credentials", summary.Credentials, "targets", summary.Targets, "proxies", summary.Proxies, "pins", summary.Pins)
+			"credentials", summary.Credentials, "targets", summary.Targets, "proxy_rate_limits", summary.Proxy429, "proxies", summary.Proxies, "pins", summary.Pins)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -345,6 +345,7 @@ func (m *RuntimeManager) ShutdownWithContext(ctx context.Context) {
 type gatewayMigrationSummary struct {
 	Credentials int
 	Targets     int
+	Proxy429    int
 	Proxies     int
 	Pins        int
 }
@@ -352,8 +353,9 @@ type gatewayMigrationSummary struct {
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
 // from the old Gateway to the newly built one before the atomic swap:
 // credential state matches by tier+full key, proxy health by (pool name,
-// raw proxy URL), target state by full identity, and route-session overrides
-// by target scope (client dimension excluded from validity). Only still-future
+// raw proxy URL), target state by full identity, proxy429 state by
+// (pool, raw proxy) identity only, and route-session overrides by target
+// scope (client dimension excluded from validity). Only still-future
 // cooldowns and still-fresh route overrides migrate (remaining capped at 5
 // minutes for cooldowns, idle TTL for sessions); new resources start at
 // zero/stateless state and removed identities are dropped. Session-affinity
@@ -393,6 +395,7 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	migrated := newGateway.scheduler.migrateFrom(oldGateway.scheduler)
 	summary.Credentials = migrated.Credentials
 	summary.Targets = migrated.Targets
+	summary.Proxy429 = migrated.Proxy429
 	validCreds := make(map[string]bool, len(newGateway.zenCreds)+len(newGateway.goCreds)+1)
 	for _, cred := range newGateway.zenCreds {
 		validCreds[cred.id] = true
@@ -461,15 +464,18 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 }
 
 type ResourceSnapshot struct {
-	Models           modelCatalogSnapshot   `json:"models"`
-	Keys             []KeyStatus            `json:"keys"`
-	Proxies          []ProxyStatus          `json:"proxies"`
-	Anonymous        bool                   `json:"anonymous"`
-	AnonymousProxies []AnonymousProxyStatus `json:"anonymous_proxies,omitempty"`
-	Targets          []TargetStatus         `json:"targets,omitempty"`
-	TargetsTotal     int                    `json:"targets_total,omitempty"`
-	TargetsTruncated bool                   `json:"targets_truncated,omitempty"`
-	Metadata         MetadataSnapshot       `json:"metadata"`
+	Models                   modelCatalogSnapshot   `json:"models"`
+	Keys                     []KeyStatus            `json:"keys"`
+	Proxies                  []ProxyStatus          `json:"proxies"`
+	Anonymous                bool                   `json:"anonymous"`
+	AnonymousProxies         []AnonymousProxyStatus `json:"anonymous_proxies,omitempty"`
+	Targets                  []TargetStatus         `json:"targets,omitempty"`
+	TargetsTotal             int                    `json:"targets_total,omitempty"`
+	TargetsTruncated         bool                   `json:"targets_truncated,omitempty"`
+	ProxyRateLimits          []ProxyRateLimitStatus `json:"proxy_rate_limits,omitempty"`
+	ProxyRateLimitsTotal     int                    `json:"proxy_rate_limits_total,omitempty"`
+	ProxyRateLimitsTruncated bool                   `json:"proxy_rate_limits_truncated,omitempty"`
+	Metadata                 MetadataSnapshot       `json:"metadata"`
 }
 
 type KeyStatus struct {
@@ -493,9 +499,11 @@ type KeyStatus struct {
 	TotalTargets     int `json:"total_targets,omitempty"`
 }
 
-// AnonymousProxyStatus is the per-proxy anonymous target summary. Transport
-// fields (Healthy/Checking) still mean proxy connectivity only; the cooldown
-// fields summarize per-(proxy, model) target state across models.
+// AnonymousProxyStatus is the per-proxy anonymous 403/5xx target summary.
+// Transport fields (Healthy/Checking) still mean proxy connectivity only;
+// the cooldown fields summarize per-(proxy, model) 403/5xx target state
+// across models. HTTP 429 never appears here; it lives in the dedicated
+// proxy429 layer (ProxyRateLimitStatus).
 // Failures/CooldownUntil/CooldownRemainingSeconds are a deprecated
 // model-agnostic aggregate (sums / latest deadline); prefer ActiveCooldowns,
 // NextAvailableAt, and LastFailureClass.
@@ -597,6 +605,10 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	result.Targets = targets
 	result.TargetsTotal = total
 	result.TargetsTruncated = total > len(targets)
+	limits, limitsTotal := gateway.scheduler.snapshotProxy429()
+	result.ProxyRateLimits = limits
+	result.ProxyRateLimitsTotal = limitsTotal
+	result.ProxyRateLimitsTruncated = limitsTotal > len(limits)
 	return result
 }
 
@@ -667,9 +679,10 @@ func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, po
 	return result
 }
 
-// anonymousTargetSummaries snapshots the per-proxy anonymous target state
-// without taking pool locks: transports are immutable after build and all
-// scheduler counters are mutex-guarded snapshots.
+// anonymousTargetSummaries snapshots the per-proxy anonymous 403/5xx target
+// state without taking pool locks: transports are immutable after build and
+// all scheduler counters are mutex-guarded snapshots. HTTP 429 never
+// contributes here; it is projected via snapshotProxy429.
 func (g *Gateway) anonymousTargetSummaries() []AnonymousProxyStatus {
 	if !g.cfg.Anonymous {
 		return nil

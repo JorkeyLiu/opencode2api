@@ -433,8 +433,11 @@ type UpstreamAttempt struct {
 
 // Shared upstream attempt failure classes. The set is intentionally small
 // and stable: the scheduler treats anonymous and authenticated channels
-// as credential types and routes on (tier, credential, proxy, model), while
-// proxy health continues to mean transport connectivity only.
+// as credential types and routes on (tier, credential, proxy, model) for
+// 403/5xx, on (pool, proxy) globally for 429, and on credential globally
+// for 401, while proxy health continues to mean transport connectivity
+// only. The rate_limited/retryable/cools_down shape is frozen for
+// compatibility; history schema is unchanged.
 const (
 	AttemptClassSuccess          = "success"
 	AttemptClassTransportFailure = "transport_failure"
@@ -455,12 +458,12 @@ const anonymousCredentialID = "anonymous"
 // fallback action (transport failures, 408/425, 401/403/429, 5xx, and other
 // responses advance the frozen candidate list; route-terminal 400 and
 // ordinary 4xx do not); CoolsDown mirrors whether the attempt class can cool
-// scheduler state (credential for 401, target for 403/429/5xx). 408/425 are
-// transient client responses: retryable and state-neutral, never ordinary
-// client rejections. Transport attempts never cool scheduler state; they only
-// trigger the async neutral proxy health verification. The scheduler itself
-// branches on status codes for ownership; callers only read these flags for
-// observability.
+// scheduler state (credential for 401, pool-qualified proxy for 429, target
+// for 403/5xx). 408/425 are transient client responses: retryable and
+// state-neutral, never ordinary client rejections. Transport attempts never
+// cool scheduler state; they only trigger the async neutral proxy health
+// verification. The scheduler itself branches on status codes for ownership;
+// callers only read these flags for observability.
 type attemptClassification struct {
 	Class     string
 	Retryable bool

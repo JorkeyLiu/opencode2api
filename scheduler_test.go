@@ -230,7 +230,7 @@ func TestStateMatrix(t *testing.T) {
 		gateway, cand := setup()
 		gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
 		gateway.scheduler.noteCredentialAuthFailure(cand.CredID)
-		class := gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(200), nil)
+		class := gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(200), nil, time.Now().UnixNano())
 		if class.Class != AttemptClassSuccess {
 			t.Fatalf("class=%s", class.Class)
 		}
@@ -244,7 +244,7 @@ func TestStateMatrix(t *testing.T) {
 
 	t.Run("401_cools_credential_not_target", func(t *testing.T) {
 		gateway, cand := setup()
-		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(401), nil)
+		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(401), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.credentialCoolUntil(cand.CredID); got <= time.Now().UnixNano() {
 			t.Fatalf("401 must cool credential")
 		}
@@ -255,7 +255,7 @@ func TestStateMatrix(t *testing.T) {
 
 	t.Run("403_cools_target_not_credential", func(t *testing.T) {
 		gateway, cand := setup()
-		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(403), nil)
+		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(403), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 			t.Fatalf("403 must cool target")
 		}
@@ -269,19 +269,37 @@ func TestStateMatrix(t *testing.T) {
 		resp := responseWithStatus(429)
 		resp.Header.Set("Retry-After", "120")
 		before := time.Now()
-		gateway.applyAttemptOutcome(ctx, cand, resp, nil)
-		until := gateway.scheduler.targetCoolUntil(cand.Identity)
+		started := time.Now().UnixNano()
+		gateway.applyAttemptOutcome(ctx, cand, resp, nil, started)
+		until, _, ok := gateway.scheduler.proxy429CooldownStatus(cand.PoolName, cand.ProxyRaw)
+		if !ok {
+			t.Fatalf("429 must cool pool-qualified proxy")
+		}
 		remaining := time.Until(time.Unix(0, until))
 		if remaining < 100*time.Second || remaining > 5*time.Minute {
 			t.Fatalf("Retry-After not honored within cap: %v", remaining)
 		}
 		_ = before
+		// 429 never cools the per-target or credential layers.
+		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
+			t.Fatalf("429 must not cool target, got %d", got)
+		}
+		if got := gateway.scheduler.credentialCoolUntil(cand.CredID); got != 0 {
+			t.Fatalf("429 must not cool credential")
+		}
+		if !cand.Proxy.healthy.Load() {
+			t.Fatalf("429 must not mark proxy unhealthy")
+		}
 		// Huge Retry-After is capped at 5 minutes.
 		gateway2, cand2 := setup()
 		resp2 := responseWithStatus(429)
 		resp2.Header.Set("Retry-After", "3600")
-		gateway2.applyAttemptOutcome(ctx, cand2, resp2, nil)
-		remaining2 := time.Until(time.Unix(0, gateway2.scheduler.targetCoolUntil(cand2.Identity)))
+		gateway2.applyAttemptOutcome(ctx, cand2, resp2, nil, time.Now().UnixNano())
+		until2, _, ok2 := gateway2.scheduler.proxy429CooldownStatus(cand2.PoolName, cand2.ProxyRaw)
+		if !ok2 {
+			t.Fatalf("429 must cool proxy")
+		}
+		remaining2 := time.Until(time.Unix(0, until2))
 		if remaining2 > 5*time.Minute {
 			t.Fatalf("cooldown exceeds cap: %v", remaining2)
 		}
@@ -289,7 +307,7 @@ func TestStateMatrix(t *testing.T) {
 
 	t.Run("5xx_cools_target_not_credential", func(t *testing.T) {
 		gateway, cand := setup()
-		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(500), nil)
+		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(500), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 			t.Fatalf("5xx must cool target")
 		}
@@ -305,7 +323,7 @@ func TestStateMatrix(t *testing.T) {
 		gateway, cand := setup()
 		gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
 		cooled := gateway.scheduler.targetCoolUntil(cand.Identity)
-		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(400), nil)
+		gateway.applyAttemptOutcome(ctx, cand, responseWithStatus(400), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != cooled {
 			t.Fatalf("400 must neither cool nor clear")
 		}
@@ -314,7 +332,7 @@ func TestStateMatrix(t *testing.T) {
 	t.Run("transport_neutral_no_cooldown_no_unhealthy", func(t *testing.T) {
 		for _, transportErr := range []error{syscall.ECONNREFUSED, errors.New("connection reset by peer")} {
 			gateway, cand := setup()
-			class := gateway.applyAttemptOutcome(ctx, cand, nil, transportErr)
+			class := gateway.applyAttemptOutcome(ctx, cand, nil, transportErr, time.Now().UnixNano())
 			if class.Class != AttemptClassTransportFailure || !class.Retryable || class.CoolsDown {
 				t.Fatalf("transport class=%+v want retryable=true coolsDown=false", class)
 			}
@@ -334,7 +352,7 @@ func TestStateMatrix(t *testing.T) {
 		gateway, cand := setup()
 		// The foreground transport path above leaves the proxy healthy;
 		// only the independent probe result may flip it.
-		gateway.applyAttemptOutcome(ctx, cand, nil, syscall.ECONNREFUSED)
+		gateway.applyAttemptOutcome(ctx, cand, nil, syscall.ECONNREFUSED, time.Now().UnixNano())
 		if !cand.Proxy.healthy.Load() {
 			t.Fatalf("foreground transport must leave proxy healthy for the probe to decide")
 		}
@@ -354,18 +372,20 @@ func TestStateMatrix(t *testing.T) {
 		gateway, cand := setup()
 		cancelled, cancel := context.WithCancel(context.Background())
 		cancel()
-		gateway.applyAttemptOutcome(cancelled, cand, responseWithStatus(500), nil)
+		gateway.applyAttemptOutcome(cancelled, cand, responseWithStatus(500), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 			t.Fatalf("cancelled ctx must not update target")
 		}
-		gateway.applyAttemptOutcome(cancelled, cand, responseWithStatus(401), nil)
+		gateway.applyAttemptOutcome(cancelled, cand, responseWithStatus(401), nil, time.Now().UnixNano())
 		if got := gateway.scheduler.credentialCoolUntil(cand.CredID); got != 0 {
 			t.Fatalf("cancelled ctx must not update credential")
 		}
 	})
 }
 
-// 3b. Model isolation: a rejection on model A never cools model B.
+// 3b. Model isolation: a 403/5xx rejection on model A never cools model B.
+// HTTP 429 is intentionally excluded here: it cools the pool-qualified proxy
+// globally across models (see proxy429 tests).
 func TestModelIsolation(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	pool := gateway.pools["shared"]
@@ -376,7 +396,7 @@ func TestModelIsolation(t *testing.T) {
 	if a.Identity == b.Identity {
 		t.Fatalf("identities must differ by model")
 	}
-	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(429), nil)
+	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(403), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(b.Identity); got != 0 {
 		t.Fatalf("model B polluted by model A rejection")
 	}
@@ -401,7 +421,7 @@ func TestCredentialGlobalVsTargetLocal(t *testing.T) {
 	a1 := authCand(TierZen, credA, pool, pool.items[1], "m")
 	b0 := authCand(TierZen, credB, pool, pool.items[0], "m")
 	// 401 on one combo cools the whole credential: both proxies gone for A.
-	gateway.applyAttemptOutcome(context.Background(), a0, responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(context.Background(), a0, responseWithStatus(401), nil, time.Now().UnixNano())
 	now := time.Now().UnixNano()
 	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, pool, "m", now)
 	for _, cand := range cands {
@@ -419,7 +439,7 @@ func TestCredentialGlobalVsTargetLocal(t *testing.T) {
 	a1b := authCand(TierZen, gateway2.zenCreds[0], pool2, pool2.items[1], "m")
 	_ = a1
 	_ = b0
-	gateway2.applyAttemptOutcome(context.Background(), a0b, responseWithStatus(500), nil)
+	gateway2.applyAttemptOutcome(context.Background(), a0b, responseWithStatus(500), nil, time.Now().UnixNano())
 	cands2 := gateway2.scheduler.buildAuthCandidates(TierZen, gateway2.zenCreds, pool2, "m", time.Now().UnixNano())
 	if len(cands2) != 3 {
 		t.Fatalf("only one combo must cool, got %d", len(cands2))
@@ -462,14 +482,15 @@ func TestDeterministicBackoff(t *testing.T) {
 	if two < 24*time.Second || two > 36*time.Second {
 		t.Fatalf("growth delay out of jitter band: %v", two)
 	}
-	// Success clears only its own scope.
+	// Success clears only its own scope (403/5xx targets are per-combo; 429
+	// is proxy-global and covered in proxy429 tests).
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct"})
 	pool := gateway.pools["shared"]
 	a := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m")
 	b := authCand(TierZen, gateway.zenCreds[1], pool, pool.items[0], "m")
-	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(500), nil)
-	gateway.applyAttemptOutcome(context.Background(), b, responseWithStatus(429), nil)
-	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(200), nil)
+	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(500), nil, time.Now().UnixNano())
+	gateway.applyAttemptOutcome(context.Background(), b, responseWithStatus(403), nil, time.Now().UnixNano())
+	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(200), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(a.Identity); got != 0 {
 		t.Fatalf("success must clear own target")
 	}
@@ -495,7 +516,7 @@ func TestHotReloadMigration(t *testing.T) {
 	keepCred := oldGateway.zenCreds[0]
 	// Seed: credential 401 on kept key, target 500 on kept combo, proxy down.
 	keepCand := authCand(TierZen, keepCred, pool, pool.items[0], "m")
-	oldGateway.applyAttemptOutcome(context.Background(), keepCand, responseWithStatus(401), nil)
+	oldGateway.applyAttemptOutcome(context.Background(), keepCand, responseWithStatus(401), nil, time.Now().UnixNano())
 	oldGateway.scheduler.noteTargetFailure(
 		targetIdentity(TierZen, keepCred.id, "shared", pool.items[1].name, "m"),
 		AttemptClassUpstreamFailure, 500, 0)
@@ -572,7 +593,7 @@ func TestApplyPreservesCooldowns(t *testing.T) {
 	pool := gateway.pools["shared"]
 	cred := gateway.zenCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "m")
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	manager.current.Store(&gatewayRuntime{config: normalized, gateway: gateway})
 
 	next, err := NewGateway(normalized, nil, manager.monitor)
@@ -585,29 +606,43 @@ func TestApplyPreservesCooldowns(t *testing.T) {
 	}
 }
 
-// 6. Refresh never touches foreground scheduler state.
+// 6. Refresh never touches foreground scheduler state (targets, proxy429,
+// credentials, or proxy health).
 func TestRefreshStateless(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	pool := gateway.pools["shared"]
 	cred := gateway.zenCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "some-model")
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
 	targetUntil := gateway.scheduler.targetCoolUntil(cand.Identity)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
+	_, proxyUntil, proxyOk := gateway.scheduler.proxy429CooldownStatus(pool.name, pool.items[0].name)
+	if !proxyOk {
+		t.Fatalf("seed proxy429 must cool")
+	}
 	credSeed := "seed-cred"
 	_ = credSeed
 	// Simulate refresh traversal the way refreshTier does: healthy proxies
 	// only, no scheduler reads or writes.
 	before, _ := gateway.scheduler.snapshotTargets()
+	beforeProxy, _ := gateway.scheduler.snapshotProxy429()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_ = gateway.refreshTier(ctx, "http://127.0.0.1:9", TierZen)
 	_ = gateway.refreshAnonymousTier(ctx, "http://127.0.0.1:9")
 	after, _ := gateway.scheduler.snapshotTargets()
+	afterProxy, _ := gateway.scheduler.snapshotProxy429()
 	if len(before) != len(after) {
 		t.Fatalf("refresh polluted targets: %d -> %d", len(before), len(after))
 	}
+	if len(beforeProxy) != len(afterProxy) {
+		t.Fatalf("refresh polluted proxy429: %d -> %d", len(beforeProxy), len(afterProxy))
+	}
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != targetUntil {
 		t.Fatalf("refresh changed target cooldown")
+	}
+	if _, got, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, pool.items[0].name); !ok || got != proxyUntil {
+		t.Fatalf("refresh changed proxy429 cooldown")
 	}
 	if _, until := gateway.scheduler.credentialSnapshot(cred.id); until != 0 {
 		t.Fatalf("refresh must not create credential state")
@@ -698,11 +733,12 @@ func TestAnonymousSummaryIgnoresSharedPoolAuthCooldown(t *testing.T) {
 			t.Fatalf("anonymous summary must stay idle: %+v", st)
 		}
 	}
-	// An anonymous failure on the same proxy is counted.
+	// An anonymous 403 failure on the same proxy is counted (403/5xx only;
+	// 429 lives in the proxy429 layer).
 	anonID := targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", pool.items[0].name, "m")
-	gateway.scheduler.noteTargetFailure(anonID, AttemptClassRateLimited, 429, 0)
+	gateway.scheduler.noteTargetFailure(anonID, AttemptClassAuthFailure, 403, 0)
 	active, _, lastClass, failures := gateway.scheduler.proxyTargetSummary("shared", pool.items[0].name)
-	if active != 1 || failures != 1 || lastClass != AttemptClassRateLimited {
+	if active != 1 || failures != 1 || lastClass != AttemptClassAuthFailure {
 		t.Fatalf("anonymous cooldown missing: active=%d failures=%d class=%q", active, failures, lastClass)
 	}
 }

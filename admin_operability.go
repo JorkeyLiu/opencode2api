@@ -18,9 +18,11 @@ import (
 //     from the active config. Raw URLs and secrets are never accepted, so
 //     the endpoint cannot be steered at an arbitrary target (no SSRF).
 //   - The probe may flip proxy transport health (the explicit management
-//     probe) but never reads or writes scheduler credential/target state.
+//     probe) but never reads or writes scheduler credential/target/proxy429
+//     state and never clears or sets proxy429 cooldowns.
 //   - Refresh is stateless: it never reads or writes foreground
-//     credential/target cooldowns and never changes proxy healthy/checking.
+//     credential/target/proxy429 cooldowns and never changes proxy
+//     healthy/checking.
 //   - Manual and scheduled refreshes share one TryLock gate per component,
 //     so a busy component returns 409 instead of stacking work.
 
@@ -147,7 +149,7 @@ func (a *AdminServer) handleProxyProbe(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	// checkClaimedProxy owns the checking flag from here: it releases the
 	// claim and may flip transport health. It never touches scheduler
-	// credential/target state.
+	// credential/target/proxy429 state.
 	result := pool.checkClaimedProxy(ctx, proxy, proxyProbeTarget, proxyHealthCheckTimeout)
 	duration := time.Since(started)
 	healthy := proxy.healthy.Load()

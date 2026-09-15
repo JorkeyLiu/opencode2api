@@ -232,19 +232,25 @@ table.table td.wrap{white-space:normal;word-break:break-all}
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>密钥尾码</th><th>上游</th><th>代理池</th><th>可用目标</th><th>全部目标</th><th>失败次数</th><th>冷却剩余</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
       </div>
       <div class="section">
+        <h2>代理限流冷却</h2>
+        <div class="cap">按代理池 + 代理节点的全局 HTTP 429 限流冷却；跨模型、凭证、通道与会话共享，同 URL 不同池互不影响。传输健康与全局就绪不受影响；就绪仍按凭证可用性 + 传输健康判定。</div>
+        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>代理池</th><th>节点</th><th>活跃</th><th>失败次数</th><th>剩余</th><th>下次可用</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-ratelimit"></tbody></table></div>
+        <div class="note" id="ratelimit-note"></div>
+      </div>
+      <div class="section">
         <h2>匿名目标汇总</h2>
-        <div class="cap">匿名固定公开凭证 × 指派池代理 × 模型的目标组合；按代理聚合各模型的活跃冷却数与下次可用时间，不是传输健康。</div>
+        <div class="cap">匿名固定公开凭证 × 指派池代理 × 模型的目标组合（仅 403/5xx；429 见“代理限流冷却”）；按代理聚合各模型的活跃冷却数与下次可用时间，不是传输健康。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>代理池</th><th>序号</th><th>节点</th><th>传输</th><th>活跃冷却</th><th>下次可用</th><th>失败分类</th></tr></thead><tbody id="tbody-anon"></tbody></table></div>
       </div>
       <div class="section">
         <h2>活跃目标冷却</h2>
-        <div class="cap">仅列出有失败记录的凭证 × 代理 × 模型组合（最多 512 条，超出截断以总数为准）。调度按会话对完整目标做 HRW 稳定排序，同凭证同代理在不同模型之间互不污染。</div>
+        <div class="cap">仅列出有失败记录的凭证 × 代理 × 模型组合（仅 403/5xx；429 为代理级全局冷却见“代理限流冷却”）（最多 512 条，超出截断以总数为准）。调度按会话对完整目标做 HRW 稳定排序，同凭证同代理在不同模型之间互不污染。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>上游</th><th>凭证</th><th>代理池</th><th>代理</th><th>模型</th><th>失败次数</th><th>剩余</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-targets"></tbody></table></div>
         <div class="note" id="targets-note"></div>
       </div>
       <div class="section">
         <h2>目录 / 元数据快照</h2>
-        <div class="cap">模型暴露由能力目录驱动；未知能力模型不暴露。手动刷新无状态，不触碰代理健康与前台调度状态；与定时刷新共享去重门，繁忙时返回 HTTP 409。</div>
+        <div class="cap">模型暴露由能力目录驱动；未知能力模型不暴露。手动刷新无状态，不触碰代理健康与前台凭证 / 目标 / 限流调度状态；与定时刷新共享去重门，繁忙时返回 HTTP 409。</div>
         <div class="facts" id="facts-catalog"></div>
         <div class="actions">
           <button class="ghost" id="btn-refresh-catalog" type="button">刷新目录</button>
@@ -355,7 +361,7 @@ function scopeLabel(v){ if(v==="last_hour")return "最近一小时"; if(v==="lif
 function rangeLabel(v){ if(v==="1h")return "最近一小时"; if(v==="24h")return "最近 24 小时"; if(v==="7d")return "最近 7 天"; return String(v||"未知"); }
 function logLevelLabel(l){ l=String(l||""); if(l==="debug")return "调试"; if(l==="info")return "信息"; if(l==="warn")return "警告"; if(l==="error")return "错误"; if(!l)return "—"; return "未知"; }
 function logComponentLabel(c){ c=String(c||""); var m={upstream:"上游",proxy:"代理",models:"模型目录",scheduler:"调度",config:"配置",history:"历史",stream:"流",conversion:"协议转换",http:"HTTP",core:"核心",auth:"认证",gateway:"网关",admin:"管理"}; if(m[c])return m[c]; if(!c)return "核心"; return "未知"; }
-function logEventLabel(e){ e=String(e||""); var m={request_failed:"请求失败",attempt_succeeded:"尝试成功",attempt_rejected:"尝试被拒绝",attempt_retryable_response:"尝试可重试",attempt_transport_failed:"尝试传输失败",transient_retry_succeeded:"临时重试成功",anonymous_fallback:"匿名回退",anonymous_attempt_succeeded:"匿名尝试成功",anonymous_attempt_rejected:"匿名尝试被拒绝",anonymous_attempt_transport_failed:"匿名尝试传输失败",anonymous_attempt_response_failed:"匿名尝试响应失败",route_session_recovery_succeeded:"会话恢复成功",proxy_restored:"代理已恢复",proxy_unavailable:"代理不可用",health_check_passed:"健康检查通过",health_check_failed:"健康检查失败",health_check_inconclusive:"健康检查未定",health_check_still_failing:"健康检查仍失败",catalog_refresh_completed:"目录刷新完成",capability_refresh_failed:"目录刷新失败",catalog_cache_write_failed:"目录缓存写入失败",anonymous_refresh_failed:"匿名刷新失败",anonymous_refresh_attempt_failed:"匿名刷新尝试失败",refresh_failed:"刷新失败",refresh_attempt_failed:"刷新尝试失败",credential_cooldown_set:"凭证冷却设置",credential_cooldown_cleared:"凭证冷却清除",target_cooldown_set:"目标冷却设置",target_cooldown_cleared:"目标冷却清除",scheduler_state_migrated:"调度状态已迁移",config_applied:"配置已应用",request_panic:"请求异常",stream_failed:"流失败",response_conversion_failed:"响应转换失败",history_disabled:"历史已禁用"}; if(m[e])return m[e]; if(!e)return "—"; return "未知（"+e+"）"; }
+function logEventLabel(e){ e=String(e||""); var m={request_failed:"请求失败",attempt_succeeded:"尝试成功",attempt_rejected:"尝试被拒绝",attempt_retryable_response:"尝试可重试",attempt_transport_failed:"尝试传输失败",transient_retry_succeeded:"临时重试成功",anonymous_fallback:"匿名回退",anonymous_attempt_succeeded:"匿名尝试成功",anonymous_attempt_rejected:"匿名尝试被拒绝",anonymous_attempt_transport_failed:"匿名尝试传输失败",anonymous_attempt_response_failed:"匿名尝试响应失败",route_session_recovery_succeeded:"会话恢复成功",proxy_restored:"代理已恢复",proxy_unavailable:"代理不可用",health_check_passed:"健康检查通过",health_check_failed:"健康检查失败",health_check_inconclusive:"健康检查未定",health_check_still_failing:"健康检查仍失败",catalog_refresh_completed:"目录刷新完成",capability_refresh_failed:"目录刷新失败",catalog_cache_write_failed:"目录缓存写入失败",anonymous_refresh_failed:"匿名刷新失败",anonymous_refresh_attempt_failed:"匿名刷新尝试失败",refresh_failed:"刷新失败",refresh_attempt_failed:"刷新尝试失败",credential_cooldown_set:"凭证冷却设置",credential_cooldown_cleared:"凭证冷却清除",target_cooldown_set:"目标冷却设置",target_cooldown_cleared:"目标冷却清除",proxy_rate_limit_cooldown_set:"代理限流冷却设置",proxy_rate_limit_cooldown_cleared:"代理限流冷却清除",scheduler_state_migrated:"调度状态已迁移",config_applied:"配置已应用",request_panic:"请求异常",stream_failed:"流失败",response_conversion_failed:"响应转换失败",history_disabled:"历史已禁用"}; if(m[e])return m[e]; if(!e)return "—"; return "未知（"+e+"）"; }
 function restartFieldLabel(f){ f=String(f||""); var m={listen:"API 监听地址","webui.listen":"WebUI 监听地址","webui.enabled":"WebUI 启用"}; if(m[f])return m[f]; return f||"未知"; }
 function replayLabel(a){ var r=a&&(a.route_session_replay||a.RouteSessionReplay); if(!r)return "无重放"; var parts=["已重放"]; if(a&&(a.dropped_previous_response_id||a.DroppedPreviousResponseID))parts.push("已清理旧响应"); if(a&&(a.dropped_reasoning_refs||a.DroppedReasoningRefs))parts.push("已清理推理引用"); return parts.join("·"); }
 function toast(msg,bad){ var n=$("toast"); clear(n); n.appendChild(document.createTextNode(msg)); n.classList.toggle("bad",!!bad); n.classList.remove("hidden"); clearTimeout(toast._t); toast._t=setTimeout(function(){n.classList.add("hidden");},3600); }
@@ -916,6 +922,7 @@ function renderHealth(){
     fact(fh,"可用凭证",availKeys+" / "+keys.length+"（HTTP 401 冷却 "+cooling+"）",availKeys>0?"ok":"warn");
     fact(fh,"匿名通道",onOffCN(r.anonymous),r.anonymous?"ok":"neutral");
     fact(fh,"活跃目标冷却",(r.targets_total===undefined?((r.targets||[]).length):r.targets_total)+(r.targets_truncated?"（已截断）":""),"neutral");
+    (function(){ var lt=(r.proxy_rate_limits_total===undefined||r.proxy_rate_limits_total===null)?((r.proxy_rate_limits||[]).length):r.proxy_rate_limits_total; fact(fh,"代理限流冷却",lt+((r.proxy_rate_limits_truncated)?"（已截断）":""),"neutral"); })();
     fact(fh,"可暴露模型",((r.models||{}).exposed||0),((r.models||{}).exposed||0)?"ok":"warn");
     void m;
   }
@@ -982,6 +989,25 @@ function renderHealth(){
   var tn=$("targets-note"); clear(tn);
   var total=(r.targets_total===undefined||r.targets_total===null)?((r.targets||[]).length):r.targets_total;
   tn.textContent=r.targets_truncated?("共 "+total+" 个活跃目标，仅展示前 "+(r.targets||[]).length+"（已截断）"):("共 "+total+" 个活跃目标");
+  var trl=$("tbody-ratelimit"); if(trl){ clear(trl);
+    var limits=(r.proxy_rate_limits||[]);
+    limits.forEach(function(l){
+      var tr=document.createElement("tr");
+      cell(tr,l.proxy_pool||"—"); cell(tr,l.proxy_node||"—","wrap");
+      (function(){ var td=document.createElement("td"); var act=!!l.active; td.appendChild(el("span",act?"限流中":"已恢复","pill "+(act?"warn":"ok"))); td.title=act?"该代理正处全局 429 冷却":"无活跃冷却（仅失败记忆）"; tr.appendChild(td); })();
+      cell(tr,l.failures===undefined?"—":l.failures);
+      (function(){ var td=document.createElement("td"); var rs=(l.remaining_seconds===undefined||l.remaining_seconds===null)?"—":l.remaining_seconds+"秒"; td.appendChild(el("span",rs,"pill "+(rs==="—"?"neutral":"warn"))); td.title=(rs==="—")?"无冷却":"冷却剩余 "+rs; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.textContent=l.next_available_at?fmtDateTime(l.next_available_at):"—"; td.title=l.next_available_at?("下次可用："+fmtDateTime(l.next_available_at)):"暂无冷却"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var fl=failureLabel(l.last_failure_class); td.textContent=fl; td.title="失败分类："+fl; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var sv=(l.last_status===undefined||l.last_status===0)?"—":("HTTP "+l.last_status); td.textContent=sv; td.title=(sv==="—")?"无状态":"状态："+sv; tr.appendChild(td); })();
+      trl.appendChild(tr);
+    });
+    if(!limits.length)emptyRow(trl,8,"暂无代理限流冷却");
+  }
+  var rn=$("ratelimit-note"); if(rn){ clear(rn);
+    var ltotal=(r.proxy_rate_limits_total===undefined||r.proxy_rate_limits_total===null)?((r.proxy_rate_limits||[]).length):r.proxy_rate_limits_total;
+    rn.textContent=r.proxy_rate_limits_truncated?("共 "+ltotal+" 个限流代理，仅展示前 "+(r.proxy_rate_limits||[]).length+"（已截断）"):("共 "+ltotal+" 个限流代理");
+  }
   var fc=$("facts-catalog"); clear(fc);
   var cat=(r.models||{});
   fact(fc,"目录（Zen / Go / 可暴露）", (cat.zen||0)+" / "+(cat.go||0)+" / "+(cat.exposed||0));

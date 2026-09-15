@@ -167,23 +167,26 @@ func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
 		ProxyRaw: proxy.name, Model: "m", Identity: targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", proxy.name, "m"),
 	}
 	// client_rejected is neutral: no cooldown, no state.
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 		t.Fatalf("client_rejected must not cool down, got %d", got)
 	}
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil)
+	// 403 cools the per-target layer (used here for the anonymous summary);
+	// 429 is proxy-global and asserted via snapshotProxy429 below.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(403), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
-		t.Fatalf("rate_limited must cool down")
+		t.Fatalf("403 must cool target down")
 	}
 	// Success clears only this target.
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(200), nil)
+	started := time.Now().UnixNano()
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(200), nil, started)
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != 0 {
 		t.Fatalf("success must clear cooldown, got %d", got)
 	}
 	// Single transport errors are neutral: no target cooldown, no proxy flip.
 	// They only trigger the async neutral verification; the classification
 	// stays retryable without claiming a cooldown.
-	class := gateway.applyAttemptOutcome(t.Context(), cand, nil, errors.New("connection reset by peer"))
+	class := gateway.applyAttemptOutcome(t.Context(), cand, nil, errors.New("connection reset by peer"), time.Now().UnixNano())
 	if class.Class != AttemptClassTransportFailure || !class.Retryable || class.CoolsDown {
 		t.Fatalf("transport class=%+v want retryable=true coolsDown=false", class)
 	}
@@ -193,10 +196,10 @@ func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
 	if !proxy.healthy.Load() {
 		t.Fatalf("single transport error must not mark proxy unhealthy")
 	}
-	// Re-cool with 429 so the snapshot below still covers a cooling proxy.
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil)
+	// Re-cool with 403 so the snapshot below still covers a cooling proxy.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(403), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
-		t.Fatalf("rate_limited must cool down")
+		t.Fatalf("403 must cool down")
 	}
 	statuses := gateway.anonymousTargetSummaries()
 	if len(statuses) != 2 {
@@ -221,6 +224,15 @@ func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected one cooling anonymous proxy")
+	}
+	// 429 uses the dedicated proxy429 snapshot, not the anonymous target table.
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, proxy.name); !ok {
+		t.Fatalf("rate_limited must cool proxy429")
+	}
+	limits, total := gateway.scheduler.snapshotProxy429()
+	if total != 1 || len(limits) != 1 || !limits[0].Active {
+		t.Fatalf("proxy429 snapshot missing active entry: total=%d %+v", total, limits)
 	}
 }
 
@@ -296,12 +308,12 @@ func TestKeyStatusCredentialAndCooldown(t *testing.T) {
 		CredDisplay: "67890", PoolName: "shared", Proxy: proxy, ProxyRaw: proxy.name,
 		Model: "m", Identity: targetIdentity(TierZen, gateway.zenCreds[0].id, "shared", proxy.name, "m"),
 	}
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(500), nil)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
 	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
 	if statuses[0].CooldownUntil != nil {
 		t.Fatalf("5xx must not cool the credential: %+v", statuses[0])
 	}
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
 	if statuses[0].CooldownUntil == nil || statuses[0].CooldownRemainingSeconds == nil {
 		t.Fatalf("401 must cool the credential: %+v", statuses[0])

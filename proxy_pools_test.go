@@ -494,7 +494,7 @@ func TestClientRejectedNeutral(t *testing.T) {
 		Model: "m", Identity: targetIdentity(TierZen, credentialIDForKey(TierZen, "k"), "shared", proxy.name, "m"),
 	}
 	before := gateway.scheduler.targetCoolUntil(cand.Identity)
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != before {
 		t.Fatalf("400 must not cool target")
 	}
@@ -507,7 +507,7 @@ func TestClientRejectedNeutral(t *testing.T) {
 	// 400 must not clear pre-existing target state either.
 	gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
 	cooled := gateway.scheduler.targetCoolUntil(cand.Identity)
-	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil)
+	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(400), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != cooled {
 		t.Fatalf("400 must not clear existing target state")
 	}

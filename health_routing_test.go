@@ -69,7 +69,7 @@ func singleZenGateway(t *testing.T, anonymous bool) *Gateway {
 func TestHealthRoutingAllCredentialsCoolingBlocks(t *testing.T) {
 	gateway := singleZenGateway(t, false)
 	// Single zen credential actively cooling, anonymous off.
-	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], gateway.pools["shared"], gateway.pools["shared"].items[0], "m1"), responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], gateway.pools["shared"], gateway.pools["shared"].items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
 	code, health := decodeHealth(t, gateway)
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d want 503", code)
@@ -127,7 +127,7 @@ func TestHealthRoutingAnonymousHealthyReady(t *testing.T) {
 	seedHealthyCatalog(t, gateway)
 	// Cool the only key; anonymous healthy pool must still provide a channel.
 	pool := gateway.pools["shared"]
-	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m1"), responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
 	code, health := decodeHealth(t, gateway)
 	if code != http.StatusOK || !health.Ready {
 		t.Fatalf("anonymous healthy must stay ready: code=%d ready=%v issues=%v routing=%+v", code, health.Ready, health.Issues, health.Routing)

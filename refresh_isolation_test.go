@@ -10,17 +10,19 @@ import (
 )
 
 type refreshStateSnapshot struct {
-	healthy  map[string]bool
-	checking map[string]bool
-	cred     map[string]int64
-	targets  map[string]int64
-	total    int
+	healthy       map[string]bool
+	checking      map[string]bool
+	cred          map[string]int64
+	targets       map[string]int64
+	proxy429      map[string]int64
+	total         int
+	proxy429Total int
 }
 
 func snapshotRefreshState(gateway *Gateway) refreshStateSnapshot {
 	snap := refreshStateSnapshot{
 		healthy: map[string]bool{}, checking: map[string]bool{},
-		cred: map[string]int64{}, targets: map[string]int64{},
+		cred: map[string]int64{}, targets: map[string]int64{}, proxy429: map[string]int64{},
 	}
 	for name, pool := range gateway.pools {
 		for _, proxy := range pool.items {
@@ -41,13 +43,19 @@ func snapshotRefreshState(gateway *Gateway) refreshStateSnapshot {
 		// Re-resolve identity via display is lossy; instead capture via direct map read.
 		_ = entry
 	}
-	// Capture raw target cooldowns without pruning side effects beyond snapshot.
+	// Capture raw target and proxy429 cooldowns without pruning side effects beyond snapshot.
 	gateway.scheduler.mu.Lock()
 	for identity, entry := range gateway.scheduler.targetState {
 		if entry != nil {
 			snap.targets[identity] = entry.cooldownUntil
 		}
 	}
+	for identity, entry := range gateway.scheduler.proxy429State {
+		if entry != nil {
+			snap.proxy429[identity] = entry.cooldownUntil
+		}
+	}
+	snap.proxy429Total = len(snap.proxy429)
 	gateway.scheduler.mu.Unlock()
 	return snap
 }
@@ -87,6 +95,21 @@ func assertRefreshStateUnchanged(t *testing.T, before, after refreshStateSnapsho
 	if before.total != after.total {
 		t.Fatalf("target snapshot total changed: %d -> %d", before.total, after.total)
 	}
+	if len(before.proxy429) != len(after.proxy429) {
+		t.Fatalf("proxy429 count changed: %d -> %d", len(before.proxy429), len(after.proxy429))
+	}
+	for identity, want := range before.proxy429 {
+		got, ok := after.proxy429[identity]
+		if !ok || got != want {
+			t.Fatalf("proxy429 cooldown changed for %q", identity)
+		}
+	}
+	// No new proxy429 entries may appear.
+	for id := range after.proxy429 {
+		if _, ok := before.proxy429[id]; !ok {
+			t.Fatalf("refresh created proxy429 state for %q", id)
+		}
+	}
 }
 
 func modelsServer(status int, body string, delay time.Duration) *httptest.Server {
@@ -117,9 +140,14 @@ func seedRefreshForeground(t *testing.T, gateway *Gateway) targetCandidate {
 	cred := gateway.zenCreds[0]
 	proxy := pool.items[0]
 	cand := authCand(TierZen, cred, pool, proxy, "some-model")
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil)
+	// Seed both layers: a 403/5xx target cooldown and a 429 proxy429 cooldown.
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("seed target must cool")
+	}
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, proxy.name); !ok {
+		t.Fatalf("seed proxy429 must cool")
 	}
 	return cand
 }
@@ -282,7 +310,7 @@ func TestRefreshDoesNotCreateCredentialState(t *testing.T) {
 	// disable the path; only the independent probe result may flip health.
 	pool := gateway.pools["shared"]
 	cand := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m")
-	gateway.applyAttemptOutcome(context.Background(), cand, nil, syscall.ECONNREFUSED)
+	gateway.applyAttemptOutcome(context.Background(), cand, nil, syscall.ECONNREFUSED, time.Now().UnixNano())
 	if !pool.items[0].healthy.Load() {
 		t.Fatalf("single transport failure must not immediately mark proxy unhealthy")
 	}

@@ -98,7 +98,7 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 	}
 
 	// 401 extends the credential cooldown.
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	if got := countEvents()["credential_cooldown_set"]; got != 1 {
 		t.Fatalf("credential_cooldown_set events=%d want 1\n%s", got, buf.String())
 	}
@@ -106,7 +106,7 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 	gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
 	before := countEvents()
 	cooled := gateway.scheduler.targetCoolUntil(cand.Identity)
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(400), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(400), nil, time.Now().UnixNano())
 	after := countEvents()
 	for event, count := range before {
 		if after[event] != count {
@@ -117,13 +117,13 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 		t.Fatalf("400 changed target cooldown")
 	}
 	// 2xx clears both layers that are actually stored.
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil, time.Now().UnixNano())
 	final := countEvents()
 	if final["target_cooldown_cleared"] != 1 || final["credential_cooldown_cleared"] != 1 {
 		t.Fatalf("clear events=%v want one target + one credential clear\n%s", final, buf.String())
 	}
 	// A second 2xx with nothing stored emits nothing new.
-	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil)
+	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil, time.Now().UnixNano())
 	steady := countEvents()
 	for event, count := range final {
 		if steady[event] != count {
@@ -147,7 +147,7 @@ func TestMigrationSummaryCounts(t *testing.T) {
 	pool := oldGateway.pools["shared"]
 	cred := oldGateway.zenCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "m")
-	oldGateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil)
+	oldGateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	oldGateway.scheduler.noteTargetFailure(
 		targetIdentity(TierZen, cred.id, "shared", pool.items[1].name, "m"),
 		AttemptClassUpstreamFailure, 500, 0)
@@ -491,6 +491,9 @@ func TestModelsRefreshFailureRetainsSnapshotAndState(t *testing.T) {
 	if got := gateway.scheduler.targetCoolUntil(seeded.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("seeded target cooldown lost")
 	}
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(seeded.PoolName, seeded.ProxyRaw); !ok {
+		t.Fatalf("seeded proxy429 cooldown lost")
+	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control=%q want no-store", got)
 	}
@@ -541,6 +544,9 @@ func TestModelsRefreshSuccessUpdatesCatalogWithoutStatePollution(t *testing.T) {
 	assertRefreshStateUnchanged(t, before, after)
 	if got := gateway.scheduler.targetCoolUntil(seeded.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("seeded target cooldown lost")
+	}
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(seeded.PoolName, seeded.ProxyRaw); !ok {
+		t.Fatalf("seeded proxy429 cooldown lost")
 	}
 }
 

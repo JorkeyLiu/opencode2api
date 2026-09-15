@@ -270,8 +270,9 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 // routingReadiness reports additive global route availability without changing
 // any existing healthz field. It reads only config, proxy transport health,
-// and global credential 401 cooldowns; per-model target cooldowns are never
-// consulted, so one model's backoff cannot trigger a global 503. An expired
+// and global credential 401 cooldowns; per-model target cooldowns and global
+// proxy429 cooldowns are never consulted, so one model's backoff or one
+// proxy's rate-limit cooldown cannot trigger a global 503. An expired
 // cooldown counts as available immediately.
 func (g *Gateway) routingReadiness() healthRouting {
 	now := time.Now().UnixNano()
@@ -976,9 +977,10 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 
 // doPinnedUpstream serves a request bound to one exact target. No cross-proxy
 // or cross-tier fallback is attempted. The exact-400 same-target one-replay
-// and the single same-target transient retry token are preserved. Cooldowns
-// active before send fail locally without an upstream send; removed or
-// unhealthy pinned resources fail locally with 502.
+// and the single same-target transient retry token are preserved. Active
+// proxy429 (pool+proxy global), credential, or target cooldowns before send
+// fail locally without an upstream send; removed or unhealthy pinned
+// resources fail locally with 502.
 func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, attemptOffset int) (*http.Response, modelRoute, int, error) {
 	effectiveRoute := route
 	effectiveRoute.Tier = pin.Tier
@@ -1067,6 +1069,17 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	now := time.Now()
+	// Pinned requests never migrate across targets: a pool-qualified proxy429
+	// cooldown fast-fails locally with target-protocol 429 + remaining
+	// Retry-After, without a send or fallback. After expiry the same pinned
+	// proxy sends normally.
+	if until, status, ok := g.scheduler.proxy429CooldownStatus(pin.Pool, pin.ProxyRaw); ok {
+		if status != http.StatusTooManyRequests {
+			status = http.StatusTooManyRequests
+		}
+		retrySec := pinRetryAfterSeconds(until, now)
+		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
 	if until, status, ok := g.scheduler.credentialCooldownStatus(pin.CredID); ok {
 		if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests && !(status >= 500 && status <= 599) {
 			status = http.StatusBadGateway
@@ -1079,11 +1092,11 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 	}
 	identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, pin.ProxyRaw, pin.Model)
 	if until, status, ok := g.scheduler.targetCooldownStatus(identity); ok {
-		if status != http.StatusForbidden && status != http.StatusTooManyRequests && !(status >= 500 && status <= 599) {
+		if status != http.StatusForbidden && !(status >= 500 && status <= 599) {
 			status = http.StatusBadGateway
 		}
 		retrySec := int64(0)
-		if status == http.StatusTooManyRequests || (status >= 500 && status <= 599) {
+		if status >= 500 && status <= 599 {
 			retrySec = pinRetryAfterSeconds(until, now)
 		}
 		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
@@ -1185,7 +1198,7 @@ func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier T
 	started := time.Now()
 	resp, err = cand.Proxy.client.Do(req)
 	duration = time.Since(started)
-	class = g.applyAttemptOutcome(ctx, cand, resp, err)
+	class = g.applyAttemptOutcome(ctx, cand, resp, err, started.UnixNano())
 	if err == nil && resp != nil && resp.StatusCode == http.StatusBadRequest {
 		diag = peek400Diag(resp)
 	}
@@ -1406,7 +1419,7 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 	started := time.Now()
 	resp, err := cand.Proxy.client.Do(req)
 	duration := time.Since(started)
-	class := g.applyAttemptOutcome(ctx, cand, resp, err)
+	class := g.applyAttemptOutcome(ctx, cand, resp, err, started.UnixNano())
 	var replayDiag badRequestDiag
 	if err == nil && resp != nil && resp.StatusCode == http.StatusBadRequest {
 		replayDiag = peek400Diag(resp)
@@ -1615,20 +1628,30 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 }
 
 // applyAttemptOutcome is the single state-update entry point for every
-// upstream attempt. It classifies once, updates the three state layers, and
+// upstream attempt. It classifies once, updates the four state layers, and
 // returns the classification so recordUpstreamAttempt reuses the same result.
 //
 //   - Downstream cancellation (request ctx done): no state is touched.
-//   - 2xx: clears this target and the credential 401 state; a healthy
-//     response also restores proxy transport health.
+//   - 2xx: clears this target and the credential 401 state, plus the
+//     pool-qualified proxy429 state when the send started at or after the
+//     latest recorded 429 (stale in-flight 2xx never clears a newer 429); a
+//     healthy response also restores proxy transport health.
 //   - 401: global credential cooldown; the target is not cooled twice.
-//   - 403/429/5xx: target cooldown (Retry-After wins when larger, capped).
-//   - Transport error (non-cancelled): neutral, no credential/target state;
-//     it only triggers the existing async neutral proxy health verification.
-//     Only that independent probe may flip proxy healthy on isProxyFailure.
+//   - 429: global pool-qualified proxy cooldown (Retry-After wins when
+//     larger, capped); the per-target and credential layers are untouched.
+//     No same-target retry is implied; it still triggers only the neutral
+//     async proxy verification and never flips healthy directly.
+//   - 403/5xx: per-target cooldown (Retry-After wins when larger, capped).
+//   - Transport error (non-cancelled): neutral, no credential/target/proxy429
+//     state; it only triggers the existing async neutral proxy health
+//     verification. Only that independent probe may flip proxy healthy on
+//     isProxyFailure.
 //   - Ordinary 4xx (client_rejected, including exact 400) and transient
 //     408/425 (transient_client): neutral no-op; never clears state.
-func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate, resp *http.Response, err error) attemptClassification {
+//
+// startedNanos is the send-start time of this attempt. It guards the proxy429
+// clear path; a zero value falls back to now.
+func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate, resp *http.Response, err error, startedNanos int64) attemptClassification {
 	class := classifyUpstreamAttempt(resp, err)
 	if ctx != nil && ctx.Err() != nil {
 		return class
@@ -1641,7 +1664,8 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 	case err == nil && status >= 200 && status < 300:
 		targetCleared := g.scheduler.noteTargetSuccess(cand.Identity)
 		credCleared := g.scheduler.noteCredentialSuccess(cand.CredID)
-		g.logSchedulerCleared(cand, targetCleared, credCleared)
+		proxyCleared := g.scheduler.noteProxy429Success(cand.PoolName, cand.ProxyRaw, startedNanos)
+		g.logSchedulerCleared(cand, targetCleared, credCleared, proxyCleared)
 		if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
 			wasHealthy := cand.Proxy.healthy.Swap(true)
 			if !wasHealthy && g.logger != nil {
@@ -1654,7 +1678,15 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 	case status == http.StatusUnauthorized:
 		change := g.scheduler.noteCredentialAuthFailure(cand.CredID)
 		g.logCredentialCooldownSet(cand, change, status)
-	case status == http.StatusForbidden || status == http.StatusTooManyRequests || status >= 500:
+	case status == http.StatusTooManyRequests:
+		var retryAfter time.Duration
+		if resp != nil {
+			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+		}
+		change := g.scheduler.noteProxy429Failure(cand.PoolName, cand.ProxyRaw, class.Class, status, retryAfter, startedNanos)
+		g.logProxy429CooldownSet(cand, change)
+		g.verifyProxyAfterError(ctx, cand.Proxy, status)
+	case status == http.StatusForbidden || status >= 500:
 		var retryAfter time.Duration
 		if resp != nil {
 			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -1729,9 +1761,42 @@ func (g *Gateway) logTargetCooldownSet(cand targetCandidate, change targetChange
 		"remaining_ms", time.Duration(remaining).Milliseconds())
 }
 
+// logProxy429CooldownSet emits proxy_rate_limit_cooldown_set only when the
+// 429 actually extended the pool-qualified proxy cooldown. The raw proxy URL
+// never leaves the Gateway; only the redacted node label is logged.
+func (g *Gateway) logProxy429CooldownSet(cand targetCandidate, change proxy429Change) {
+	if g.logger == nil || !change.Changed {
+		return
+	}
+	remaining := change.CooldownUntil - time.Now().UnixNano()
+	if remaining < 0 {
+		remaining = 0
+	}
+	proxyNode := ""
+	poolName := cand.PoolName
+	if cand.Proxy != nil {
+		proxyNode = redactURL(cand.Proxy.name)
+		poolName = cand.Proxy.pool
+		if poolName == "" {
+			poolName = cand.PoolName
+		}
+	} else if cand.ProxyRaw != "" {
+		proxyNode = redactURL(cand.ProxyRaw)
+	}
+	g.logger.Debug("proxy rate-limit cooldown extended",
+		"component", "scheduler", "event", "proxy_rate_limit_cooldown_set",
+		"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+		"channel", credentialChannel(cand),
+		"proxy_pool", poolName, "proxy_node", proxyNode,
+		"failure_class", change.FailureClass,
+		"status", change.Status, "failures", change.Failures,
+		"cooldown_until", time.Unix(0, change.CooldownUntil).UTC(),
+		"remaining_ms", time.Duration(remaining).Milliseconds())
+}
+
 // logSchedulerCleared emits clear events only when 2xx actually removed
-// stored credential/target state.
-func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange) {
+// stored credential/target/proxy429 state.
+func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange, proxy proxy429Change) {
 	if g.logger == nil {
 		return
 	}
@@ -1759,6 +1824,14 @@ func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange,
 			"component", "scheduler", "event", "credential_cooldown_cleared",
 			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
 			"failures", cred.Failures, "remaining_ms", 0)
+	}
+	if proxy.Changed && proxy.Cleared {
+		g.logger.Debug("proxy rate-limit cooldown cleared",
+			"component", "scheduler", "event", "proxy_rate_limit_cooldown_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"channel", credentialChannel(cand),
+			"proxy_pool", poolName, "proxy_node", proxyNode,
+			"failures", proxy.Failures)
 	}
 }
 

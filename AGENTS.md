@@ -36,9 +36,15 @@
   from config. NEVER treat
   it as editable directly; change it only by changing config (or the seed/env
   inputs that produce config) and letting the runtime rebuild. Scheduler
-  state has three layers: proxy transport health (connectivity only),
-  per-credential global 401 cooldowns, and per-(credential, proxy, model)
-  target cooldowns. There is no static key→proxy binding.
+  state has four layers: proxy transport health (connectivity only),
+  per-(pool, proxy) global 429 rate-limit cooldowns, per-credential global
+  401 cooldowns, and per-(tier, credential, pool, proxy, model) target
+  cooldowns for 403/5xx only. There is no static key→proxy binding. Two
+  distinct in-memory affinity authorities sit above these layers:
+  route-session rotation overrides (per target-scope recovery string for one
+  target) and client-session+model target pins (durable binding selecting
+  which target an established session+model may use); the former rotates the
+  upstream session value, the latter fixes the target itself.
 - Proxy identity is two-level: `proxy_pools` names stable pool identities and
   `proxy_routing` assigns exactly one pool each to the anonymous, zen, and go
   channels (same or different). Top-level `proxies` / `proxyfile` are
@@ -73,23 +79,40 @@
   usage when the upstream reports it).
 - Session affinity spine: explicit client session headers or
   `metadata.session_id` win; otherwise the first user message derives a stable
-  client session hash. The client session only orders the frozen
-  credential×proxy×model target list with session-stable Rendezvous/HRW and
-  never leaves the process as an upstream session. Each frozen candidate sends
-  its own target-bound upstream route session (upstream authority, tier,
-  internal credential identity, proxy pool, raw proxy identity, target
-  protocol; never the model, never raw secrets) in the upstream session
-  headers and in the already-present body session fields. The first generation
-  is a stable stateless derivation; only a 400 rotation stores a bounded
-  in-memory override. Failure walks the next target without breaking
-  in-flight streams.
+  client session hash. The derived client session is the establishment identity
+  and never leaves the process raw; upstream receives only the target-bound
+  route session (upstream authority, tier, internal credential identity, proxy
+  pool, raw proxy identity, target protocol; never the model, never raw
+  secrets) in the upstream session headers and in the already-present body
+  session fields. The first generation is a stable stateless derivation; only
+  a 400 rotation stores a bounded in-memory override. Before a pin exists for
+  session+model, one establishment owner freezes/HRW-orders the currently
+  available targets and may walk proxies/tiers per §4; concurrent followers
+  wait cancellably, then adopt the pin or contend to become the next owner.
+  The first upstream 2xx, including a successful exact-400 replay, pins
+  session+model to the complete target (tier, internal credential identity,
+  pool, raw proxy identity, model, protocol/authority validity). After the pin,
+  every request uses exactly that target with no cross-proxy/tier fallback and
+  no anonymous→authenticated promotion; an active proxy429/credential/target
+  cooldown fast-fails locally with the corresponding protocol/status/
+  Retry-After without a send, and a removed/unhealthy/unresolvable target fails
+  locally with 502. Same-target transient retry and exact-400 replay remain per
+  §4. Pins are process-lifetime and never expire/evict; the store is
+  fixed-bounded (see `sessionPinStoreCap` in `scheduler.go`) and a new
+  session+model at capacity fails closed locally with 502 before any send
+  while existing pins keep serving. Restart is the explicit clearing boundary.
 - Config change spine (save / Apply / reload-from-disk): parse and validate
   the full candidate → build new pools and Gateway instance → migrate
-  still-future scheduler cooldowns, proxy health, and still-fresh
-  route-session overrides by identity (credential by tier+key, proxy by
-  pool+URL, target by full identity, route session by target scope with the
-  client dimension excluded from validity; new resources start at zero /
-  stateless, removed ones drop) → atomically write
+  still-future scheduler cooldowns, proxy health, still-fresh
+  route-session overrides by identity, and session+model pins without validity
+  filtering as tombstone-like identity (credential by tier+key, proxy health
+  by pool+URL, target by full identity, proxy429 by pool+URL identity only
+  with aggregate count in the migration log, route session by target scope
+  with the client dimension excluded from validity and still-fresh/idle-TTL
+  filtering, pins migrated by identity up to the pin cap with aggregate count
+  only where a removed target remains pinned and fails locally with 502 rather
+  than re-establishing; new resources start at
+  zero / stateless, removed ones drop except pinned tombstones) → atomically write
   (temp file + `config.json.bak` + replace) → atomically switch new requests
   to the new instance. On write or init failure the old instance MUST keep
   serving; already-started requests MUST NOT be interrupted. Saved JSON is
@@ -102,18 +125,20 @@
 - Cache refresh spine: model lists + capability directory refresh
   concurrently every `models.refresh_seconds`; `models.dev` refreshes every
   24h with fixed timeout. Refresh uses a stateless key x healthy-proxy
-  traversal that never reads or writes foreground credential/target cooldowns
-  and never changes proxy healthy/checking (healthy proxies observed
-  read-only; no syncProxyResult/verifyProxyAfterError). A refresh context
-  deadline/cancel is only a refresh failure, never a proxy signal. Refresh
-  failure MUST keep the previous snapshot;
+  traversal that never reads or writes foreground credential/target/proxy429
+  cooldowns and never changes proxy healthy/checking (healthy proxies
+  observed read-only; no syncProxyResult/verifyProxyAfterError). A refresh
+  context deadline/cancel is only a refresh failure, never a proxy signal.
+  Refresh failure MUST keep the previous snapshot;
   startup uses valid disk cache before the first live refresh.
 
 ## 4. Invariants (MUST Preserve)
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
-  first, non-free models skip it entirely. Dispersion and fallback belong to
+  first, non-free models skip it entirely. Proxy/tier fallback below applies
+  only to unpinned establishment; once pinned, the pinned target serves alone
+  per the Session affinity spine. Dispersion and fallback belong to
   the frozen order only (HRW/round-robin); same-target retry never disperses.
   Each available proxy gets at most one fallback send and is NEVER truncated
   by `retry.max_attempts`; the whole channel additionally owns one shared
@@ -129,10 +154,11 @@
   reasoning refs; never consumes the transient token). The replay result is
   final for the whole route: success returns normally, a second 400 returns
   that 400, and any other replay outcome returns as-is without scanning
-  remaining proxies or entering the authenticated tiers.
+  remaining proxies or entering the authenticated tiers. A replay 2xx pins the
+  session+model when still unbound.
 - Authenticated tiers: each tier owns its own `retry.max_attempts` real-send
   budget (each first send plus each same-target transient retry consumes it)
-  and its own transient token. Inside a tier, only transport errors, 408/425,
+  and its own transient token. Inside a tier, while still unpinned, only transport errors, 408/425,
   401/403, 429, 5xx, and other retryable responses advance the frozen list;
   401/403/429 never retry same-target; transport/408/425/5xx retry same-target
   at most once per tier; any other 4xx MUST end that tier. The first exact
@@ -142,28 +168,43 @@
   ordinary budget); a second 400 terminates the whole route and MUST NOT fall
   back to the other tier. Only a non-400 tier failure falls back to the other
   tier that actually serves the model and has keys, ordered by `prefer` (`go`
-  default: Go → Zen). Cancel/deadline ends the route without further tiers.
+  default: Go → Zen). Cancel/deadline ends the route without further tiers. A
+  replay 2xx pins the session+model when still unbound; once pinned, the
+  pinned target serves alone per the Session affinity spine.
 - Scheduler state: proxy health is transport connectivity only (HTTP statuses
   never change it); a single foreground transport error never cools
-  credential/target state and never flips proxy healthy directly — it only
-  triggers the existing async neutral proxy health verification, and only
-  that independent probe on explicit isProxyFailure may flip healthy. 401
-  cools the credential globally; 403/429/5xx cool the single (credential,
-  proxy, model) target, so one model's rejection never affects another;
-  408/425 are transient neutral (retryable, never cooling); ordinary 4xx
-  (including exact 400) is neutral and 2xx clears this target
-  and this credential's 401 state. Route-session overrides are bounded
-  in-memory Gateway authority (first generation stateless, rotation stored
-  with idle TTL and deterministic eviction; never persisted, never projected,
-  never logged). Model/capability refresh is stateless and
+  credential/target/proxy429 state and never flips proxy healthy directly —
+  it only triggers the existing async neutral proxy health verification,
+  and only that independent probe on explicit isProxyFailure may flip
+  healthy. 401 cools the credential globally; 429 cools the pool-qualified
+  proxy globally across models, tiers, credentials, channels, and client
+  sessions (same raw URL in different pools stays isolated), so one proxy's
+  rate limit filters every model/credential/tier using that pool+proxy;
+  403/5xx cool the single (tier, credential, pool, proxy, model) target, so
+  one model's 403/5xx never affects another; 408/425 are transient neutral
+  (retryable, never cooling); ordinary 4xx (including exact 400) is neutral
+  and 2xx clears this target and this credential's 401 state, plus the
+  pool-qualified proxy429 state only when the send started at or after the
+  latest recorded 429 (stale in-flight 2xx never clears a newer 429; newer
+  failures stay authoritative). Proxy429 uses deterministic exponential
+  backoff with Retry-After max/cap, no same-target retry, bounded map with
+  stale prune/eviction proportional to proxy resources, and still-future
+  migration by pool+proxy with aggregate count only. Route-session overrides
+  are bounded in-memory Gateway authority (first generation stateless,
+  rotation stored with idle TTL and deterministic eviction; never persisted,
+  never projected, never logged), in contrast to session+model pins which are
+  process-lifetime, never expire/evict, and are fixed-bounded fail-closed.
+  Restart clears all in-memory cooldowns/overrides/pins. Model/capability refresh is stateless and
   touches none of these layers. The admin probe is one of the explicit
-  transport-health actions: it may flip proxy healthy and nothing else;
-  manual refresh shares the scheduled stateless path and its concurrency
-  gate, so it never reads or writes proxy or foreground scheduler state.
+  transport-health actions: it may flip proxy healthy and nothing else (never
+  clears/sets proxy429); manual refresh shares the scheduled stateless path
+  and its concurrency gate, so it never reads or writes proxy or foreground
+  scheduler state.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
-  per-model target cooldowns never count). Zero globally available channels
-  degrades readiness; one model's targets all cooling never does.
+  per-model target cooldowns and proxy429 cooldowns never count). Zero
+  globally available channels degrades readiness; one model's targets all
+  cooling or one proxy's 429 cooling never does.
 - Streaming: once bytes have been written to the client, the Gateway MUST
   NOT switch upstreams or regenerate; error-class upstream stream signals
   MUST surface as structured target-protocol error events, never as clean
