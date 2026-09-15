@@ -11,8 +11,9 @@ import (
 	"time"
 )
 
-// 429 on proxy P/model A filters P for model B, anonymous and authenticated,
-// and across credentials/tier when pool+raw proxy same.
+// 429 on proxy P/model A filters P for model B, anonymous and authenticated
+// Zen, and across Zen credentials when tier+pool+proxy same. Go stays
+// isolated even for the same pool+URL (tier/channel qualification).
 func TestProxy429FiltersAcrossModelsCredsTiers(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
@@ -34,7 +35,7 @@ func TestProxy429FiltersAcrossModelsCredsTiers(t *testing.T) {
 	candA := authCand(TierZen, cred, pool, pool.items[0], "model-a")
 	started := time.Now().UnixNano()
 	gateway.applyAttemptOutcome(context.Background(), candA, responseWithStatus(429), nil, started)
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus("shared", pool.items[0].name); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, "shared", pool.items[0].name); !ok {
 		t.Fatalf("proxy429 must cool shared/direct")
 	}
 	if got := gateway.scheduler.targetCoolUntil(candA.Identity); got != 0 {
@@ -55,13 +56,10 @@ func TestProxy429FiltersAcrossModelsCredsTiers(t *testing.T) {
 	if len(authB) != 2 {
 		t.Fatalf("authB=%d want 2 (2 creds x 1 remaining proxy)", len(authB))
 	}
-	// Go tier with same pool+proxy is also filtered.
+	// Go tier with same pool+proxy stays isolated (tier qualification).
 	goB := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, pool, "model-b", now)
-	if len(goB) != 1 {
-		t.Fatalf("goB=%d want 1 (other proxy only)", len(goB))
-	}
-	if goB[0].ProxyRaw == pool.items[0].name {
-		t.Fatalf("go tier must also filter cooled proxy")
+	if len(goB) != 2 {
+		t.Fatalf("goB=%d want 2 (both proxies; Zen 429 must not block Go)", len(goB))
 	}
 	// Anonymous model B is filtered identically.
 	anonB := gateway.scheduler.buildAnonymousCandidates(pool, "model-b", now)
@@ -98,10 +96,10 @@ func TestProxy429PoolIsolationSameURL(t *testing.T) {
 	// Record 429 against pool a/direct via a candidate that uses pool a.
 	cand.PoolName = "a"
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus("a", "direct"); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, "a", "direct"); !ok {
 		t.Fatalf("a/direct must cool")
 	}
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus("z", "direct"); ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, "z", "direct"); ok {
 		t.Fatalf("z/direct must stay isolated from a/direct")
 	}
 	now := time.Now().UnixNano()
@@ -130,7 +128,7 @@ func TestProxy429Target403_5xxStayScoped(t *testing.T) {
 		p := gw.pools["shared"]
 		aa := authCand(TierZen, gw.zenCreds[0], p, p.items[0], "model-a")
 		gw.applyAttemptOutcome(context.Background(), aa, responseWithStatus(status), nil, time.Now().UnixNano())
-		if _, _, ok := gw.scheduler.proxy429CooldownStatus("shared", p.items[0].name); ok {
+		if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "shared", p.items[0].name); ok {
 			t.Fatalf("status %d must not create proxy429", status)
 		}
 		now := time.Now().UnixNano()
@@ -162,7 +160,7 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
 	)
 	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.Anonymous = false
+	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -172,13 +170,13 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
 	auth := normalizeRouteAuthority(normalized.Upstream.Zen)
-	// Pin same client session, two models, to the same pool+proxy P.
-	gateway.scheduler.pinBind("ses_429_cross", "model-a", sessionPin{Tier: TierZen, CredID: cred.id, Pool: "shared", ProxyRaw: "direct", Model: "model-a", Protocol: ProtocolChat, Authority: auth})
-	gateway.scheduler.pinBind("ses_429_cross", "model-b", sessionPin{Tier: TierZen, CredID: cred.id, Pool: "shared", ProxyRaw: "direct", Model: "model-b", Protocol: ProtocolChat, Authority: auth})
-	// One live 429 on P (model-a context) cools P globally.
-	live := authCand(TierZen, cred, pool, pool.items[0], "model-a")
+	// Anonymous pins remain exactly proxy-affine with no moves: pin same
+	// client session, two models, to the same pool+proxy P.
+	gateway.scheduler.pinBind("ses_429_cross", "model-a", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Model: "model-a", Protocol: ProtocolChat, Authority: auth})
+	gateway.scheduler.pinBind("ses_429_cross", "model-b", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Model: "model-b", Protocol: ProtocolChat, Authority: auth})
+	// One live 429 on P (model-a context) cools P on the Zen channel.
+	live := targetCandidate{Tier: TierZen, CredKey: anonymousZenKey, CredID: anonymousSchedulerCredentialID, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: "shared", Proxy: pool.items[0], ProxyRaw: pool.items[0].name, Model: "model-a", Identity: targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", pool.items[0].name, "model-a")}
 	gateway.applyAttemptOutcome(context.Background(), live, responseWithStatus(429), nil, time.Now().UnixNano())
 	routeA := modelRoute{ID: "model-a", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: false, KeyTiers: []Tier{TierZen}}
 	routeB := modelRoute{ID: "model-b", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: false, KeyTiers: []Tier{TierZen}}
@@ -219,7 +217,7 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 	}
 	// After expiry the same pins send only P.
 	gateway.scheduler.mu.Lock()
-	if entry := gateway.scheduler.proxy429State[proxy429Identity("shared", "direct")]; entry != nil {
+	if entry := gateway.scheduler.proxy429State[proxy429Identity(TierZen, "shared", "direct")]; entry != nil {
 		entry.cooldownUntil = time.Now().Add(-time.Second).UnixNano()
 	}
 	gateway.scheduler.mu.Unlock()
@@ -243,7 +241,7 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 // Retry-After/backoff/cap, local envelope, and no same-target retry.
 func TestProxy429BackoffCapEnvelopeNoRetry(t *testing.T) {
 	scheduler := newTargetScheduler(15 * time.Second)
-	first := scheduler.backoffDelay(1, proxy429Identity("p", "direct"), 0)
+	first := scheduler.backoffDelay(1, proxy429Identity(TierZen, "p", "direct"), 0)
 	if first < 12*time.Second || first > 18*time.Second {
 		t.Fatalf("proxy429 base delay out of band: %v", first)
 	}
@@ -255,7 +253,7 @@ func TestProxy429BackoffCapEnvelopeNoRetry(t *testing.T) {
 	resp := responseWithStatus(429)
 	resp.Header.Set("Retry-After", "120")
 	gateway.applyAttemptOutcome(context.Background(), cand, resp, nil, time.Now().UnixNano())
-	until, _, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, pool.items[0].name)
+	until, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, pool.items[0].name)
 	if !ok {
 		t.Fatalf("must cool")
 	}
@@ -268,7 +266,7 @@ func TestProxy429BackoffCapEnvelopeNoRetry(t *testing.T) {
 	resp2 := responseWithStatus(429)
 	resp2.Header.Set("Retry-After", "3600")
 	gateway2.applyAttemptOutcome(context.Background(), cand2, resp2, nil, time.Now().UnixNano())
-	until2, _, _ := gateway2.scheduler.proxy429CooldownStatus(pool2.name, pool2.items[0].name)
+	until2, _, _ := gateway2.scheduler.proxy429CooldownStatus(TierZen, pool2.name, pool2.items[0].name)
 	if remaining := time.Until(time.Unix(0, until2)); remaining > 5*time.Minute {
 		t.Fatalf("cap exceeded: %v", remaining)
 	}
@@ -315,28 +313,28 @@ func TestProxy429ClearOrdering(t *testing.T) {
 	scheduler := newTargetScheduler(15 * time.Second)
 	pool, raw := "shared", "direct"
 	// Failure started at 2000.
-	scheduler.noteProxy429Failure(pool, raw, AttemptClassRateLimited, 429, 0, 2000)
+	scheduler.noteProxy429Failure(TierZen, pool, raw, AttemptClassRateLimited, 429, 0, 2000)
 	// Older success started at 1000 must not clear.
-	if cleared := scheduler.noteProxy429Success(pool, raw, 1000); cleared.Cleared {
+	if cleared := scheduler.noteProxy429Success(TierZen, pool, raw, 1000); cleared.Cleared {
 		t.Fatalf("stale 2xx must not clear newer 429")
 	}
-	if _, _, ok := scheduler.proxy429CooldownStatus(pool, raw); !ok {
+	if _, _, ok := scheduler.proxy429CooldownStatus(TierZen, pool, raw); !ok {
 		// Status uses wall clock; the entry above may have expired already
 		// because backoff uses wall now. Re-seed with wall-started failure
 		// for the status check below.
 		_ = ok
 	}
 	// Newer success started at 2000 (equal) clears.
-	if cleared := scheduler.noteProxy429Success(pool, raw, 2000); !cleared.Cleared {
+	if cleared := scheduler.noteProxy429Success(TierZen, pool, raw, 2000); !cleared.Cleared {
 		t.Fatalf("equal-started 2xx must clear")
 	}
 	// Multiple newer failures remain authoritative: two failures, stale clear fails.
-	scheduler.noteProxy429Failure(pool, raw, AttemptClassRateLimited, 429, 0, 1000)
-	scheduler.noteProxy429Failure(pool, raw, AttemptClassRateLimited, 429, 0, 2000)
-	if cleared := scheduler.noteProxy429Success(pool, raw, 1500); cleared.Cleared {
+	scheduler.noteProxy429Failure(TierZen, pool, raw, AttemptClassRateLimited, 429, 0, 1000)
+	scheduler.noteProxy429Failure(TierZen, pool, raw, AttemptClassRateLimited, 429, 0, 2000)
+	if cleared := scheduler.noteProxy429Success(TierZen, pool, raw, 1500); cleared.Cleared {
 		t.Fatalf("2xx between two failures must not clear the newer failure")
 	}
-	if cleared := scheduler.noteProxy429Success(pool, raw, 3000); !cleared.Cleared {
+	if cleared := scheduler.noteProxy429Success(TierZen, pool, raw, 3000); !cleared.Cleared {
 		t.Fatalf("newest 2xx must clear")
 	}
 	// Gateway-level ordering with wall-clock cooldowns.
@@ -348,12 +346,12 @@ func TestProxy429ClearOrdering(t *testing.T) {
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, newerStarted)
 	olderStarted := newerStarted - int64(time.Second)
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil, olderStarted)
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(gwPool.name, gwPool.items[0].name); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, gwPool.name, gwPool.items[0].name); !ok {
 		t.Fatalf("stale in-flight 2xx cleared a newer 429")
 	}
 	laterStarted := time.Now().UnixNano()
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(200), nil, laterStarted)
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(gwPool.name, gwPool.items[0].name); ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, gwPool.name, gwPool.items[0].name); ok {
 		t.Fatalf("newer-started 2xx must clear proxy429")
 	}
 }
@@ -369,19 +367,19 @@ func TestProxy429ConcurrentOrderingRace(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 50; i++ {
-			scheduler.noteProxy429Failure(pool, raw, AttemptClassRateLimited, 429, 0, base+int64(i))
+			scheduler.noteProxy429Failure(TierZen, pool, raw, AttemptClassRateLimited, 429, 0, base+int64(i))
 			failures.Add(1)
 		}
 	}()
 	for i := 0; i < 50; i++ {
 		// Stale clears (started before base) must never clear the newest failure.
-		scheduler.noteProxy429Success(pool, raw, base-1)
+		scheduler.noteProxy429Success(TierZen, pool, raw, base-1)
 	}
 	<-done
 	// Newest success clears deterministically.
-	if cleared := scheduler.noteProxy429Success(pool, raw, base+1000); !cleared.Cleared && failures.Load() > 0 {
+	if cleared := scheduler.noteProxy429Success(TierZen, pool, raw, base+1000); !cleared.Cleared && failures.Load() > 0 {
 		// If already cleared by a concurrent path, status must be absent.
-		if _, _, ok := scheduler.proxy429CooldownStatus(pool, raw); ok {
+		if _, _, ok := scheduler.proxy429CooldownStatus(TierZen, pool, raw); ok {
 			t.Fatalf("newest clear failed while state remains")
 		}
 	}
@@ -400,11 +398,11 @@ func TestProxy429MigrationAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldGateway.scheduler.noteProxy429Failure("shared", "direct", AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
-	oldGateway.scheduler.noteProxy429Failure("shared", "http://127.0.0.1:8081", AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
+	oldGateway.scheduler.noteProxy429Failure(TierZen, "shared", "direct", AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
+	oldGateway.scheduler.noteProxy429Failure(TierZen, "shared", "http://127.0.0.1:8081", AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
 	// Expire the second entry: it must not migrate.
 	oldGateway.scheduler.mu.Lock()
-	oldGateway.scheduler.proxy429State[proxy429Identity("shared", "http://127.0.0.1:8081")].cooldownUntil = time.Now().Add(-time.Second).UnixNano()
+	oldGateway.scheduler.proxy429State[proxy429Identity(TierZen, "shared", "http://127.0.0.1:8081")].cooldownUntil = time.Now().Add(-time.Second).UnixNano()
 	oldGateway.scheduler.mu.Unlock()
 
 	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
@@ -422,20 +420,20 @@ func TestProxy429MigrationAndBounds(t *testing.T) {
 	if summary.Proxy429 != 1 {
 		t.Fatalf("migrated proxy429=%d want 1 (valid only)", summary.Proxy429)
 	}
-	if _, _, ok := newGateway.scheduler.proxy429CooldownStatus("shared", "direct"); !ok {
+	if _, _, ok := newGateway.scheduler.proxy429CooldownStatus(TierZen, "shared", "direct"); !ok {
 		t.Fatalf("valid proxy429 must migrate")
 	}
-	if _, _, ok := newGateway.scheduler.proxy429CooldownStatus("shared", "http://127.0.0.1:8081"); ok {
+	if _, _, ok := newGateway.scheduler.proxy429CooldownStatus(TierZen, "shared", "http://127.0.0.1:8081"); ok {
 		t.Fatalf("removed/expired proxy429 must drop")
 	}
 	// Remaining capped at 5m.
 	old2 := newTargetScheduler(15 * time.Second)
 	old2.mu.Lock()
-	old2.proxy429State[proxy429Identity("shared", "direct")] = &proxy429Entry{failures: 1, cooldownUntil: time.Now().Add(time.Hour).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStartedNanos: time.Now().UnixNano(), lastFailureClass: AttemptClassRateLimited, lastStatus: 429}
+	old2.proxy429State[proxy429Identity(TierZen, "shared", "direct")] = &proxy429Entry{failures: 1, cooldownUntil: time.Now().Add(time.Hour).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStartedNanos: time.Now().UnixNano(), lastFailureClass: AttemptClassRateLimited, lastStatus: 429}
 	old2.mu.Unlock()
 	next2 := newTargetScheduler(15 * time.Second)
 	next2.migrateFrom(old2)
-	_, until := next2.proxy429EntrySnapshot("shared", "direct")
+	_, until := next2.proxy429EntrySnapshot(TierZen, "shared", "direct")
 	if remaining := time.Until(time.Unix(0, until)); remaining <= 0 || remaining > 5*time.Minute {
 		t.Fatalf("migrated remaining=%v want (0,5m]", remaining)
 	}
@@ -445,15 +443,15 @@ func TestProxy429MigrationAndBounds(t *testing.T) {
 	expired := nowNanos - int64(time.Second)
 	bounded.mu.Lock()
 	for i := 0; i < maxProxy429States; i++ {
-		id := proxy429Identity("shared", "proxy-cap-"+itoa(i))
+		id := proxy429Identity(TierZen, "shared", "proxy-cap-"+itoa(i))
 		bounded.proxy429State[id] = &proxy429Entry{failures: 1, cooldownUntil: expired, lastFailureAt: nowNanos - int64(maxProxy429States-i), lastFailureClass: AttemptClassRateLimited, lastStatus: 429, lastStartedNanos: nowNanos - int64(maxProxy429States-i)}
 	}
 	bounded.mu.Unlock()
-	bounded.noteProxy429Failure("shared", "proxy-cap-fresh", AttemptClassRateLimited, 429, 0, nowNanos)
+	bounded.noteProxy429Failure(TierZen, "shared", "proxy-cap-fresh", AttemptClassRateLimited, 429, 0, nowNanos)
 	bounded.mu.Lock()
 	size := len(bounded.proxy429State)
-	_, freshThere := bounded.proxy429State[proxy429Identity("shared", "proxy-cap-fresh")]
-	_, oldestThere := bounded.proxy429State[proxy429Identity("shared", "proxy-cap-0")]
+	_, freshThere := bounded.proxy429State[proxy429Identity(TierZen, "shared", "proxy-cap-fresh")]
+	_, oldestThere := bounded.proxy429State[proxy429Identity(TierZen, "shared", "proxy-cap-0")]
 	bounded.mu.Unlock()
 	if size != maxProxy429States {
 		t.Fatalf("size=%d want %d after eviction", size, maxProxy429States)
@@ -468,7 +466,7 @@ func TestProxy429MigrationAndBounds(t *testing.T) {
 		entry.cooldownUntil = future
 	}
 	bounded.mu.Unlock()
-	bounded.noteProxy429Failure("shared", "proxy-cap-overflow", AttemptClassRateLimited, 429, 0, nowNanos)
+	bounded.noteProxy429Failure(TierZen, "shared", "proxy-cap-overflow", AttemptClassRateLimited, 429, 0, nowNanos)
 	bounded.mu.Lock()
 	overflowSize := len(bounded.proxy429State)
 	bounded.mu.Unlock()
@@ -498,14 +496,14 @@ func TestProxy429ReadinessProbeRefreshIsolation(t *testing.T) {
 	gwCred := gw.zenCreds[0]
 	gwCand := authCand(TierZen, gwCred, gwPool, gwPool.items[0], "probe-model")
 	gw.applyAttemptOutcome(context.Background(), gwCand, responseWithStatus(429), nil, time.Now().UnixNano())
-	_, proxyUntil, ok := gw.scheduler.proxy429CooldownStatus("shared", "direct")
+	_, proxyUntil, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "shared", "direct")
 	if !ok {
 		t.Fatalf("seed proxy429 must cool")
 	}
 	targetUntil := gw.scheduler.targetCoolUntil(gwCand.Identity)
 	// Direct probe via transport result (healthy flip) must not touch proxy429.
 	gw.applyProxyHealthResult(proxyHealthResult{proxy: gwPool.items[0], err: nil, failed: false, wasHealthy: false}, "test probe", 0)
-	if _, got, ok2 := gw.scheduler.proxy429CooldownStatus("shared", "direct"); !ok2 || got != proxyUntil {
+	if _, got, ok2 := gw.scheduler.proxy429CooldownStatus(TierZen, "shared", "direct"); !ok2 || got != proxyUntil {
 		t.Fatalf("probe changed proxy429")
 	}
 	if got := gw.scheduler.targetCoolUntil(gwCand.Identity); got != targetUntil {

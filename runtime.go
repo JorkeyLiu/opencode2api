@@ -240,7 +240,7 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 		next.gateway.catalog.CopyState(current.gateway.catalog)
 		summary := migrateGatewaySchedulerState(current.gateway, next.gateway)
 		m.logger.Info("scheduler state migrated", "component", "scheduler", "event", "scheduler_state_migrated",
-			"credentials", summary.Credentials, "targets", summary.Targets, "proxy_rate_limits", summary.Proxy429, "proxies", summary.Proxies, "pins", summary.Pins)
+			"credentials", summary.Credentials, "credential_rate_limits", summary.Credential429, "targets", summary.Targets, "proxy_rate_limits", summary.Proxy429, "channel_availability", summary.Channel, "proxies", summary.Proxies, "pins", summary.Pins)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -343,25 +343,33 @@ func (m *RuntimeManager) ShutdownWithContext(ctx context.Context) {
 // gatewayMigrationSummary counts migrated state for the Apply log summary.
 // No per-identity detail is included.
 type gatewayMigrationSummary struct {
-	Credentials int
-	Targets     int
-	Proxy429    int
-	Proxies     int
-	Pins        int
+	Credentials   int
+	Credential429 int
+	Targets       int
+	Proxy429      int
+	Channel       int
+	Proxies       int
+	Pins          int
 }
 
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
 // from the old Gateway to the newly built one before the atomic swap:
-// credential state matches by tier+full key, proxy health by (pool name,
-// raw proxy URL), target state by full identity, proxy429 state by
-// (pool, raw proxy) identity only, and route-session overrides by target
-// scope (client dimension excluded from validity). Only still-future
-// cooldowns and still-fresh route overrides migrate (remaining capped at 5
-// minutes for cooldowns, idle TTL for sessions); new resources start at
-// zero/stateless state and removed identities are dropped. Session-affinity
-// pins migrate without validity filtering up to the pin cap as
-// tombstone-like bindings: removed/changed targets still resolve to the
-// pinned path and fail locally with 502. Checking flags never migrate.
+// credential state matches by tier+full key, credential429 by tier+key,
+// proxy health by (pool name, raw proxy URL), target state by full identity,
+// proxy429 and channel state by (tier, pool, raw proxy) identity only, and
+// route-session overrides by target scope (client dimension excluded from
+// validity).
+// Authenticated route-session scopes are proxy-independent; only anonymous
+// scopes require proxy validity, and legacy auth overrides with proxy-bound
+// keys are dropped (new requests derive the proxy-independent session
+// statelessly). Only still-future cooldowns and still-fresh route overrides
+// migrate (remaining capped at 5 minutes for cooldowns, idle TTL for
+// sessions); new resources start at zero/stateless state and removed
+// identities are dropped. Session-affinity pins migrate without validity
+// filtering up to the pin cap as tombstone-like bindings: authenticated pins
+// validate proxy-independently (binding without proxy) while anonymous pins
+// remain full-target; removed/changed bindings still resolve to the pinned
+// path and fail locally with 502. Checking flags never migrate.
 // Route-session overrides and pins are in-memory authority (not a
 // projection): they never persist across restarts and never enter logs,
 // metrics, history, or admin output. In-flight requests keep using the old
@@ -394,8 +402,10 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	}
 	migrated := newGateway.scheduler.migrateFrom(oldGateway.scheduler)
 	summary.Credentials = migrated.Credentials
+	summary.Credential429 = migrated.Credential429
 	summary.Targets = migrated.Targets
 	summary.Proxy429 = migrated.Proxy429
+	summary.Channel = migrated.Channel
 	validCreds := make(map[string]bool, len(newGateway.zenCreds)+len(newGateway.goCreds)+1)
 	for _, cred := range newGateway.zenCreds {
 		validCreds[cred.id] = true
@@ -416,7 +426,11 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 		}
 		validPoolProxy[name] = set
 	}
-	newGateway.scheduler.retainOnly(validCreds, validPoolProxy)
+	validTierPool := map[string]map[string]bool{
+		string(TierZen): {newGateway.cfg.ProxyRouting.Zen: true, newGateway.cfg.ProxyRouting.Anonymous: true},
+		string(TierGo):  {newGateway.cfg.ProxyRouting.Go: true},
+	}
+	newGateway.scheduler.retainOnly(validCreds, validPoolProxy, validTierPool)
 	zenAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Zen)
 	goAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Go)
 	if oldGateway.scheduler.routeSessions != nil && newGateway.scheduler.routeSessions != nil {
@@ -424,9 +438,21 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 			if !validCreds[scope.CredID] {
 				return false
 			}
-			proxies, ok := validPoolProxy[scope.Pool]
-			if !ok || !proxies[scope.ProxyRaw] {
-				return false
+			// Authenticated scopes are proxy-independent: only pool validity
+			// matters; legacy proxy-bound auth overrides (ProxyRaw != "")
+			// are dropped and re-derived statelessly.
+			if scope.CredID != anonymousSchedulerCredentialID {
+				if scope.ProxyRaw != "" {
+					return false
+				}
+				if _, ok := validPoolProxy[scope.Pool]; !ok {
+					return false
+				}
+			} else {
+				proxies, ok := validPoolProxy[scope.Pool]
+				if !ok || !proxies[scope.ProxyRaw] {
+					return false
+				}
 			}
 			if scope.Protocol != ProtocolChat && scope.Protocol != ProtocolResponses && scope.Protocol != ProtocolAnthropic {
 				return false
@@ -464,20 +490,31 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 }
 
 type ResourceSnapshot struct {
-	Models                   modelCatalogSnapshot   `json:"models"`
-	Keys                     []KeyStatus            `json:"keys"`
-	Proxies                  []ProxyStatus          `json:"proxies"`
-	Anonymous                bool                   `json:"anonymous"`
-	AnonymousProxies         []AnonymousProxyStatus `json:"anonymous_proxies,omitempty"`
-	Targets                  []TargetStatus         `json:"targets,omitempty"`
-	TargetsTotal             int                    `json:"targets_total,omitempty"`
-	TargetsTruncated         bool                   `json:"targets_truncated,omitempty"`
-	ProxyRateLimits          []ProxyRateLimitStatus `json:"proxy_rate_limits,omitempty"`
-	ProxyRateLimitsTotal     int                    `json:"proxy_rate_limits_total,omitempty"`
-	ProxyRateLimitsTruncated bool                   `json:"proxy_rate_limits_truncated,omitempty"`
-	Metadata                 MetadataSnapshot       `json:"metadata"`
+	Models                   modelCatalogSnapshot        `json:"models"`
+	Keys                     []KeyStatus                 `json:"keys"`
+	Proxies                  []ProxyStatus               `json:"proxies"`
+	Anonymous                bool                        `json:"anonymous"`
+	Targets                  []TargetStatus              `json:"targets,omitempty"`
+	TargetsTotal             int                         `json:"targets_total,omitempty"`
+	TargetsTruncated         bool                        `json:"targets_truncated,omitempty"`
+	ProxyRateLimits          []ProxyRateLimitStatus      `json:"proxy_rate_limits,omitempty"`
+	ProxyRateLimitsTotal     int                         `json:"proxy_rate_limits_total,omitempty"`
+	ProxyRateLimitsTruncated bool                        `json:"proxy_rate_limits_truncated,omitempty"`
+	ChannelCooldowns         []ChannelAvailabilityStatus `json:"channel_cooldowns,omitempty"`
+	ChannelCooldownsTotal    int                         `json:"channel_cooldowns_total,omitempty"`
+	ChannelTruncated         bool                        `json:"channel_truncated,omitempty"`
+	AvailabilityCheckedAt    *time.Time                  `json:"availability_checked_at,omitempty"`
+	AvailabilityTruncated    bool                        `json:"availability_truncated,omitempty"`
+	AvailabilityPartial      bool                        `json:"availability_partial,omitempty"`
+	Metadata                 MetadataSnapshot            `json:"metadata"`
 }
 
+// KeyStatus is the per-credential availability row (凭证可用性). ID is the
+// key tail (never full secrets); Tier names the channel; ProxyPool is the
+// assigned pool identity. Status is available/unavailable/rate_limited;
+// Reason is the short machine reason (auth_failure, rate_limited,
+// no_healthy_proxies, all_proxies_cooling, success, untested, ...).
+// LastChecked is the admin bulk-check projection (never routing authority).
 type KeyStatus struct {
 	ID    string `json:"id"`
 	Tier  string `json:"tier"`
@@ -497,30 +534,20 @@ type KeyStatus struct {
 	// live in the targets list.
 	AvailableTargets int `json:"available_targets,omitempty"`
 	TotalTargets     int `json:"total_targets,omitempty"`
+	// Credential availability (operator-facing): status/reason/last checked.
+	Status      string     `json:"status,omitempty"`
+	Reason      string     `json:"reason,omitempty"`
+	LastChecked *time.Time `json:"last_checked,omitempty"`
 }
 
-// AnonymousProxyStatus is the per-proxy anonymous 403/5xx target summary.
-// Transport fields (Healthy/Checking) still mean proxy connectivity only;
-// the cooldown fields summarize per-(proxy, model) 403/5xx target state
-// across models. HTTP 429 never appears here; it lives in the dedicated
-// proxy429 layer (ProxyRateLimitStatus).
-// Failures/CooldownUntil/CooldownRemainingSeconds are a deprecated
-// model-agnostic aggregate (sums / latest deadline); prefer ActiveCooldowns,
-// NextAvailableAt, and LastFailureClass.
-type AnonymousProxyStatus struct {
-	Index                    int        `json:"index"`
-	Pool                     string     `json:"proxy_pool,omitempty"`
-	Address                  string     `json:"address"`
-	Healthy                  bool       `json:"healthy"`
-	Checking                 bool       `json:"checking"`
-	ActiveCooldowns          int        `json:"active_cooldowns,omitempty"`
-	NextAvailableAt          *time.Time `json:"next_available_at,omitempty"`
-	LastFailureClass         string     `json:"last_failure_class,omitempty"`
-	Failures                 uint32     `json:"failures"`
-	CooldownUntil            *time.Time `json:"cooldown_until,omitempty"`
-	CooldownRemainingSeconds *int64     `json:"cooldown_remaining_seconds,omitempty"`
-}
-
+// ProxyStatus is one pool-qualified proxy row in the unified 代理可用性
+// view. The same raw URL in different pools appears as independent rows
+// (pool-qualified); the UI may visually group by redacted node but must
+// never merge state across pools. Zen/Go are channel-specific availability
+// labels for that tier+pool+proxy (available, rate_limited,
+// channel_unavailable, transport_unavailable, untested). CooldownReason is
+// the active Zen/Go cooldown reason (if any); LastChecked is the bulk-check
+// projection.
 type ProxyStatus struct {
 	Index    int    `json:"index"`
 	Pool     string `json:"proxy_pool,omitempty"`
@@ -539,7 +566,11 @@ type ProxyStatus struct {
 	// zen keys + go keys routed to this pool, plus one when the anonymous
 	// credential is routed here. Same value as ZenKeys+GoKeys(+1); kept for
 	// compatibility with consumers reading a single field.
-	AvailableCredentials int `json:"available_credentials,omitempty"`
+	AvailableCredentials int        `json:"available_credentials,omitempty"`
+	Zen                  string     `json:"zen,omitempty"`
+	Go                   string     `json:"go,omitempty"`
+	CooldownReason       string     `json:"cooldown_reason,omitempty"`
+	LastChecked          *time.Time `json:"last_checked,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -552,8 +583,28 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	if gateway.catalog.metadata != nil {
 		result.Metadata = gateway.catalog.metadata.Snapshot()
 	}
-	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.zenCreds, gateway.cfg.ProxyRouting.Zen)...)
-	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "go", gateway.goCreds, gateway.cfg.ProxyRouting.Go)...)
+	bulkSnap := gateway.bulkSnapshot.Load()
+	credLastChecked := map[string]*time.Time{}
+	if bulkSnap != nil {
+		for _, c := range bulkSnap.Credentials {
+			// Lookup by internal credential ID (tier-qualified); tail-only
+			// keys would collapse collisions. Fall back to tail key for
+			// snapshots written before CredID existed.
+			if c.CredID != "" {
+				credLastChecked[string(c.Tier)+"\x00"+c.CredID+"\x00"+c.Pool] = c.LastChecked
+			} else {
+				credLastChecked[string(c.Tier)+"\x00"+c.KeyTail+"\x00"+c.Pool] = c.LastChecked
+			}
+		}
+		if bulkSnap.CheckedAt.IsZero() == false {
+			value := bulkSnap.CheckedAt.UTC()
+			result.AvailabilityCheckedAt = &value
+			result.AvailabilityTruncated = bulkSnap.Truncated
+			result.AvailabilityPartial = bulkSnap.Partial
+		}
+	}
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.zenCreds, gateway.cfg.ProxyRouting.Zen, credLastChecked)...)
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "go", gateway.goCreds, gateway.cfg.ProxyRouting.Go, credLastChecked)...)
 	routingFor := func(poolName string) []string {
 		out := []string{}
 		if gateway.cfg.ProxyRouting.Anonymous == poolName {
@@ -581,6 +632,14 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		}
 		return count
 	}
+	// Bulk projection lookup for per-proxy last-checked (pool-qualified).
+	nodeLastChecked := map[string]*time.Time{}
+	if bulkSnap != nil {
+		for _, n := range bulkSnap.Nodes {
+			nodeLastChecked[n.Pool+"\x00"+n.ProxyNode] = n.LastChecked
+		}
+	}
+	now := time.Now()
 	for _, pool := range gateway.uniquePools() {
 		zenRouted, goRouted := 0, 0
 		if gateway.cfg.ProxyRouting.Zen == pool.name {
@@ -590,17 +649,41 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			goRouted = len(gateway.goCreds)
 		}
 		for _, proxy := range pool.items {
+			healthy := proxy.healthy.Load()
+			zenLabel, zenReason := proxyChannelLabel(gateway, TierZen, pool.name, proxy.name, healthy, now)
+			goLabel, goReason := proxyChannelLabel(gateway, TierGo, pool.name, proxy.name, healthy, now)
+			reason := ""
+			if zenReason != "" {
+				reason = "zen:" + zenReason
+			}
+			if goReason != "" {
+				if reason != "" {
+					reason += ";"
+				}
+				reason += "go:" + goReason
+			}
+			// Preserve anonymous Zen 403/5xx + proxy429 context inside the
+			// Zen reason column: channel/proxy429 already encode it, and the
+			// dedicated anonymous summary table is removed.
 			status := ProxyStatus{
 				Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
-				Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(),
+				Healthy: healthy, Checking: proxy.checking.Load(),
 				ZenKeys: zenRouted, GoKeys: goRouted,
 				Anonymous: gateway.cfg.Anonymous && anonPool == pool,
 				Routing:   routingFor(pool.name), AvailableCredentials: credsForPool(pool.name),
+				Zen: zenLabel, Go: goLabel, CooldownReason: reason,
+			}
+			if lc, ok := nodeLastChecked[pool.name+"\x00"+redactURL(proxy.name)]; ok {
+				status.LastChecked = lc
+			} else if bulkSnap != nil && !bulkSnap.CheckedAt.IsZero() {
+				// Fall back to the run timestamp so every row shows a
+				// last-checked projection after at least one bulk run.
+				value := bulkSnap.CheckedAt.UTC()
+				status.LastChecked = &value
 			}
 			result.Proxies = append(result.Proxies, status)
 		}
 	}
-	result.AnonymousProxies = gateway.anonymousTargetSummaries()
 	targets, total := gateway.scheduler.snapshotTargets()
 	result.Targets = targets
 	result.TargetsTotal = total
@@ -609,7 +692,28 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	result.ProxyRateLimits = limits
 	result.ProxyRateLimitsTotal = limitsTotal
 	result.ProxyRateLimitsTruncated = limitsTotal > len(limits)
+	channels, channelsTotal := gateway.scheduler.snapshotChannel()
+	result.ChannelCooldowns = channels
+	result.ChannelCooldownsTotal = channelsTotal
+	result.ChannelTruncated = channelsTotal > len(channels)
 	return result
+}
+
+// proxyChannelLabel resolves one tier's operator-facing availability for a
+// pool-qualified proxy: transport first, then proxy429, then channel.
+// It returns the compact label plus the active cooldown reason (if any).
+// Zen and Go are evaluated independently so the same node can differ by tier.
+func proxyChannelLabel(gateway *Gateway, tier Tier, pool, raw string, healthy bool, now time.Time) (string, string) {
+	if !healthy {
+		return "transport_unavailable", "transport_unavailable"
+	}
+	if until, _, ok := gateway.scheduler.proxy429CooldownStatus(tier, pool, raw); ok && until > now.UnixNano() {
+		return "rate_limited", "rate_limited"
+	}
+	if until, _, ok := gateway.scheduler.channelCooldownStatus(tier, pool, raw); ok && until > now.UnixNano() {
+		return "channel_unavailable", "channel_unavailable"
+	}
+	return "available", ""
 }
 
 func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot) {
@@ -641,9 +745,12 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 
 // keyStatusesForTier snapshots credential-level state for one tier without
 // taking pool locks: credential lists are immutable after build and all
-// scheduler counters are mutex-guarded snapshots.
-func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, poolName string) []KeyStatus {
+// scheduler counters are mutex-guarded snapshots. Status/reason form the
+// operator-facing 凭证可用性 view: tier, key tail, assigned pool, status,
+// availability counts, reason, last checked. Full secrets never appear.
+func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, poolName string, lastChecked map[string]*time.Time) []KeyStatus {
 	now := time.Now()
+	nowNanos := now.UnixNano()
 	var total, healthy int
 	if pool := gateway.pools[poolName]; pool != nil {
 		total = len(pool.items)
@@ -653,6 +760,7 @@ func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, po
 			}
 		}
 	}
+	tierTyped := Tier(tier)
 	result := make([]KeyStatus, 0, len(creds))
 	for _, cred := range creds {
 		failures, until := gateway.scheduler.credentialSnapshot(cred.id)
@@ -664,50 +772,61 @@ func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, po
 		// Only an unexpired credential (401) cooldown hides targets. An
 		// expired cooldown with failures>0 (backoff memory) must report the
 		// same transport-level availability as buildAuthCandidates sees.
-		if until > now.UnixNano() {
+		if until > nowNanos {
 			status.AvailableTargets = 0
 		} else {
 			status.AvailableTargets = healthy
 		}
-		if until > now.UnixNano() {
+		if until > nowNanos {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value
 			status.CooldownRemainingSeconds = cooldownRemainingSeconds(until, now)
 		}
-		result = append(result, status)
-	}
-	return result
-}
-
-// anonymousTargetSummaries snapshots the per-proxy anonymous 403/5xx target
-// state without taking pool locks: transports are immutable after build and
-// all scheduler counters are mutex-guarded snapshots. HTTP 429 never
-// contributes here; it is projected via snapshotProxy429.
-func (g *Gateway) anonymousTargetSummaries() []AnonymousProxyStatus {
-	if !g.cfg.Anonymous {
-		return nil
-	}
-	pool := g.pools[g.cfg.ProxyRouting.Anonymous]
-	if pool == nil || len(pool.items) == 0 {
-		return nil
-	}
-	now := time.Now()
-	result := make([]AnonymousProxyStatus, 0, len(pool.items))
-	for _, proxy := range pool.items {
-		if proxy == nil {
-			continue
+		// Operator status: 401 cooling wins, then credential429 cooling, then
+		// transport (no healthy proxy), then all-proxies tier cooling
+		// (proxy429/channel covering every healthy proxy), else available.
+		// healthz readiness is unchanged: channel and credential429 never
+		// affect it; this display-only status may still report them.
+		if until > nowNanos {
+			status.Status = "unavailable"
+			status.Reason = "auth_failure"
+		} else if cUntil, _, ok := gateway.scheduler.credential429CooldownStatus(cred.id); ok && cUntil > nowNanos {
+			status.Status = "rate_limited"
+			status.Reason = "rate_limited"
+		} else if healthy == 0 {
+			status.Status = "unavailable"
+			status.Reason = "no_healthy_proxies"
+		} else {
+			cooling := 0
+			if pool := gateway.pools[poolName]; pool != nil {
+				for _, proxy := range pool.items {
+					if proxy == nil || !proxy.healthy.Load() {
+						continue
+					}
+					if pUntil, _, ok := gateway.scheduler.proxy429CooldownStatus(tierTyped, poolName, proxy.name); ok && pUntil > nowNanos {
+						cooling++
+						continue
+					}
+					if cUntil, _, ok := gateway.scheduler.channelCooldownStatus(tierTyped, poolName, proxy.name); ok && cUntil > nowNanos {
+						cooling++
+					}
+				}
+			}
+			if total > 0 && cooling >= healthy {
+				status.Status = "unavailable"
+				status.Reason = "all_proxies_cooling"
+			} else {
+				status.Status = "available"
+				status.Reason = "success"
+			}
 		}
-		active, nextAvailable, lastClass, failures := g.scheduler.proxyTargetSummary(pool.name, proxy.name)
-		status := AnonymousProxyStatus{
-			Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
-			Healthy: proxy.healthy.Load(), Checking: proxy.checking.Load(),
-			ActiveCooldowns: active, NextAvailableAt: nextAvailable,
-			LastFailureClass: lastClass, Failures: failures,
-		}
-		if nextAvailable != nil {
-			value := *nextAvailable
-			status.CooldownUntil = &value
-			status.CooldownRemainingSeconds = cooldownRemainingSeconds(value.UnixNano(), now)
+		if lc, ok := lastChecked[tier+"\x00"+cred.id+"\x00"+poolName]; ok {
+			status.LastChecked = lc
+		} else if lc, ok := lastChecked[tier+"\x00"+cred.display+"\x00"+poolName]; ok {
+			status.LastChecked = lc
+		} else if snap := gateway.bulkSnapshot.Load(); snap != nil && !snap.CheckedAt.IsZero() {
+			value := snap.CheckedAt.UTC()
+			status.LastChecked = &value
 		}
 		result = append(result, status)
 	}

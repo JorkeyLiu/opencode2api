@@ -146,7 +146,7 @@ func seedRefreshForeground(t *testing.T, gateway *Gateway) targetCandidate {
 		t.Fatalf("seed target must cool")
 	}
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, proxy.name); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, proxy.name); !ok {
 		t.Fatalf("seed proxy429 must cool")
 	}
 	return cand

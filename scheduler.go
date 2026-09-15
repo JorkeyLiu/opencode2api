@@ -14,22 +14,39 @@ import (
 
 // Unified credential x proxy target scheduler.
 //
-// Four state layers with separate ownership:
+// Six state layers with separate ownership:
 //   - proxyTransport.healthy: transport connectivity only. Only isProxyFailure
 //     (timeout/deadline/refused) may set unhealthy; HTTP statuses never do.
-//   - proxy429State: global per (pool, raw proxy) rate-limit cooldown, 429
-//     only. It is shared across models, tiers, credentials, anonymous and
-//     authenticated channels, and client sessions using that pool-qualified
-//     proxy. Same raw URL in different named pools is isolated.
+//   - proxy429State: per (tier/channel, pool, raw proxy) rate-limit cooldown,
+//     429 only. Anonymous Zen and authenticated Zen share the Zen channel;
+//     Go is isolated even for the same pool+URL. Pool isolation is preserved.
+//     Model, credential, and client session never participate.
+//   - channelState: per (tier/channel, pool, raw proxy) channel-availability
+//     cooldown, 403/5xx only. Written only by comparative management probes
+//     (same tier+credential success on one node plus 403/5xx on another);
+//     lone 403/5xx without comparative success is display-only. Anonymous Zen
+//     and authenticated Zen share the Zen channel; Go is isolated. Pool
+//     isolation is preserved. Model, credential, and client session never
+//     participate.
 //   - credentialState: global per-credential cooldown, 401 only.
+//   - credential429State: per (tier, credential) rate-limit cooldown, 429
+//     only. Set only when one established/unbound authenticated request
+//     observes 429 from two distinct eligible proxies in sequence with the
+//     same credential. Single-proxy 429 never sets it.
 //   - targetState: per (tier, credential, pool, proxy, model) cooldown for
 //     403/5xx only. Transport errors, 408/425, and ordinary 4xx (including
 //     400) are neutral no-ops and 2xx clears only the single target (plus the
 //     credential 401 state and, when the send started at or after the latest
-//     429, the pool-qualified proxy429 state).
+//     429, the tier-qualified proxy429/channel state and the credential429 state).
 //
 // Target identity uses the raw configured proxy URL string qualified by pool
 // name for internal matching; external output always uses redactURL.
+//
+// Authenticated session+model bindings are proxy-independent: the durable
+// identity fixes tier, credential, pool, model, protocol, and authority but
+// not the proxy node. The pin's ProxyRaw is the mutable current/preferred
+// proxy with generation fencing. Anonymous bindings remain full-target
+// (proxy is identity) with no cross-proxy recovery.
 
 const (
 	// anonymousSchedulerCredentialID is the internal scheduler identity for the
@@ -78,6 +95,23 @@ const (
 	// layer: expired failure memory is kept for backoff escalation, then
 	// pruned once out of cooldown and past retention.
 	proxy429StaleRetention = targetBackoffCap
+
+	// maxChannelStates bounds the live channel-availability map
+	// (tier x pool x proxy). Each pool-qualified proxy holds at most one
+	// entry per tier, so live size stays proportional to proxy resources.
+	// Creation at the cap first prunes expired-stale entries, then
+	// deterministically evicts the oldest idle entry. If every entry is in
+	// active cooldown the map temporarily exceeds the cap rather than
+	// breaking active state. No randomness.
+	maxChannelStates = 1024
+
+	// maxChannelSnapshotEntries bounds the admin channel-availability list.
+	maxChannelSnapshotEntries = 256
+
+	// channelStaleRetention mirrors targetStaleRetention for the channel
+	// layer: expired failure memory is kept for backoff escalation, then
+	// pruned once out of cooldown and past retention.
+	channelStaleRetention = targetBackoffCap
 )
 
 // credentialIDForKey returns the internal credential identity:
@@ -133,24 +167,66 @@ type proxy429Entry struct {
 	retryAfterUntil  int64 // unix nanos
 }
 
-func proxy429Identity(pool, proxyRaw string) string {
-	return pool + "\x00" + proxyRaw
+func proxy429Identity(tier Tier, pool, proxyRaw string) string {
+	return string(tier) + "\x00" + pool + "\x00" + proxyRaw
 }
 
-func parseProxy429Identity(identity string) (pool, proxyRaw string) {
-	idx := strings.IndexByte(identity, 0)
-	if idx < 0 {
-		return "", ""
+func parseProxy429Identity(identity string) (tier Tier, pool, proxyRaw string) {
+	parts := splitNul3(identity)
+	if len(parts) != 3 {
+		return "", "", ""
 	}
-	return identity[:idx], identity[idx+1:]
+	return Tier(parts[0]), parts[1], parts[2]
+}
+
+func splitNul3(s string) []string {
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0 {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+// channelEntry is the per-(tier, pool, raw proxy) channel-availability
+// cooldown for 403/5xx only. It filters one proxy for one tier across all
+// models and credentials using that tier+pool+proxy. It is distinct from
+// transport health (connectivity only), proxy429 (429 only),
+// credential401/429 (per-credential global), and model-specific target
+// 403/5xx (per credential x pool x proxy x model). Zen anonymous and
+// authenticated Zen share the Zen tier entry; Go is isolated even for the
+// same raw URL. Pool qualification is preserved: the same raw URL in
+// different pools holds independent entries.
+type channelEntry struct {
+	failures         uint32
+	cooldownUntil    int64 // unix nanos
+	lastFailureAt    int64 // unix nanos, last noteChannelFailure wall time; drives retention/eviction
+	lastStartedNanos int64 // send-start nanos of latest recorded failure; guards success clears
+	lastFailureClass string
+	lastStatus       int
+	retryAfterUntil  int64 // unix nanos
+}
+
+func channelIdentity(tier Tier, pool, proxyRaw string) string {
+	return string(tier) + "\x00" + pool + "\x00" + proxyRaw
+}
+
+func parseChannelIdentity(identity string) (tier Tier, pool, proxyRaw string) {
+	return parseProxy429Identity(identity)
 }
 
 type targetScheduler struct {
 	mu            sync.Mutex
 	baseCooldown  time.Duration
 	credState     map[string]*credentialEntry
+	cred429State  map[string]*credential429Entry
 	targetState   map[string]*targetEntry
 	proxy429State map[string]*proxy429Entry
+	channelState  map[string]*channelEntry
 	credDisplay   map[string]string
 	roundRobin    atomic.Uint64
 	routeSessions *routeSessionStore
@@ -164,12 +240,29 @@ func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
 	return &targetScheduler{
 		baseCooldown:  baseCooldown,
 		credState:     make(map[string]*credentialEntry),
+		cred429State:  make(map[string]*credential429Entry),
 		targetState:   make(map[string]*targetEntry),
 		proxy429State: make(map[string]*proxy429Entry),
+		channelState:  make(map[string]*channelEntry),
 		credDisplay:   make(map[string]string),
 		routeSessions: newRouteSessionStore(),
 		pins:          newSessionPinStore(),
 	}
+}
+
+// credential429Entry is the per-(tier, credential) rate-limit cooldown. The
+// map key is the internal credential ID (already tier-qualified via
+// credentialIDForKey), so Zen and Go stay isolated even for identical key
+// text. Only two-distinct-proxy 429 evidence sets it; single-proxy 429 never
+// does. Success started at/after the latest credential-429 clears it.
+type credential429Entry struct {
+	failures         uint32
+	cooldownUntil    int64 // unix nanos
+	lastFailureAt    int64 // unix nanos, last noteCredential429Failure time
+	lastStartedNanos int64 // send-start nanos of latest recorded 429
+	lastFailureClass string
+	lastStatus       int
+	retryAfterUntil  int64 // unix nanos
 }
 
 // Route-session layer: client session vs upstream route session.
@@ -209,12 +302,19 @@ func normalizeRouteAuthority(baseURL string) string {
 }
 
 func routeScopeForCandidate(authority string, cand targetCandidate, protocol Protocol) routeSessionScope {
+	// Authenticated sessions are NOT proxy-affine: the route-session scope
+	// excludes the proxy node so moving within the bound pool preserves the
+	// same upstream session value. Anonymous Zen remains exactly proxy-affine.
+	proxyRaw := cand.ProxyRaw
+	if cand.CredID != anonymousSchedulerCredentialID {
+		proxyRaw = ""
+	}
 	return routeSessionScope{
 		Authority: normalizeRouteAuthority(authority),
 		Tier:      cand.Tier,
 		CredID:    cand.CredID,
 		Pool:      cand.PoolName,
-		ProxyRaw:  cand.ProxyRaw,
+		ProxyRaw:  proxyRaw,
 		Protocol:  protocol,
 	}
 }
@@ -699,15 +799,107 @@ func (s *targetScheduler) noteCredentialSuccess(credID string) credentialChange 
 	return credentialChange{Cleared: true, Changed: true, Failures: failures}
 }
 
-// proxy429CooldownStatus reports an active pool-qualified proxy 429 cooldown
-// with its stored sanitized HTTP status (429). It returns ok=false when no
-// cooldown is active. The identity is (pool, raw proxy) only: model, tier,
-// credential, channel, and client session never participate.
-func (s *targetScheduler) proxy429CooldownStatus(pool, proxyRaw string) (until int64, status int, ok bool) {
+// noteCredential429Failure sets the per-(tier, credential) rate-limit
+// cooldown. Callers must only invoke it after observing 429 from two distinct
+// eligible proxies in sequence with the same credential in one request; a
+// single-proxy 429 must never reach here. Retry-After uses the second 429
+// with deterministic capped backoff conventions. The key is the internal
+// credential ID (already tier-qualified), so identical key text on Zen vs Go
+// stays isolated.
+func (s *targetScheduler) noteCredential429Failure(credID, failureClass string, status int, retryAfter time.Duration, startedNanos int64) credentialChange {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	if startedNanos == 0 {
+		startedNanos = nowNanos
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.cred429State[credID]
+	var previous int64
+	if entry == nil {
+		entry = &credential429Entry{}
+		if s.cred429State == nil {
+			s.cred429State = make(map[string]*credential429Entry)
+		}
+		s.cred429State[credID] = entry
+	} else {
+		previous = entry.cooldownUntil
+	}
+	entry.failures++
+	delay := s.backoffDelayLocked(entry.failures, "cred429\x00"+credID, retryAfter)
+	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.lastFailureAt = nowNanos
+	if startedNanos > entry.lastStartedNanos {
+		entry.lastStartedNanos = startedNanos
+	}
+	entry.lastFailureClass = failureClass
+	entry.lastStatus = status
+	if retryAfter > 0 {
+		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+	}
+	return credentialChange{
+		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
+		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
+	}
+}
+
+// credential429CooldownStatus reports an active per-credential 429 cooldown.
+func (s *targetScheduler) credential429CooldownStatus(credID string) (until int64, status int, ok bool) {
 	now := time.Now().UnixNano()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entry := s.proxy429State[proxy429Identity(pool, proxyRaw)]
+	entry := s.cred429State[credID]
+	if entry == nil || entry.cooldownUntil <= now {
+		return 0, 0, false
+	}
+	status = entry.lastStatus
+	if status == 0 {
+		status = 429
+	}
+	return entry.cooldownUntil, status, true
+}
+
+// noteCredential429Success clears the credential429 state only when the
+// successful send started at or after the latest recorded credential-429.
+// Stale in-flight success must not clear a newer cooldown.
+func (s *targetScheduler) noteCredential429Success(credID string, startedNanos int64) credentialChange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.cred429State[credID]
+	if entry == nil {
+		return credentialChange{}
+	}
+	if startedNanos == 0 {
+		startedNanos = time.Now().UnixNano()
+	}
+	if startedNanos < entry.lastStartedNanos {
+		return credentialChange{}
+	}
+	failures := entry.failures
+	delete(s.cred429State, credID)
+	return credentialChange{Cleared: true, Changed: true, Failures: failures}
+}
+
+// credential429Snapshot returns failures/cooldown for one credential429 identity.
+func (s *targetScheduler) credential429Snapshot(credID string) (failures uint32, cooldownUntil int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry := s.cred429State[credID]; entry != nil {
+		return entry.failures, entry.cooldownUntil
+	}
+	return 0, 0
+}
+
+// proxy429CooldownStatus reports an active tier-qualified proxy 429 cooldown
+// with its stored sanitized HTTP status (429). It returns ok=false when no
+// cooldown is active. The identity is (tier/channel, pool, raw proxy) only:
+// model, credential, and client session never participate. Anonymous and
+// authenticated Zen share the Zen channel; Go is isolated.
+func (s *targetScheduler) proxy429CooldownStatus(tier Tier, pool, proxyRaw string) (until int64, status int, ok bool) {
+	now := time.Now().UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.proxy429State[proxy429Identity(tier, pool, proxyRaw)]
 	if entry == nil || entry.cooldownUntil <= now {
 		return 0, 0, false
 	}
@@ -719,31 +911,33 @@ func (s *targetScheduler) proxy429CooldownStatus(pool, proxyRaw string) (until i
 }
 
 // proxy429CoolUntil returns the proxy429 cooldown deadline (nanos), or 0.
-func (s *targetScheduler) proxy429CoolUntil(pool, proxyRaw string) int64 {
+func (s *targetScheduler) proxy429CoolUntil(tier Tier, pool, proxyRaw string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry := s.proxy429State[proxy429Identity(pool, proxyRaw)]; entry != nil {
+	if entry := s.proxy429State[proxy429Identity(tier, pool, proxyRaw)]; entry != nil {
 		return entry.cooldownUntil
 	}
 	return 0
 }
 
-// noteProxy429Failure records a live 429 on one pool-qualified proxy. The
-// cooldown is global across models, tiers, credentials, channels, and client
-// sessions using that pool+proxy. It uses the existing deterministic
-// exponential backoff with Retry-After max/cap behavior. startedNanos is the
-// send-start time of the failing send; a zero value falls back to now. The
-// stored start clock only moves forward so multiple newer failures remain
-// authoritative while a stale late-arriving failure still escalates backoff
-// without moving the clear watermark backwards. No same-target retry is
-// implied here; callers decide retry behavior separately.
-func (s *targetScheduler) noteProxy429Failure(pool, proxyRaw, failureClass string, status int, retryAfter time.Duration, startedNanos int64) proxy429Change {
+// noteProxy429Failure records a live 429 on one tier-qualified proxy. The
+// cooldown is shared across models, credentials, and client sessions using
+// that tier/channel+pool+proxy; other tiers (Zen vs Go) stay isolated even
+// for the same pool+URL. Anonymous and authenticated Zen share the Zen
+// channel. It uses the existing deterministic exponential backoff with
+// Retry-After max/cap behavior. startedNanos is the send-start time of the
+// failing send; a zero value falls back to now. The stored start clock only
+// moves forward so multiple newer failures remain authoritative while a stale
+// late-arriving failure still escalates backoff without moving the clear
+// watermark backwards. No same-target retry is implied here; callers decide
+// retry behavior separately.
+func (s *targetScheduler) noteProxy429Failure(tier Tier, pool, proxyRaw, failureClass string, status int, retryAfter time.Duration, startedNanos int64) proxy429Change {
 	now := time.Now()
 	nowNanos := now.UnixNano()
 	if startedNanos == 0 {
 		startedNanos = nowNanos
 	}
-	identity := proxy429Identity(pool, proxyRaw)
+	identity := proxy429Identity(tier, pool, proxyRaw)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.proxy429State[identity]
@@ -782,15 +976,15 @@ func (s *targetScheduler) noteProxy429Failure(pool, proxyRaw, failureClass strin
 	}
 }
 
-// noteProxy429Success clears the pool-qualified proxy429 state, but only when
+// noteProxy429Success clears the tier-qualified proxy429 state, but only when
 // the successful send started at or after the latest recorded 429 failure.
 // A 2xx from a request already in flight before a newer 429 must not clear
 // it. A zero startedNanos is treated as now (newest) to preserve the
 // historical clear path for callers without send-start tracking.
-func (s *targetScheduler) noteProxy429Success(pool, proxyRaw string, startedNanos int64) proxy429Change {
+func (s *targetScheduler) noteProxy429Success(tier Tier, pool, proxyRaw string, startedNanos int64) proxy429Change {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	identity := proxy429Identity(pool, proxyRaw)
+	identity := proxy429Identity(tier, pool, proxyRaw)
 	entry := s.proxy429State[identity]
 	if entry == nil {
 		return proxy429Change{}
@@ -846,6 +1040,165 @@ func (s *targetScheduler) evictOldestIdleProxy429Locked(nowNanos int64) bool {
 	return true
 }
 
+// channelChange is the pool-qualified channel-availability delta snapshot.
+// It carries only counts and deadlines; pool names are operator identities
+// and the redacted node label is resolved by callers. Raw proxy URLs never
+// appear here.
+type channelChange struct {
+	Changed       bool
+	Cleared       bool
+	Failures      uint32
+	CooldownUntil int64
+	PreviousUntil int64
+	FailureClass  string
+	Status        int
+}
+
+// channelCooldownStatus reports an active tier-qualified channel cooldown
+// with its stored sanitized HTTP status (403/5xx). It returns ok=false when
+// no cooldown is active. The identity is (tier, pool, raw proxy) only:
+// model, credential, and client session never participate. Anonymous and
+// authenticated Zen share the Zen tier entry; Go is isolated.
+func (s *targetScheduler) channelCooldownStatus(tier Tier, pool, proxyRaw string) (until int64, status int, ok bool) {
+	now := time.Now().UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.channelState[channelIdentity(tier, pool, proxyRaw)]
+	if entry == nil || entry.cooldownUntil <= now {
+		return 0, 0, false
+	}
+	status = entry.lastStatus
+	if status == 0 {
+		status = 502
+	}
+	return entry.cooldownUntil, status, true
+}
+
+// channelCoolUntil returns the channel cooldown deadline (nanos), or 0.
+func (s *targetScheduler) channelCoolUntil(tier Tier, pool, proxyRaw string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry := s.channelState[channelIdentity(tier, pool, proxyRaw)]; entry != nil {
+		return entry.cooldownUntil
+	}
+	return 0
+}
+
+// noteChannelFailure records a comparative 403/5xx on one tier-qualified
+// proxy. Callers must only invoke it after observing success on another
+// node with the same credential (or public credential) in the same tier:
+// a lone 403/5xx without comparative success is display-only and must never
+// reach here. It uses deterministic exponential backoff with Retry-After
+// max/cap conventions. startedNanos is the send-start time; zero falls back
+// to now. The stored start clock only moves forward so newer failures stay
+// authoritative while stale late arrivals still escalate backoff without
+// moving the clear watermark backwards.
+func (s *targetScheduler) noteChannelFailure(tier Tier, pool, proxyRaw, failureClass string, status int, retryAfter time.Duration, startedNanos int64) channelChange {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	if startedNanos == 0 {
+		startedNanos = nowNanos
+	}
+	identity := channelIdentity(tier, pool, proxyRaw)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.channelState[identity]
+	var previous int64
+	if entry == nil {
+		if len(s.channelState) >= maxChannelStates {
+			s.pruneStaleChannelLocked(nowNanos)
+			if len(s.channelState) >= maxChannelStates {
+				s.evictOldestIdleChannelLocked(nowNanos)
+			}
+		}
+		entry = &channelEntry{}
+		if s.channelState == nil {
+			s.channelState = make(map[string]*channelEntry)
+		}
+		s.channelState[identity] = entry
+	} else {
+		previous = entry.cooldownUntil
+	}
+	entry.failures++
+	delay := s.backoffDelayLocked(entry.failures, "channel\x00"+identity, retryAfter)
+	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.lastFailureAt = nowNanos
+	if startedNanos > entry.lastStartedNanos {
+		entry.lastStartedNanos = startedNanos
+	}
+	entry.lastFailureClass = failureClass
+	entry.lastStatus = status
+	if retryAfter > 0 {
+		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+	}
+	return channelChange{
+		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
+		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
+		FailureClass: failureClass, Status: status,
+	}
+}
+
+// noteChannelSuccess clears the tier-qualified channel state, but only when
+// the successful send started at or after the latest recorded channel
+// failure. A stale in-flight success must not clear a newer cooldown.
+func (s *targetScheduler) noteChannelSuccess(tier Tier, pool, proxyRaw string, startedNanos int64) channelChange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity := channelIdentity(tier, pool, proxyRaw)
+	entry := s.channelState[identity]
+	if entry == nil {
+		return channelChange{}
+	}
+	if startedNanos == 0 {
+		startedNanos = time.Now().UnixNano()
+	}
+	if startedNanos < entry.lastStartedNanos {
+		return channelChange{}
+	}
+	failures := entry.failures
+	delete(s.channelState, identity)
+	return channelChange{Cleared: true, Changed: true, Failures: failures}
+}
+
+// pruneStaleChannelLocked deletes entries whose cooldown has expired and
+// whose last failure is older than channelStaleRetention. Caller holds s.mu.
+func (s *targetScheduler) pruneStaleChannelLocked(nowNanos int64) {
+	for identity, entry := range s.channelState {
+		if entry == nil {
+			delete(s.channelState, identity)
+			continue
+		}
+		if entry.cooldownUntil > nowNanos {
+			continue
+		}
+		if entry.lastFailureAt == 0 || nowNanos-entry.lastFailureAt > int64(channelStaleRetention) {
+			delete(s.channelState, identity)
+		}
+	}
+}
+
+// evictOldestIdleChannelLocked deterministically deletes the oldest entry
+// that is not in active cooldown. Returns true when evicted. Caller holds s.mu.
+func (s *targetScheduler) evictOldestIdleChannelLocked(nowNanos int64) bool {
+	var victim string
+	var victimAt int64
+	found := false
+	for identity, entry := range s.channelState {
+		if entry == nil || entry.cooldownUntil > nowNanos {
+			continue
+		}
+		at := entry.lastFailureAt
+		if !found || at < victimAt || (at == victimAt && identity < victim) {
+			victim, victimAt, found = identity, at, true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(s.channelState, victim)
+	return true
+}
+
 func (s *targetScheduler) backoffDelayLocked(failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	// Caller holds s.mu; baseCooldown is immutable after construction.
 	base := s.baseCooldown
@@ -893,12 +1246,69 @@ func hrwScore(session, credID, pool, proxyRaw, model string) uint64 {
 	return h.Sum64()
 }
 
-// orderCandidates sorts a frozen candidate slice: session-stable HRW
-// descending when a session is present, otherwise an atomic round-robin
-// start offset over config order. No randomness is used.
+// proxyAffinityScore is the deterministic soft-affinity score for one
+// (credential, pool, proxy) triple. Higher sorts first; no session, model,
+// tier-beyond-credID, or pool-contents beyond the triple participates. Same
+// key+pool prefers the same proxy across sessions/models; different pools
+// choose independently. Rendezvous hashing preserves fair dispersion across
+// credentials and minimal disruption when pool contents change. No persisted
+// key->proxy map exists; the order derives from current pool contents.
+func proxyAffinityScore(credID, pool, proxyRaw string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(credID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(pool))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(proxyRaw))
+	return h.Sum64()
+}
+
+// credOrderScore orders credential groups for unbound establishment: session
+// HRW over credential identity only (pool is constant within one tier build).
+// Sessions disperse across credentials; proxies within each credential stay
+// session-independent via proxyAffinityScore.
+func credOrderScore(session, credID string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(session))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(credID))
+	return h.Sum64()
+}
+
+// preferredProxyRaw returns the affinity-preferred proxy raw identity for one
+// credential+pool from the current pool contents. Empty when no proxies.
+func preferredProxyRaw(credID, poolName string, proxies []*proxyTransport) string {
+	best := ""
+	var bestScore uint64
+	found := false
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		score := proxyAffinityScore(credID, poolName, proxy.name)
+		if !found || score > bestScore || (score == bestScore && proxy.name < best) {
+			best, bestScore, found = proxy.name, score, true
+		}
+	}
+	return best
+}
+
+// orderCandidates sorts a frozen candidate slice. Anonymous candidates keep
+// session-stable HRW over the full target (proxy-affine). Authenticated
+// candidates use credential-soft-affinity ordering: credential groups ordered
+// by session HRW, proxies within each credential ordered by deterministic
+// affinity (session/model independent). Empty session uses round-robin. No
+// randomness is used.
 func (s *targetScheduler) orderCandidates(cands []targetCandidate, session string) []targetCandidate {
 	if len(cands) < 2 {
 		return cands
+	}
+	isAnon := true
+	for _, c := range cands {
+		if c.CredID != anonymousSchedulerCredentialID {
+			isAnon = false
+			break
+		}
 	}
 	if session == "" {
 		start := int((s.roundRobin.Add(1) - 1) % uint64(len(cands)))
@@ -910,24 +1320,103 @@ func (s *targetScheduler) orderCandidates(cands []targetCandidate, session strin
 		rotated = append(rotated, cands[:start]...)
 		return rotated
 	}
-	ordered := append([]targetCandidate(nil), cands...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		si := hrwScore(session, ordered[i].CredID, ordered[i].PoolName, ordered[i].ProxyRaw, ordered[i].Model)
-		sj := hrwScore(session, ordered[j].CredID, ordered[j].PoolName, ordered[j].ProxyRaw, ordered[j].Model)
+	if isAnon {
+		ordered := append([]targetCandidate(nil), cands...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			si := hrwScore(session, ordered[i].CredID, ordered[i].PoolName, ordered[i].ProxyRaw, ordered[i].Model)
+			sj := hrwScore(session, ordered[j].CredID, ordered[j].PoolName, ordered[j].ProxyRaw, ordered[j].Model)
+			if si != sj {
+				return si > sj
+			}
+			return ordered[i].Identity < ordered[j].Identity
+		})
+		return ordered
+	}
+	return s.orderAuthCandidates(cands, session)
+}
+
+// orderAuthCandidates implements credential-soft-affinity ordering for
+// authenticated candidates: group by credential, order groups by session HRW,
+// order proxies within each group by affinity. Deterministic, session
+// disperses across credentials, proxy choice is session/model stable.
+func (s *targetScheduler) orderAuthCandidates(cands []targetCandidate, session string) []targetCandidate {
+	groups := make(map[string][]targetCandidate)
+	credOrder := []string{}
+	for _, c := range cands {
+		if _, ok := groups[c.CredID]; !ok {
+			credOrder = append(credOrder, c.CredID)
+		}
+		groups[c.CredID] = append(groups[c.CredID], c)
+	}
+	sort.SliceStable(credOrder, func(i, j int) bool {
+		si := credOrderScore(session, credOrder[i])
+		sj := credOrderScore(session, credOrder[j])
 		if si != sj {
 			return si > sj
 		}
-		return ordered[i].Identity < ordered[j].Identity
+		return credOrder[i] < credOrder[j]
 	})
-	return ordered
+	for credID := range groups {
+		list := groups[credID]
+		sort.SliceStable(list, func(i, j int) bool {
+			si := proxyAffinityScore(list[i].CredID, list[i].PoolName, list[i].ProxyRaw)
+			sj := proxyAffinityScore(list[j].CredID, list[j].PoolName, list[j].ProxyRaw)
+			if si != sj {
+				return si > sj
+			}
+			return list[i].Identity < list[j].Identity
+		})
+		groups[credID] = list
+	}
+	out := make([]targetCandidate, 0, len(cands))
+	for _, credID := range credOrder {
+		out = append(out, groups[credID]...)
+	}
+	return out
+}
+
+// affinityProxyOrder returns eligible proxies for one authenticated binding
+// in try order: current/preferred first when eligible, then remaining healthy
+// proxies in affinity order. Callers filter by health/cooldowns before or via
+// the eligible set.
+func affinityProxyOrder(pool *transportPool, credID, currentRaw string) []*proxyTransport {
+	if pool == nil {
+		return nil
+	}
+	others := make([]*proxyTransport, 0, len(pool.items))
+	var current *proxyTransport
+	for _, proxy := range pool.items {
+		if proxy == nil {
+			continue
+		}
+		if proxy.name == currentRaw {
+			current = proxy
+			continue
+		}
+		others = append(others, proxy)
+	}
+	sort.SliceStable(others, func(i, j int) bool {
+		si := proxyAffinityScore(credID, pool.name, others[i].name)
+		sj := proxyAffinityScore(credID, pool.name, others[j].name)
+		if si != sj {
+			return si > sj
+		}
+		return others[i].name < others[j].name
+	})
+	if current != nil {
+		return append([]*proxyTransport{current}, others...)
+	}
+	return others
 }
 
 // buildAuthCandidates returns every (credential x healthy proxy) combination
-// for one tier and model, filtered by credential and target cooldowns plus
-// the global pool-qualified proxy429 cooldown. A proxy under active 429 is
-// excluded for every model, credential, and tier using that pool+proxy.
-// The result is in config order (credential index, then proxy index);
-// callers freeze it with orderCandidates.
+// for one tier and model, filtered by credential 401/429, tier-qualified
+// proxy429, tier-qualified channel-availability, and target cooldowns. A
+// proxy under active tier-qualified 429 or channel cooldown is excluded for
+// every model/credential/client using that tier+pool+proxy; the other tier
+// stays available. The result is in config order (credential index, then
+// proxy index); callers freeze it with orderCandidates (affinity ordering
+// for auth).
 func (s *targetScheduler) buildAuthCandidates(tier Tier, creds []credentialRef, pool *transportPool, model string, now int64) []targetCandidate {
 	if len(creds) == 0 || pool == nil || len(pool.items) == 0 {
 		return nil
@@ -944,11 +1433,17 @@ func (s *targetScheduler) buildAuthCandidates(tier Tier, creds []credentialRef, 
 		if entry := s.credState[cred.id]; entry != nil && entry.cooldownUntil > now {
 			continue
 		}
+		if entry := s.cred429State[cred.id]; entry != nil && entry.cooldownUntil > now {
+			continue
+		}
 		for _, proxy := range pool.items {
 			if proxy == nil || !proxy.healthy.Load() {
 				continue
 			}
-			if entry := s.proxy429State[proxy429Identity(pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+			if entry := s.proxy429State[proxy429Identity(tier, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+				continue
+			}
+			if entry := s.channelState[channelIdentity(tier, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
 				continue
 			}
 			identity := targetIdentity(tier, cred.id, pool.name, proxy.name, model)
@@ -966,9 +1461,10 @@ func (s *targetScheduler) buildAuthCandidates(tier Tier, creds []credentialRef, 
 }
 
 // buildAnonymousCandidates returns the fixed anonymous credential x every
-// healthy, target- and proxy429-available proxy in the assigned pool. The
-// pool-qualified proxy429 filter is identical to the authenticated path: an
-// actively rate-limited proxy is excluded for every model and credential.
+// healthy, target-, proxy429-, and channel-available proxy in the assigned
+// pool. The tier-qualified (Zen channel) proxy429 and channel filters match
+// the authenticated Zen path: an actively cooling Zen proxy is excluded for
+// every model and credential on Zen; Go stays isolated.
 func (s *targetScheduler) buildAnonymousCandidates(pool *transportPool, model string, now int64) []targetCandidate {
 	if pool == nil || len(pool.items) == 0 {
 		return nil
@@ -986,7 +1482,10 @@ func (s *targetScheduler) buildAnonymousCandidates(pool *transportPool, model st
 		if proxy == nil || !proxy.healthy.Load() {
 			continue
 		}
-		if entry := s.proxy429State[proxy429Identity(pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+		if entry := s.proxy429State[proxy429Identity(TierZen, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+			continue
+		}
+		if entry := s.channelState[channelIdentity(TierZen, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
 			continue
 		}
 		identity := targetIdentity(TierZen, anonymousSchedulerCredentialID, pool.name, proxy.name, model)
@@ -1040,14 +1539,17 @@ type TargetStatus struct {
 	LastStatus       int        `json:"last_status,omitempty"`
 }
 
-// ProxyRateLimitStatus is the bounded additive admin view of the global
-// proxy429 layer: one row per pool-qualified proxy with recorded 429 state.
-// Pool is the operator pool identity; ProxyNode is the redacted proxy node
-// (never raw credentials). Active reports whether the cooldown is currently
-// in the future; Failures counts recorded 429s (including retained backoff
-// memory); RemainingSeconds/CooldownUntil/NextAvailableAt describe the
-// active deadline; LastFailureClass/LastStatus describe the latest 429.
+// ProxyRateLimitStatus is the bounded additive admin view of the
+// tier-qualified proxy429 layer: one row per (tier/channel, pool, proxy) with
+// recorded 429 state. Tier names the channel (zen shared by anonymous and
+// authenticated Zen; go isolated). Pool is the operator pool identity;
+// ProxyNode is the redacted proxy node (never raw credentials). Active
+// reports whether the cooldown is currently in the future; Failures counts
+// recorded 429s (including retained backoff memory);
+// RemainingSeconds/CooldownUntil/NextAvailableAt describe the active
+// deadline; LastFailureClass/LastStatus describe the latest 429.
 type ProxyRateLimitStatus struct {
+	Tier             string     `json:"tier,omitempty"`
 	ProxyPool        string     `json:"proxy_pool"`
 	ProxyNode        string     `json:"proxy_node"`
 	Active           bool       `json:"active"`
@@ -1108,7 +1610,7 @@ func (s *targetScheduler) snapshotTargets() (entries []TargetStatus, total int) 
 }
 
 // snapshotProxy429 returns at most maxProxy429SnapshotEntries stateful
-// pool-qualified proxies plus the total count so callers can report
+// tier-qualified proxies plus the total count so callers can report
 // truncation. Expired-stale entries are pruned under the same lock before
 // the snapshot; the per-candidate hot loop never scans the map. The view is
 // additive and redacted: pool names are operator identities, proxy nodes are
@@ -1127,9 +1629,9 @@ func (s *targetScheduler) snapshotProxy429() (entries []ProxyRateLimitStatus, to
 		if entry == nil || (entry.failures == 0 && entry.cooldownUntil <= nowNanos) {
 			continue
 		}
-		pool, proxyRaw := parseProxy429Identity(identity)
+		tier, pool, proxyRaw := parseProxy429Identity(identity)
 		st := ProxyRateLimitStatus{
-			ProxyPool: pool, ProxyNode: redactURL(proxyRaw), Failures: entry.failures,
+			Tier: string(tier), ProxyPool: pool, ProxyNode: redactURL(proxyRaw), Failures: entry.failures,
 			LastFailureClass: entry.lastFailureClass, LastStatus: entry.lastStatus,
 		}
 		if entry.cooldownUntil > nowNanos {
@@ -1148,6 +1650,74 @@ func (s *targetScheduler) snapshotProxy429() (entries []ProxyRateLimitStatus, to
 		all = all[:maxProxy429SnapshotEntries]
 	}
 	entries = make([]ProxyRateLimitStatus, 0, len(all))
+	for _, p := range all {
+		entries = append(entries, p.status)
+	}
+	return entries, total
+}
+
+// ChannelAvailabilityStatus is the bounded additive admin view of the
+// tier-qualified channel-availability layer: one row per (tier/channel,
+// pool, proxy) with recorded 403/5xx channel state. Tier names the channel
+// (zen shared by anonymous and authenticated Zen; go isolated). Pool is the
+// operator pool identity; ProxyNode is the redacted proxy node (never raw
+// credentials). Active reports whether the cooldown is currently in the
+// future; Failures counts recorded channel failures (including retained
+// backoff memory); RemainingSeconds/CooldownUntil/NextAvailableAt describe
+// the active deadline; LastFailureClass/LastStatus describe the latest
+// channel failure.
+type ChannelAvailabilityStatus struct {
+	Tier             string     `json:"tier,omitempty"`
+	ProxyPool        string     `json:"proxy_pool"`
+	ProxyNode        string     `json:"proxy_node"`
+	Active           bool       `json:"active"`
+	Failures         uint32     `json:"failures"`
+	CooldownUntil    *time.Time `json:"cooldown_until,omitempty"`
+	RemainingSeconds *int64     `json:"remaining_seconds,omitempty"`
+	NextAvailableAt  *time.Time `json:"next_available_at,omitempty"`
+	LastFailureClass string     `json:"last_failure_class,omitempty"`
+	LastStatus       int        `json:"last_status,omitempty"`
+}
+
+// snapshotChannel returns at most maxChannelSnapshotEntries stateful
+// tier-qualified proxies plus the total count so callers can report
+// truncation. Expired-stale entries are pruned under the same lock before
+// the snapshot; the per-candidate hot loop never scans the map.
+func (s *targetScheduler) snapshotChannel() (entries []ChannelAvailabilityStatus, total int) {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	type parsed struct {
+		status   ChannelAvailabilityStatus
+		identity string
+	}
+	s.mu.Lock()
+	s.pruneStaleChannelLocked(nowNanos)
+	all := make([]parsed, 0, len(s.channelState))
+	for identity, entry := range s.channelState {
+		if entry == nil || (entry.failures == 0 && entry.cooldownUntil <= nowNanos) {
+			continue
+		}
+		tier, pool, proxyRaw := parseChannelIdentity(identity)
+		st := ChannelAvailabilityStatus{
+			Tier: string(tier), ProxyPool: pool, ProxyNode: redactURL(proxyRaw), Failures: entry.failures,
+			LastFailureClass: entry.lastFailureClass, LastStatus: entry.lastStatus,
+		}
+		if entry.cooldownUntil > nowNanos {
+			value := time.Unix(0, entry.cooldownUntil).UTC()
+			st.Active = true
+			st.CooldownUntil = &value
+			st.NextAvailableAt = &value
+			st.RemainingSeconds = cooldownRemainingSeconds(entry.cooldownUntil, now)
+		}
+		all = append(all, parsed{status: st, identity: identity})
+	}
+	s.mu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return all[i].identity < all[j].identity })
+	total = len(all)
+	if len(all) > maxChannelSnapshotEntries {
+		all = all[:maxChannelSnapshotEntries]
+	}
+	entries = make([]ChannelAvailabilityStatus, 0, len(all))
 	for _, p := range all {
 		entries = append(entries, p.status)
 	}
@@ -1175,22 +1745,27 @@ func splitNul5(s string) []string {
 	return out
 }
 
-// migrateFrom copies still-future credential, target, and proxy429 cooldowns
-// from the old scheduler. Remaining time is capped at 5 minutes. Expired
-// cooldowns never migrate, including expired failure memory (failures>0 out
-// of cooldown): the new instance restarts backoff from zero. New resources
-// start at zero state and removed identities are dropped. Proxy429 migrates
-// by (pool, proxy) identity only and preserves backoff/Retry-After remaining
-// within the cap. Migrated targets respect maxTargetStates and migrated
-// proxy429 entries respect maxProxy429States with the same deterministic
+// migrateFrom copies still-future credential, credential429, target,
+// proxy429, and channel cooldowns from the old scheduler. Remaining time is
+// capped at 5 minutes. Expired cooldowns never migrate, including expired
+// failure memory (failures>0 out of cooldown): the new instance restarts
+// backoff from zero. New resources start at zero state and removed
+// identities are dropped. Proxy429 and channel migrate by (tier, pool,
+// proxy) identity only and preserve backoff/Retry-After remaining within
+// the cap; old pool-only identities (no tier separator count) are dropped.
+// Credential429 migrates by tier+key (internal credential ID). Migrated
+// targets respect maxTargetStates and migrated proxy429/channel entries
+// respect maxProxy429States/maxChannelStates with the same deterministic
 // policy as creation: prune expired-stale first, evict oldest idle next,
 // allow temporary overflow only when every entry is in active cooldown.
 // migrationSummary counts migrated still-future state for the Apply log
 // (aggregate counts only). No per-identity detail is included.
 type migrationSummary struct {
-	Credentials int
-	Targets     int
-	Proxy429    int
+	Credentials   int
+	Credential429 int
+	Targets       int
+	Proxy429      int
+	Channel       int
 }
 
 func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
@@ -1220,6 +1795,20 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 			continue
 		}
 		proxy429[id] = *entry
+	}
+	cred429 := make(map[string]credential429Entry, len(old.cred429State))
+	for id, entry := range old.cred429State {
+		if entry == nil {
+			continue
+		}
+		cred429[id] = *entry
+	}
+	channel := make(map[string]channelEntry, len(old.channelState))
+	for id, entry := range old.channelState {
+		if entry == nil {
+			continue
+		}
+		channel[id] = *entry
 	}
 	displays := make(map[string]string, len(old.credDisplay))
 	for id, display := range old.credDisplay {
@@ -1264,10 +1853,28 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		s.targetState[id] = &fresh
 		summary.Targets++
 	}
+	for id, entry := range cred429 {
+		if entry.cooldownUntil <= now {
+			continue
+		}
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
+			entry.cooldownUntil = now + int64(targetBackoffCap)
+		}
+		if s.cred429State == nil {
+			s.cred429State = make(map[string]*credential429Entry)
+		}
+		fresh := entry
+		s.cred429State[id] = &fresh
+		summary.Credential429++
+	}
 	for id, entry := range proxy429 {
-		// Only still-future proxy429 cooldowns migrate by pool+proxy
-		// identity; expired memory does not cross Apply. Backoff and
-		// Retry-After remaining are preserved within the cap.
+		// Only still-future tier-qualified proxy429 cooldowns migrate;
+		// legacy pool-only identities (no tier separator count) are dropped.
+		// Expired memory does not cross Apply. Backoff and Retry-After
+		// remaining are preserved within the cap.
+		if len(splitNul3(id)) != 3 {
+			continue
+		}
 		if entry.cooldownUntil <= now {
 			continue
 		}
@@ -1287,18 +1894,49 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		s.proxy429State[id] = &fresh
 		summary.Proxy429++
 	}
+	for id, entry := range channel {
+		if len(splitNul3(id)) != 3 {
+			continue
+		}
+		if entry.cooldownUntil <= now {
+			continue
+		}
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
+			entry.cooldownUntil = now + int64(targetBackoffCap)
+		}
+		if s.channelState == nil {
+			s.channelState = make(map[string]*channelEntry)
+		}
+		if len(s.channelState) >= maxChannelStates {
+			s.pruneStaleChannelLocked(now)
+			if len(s.channelState) >= maxChannelStates {
+				s.evictOldestIdleChannelLocked(now)
+			}
+		}
+		fresh := entry
+		s.channelState[id] = &fresh
+		summary.Channel++
+	}
 	return summary
 }
 
-// retainOnly drops credential, target, and proxy429 state that no longer
-// matches live resources: unknown credential IDs, unknown (pool, proxy)
-// pairs, and their display entries. New resources start at zero state.
-func (s *targetScheduler) retainOnly(validCreds map[string]bool, validPoolProxy map[string]map[string]bool) {
+// retainOnly drops credential, credential429, target, proxy429, and channel
+// state that no longer matches live resources: unknown credential IDs,
+// unknown (tier, pool, proxy) triples, and their display entries. Tier
+// qualification is enforced: a proxy429/channel entry whose tier channel no
+// longer routes that pool is dropped even if the pool+URL still exists
+// elsewhere. New resources start at zero state.
+func (s *targetScheduler) retainOnly(validCreds map[string]bool, validPoolProxy map[string]map[string]bool, validTierPool map[string]map[string]bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for id := range s.credState {
 		if !validCreds[id] {
 			delete(s.credState, id)
+		}
+	}
+	for id := range s.cred429State {
+		if !validCreds[id] {
+			delete(s.cred429State, id)
 		}
 	}
 	for id := range s.credDisplay {
@@ -1307,13 +1945,17 @@ func (s *targetScheduler) retainOnly(validCreds map[string]bool, validPoolProxy 
 		}
 	}
 	for identity, entry := range s.proxy429State {
-		pool, proxyRaw := parseProxy429Identity(identity)
+		tier, pool, proxyRaw := parseProxy429Identity(identity)
 		if entry == nil {
 			delete(s.proxy429State, identity)
 			continue
 		}
 		proxies, ok := validPoolProxy[pool]
 		if !ok || !proxies[proxyRaw] {
+			delete(s.proxy429State, identity)
+			continue
+		}
+		if pools, ok := validTierPool[string(tier)]; !ok || !pools[pool] {
 			delete(s.proxy429State, identity)
 		}
 	}
@@ -1328,6 +1970,21 @@ func (s *targetScheduler) retainOnly(validCreds map[string]bool, validPoolProxy 
 			delete(s.targetState, identity)
 		}
 	}
+	for identity, entry := range s.channelState {
+		tier, pool, proxyRaw := parseChannelIdentity(identity)
+		if entry == nil {
+			delete(s.channelState, identity)
+			continue
+		}
+		proxies, ok := validPoolProxy[pool]
+		if !ok || !proxies[proxyRaw] {
+			delete(s.channelState, identity)
+			continue
+		}
+		if pools, ok := validTierPool[string(tier)]; !ok || !pools[pool] {
+			delete(s.channelState, identity)
+		}
+	}
 }
 
 // credentialSnapshot returns failures/cooldown for one credential identity.
@@ -1340,11 +1997,21 @@ func (s *targetScheduler) credentialSnapshot(credID string) (failures uint32, co
 	return 0, 0
 }
 
-// proxy429EntrySnapshot returns failures/cooldown for one pool-qualified proxy.
-func (s *targetScheduler) proxy429EntrySnapshot(pool, proxyRaw string) (failures uint32, cooldownUntil int64) {
+// proxy429EntrySnapshot returns failures/cooldown for one tier-qualified proxy.
+func (s *targetScheduler) proxy429EntrySnapshot(tier Tier, pool, proxyRaw string) (failures uint32, cooldownUntil int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry := s.proxy429State[proxy429Identity(pool, proxyRaw)]; entry != nil {
+	if entry := s.proxy429State[proxy429Identity(tier, pool, proxyRaw)]; entry != nil {
+		return entry.failures, entry.cooldownUntil
+	}
+	return 0, 0
+}
+
+// channelEntrySnapshot returns failures/cooldown for one tier-qualified proxy.
+func (s *targetScheduler) channelEntrySnapshot(tier Tier, pool, proxyRaw string) (failures uint32, cooldownUntil int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry := s.channelState[channelIdentity(tier, pool, proxyRaw)]; entry != nil {
 		return entry.failures, entry.cooldownUntil
 	}
 	return 0, 0
@@ -1409,8 +2076,12 @@ func credentialDisplayForID(credID string) string {
 }
 
 // Session-affinity pin layer: derived client session + model ID binds to one
-// full target identity. In-memory Gateway authority only: no persistence,
-// no log/admin/history projection. Strict process-lifetime semantics: once
+// target. Anonymous bindings are full-target (proxy is identity, no moves).
+// Authenticated bindings are proxy-independent: the durable identity fixes
+// tier, credential, pool, model, protocol, and authority but not the proxy
+// node; ProxyRaw is the mutable current/preferred proxy with generation
+// fencing. In-memory Gateway authority only: no persistence, no
+// log/admin/history projection. Strict process-lifetime semantics: once
 // pinned, a binding never expires and is never evicted during the process
 // lifetime. Memory stays bounded by sessionPinStoreCap entries; at the cap a
 // new unpinned session+model fails closed locally before any upstream send
@@ -1420,10 +2091,10 @@ func credentialDisplayForID(credID string) string {
 const sessionPinStoreCap = 4096
 
 // sessionPin is the bound target for one derived session + model. It carries
-// the full target identity (tier, internal credential identity, proxy pool,
-// raw proxy identity, model) plus the target protocol and normalized upstream
-// authority needed to validate the pin against the current route/config.
-// Raw client signals, key material, and pin state never leave this struct.
+// the binding identity plus the mutable current proxy and generation. For
+// anonymous bindings ProxyRaw is identity; for authenticated bindings it is
+// the current/preferred selection fenced by Generation. Raw client signals,
+// key material, and pin state never leave this struct.
 type sessionPin struct {
 	Tier      Tier
 	CredID    string
@@ -1432,6 +2103,26 @@ type sessionPin struct {
 	Model     string
 	Protocol  Protocol
 	Authority string
+	// Generation fences concurrent proxy moves for authenticated bindings.
+	// Anonymous bindings never move; generation stays zero.
+	Generation uint64
+}
+
+// isAnonymousPin reports whether the pin uses the shared public credential.
+func (p sessionPin) isAnonymousPin() bool { return p.CredID == anonymousSchedulerCredentialID }
+
+// bindingEqual reports durable identity equality: full-target for anonymous
+// (including proxy), proxy-independent for authenticated (excluding proxy
+// and generation).
+func (p sessionPin) bindingEqual(other sessionPin) bool {
+	if p.Tier != other.Tier || p.CredID != other.CredID || p.Pool != other.Pool ||
+		p.Model != other.Model || p.Protocol != other.Protocol || p.Authority != other.Authority {
+		return false
+	}
+	if p.isAnonymousPin() {
+		return p.ProxyRaw == other.ProxyRaw
+	}
+	return true
 }
 
 func sessionPinKey(session, model string) string {
@@ -1627,12 +2318,50 @@ func (st *sessionPinStore) reservedCount() int {
 	return st.reserved
 }
 
+// pinMoveCurrent performs generation-fenced current-proxy update for an
+// established authenticated binding. It succeeds only when the stored binding
+// identity still matches (proxy-independent) and the generation equals the
+// observed generation; stale in-flight outcomes cannot move the pin back and
+// competing moves cannot overwrite a newer selection or split one session.
+// Anonymous pins never move. Returns the new generation on success.
+func (s *targetScheduler) pinMoveCurrent(session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" || newProxyRaw == "" {
+		return 0, false
+	}
+	return s.pins.moveCurrent(session, model, expectedGen, newProxyRaw)
+}
+
+func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+	if st == nil {
+		return 0, false
+	}
+	key := sessionPinKey(session, model)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	entry, ok := st.entries[key]
+	if !ok || entry == nil || entry.isAnonymousPin() {
+		return 0, false
+	}
+	if entry.Generation != expectedGen {
+		return entry.Generation, false
+	}
+	if entry.ProxyRaw == newProxyRaw {
+		return entry.Generation, true
+	}
+	entry.ProxyRaw = newProxyRaw
+	entry.Generation++
+	return entry.Generation, true
+}
+
 // migratePinsFrom carries all existing pin identities up to the cap without
 // validity filtering. Removed or changed targets migrate as unresolved
 // tombstone-like bindings: the pinned resolver still matches them and fails
-// locally with 502 rather than re-establishing or falling back. Insertion is
-// deterministic key order and stops at the cap without evicting. Restart
-// remains the only clearing boundary (fresh store starts empty).
+// locally with 502 rather than re-establishing or falling back. Authenticated
+// pins migrate with their current proxy and generation intact; validity is
+// proxy-independent (binding without proxy) while anonymous remains full
+// target. Insertion is deterministic key order and stops at the cap without
+// evicting. Restart remains the only clearing boundary (fresh store starts
+// empty).
 func (st *sessionPinStore) migratePinsFrom(old *sessionPinStore) int {
 	if st == nil || old == nil || st == old {
 		return 0

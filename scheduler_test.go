@@ -271,7 +271,7 @@ func TestStateMatrix(t *testing.T) {
 		before := time.Now()
 		started := time.Now().UnixNano()
 		gateway.applyAttemptOutcome(ctx, cand, resp, nil, started)
-		until, _, ok := gateway.scheduler.proxy429CooldownStatus(cand.PoolName, cand.ProxyRaw)
+		until, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, cand.PoolName, cand.ProxyRaw)
 		if !ok {
 			t.Fatalf("429 must cool pool-qualified proxy")
 		}
@@ -295,7 +295,7 @@ func TestStateMatrix(t *testing.T) {
 		resp2 := responseWithStatus(429)
 		resp2.Header.Set("Retry-After", "3600")
 		gateway2.applyAttemptOutcome(ctx, cand2, resp2, nil, time.Now().UnixNano())
-		until2, _, ok2 := gateway2.scheduler.proxy429CooldownStatus(cand2.PoolName, cand2.ProxyRaw)
+		until2, _, ok2 := gateway2.scheduler.proxy429CooldownStatus(TierZen, cand2.PoolName, cand2.ProxyRaw)
 		if !ok2 {
 			t.Fatalf("429 must cool proxy")
 		}
@@ -616,7 +616,7 @@ func TestRefreshStateless(t *testing.T) {
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
 	targetUntil := gateway.scheduler.targetCoolUntil(cand.Identity)
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
-	_, proxyUntil, proxyOk := gateway.scheduler.proxy429CooldownStatus(pool.name, pool.items[0].name)
+	_, proxyUntil, proxyOk := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, pool.items[0].name)
 	if !proxyOk {
 		t.Fatalf("seed proxy429 must cool")
 	}
@@ -641,7 +641,7 @@ func TestRefreshStateless(t *testing.T) {
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got != targetUntil {
 		t.Fatalf("refresh changed target cooldown")
 	}
-	if _, got, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, pool.items[0].name); !ok || got != proxyUntil {
+	if _, got, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, pool.items[0].name); !ok || got != proxyUntil {
 		t.Fatalf("refresh changed proxy429 cooldown")
 	}
 	if _, until := gateway.scheduler.credentialSnapshot(cred.id); until != 0 {
@@ -684,7 +684,7 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 	cred := gateway.zenCreds[0]
 	// Active 401 cooldown: zero available.
 	gateway.scheduler.noteCredentialAuthFailure(cred.id)
-	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
 	if len(statuses) != 1 || statuses[0].AvailableTargets != 0 {
 		t.Fatalf("cooling credential must report zero: %+v", statuses)
 	}
@@ -693,7 +693,7 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 	gateway.scheduler.mu.Lock()
 	gateway.scheduler.credState[cred.id].cooldownUntil = past
 	gateway.scheduler.mu.Unlock()
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
 	if len(statuses) != 1 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
@@ -710,9 +710,10 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 	}
 }
 
-// Finding 2: the anonymous proxy summary aggregates only the anonymous
-// credential. An auth target cooldown on the same shared-pool proxy must not
-// pollute it.
+// Finding 2: the per-proxy anonymous target aggregate counts only the
+// anonymous credential. An auth target cooldown on the same shared-pool proxy
+// must not pollute it. The unified 代理可用性 Zen column reflects only
+// transport + proxy429 + channel layers, never per-model target cooldowns.
 func TestAnonymousSummaryIgnoresSharedPoolAuthCooldown(t *testing.T) {
 	gateway := schedulerTestGateway(t,
 		[]string{"zen-key-aaaaa"},
@@ -727,11 +728,6 @@ func TestAnonymousSummaryIgnoresSharedPoolAuthCooldown(t *testing.T) {
 	active, _, _, failures := gateway.scheduler.proxyTargetSummary("shared", pool.items[0].name)
 	if active != 0 || failures != 0 {
 		t.Fatalf("auth cooldown polluted anonymous summary: active=%d failures=%d", active, failures)
-	}
-	for _, st := range gateway.anonymousTargetSummaries() {
-		if st.ActiveCooldowns != 0 {
-			t.Fatalf("anonymous summary must stay idle: %+v", st)
-		}
 	}
 	// An anonymous 403 failure on the same proxy is counted (403/5xx only;
 	// 429 lives in the proxy429 layer).

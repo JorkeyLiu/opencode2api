@@ -196,38 +196,22 @@ func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
 	if !proxy.healthy.Load() {
 		t.Fatalf("single transport error must not mark proxy unhealthy")
 	}
-	// Re-cool with 403 so the snapshot below still covers a cooling proxy.
+	// Re-cool with 403 so the per-target snapshot below still covers a cooling
+	// target. The unified 代理可用性 Zen column stays available: per-model
+	// target cooldowns never filter the proxy; only transport, proxy429, and
+	// channel layers do. Anonymous Zen 403/5xx context is preserved inside
+	// the Zen reason/channel detail, not a separate summary table.
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(403), nil, time.Now().UnixNano())
 	if got := gateway.scheduler.targetCoolUntil(cand.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("403 must cool down")
 	}
-	statuses := gateway.anonymousTargetSummaries()
-	if len(statuses) != 2 {
-		t.Fatalf("statuses=%d", len(statuses))
+	active, nextAvailable, lastClass, _ := gateway.scheduler.proxyTargetSummary(pool.name, proxy.name)
+	if active != 1 || nextAvailable == nil || lastClass == "" {
+		t.Fatalf("anonymous per-proxy target aggregate missing: active=%d class=%q", active, lastClass)
 	}
-	found := false
-	for _, st := range statuses {
-		if st.ActiveCooldowns > 0 {
-			found = true
-			if st.NextAvailableAt == nil || st.CooldownUntil == nil || st.CooldownRemainingSeconds == nil {
-				t.Fatalf("cooling proxy must expose cooldown: %+v", st)
-			}
-			if st.LastFailureClass == "" {
-				t.Fatalf("cooling proxy must expose failure class: %+v", st)
-			}
-		} else if st.NextAvailableAt != nil {
-			t.Fatalf("idle proxy must not expose cooldown: %+v", st)
-		}
-		if st.Address == "" || strings.Contains(st.Address, "://") && strings.Contains(st.Address, "@") && strings.Contains(st.Address, "***") == false {
-			t.Fatalf("proxy address not redacted: %q", st.Address)
-		}
-	}
-	if !found {
-		t.Fatalf("expected one cooling anonymous proxy")
-	}
-	// 429 uses the dedicated proxy429 snapshot, not the anonymous target table.
+	// 429 uses the dedicated proxy429 snapshot, not a separate anonymous table.
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(429), nil, time.Now().UnixNano())
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(pool.name, proxy.name); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, proxy.name); !ok {
 		t.Fatalf("rate_limited must cool proxy429")
 	}
 	limits, total := gateway.scheduler.snapshotProxy429()
@@ -281,7 +265,7 @@ func TestKeyStatusCredentialAndCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
 	if len(statuses) != 1 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
@@ -309,12 +293,12 @@ func TestKeyStatusCredentialAndCooldown(t *testing.T) {
 		Model: "m", Identity: targetIdentity(TierZen, gateway.zenCreds[0].id, "shared", proxy.name, "m"),
 	}
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
 	if statuses[0].CooldownUntil != nil {
 		t.Fatalf("5xx must not cool the credential: %+v", statuses[0])
 	}
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared")
+	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
 	if statuses[0].CooldownUntil == nil || statuses[0].CooldownRemainingSeconds == nil {
 		t.Fatalf("401 must cool the credential: %+v", statuses[0])
 	}

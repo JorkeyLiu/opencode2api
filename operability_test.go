@@ -491,7 +491,7 @@ func TestModelsRefreshFailureRetainsSnapshotAndState(t *testing.T) {
 	if got := gateway.scheduler.targetCoolUntil(seeded.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("seeded target cooldown lost")
 	}
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(seeded.PoolName, seeded.ProxyRaw); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, seeded.PoolName, seeded.ProxyRaw); !ok {
 		t.Fatalf("seeded proxy429 cooldown lost")
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
@@ -545,7 +545,7 @@ func TestModelsRefreshSuccessUpdatesCatalogWithoutStatePollution(t *testing.T) {
 	if got := gateway.scheduler.targetCoolUntil(seeded.Identity); got <= time.Now().UnixNano() {
 		t.Fatalf("seeded target cooldown lost")
 	}
-	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(seeded.PoolName, seeded.ProxyRaw); !ok {
+	if _, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, seeded.PoolName, seeded.ProxyRaw); !ok {
 		t.Fatalf("seeded proxy429 cooldown lost")
 	}
 }

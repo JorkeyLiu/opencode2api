@@ -36,20 +36,35 @@
   from config. NEVER treat
   it as editable directly; change it only by changing config (or the seed/env
   inputs that produce config) and letting the runtime rebuild. Scheduler
-  state has four layers: proxy transport health (connectivity only),
-  per-(pool, proxy) global 429 rate-limit cooldowns, per-credential global
-  401 cooldowns, and per-(tier, credential, pool, proxy, model) target
-  cooldowns for 403/5xx only. There is no static key→proxy binding. Two
+  state has six layers: proxy transport health (connectivity only),
+  tier-qualified `(tier,pool,proxy)` 429 rate-limit cooldowns, tier-qualified
+  `(tier,pool,proxy)` comparative channel-availability cooldowns for 403/5xx,
+  per-(tier, credential) 401 cooldowns, per-(tier, credential) 429 cooldowns
+  established only by two distinct proxies 429ing in one request, and
+  per-(tier, credential, pool, proxy, model) target cooldowns for 403/5xx
+  only. Anonymous Zen and authenticated Zen share the Zen channel state (Go
+  stays isolated even for identical key text or raw URL); pool qualification
+  is preserved throughout. There is no static key→proxy binding: one
+  credential+pool deterministically prefers a stable proxy (soft affinity,
+  recomputed from current pool contents) without any persisted map. Two
   distinct in-memory affinity authorities sit above these layers:
-  route-session rotation overrides (per target-scope recovery string for one
-  target) and client-session+model target pins (durable binding selecting
-  which target an established session+model may use); the former rotates the
-  upstream session value, the latter fixes the target itself.
+  route-session rotation overrides (per target-scope recovery string; the
+  scope includes the proxy for anonymous Zen and excludes it for
+  authenticated sessions) and client-session+model pins (durable binding
+  selecting which target an established session+model may use); the former
+  rotates the upstream session value, the latter fixes the binding itself.
+  Anonymous pins fix the complete target including the proxy; authenticated
+  pins fix tier, credential, pool, model, protocol, and authority while the
+  proxy remains a mutable current selection under generation fencing.
 - Proxy identity is two-level: `proxy_pools` names stable pool identities and
   `proxy_routing` assigns exactly one pool each to the anonymous, zen, and go
   channels (same or different). Top-level `proxies` / `proxyfile` are
   load-time legacy inputs only: they migrate to a `shared` pool on load and
   never persist. Pool names are operator identities, never IPs or URLs.
+  Same pool name referenced by multiple channels shares one transport
+  instance; different pool names isolate pool-qualified runtime state even for
+  the same raw URL. The key↔proxy relation is deterministic soft affinity
+  (like a stable user/VPN IP preference), never a hard binding.
   Only referenced pools are runtime resources; unreferenced pools are staged
   config (validated, never built/probed/counted).
 - External authorities MUST NOT be duplicated into this guide or hardcoded:
@@ -84,7 +99,9 @@
   route session (upstream authority, tier, internal credential identity, proxy
   pool, raw proxy identity, target protocol; never the model, never raw
   secrets) in the upstream session headers and in the already-present body
-  session fields. The first generation is a stable stateless derivation; only
+  session fields. The authenticated route session excludes the proxy so a
+  within-pool proxy move preserves the same upstream session value; the
+  anonymous route session includes it. The first generation is a stable stateless derivation; only
   a 400 rotation stores a bounded in-memory override. Before a pin exists for
   session+model, one establishment owner freezes/HRW-orders the currently
   available targets and may walk proxies/tiers per §4; concurrent followers
@@ -97,7 +114,14 @@
   cooldown fast-fails locally with the corresponding protocol/status/
   Retry-After without a send, and a removed/unhealthy/unresolvable target fails
   locally with 502. Same-target transient retry and exact-400 replay remain per
-  §4. Pins are process-lifetime and never expire/evict; the store is
+  §4. For authenticated pins the binding is proxy-independent (tier,
+  credential, pool, model, protocol, authority) while the current proxy is a
+  fenced mutable selection: an established session may move within the same
+  pool, credential, tier, model, protocol, and authority only after a transport
+  failure under the normal send budget or an HTTP 429, before any client bytes
+  and never across tiers, keys, or pools; a successful move updates only the
+  current proxy. No move occurs on 400/401/403/408/425, ordinary 4xx, or 5xx.
+  Anonymous pins stay exactly proxy-affine with no cross-proxy recovery. Pins are process-lifetime and never expire/evict; the store is
   fixed-bounded (see `sessionPinStoreCap` in `scheduler.go`) and a new
   session+model at capacity fails closed locally with 502 before any send
   while existing pins keep serving. Restart is the explicit clearing boundary.
@@ -106,10 +130,12 @@
   still-future scheduler cooldowns, proxy health, still-fresh
   route-session overrides by identity, and session+model pins without validity
   filtering as tombstone-like identity (credential by tier+key, proxy health
-  by pool+URL, target by full identity, proxy429 by pool+URL identity only
-  with aggregate count in the migration log, route session by target scope
-  with the client dimension excluded from validity and still-fresh/idle-TTL
-  filtering, pins migrated by identity up to the pin cap with aggregate count
+  by pool+URL, target by full identity, proxy429 and channel by
+  tier+pool+URL identity with aggregate counts in the migration log, credential
+  429 by tier+key, route session by target scope with the client dimension
+  excluded from validity — authenticated scopes migrate only when proxy-free
+  and pool-routable — and still-fresh/idle-TTL filtering, pins migrated by
+  identity up to the pin cap with aggregate count
   only where a removed target remains pinned and fails locally with 502 rather
   than re-establishing; new resources start at
   zero / stateless, removed ones drop except pinned tombstones) → atomically write
@@ -173,23 +199,30 @@
   pinned target serves alone per the Session affinity spine.
 - Scheduler state: proxy health is transport connectivity only (HTTP statuses
   never change it); a single foreground transport error never cools
-  credential/target/proxy429 state and never flips proxy healthy directly —
+  credential/target/proxy429/channel state and never flips proxy healthy directly —
   it only triggers the existing async neutral proxy health verification,
   and only that independent probe on explicit isProxyFailure may flip
-  healthy. 401 cools the credential globally; 429 cools the pool-qualified
-  proxy globally across models, tiers, credentials, channels, and client
-  sessions (same raw URL in different pools stays isolated), so one proxy's
-  rate limit filters every model/credential/tier using that pool+proxy;
-  403/5xx cool the single (tier, credential, pool, proxy, model) target, so
-  one model's 403/5xx never affects another; 408/425 are transient neutral
+  healthy. 401 cools the tier+credential globally; 429 cools the tier-qualified
+  `(tier,pool,proxy)` proxy globally across models, credentials, channels, and
+  client sessions (anonymous and authenticated Zen share the Zen entry; Go stays
+  isolated even for the same raw URL; same raw URL in different pools stays
+  isolated), so one proxy's rate limit filters every model/credential using that
+  tier+pool+proxy; two distinct proxies 429ing with the same tier+credential in
+  one request additionally cool that tier+credential using the second Retry-After
+  (Zen and Go stay isolated even for identical key text), while a single proxy429
+  never does; 403/5xx cool the single (tier, credential, pool, proxy, model) target,
+  so one model's 403/5xx never affects another, and only with comparative success
+  (same tier+credential succeeding on another node) cool the tier-qualified
+  `(tier,pool,proxy)` channel — a lone 403/5xx without comparative success is
+  display-only; 408/425 are transient neutral
   (retryable, never cooling); ordinary 4xx (including exact 400) is neutral
   and 2xx clears this target and this credential's 401 state, plus the
-  pool-qualified proxy429 state only when the send started at or after the
-  latest recorded 429 (stale in-flight 2xx never clears a newer 429; newer
-  failures stay authoritative). Proxy429 uses deterministic exponential
-  backoff with Retry-After max/cap, no same-target retry, bounded map with
+  tier-qualified proxy429/channel and credential429 state only when the send started
+  at or after the latest recorded failure (stale in-flight 2xx never clears a newer
+  cooldown; newer failures stay authoritative). Proxy429/channel use deterministic exponential
+  backoff with Retry-After max/cap, no same-target retry, bounded maps with
   stale prune/eviction proportional to proxy resources, and still-future
-  migration by pool+proxy with aggregate count only. Route-session overrides
+  migration by tier+pool+proxy with aggregate counts only. Route-session overrides
   are bounded in-memory Gateway authority (first generation stateless,
   rotation stored with idle TTL and deterministic eviction; never persisted,
   never projected, never logged), in contrast to session+model pins which are
@@ -200,9 +233,21 @@
   clears/sets proxy429); manual refresh shares the scheduled stateless path
   and its concurrency gate, so it never reads or writes proxy or foreground
   scheduler state.
+- Availability management: `POST /api/availability/check` is Models-only (no inference),
+  active nodes only, and inherits admin auth/CSRF/Origin checks, `no-store`, strict `{}`,
+  rate/concurrency/send caps, partial-result reporting, and redaction. Zen public probes
+  the Zen-channel nodes and never affects Go or configured credentials; a real-credential
+  401 cools that tier+credential; success clears tier-qualified proxy/channel state
+  (stale-fenced) while success+429 writes proxy429 and success+403/5xx writes channel state;
+  two 429s without success write credential429 while a single 429 stays display-only;
+  ambiguous outcomes (transport-inconclusive, 408/425, ordinary 4xx, parse/empty, timeouts)
+  stay display-only. Per-send/admin timeouts are diagnostic only. The single-proxy probe
+  stays distinct (one proxy, transport connectivity target). Both update health only through
+  the existing independent last-healthy protection.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
-  per-model target cooldowns and proxy429 cooldowns never count). Zero
+  per-model target cooldowns, proxy429 cooldowns, channel cooldowns, and credential429
+  cooldowns never count). Zero
   globally available channels degrades readiness; one model's targets all
   cooling or one proxy's 429 cooling never does.
 - Streaming: once bytes have been written to the client, the Gateway MUST
@@ -309,7 +354,7 @@
   ports, healthcheck, volume/seed wiring.
 - `.github/workflows/release.yml` — CI gate (`go test ./...`) and release
   build matrix.
-- Source of truth for behavior: `gateway.go`, `scheduler.go`, `convert.go`, `stream.go`,
+- Source of truth for behavior: `gateway.go`, `scheduler.go`, `availability.go`, `convert.go`, `stream.go`,
   `models.go`, `model_metadata.go`, `pool.go`, `runtime.go`, `config.go`,
   `admin.go`, `observability.go`, `password.go`, `ids.go`, `main.go`
   (read them; this guide states relationships, not code locations).

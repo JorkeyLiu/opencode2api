@@ -449,8 +449,13 @@ func TestResourcesPoolAttribution(t *testing.T) {
 			t.Fatalf("key missing pool: %+v", key)
 		}
 	}
-	if len(snap.AnonymousProxies) != 1 || snap.AnonymousProxies[0].Pool != "a" {
-		t.Fatalf("anon proxies=%+v", snap.AnonymousProxies)
+	// Unified 代理可用性 view replaces the independent anonymous summary:
+	// pool a carries the anonymous routing and its Zen channel is available.
+	if byPool["a"].Zen != "available" {
+		t.Fatalf("pool a zen availability=%q want available", byPool["a"].Zen)
+	}
+	if len(snap.ChannelCooldowns) != 0 {
+		t.Fatalf("fresh channel state must be empty: %+v", snap.ChannelCooldowns)
 	}
 }
 

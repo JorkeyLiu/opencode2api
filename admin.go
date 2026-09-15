@@ -55,6 +55,7 @@ type AdminServer struct {
 	probeAttempts   map[string]loginWindow
 	refreshAttempts map[string]loginWindow
 	historyAttempts map[string]loginWindow
+	bulkAttempts    map[string]loginWindow
 	lastInference   *DebugInferenceResult
 }
 
@@ -63,7 +64,7 @@ func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, log
 		manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession),
 		attempts: make(map[string]loginWindow), debugAttempts: make(map[string]loginWindow),
 		probeAttempts: make(map[string]loginWindow), refreshAttempts: make(map[string]loginWindow),
-		historyAttempts: make(map[string]loginWindow),
+		historyAttempts: make(map[string]loginWindow), bulkAttempts: make(map[string]loginWindow),
 	}
 }
 
@@ -83,6 +84,7 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.Handle("GET /api/logs", a.authenticate(http.HandlerFunc(a.handleLogs)))
 	mux.Handle("GET /api/logs/stream", a.authenticate(http.HandlerFunc(a.handleLogStream)))
 	mux.Handle("POST /api/proxies/probe", a.authenticate(a.csrf(http.HandlerFunc(a.handleProxyProbe))))
+	mux.Handle("POST /api/availability/check", a.authenticate(a.csrf(http.HandlerFunc(a.handleBulkCheck))))
 	mux.Handle("POST /api/models/refresh", a.authenticate(a.csrf(http.HandlerFunc(a.handleModelsRefresh))))
 	mux.Handle("GET /api/history/requests", a.authenticate(http.HandlerFunc(a.handleHistoryRequests)))
 	mux.Handle("GET /api/history/attempts", a.authenticate(http.HandlerFunc(a.handleHistoryAttempts)))

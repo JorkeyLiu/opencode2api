@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +39,12 @@ type Gateway struct {
 	// Both paths use TryLock so a busy refresh returns 409 instead of
 	// stacking. No new dependency is introduced.
 	catalogRefreshMu sync.Mutex
+	// bulkMu gates overlapping bulk availability checks (409 busy).
+	// bulkSnapshot is the admin-only latest-result projection: fixed
+	// bounded, replaced atomically per completed/partial run, never
+	// routing authority. Restart/Apply clears via fresh Gateway.
+	bulkMu       sync.Mutex
+	bulkSnapshot atomic.Pointer[bulkAvailabilitySnapshot]
 }
 
 type healthResponse struct {
@@ -1051,6 +1058,48 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 	}
+	if g.pools[pin.Pool] == nil {
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	now := time.Now()
+	if until, status, ok := g.scheduler.credentialCooldownStatus(pin.CredID); ok {
+		if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests && !(status >= 500 && status <= 599) {
+			status = http.StatusBadGateway
+		}
+		retrySec := int64(0)
+		if status == http.StatusTooManyRequests || (status >= 500 && status <= 599) {
+			retrySec = pinRetryAfterSeconds(until, now)
+		}
+		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	if !isAnonymous {
+		if until, status, ok := g.scheduler.credential429CooldownStatus(pin.CredID); ok {
+			if status != http.StatusTooManyRequests {
+				status = http.StatusTooManyRequests
+			}
+			retrySec := pinRetryAfterSeconds(until, now)
+			return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+		}
+	}
+	if isContextCancelled(ctx) {
+		return nil, effectiveRoute, attemptOffset, ctx.Err()
+	}
+	body := bodies[pin.Tier]
+	if len(body) == 0 {
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	if isAnonymous {
+		return g.doPinnedAnonymous(ctx, route, bodies, ids, pin, effectiveRoute, baseURL, protocol, body, attemptOffset)
+	}
+	return g.doPinnedAuth(ctx, route, bodies, ids, pin, effectiveRoute, baseURL, poolName, protocol, body, credKey, credDisplay, credIndex, attemptOffset)
+}
+
+// doPinnedAnonymous serves an anonymous bound target: exactly proxy-affine,
+// full-target pin includes proxy, route-session includes proxy, no
+// cross-proxy recovery. Active tier-qualified (Zen) proxy429, channel, credential, or
+// target cooldowns fast-fail locally; removed/unhealthy pinned resources fail
+// with 502. Same-target transient retry and exact-400 replay remain.
+func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL string, protocol Protocol, body []byte, attemptOffset int) (*http.Response, modelRoute, int, error) {
 	pool := g.pools[pin.Pool]
 	if pool == nil {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
@@ -1062,30 +1111,22 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 			break
 		}
 	}
-	if proxy == nil {
-		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
-	}
-	if !proxy.healthy.Load() {
+	if proxy == nil || !proxy.healthy.Load() {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	now := time.Now()
-	// Pinned requests never migrate across targets: a pool-qualified proxy429
-	// cooldown fast-fails locally with target-protocol 429 + remaining
-	// Retry-After, without a send or fallback. After expiry the same pinned
-	// proxy sends normally.
-	if until, status, ok := g.scheduler.proxy429CooldownStatus(pin.Pool, pin.ProxyRaw); ok {
+	if until, status, ok := g.scheduler.proxy429CooldownStatus(TierZen, pin.Pool, pin.ProxyRaw); ok {
 		if status != http.StatusTooManyRequests {
 			status = http.StatusTooManyRequests
 		}
-		retrySec := pinRetryAfterSeconds(until, now)
-		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+		return pinLocalResponse(status, pinRetryAfterSeconds(until, now), "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	if until, status, ok := g.scheduler.credentialCooldownStatus(pin.CredID); ok {
-		if status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests && !(status >= 500 && status <= 599) {
+	if until, status, ok := g.scheduler.channelCooldownStatus(TierZen, pin.Pool, pin.ProxyRaw); ok {
+		if status != http.StatusForbidden && !(status >= 500 && status <= 599) {
 			status = http.StatusBadGateway
 		}
-		retrySec := int64(0)
-		if status == http.StatusTooManyRequests || (status >= 500 && status <= 599) {
+		var retrySec int64
+		if status >= 500 && status <= 599 {
 			retrySec = pinRetryAfterSeconds(until, now)
 		}
 		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
@@ -1095,7 +1136,7 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		if status != http.StatusForbidden && !(status >= 500 && status <= 599) {
 			status = http.StatusBadGateway
 		}
-		retrySec := int64(0)
+		var retrySec int64
 		if status >= 500 && status <= 599 {
 			retrySec = pinRetryAfterSeconds(until, now)
 		}
@@ -1104,13 +1145,9 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 	if isContextCancelled(ctx) {
 		return nil, effectiveRoute, attemptOffset, ctx.Err()
 	}
-	body := bodies[pin.Tier]
-	if len(body) == 0 {
-		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
-	}
 	cand := targetCandidate{
-		Tier: pin.Tier, CredKey: credKey, CredID: pin.CredID, CredDisplay: credDisplay,
-		CredIndex: credIndex, PoolName: pin.Pool, Proxy: proxy,
+		Tier: pin.Tier, CredKey: anonymousZenKey, CredID: pin.CredID, CredDisplay: anonymousCredentialID,
+		CredIndex: -1, PoolName: pin.Pool, Proxy: proxy,
 		ProxyRaw: pin.ProxyRaw, Model: pin.Model, Identity: identity,
 	}
 	scope := routeScopeForCandidate(baseURL, cand, protocol)
@@ -1119,24 +1156,11 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
-	channel := "key"
-	anonymous := false
-	if isAnonymous {
-		channel = "anonymous"
-		anonymous = true
-		credDisplay = "anonymous"
-	}
-	budget := g.cfg.Retry.MaxAttempts
-	if budget < 1 {
-		budget = 1
-	}
 	attempts := 0
-	ordinarySends := 0
 	transientAvailable := true
 	attempts++
-	ordinarySends++
 	syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-	resp, sendErr, _, _, firstDiag, buildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, channel, credDisplay, anonymous, attemptOffset+attempts)
+	resp, sendErr, _, _, firstDiag, _, buildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 	if buildErr != nil {
 		return nil, effectiveRoute, attemptOffset + attempts, buildErr
 	}
@@ -1150,8 +1174,10 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
 		return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 	}
-	allowRetry := isAnonymous || ordinarySends < budget
-	if isSameTargetTransient(resp, sendErr) && transientAvailable && allowRetry {
+	// Pinned anonymous owns one same-target transient retry independent of
+	// the ordinary authenticated real-send budget, matching the unbound
+	// anonymous contract (frozen list never truncated by max_attempts).
+	if isSameTargetTransient(resp, sendErr) && transientAvailable {
 		transientAvailable = false
 		if isContextCancelled(ctx) {
 			return resp, effectiveRoute, attemptOffset + attempts, sendErr
@@ -1160,9 +1186,8 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 			drainAndClose(resp.Body)
 		}
 		attempts++
-		ordinarySends++
 		syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-		retryResp, retryErr, _, _, retryDiag, retryBuildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, channel, credDisplay, anonymous, attemptOffset+attempts)
+		retryResp, retryErr, _, _, retryDiag, _, retryBuildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 		if retryBuildErr != nil {
 			return nil, effectiveRoute, attemptOffset + attempts, retryBuildErr
 		}
@@ -1181,6 +1206,268 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 	return resp, effectiveRoute, attemptOffset + attempts, sendErr
 }
 
+// doPinnedAuth serves an established authenticated binding proxy-independently.
+// The durable identity fixes tier, credential, pool, model, protocol, and
+// authority; ProxyRaw is the current/preferred selection with generation
+// fencing. The route session is proxy-independent so moves preserve the same
+// upstream session value and body bytes. Within one request, only transport
+// failure (after same-target transient retry) or HTTP 429 may try the next
+// eligible healthy proxy in the same pool/tier/credential/model/protocol/
+// authority before client bytes, and every such move obeys the authenticated
+// tier real-send budget exactly like unbound auth: each first send and each
+// same-target transient retry consumes retry.max_attempts, and the next proxy
+// is tried only while budget remains. Two distinct eligible-proxy 429s stop
+// the walk even with more proxies, within budget, returning the second 429
+// with its target-protocol envelope/Retry-After and setting credential429
+// (second Retry-After, capped); a single 429 never does. Pre-existing
+// cooling proxies are skipped before any send and never count as observed
+// evidence. No moves on 400/401/403/408/425/ordinary 4xx/5xx. Success on an
+// alternate updates only current/generation via CAS.
+func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL, poolName string, protocol Protocol, body []byte, credKey, credDisplay string, credIndex int, attemptOffset int) (*http.Response, modelRoute, int, error) {
+	pool := g.pools[poolName]
+	if pool == nil || len(pool.items) == 0 {
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	// Current-proxy target cooling (403/5xx) fast-fails without moves.
+	currentIdentity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, pin.ProxyRaw, pin.Model)
+	if until, status, ok := g.scheduler.targetCooldownStatus(currentIdentity); ok {
+		if status != http.StatusForbidden && !(status >= 500 && status <= 599) {
+			status = http.StatusBadGateway
+		}
+		var retrySec int64
+		if status >= 500 && status <= 599 {
+			retrySec = pinRetryAfterSeconds(until, time.Now())
+		}
+		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	// Filter to eligible: healthy, not target-cooling, not tier-429-cooling,
+	// not tier-channel-cooling. Current proxy429/channel cooling does not
+	// fast-fail immediately; it is skipped in favor of the next eligible
+	// (429/channel are move triggers for auth). Target cooling on alternates
+	// only skips them.
+	type eligibleProxy struct {
+		proxy *proxyTransport
+		raw   string
+	}
+	eligible := make([]eligibleProxy, 0, len(ordered))
+	nowNanos := time.Now().UnixNano()
+	for _, proxy := range ordered {
+		if proxy == nil || !proxy.healthy.Load() {
+			continue
+		}
+		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, proxy.name, pin.Model)
+		if until, _, ok := g.scheduler.targetCooldownStatus(identity); ok && until > nowNanos {
+			continue
+		}
+		if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+			continue
+		}
+		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+			continue
+		}
+		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
+	}
+	if len(eligible) == 0 {
+		// No eligible proxy: distinguish 429 exhaustion from 502. If any
+		// proxy is under tier-429 cooldown, fast-fail 429 with max remaining;
+		// channel cooling alone fast-fails 502 (its 403/5xx status is kept
+		// in the channel detail table, not as a pinned envelope); otherwise
+		// 502 (unhealthy/removed).
+		var latest int64
+		for _, proxy := range ordered {
+			if proxy == nil {
+				continue
+			}
+			if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > latest {
+				latest = until
+			}
+		}
+		if latest > nowNanos {
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+		}
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
+	}
+	// Proxy-independent route session: identical across moves.
+	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: credKey, CredDisplay: credDisplay, CredIndex: credIndex, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
+	scope := routeScopeForCandidate(baseURL, probe, protocol)
+	routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
+	candBody, err := applyRouteSessionToBody(body, routeSession, protocol, false)
+	if err != nil {
+		return nil, effectiveRoute, attemptOffset, err
+	}
+	budget := g.cfg.Retry.MaxAttempts
+	if budget < 1 {
+		budget = 1
+	}
+	attempts := 0
+	ordinarySends := 0
+	observed429 := make(map[string]time.Duration)
+	for idx, ep := range eligible {
+		// Authenticated tier real-send budget: every first send and every
+		// same-target transient retry consumes retry.max_attempts. Stop
+		// before the next proxy when the budget is exhausted, exactly like
+		// unbound auth. The 429 two-distinct stop below stays within budget
+		// because its second send already consumed the last token.
+		if ordinarySends >= budget {
+			break
+		}
+		if isContextCancelled(ctx) {
+			return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
+		}
+		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, ep.raw, pin.Model)
+		cand := targetCandidate{
+			Tier: pin.Tier, CredKey: credKey, CredID: pin.CredID, CredDisplay: credDisplay,
+			CredIndex: credIndex, PoolName: pin.Pool, Proxy: ep.proxy,
+			ProxyRaw: ep.raw, Model: pin.Model, Identity: identity,
+		}
+		attempts++
+		ordinarySends++
+		syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
+		resp, sendErr, _, _, firstDiag, firstStarted, buildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, attemptOffset+attempts)
+		if buildErr != nil {
+			return nil, effectiveRoute, attemptOffset + attempts, buildErr
+		}
+		if sendErr == nil && resp != nil && resp.StatusCode/100 == 2 {
+			if ep.raw != pin.ProxyRaw {
+				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			}
+			return resp, effectiveRoute, attemptOffset + attempts, nil
+		}
+		if isContextCancelled(ctx) {
+			return resp, effectiveRoute, attemptOffset + attempts, sendErr
+		}
+		if isRouteTerminalBadRequest(resp, sendErr) {
+			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
+			attempts = replayed
+			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			}
+			return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
+		}
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		if status == http.StatusTooManyRequests && sendErr == nil {
+			var retryAfter time.Duration
+			if resp != nil {
+				retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
+			}
+			if _, seen := observed429[ep.raw]; !seen {
+				observed429[ep.raw] = retryAfter
+			}
+			if len(observed429) >= 2 {
+				_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, status, retryAfter, firstStarted)
+				return resp, effectiveRoute, attemptOffset + attempts, nil
+			}
+			// Single 429 without second-distinct evidence: terminal when no
+			// budget or no proxy remains, preserving the target-protocol
+			// envelope/Retry-After; otherwise drain and try the next proxy.
+			lastProxy := idx == len(eligible)-1
+			if ordinarySends >= budget || lastProxy {
+				return resp, effectiveRoute, attemptOffset + attempts, nil
+			}
+			if resp != nil {
+				drainAndClose(resp.Body)
+			}
+			continue
+		}
+		if sendErr != nil || status == http.StatusRequestTimeout || status == 425 || (status >= 500 && status <= 599) {
+			// Same-target transient policy: one retry per proxy while
+			// ordinary sends remain within budget.
+			if ordinarySends < budget {
+				if isContextCancelled(ctx) {
+					return resp, effectiveRoute, attemptOffset + attempts, sendErr
+				}
+				if resp != nil {
+					drainAndClose(resp.Body)
+				}
+				attempts++
+				ordinarySends++
+				syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
+				retryResp, retryErr, _, _, retryDiag, retryStarted, retryBuildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, attemptOffset+attempts)
+				if retryBuildErr != nil {
+					return nil, effectiveRoute, attemptOffset + attempts, retryBuildErr
+				}
+				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
+					if ep.raw != pin.ProxyRaw {
+						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					}
+					return retryResp, effectiveRoute, attemptOffset + attempts, nil
+				}
+				if isContextCancelled(ctx) {
+					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
+				}
+				if isRouteTerminalBadRequest(retryResp, retryErr) {
+					replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, retryResp, retryDiag, attemptOffset, attempts)
+					attempts = replayed
+					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					}
+					return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
+				}
+				retryStatus := 0
+				if retryResp != nil {
+					retryStatus = retryResp.StatusCode
+				}
+				if retryErr == nil && retryStatus == http.StatusTooManyRequests {
+					var retryAfter time.Duration
+					if retryResp != nil {
+						retryAfter = parseRetryAfter(retryResp.Header.Get("Retry-After"))
+					}
+					if _, seen := observed429[ep.raw]; !seen {
+						observed429[ep.raw] = retryAfter
+					}
+					if len(observed429) >= 2 {
+						_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, retryStatus, retryAfter, retryStarted)
+						return retryResp, effectiveRoute, attemptOffset + attempts, nil
+					}
+					lastProxy := idx == len(eligible)-1
+					if ordinarySends >= budget || lastProxy {
+						return retryResp, effectiveRoute, attemptOffset + attempts, nil
+					}
+					drainAndClose(retryResp.Body)
+					continue
+				}
+				if retryErr != nil {
+					// Transport retry still failing: move to next proxy only
+					// while budget remains; the top-of-loop guard enforces it.
+					if retryResp != nil {
+						drainAndClose(retryResp.Body)
+					}
+					continue
+				}
+				// Non-transport retry outcome (401/403/408/425/ordinary
+				// 4xx/5xx): no cross-proxy moves.
+				return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
+			}
+			// No retry token: transport failure moves directly only while
+			// budget remains; otherwise stop without another send.
+			if sendErr != nil {
+				if ordinarySends >= budget || idx == len(eligible)-1 {
+					if resp != nil {
+						drainAndClose(resp.Body)
+					}
+					break
+				}
+				if resp != nil {
+					drainAndClose(resp.Body)
+				}
+				continue
+			}
+			return resp, effectiveRoute, attemptOffset + attempts, sendErr
+		}
+		// 401/403/408/425/ordinary 4xx/5xx: no cross-proxy moves.
+		return resp, effectiveRoute, attemptOffset + attempts, sendErr
+	}
+	// Exhausted eligible proxies or real-send budget after transport moves, or
+	// budget stopped the walk before the next proxy. No 429 envelope is owed
+	// here (single-429 terminals returned above); report 502 with the exact
+	// consumed attempt count.
+	return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
+}
+
 // sendUpstreamOnce performs one real upstream send on a fixed candidate with
 // a fixed route session and candidate body. It builds the request, sends it,
 // applies the single state-update entry point, and records the attempt with
@@ -1189,21 +1476,25 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 // bounded body for the privacy-safe diagnostic and restores the bytes so the
 // existing drain/client-envelope flow is unchanged; the diagnostic is
 // recorded on the attempt and returned for replay logging. No extra send.
-func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) (resp *http.Response, err error, duration time.Duration, class attemptClassification, diag badRequestDiag, buildErr error) {
+// startedNanos is the true send-start time for stale-fenced state updates;
+// callers must use it (not note-time time.Now()) for credential429
+// failure comparisons so in-flight ordering matches proxy429/target guards.
+func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) (resp *http.Response, err error, duration time.Duration, class attemptClassification, diag badRequestDiag, startedNanos int64, buildErr error) {
 	req, err := newUpstreamRequest(ctx, baseURL, protocol, candBody, ids, cand.CredKey, routeSession)
 	if err != nil {
-		return nil, err, 0, attemptClassification{}, badRequestDiag{}, err
+		return nil, err, 0, attemptClassification{}, badRequestDiag{}, 0, err
 	}
 	setRequestCredential(ctx, tier, protocol, credDisplay, channel, anonymous, cand.Proxy)
 	started := time.Now()
+	startedNanos = started.UnixNano()
 	resp, err = cand.Proxy.client.Do(req)
 	duration = time.Since(started)
-	class = g.applyAttemptOutcome(ctx, cand, resp, err, started.UnixNano())
+	class = g.applyAttemptOutcome(ctx, cand, resp, err, startedNanos)
 	if err == nil && resp != nil && resp.StatusCode == http.StatusBadRequest {
 		diag = peek400Diag(resp)
 	}
 	g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class, false, false, false, diag)
-	return resp, err, duration, class, diag, nil
+	return resp, err, duration, class, diag, startedNanos, nil
 }
 
 func syncAttemptMeta(ctx context.Context, tier Tier, protocol Protocol, attemptOffset, attempts int) {
@@ -1277,7 +1568,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		attempts++
 		syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-		resp, err, _, _, firstDiag, buildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+		resp, err, _, _, firstDiag, _, buildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 		if buildErr != nil {
 			return nil, buildErr, attempts, false, false
 		}
@@ -1311,7 +1602,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			}
 			attempts++
 			syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-			retryResp, retryErr, _, _, retryDiag, retryBuildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+			retryResp, retryErr, _, _, retryDiag, _, retryBuildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 			if retryBuildErr != nil {
 				return nil, retryBuildErr, attempts, false, false
 			}
@@ -1484,10 +1775,38 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	// upstream sends (each candidate first send plus at most one same-target
 	// transient retry) against retry.max_attempts. The 400 route-session
 	// recovery is always allowed once extra and never consumes the transient
-	// token or the ordinary budget. HRW uses only the client session; the
-	// route session is per-candidate and target-bound.
+	// token or the ordinary budget. Auth ordering is credential-soft-affinity:
+	// credential groups by session HRW, proxies within each credential by
+	// deterministic affinity (session/model independent). The route session
+	// for auth is proxy-independent.
 	now := time.Now().UnixNano()
+	// Credential429 fast-fail before any send: when every credential for this
+	// tier is cooling and at least one is credential-429 cooling, fail locally
+	// with 429 + max Retry-After and zero sends.
+	if len(creds) > 0 {
+		allCooling := true
+		var latest429 int64
+		for _, cred := range creds {
+			if until, _, ok := g.scheduler.credential429CooldownStatus(cred.id); ok && until > now {
+				if until > latest429 {
+					latest429 = until
+				}
+				continue
+			}
+			if until, _, ok := g.scheduler.credentialCooldownStatus(cred.id); ok && until > now {
+				continue
+			}
+			allCooling = false
+			break
+		}
+		if allCooling && latest429 > now {
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest429, time.Now()), "upstream temporarily unavailable"), nil, 0, false, false
+		}
+	}
 	cands := g.scheduler.orderCandidates(g.scheduler.buildAuthCandidates(route.Tier, creds, pool, route.ID, now), ids.Session)
+	// Two-distinct-proxy 429 evidence per credential for this unbound request.
+	// Only same-credential 429s on two distinct proxies set credential429.
+	cred429Evidence := make(map[string]map[string]time.Duration)
 	budget := g.cfg.Retry.MaxAttempts
 	if budget < 1 {
 		budget = 1
@@ -1521,6 +1840,12 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
 		}
+		// Mid-request credential429 evidence: skip remaining candidates with
+		// a credential already proven rate-limited in this request (two
+		// distinct proxies 429). Other credentials still walk normally.
+		if ev, ok := cred429Evidence[cand.CredID]; ok && len(ev) >= 2 {
+			continue
+		}
 		scope := routeScopeForCandidate(baseURL, cand, route.Protocol)
 		routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
 		candBody, err := applyRouteSessionToBody(body, routeSession, route.Protocol, false)
@@ -1533,7 +1858,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		// about to be sent. Only the redacted key suffix is retained.
 		attempts++
 		syncAttemptMeta(ctx, route.Tier, route.Protocol, attemptOffset, attempts)
-		resp, err, duration, _, firstDiag, buildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+		resp, err, duration, _, firstDiag, firstStarted, buildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
 		if buildErr != nil {
 			return nil, buildErr, attempts, false, false
 		}
@@ -1543,6 +1868,23 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
 			return resp, nil, attempts, false, false
+		}
+		// Unbound two-distinct-proxy 429 evidence: same credential on two
+		// distinct proxies both 429 sets credential429 (second Retry-After).
+		// Single-proxy 429 never sets it.
+		if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+			ev, ok := cred429Evidence[cand.CredID]
+			if !ok {
+				ev = make(map[string]time.Duration)
+				cred429Evidence[cand.CredID] = ev
+			}
+			if _, seen := ev[cand.ProxyRaw]; !seen {
+				ev[cand.ProxyRaw] = retryAfter
+				if len(ev) >= 2 {
+					_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, resp.StatusCode, retryAfter, firstStarted)
+				}
+			}
 		}
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false
@@ -1568,7 +1910,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			}
 			attempts++
 			syncAttemptMeta(ctx, route.Tier, route.Protocol, attemptOffset, attempts)
-			retryResp, retryErr, _, _, retryDiag, retryBuildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+			retryResp, retryErr, _, _, retryDiag, _, retryBuildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
 			if retryBuildErr != nil {
 				return nil, retryBuildErr, attempts, false, false
 			}
@@ -1628,29 +1970,35 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 }
 
 // applyAttemptOutcome is the single state-update entry point for every
-// upstream attempt. It classifies once, updates the four state layers, and
+// upstream attempt. It classifies once, updates the six state layers, and
 // returns the classification so recordUpstreamAttempt reuses the same result.
 //
 //   - Downstream cancellation (request ctx done): no state is touched.
 //   - 2xx: clears this target and the credential 401 state, plus the
-//     pool-qualified proxy429 state when the send started at or after the
-//     latest recorded 429 (stale in-flight 2xx never clears a newer 429); a
-//     healthy response also restores proxy transport health.
+//     tier-qualified proxy429/channel state and the credential429 state when
+//     the send started at or after the latest recorded failure (stale
+//     in-flight 2xx never clears a newer cooldown); a healthy response also
+//     restores proxy transport health.
 //   - 401: global credential cooldown; the target is not cooled twice.
-//   - 429: global pool-qualified proxy cooldown (Retry-After wins when
-//     larger, capped); the per-target and credential layers are untouched.
-//     No same-target retry is implied; it still triggers only the neutral
-//     async proxy verification and never flips healthy directly.
+//   - 429: tier-qualified proxy cooldown (Retry-After wins when larger,
+//     capped); the per-target, credential-401, credential429, and channel
+//     layers are untouched here. Credential429 is set only by the
+//     two-distinct-proxy evidence rule in pinned/unbound flows, never from a
+//     single 429. No same-target retry is implied; it still triggers only the
+//     neutral async proxy verification and never flips healthy directly.
 //   - 403/5xx: per-target cooldown (Retry-After wins when larger, capped).
-//   - Transport error (non-cancelled): neutral, no credential/target/proxy429
-//     state; it only triggers the existing async neutral proxy health
-//     verification. Only that independent probe may flip proxy healthy on
-//     isProxyFailure.
+//     The channel layer is never written here; only comparative management
+//     probes write it.
+//   - Transport error (non-cancelled): neutral, no
+//     credential/target/proxy429/channel state; it only triggers the existing
+//     async neutral proxy health verification. Only that independent probe may
+//     flip proxy healthy on isProxyFailure.
 //   - Ordinary 4xx (client_rejected, including exact 400) and transient
 //     408/425 (transient_client): neutral no-op; never clears state.
 //
-// startedNanos is the send-start time of this attempt. It guards the proxy429
-// clear path; a zero value falls back to now.
+// startedNanos is the send-start time of this attempt. It guards the
+// proxy429/channel and credential429 clear paths; a zero value falls back to
+// now.
 func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate, resp *http.Response, err error, startedNanos int64) attemptClassification {
 	class := classifyUpstreamAttempt(resp, err)
 	if ctx != nil && ctx.Err() != nil {
@@ -1664,8 +2012,10 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 	case err == nil && status >= 200 && status < 300:
 		targetCleared := g.scheduler.noteTargetSuccess(cand.Identity)
 		credCleared := g.scheduler.noteCredentialSuccess(cand.CredID)
-		proxyCleared := g.scheduler.noteProxy429Success(cand.PoolName, cand.ProxyRaw, startedNanos)
-		g.logSchedulerCleared(cand, targetCleared, credCleared, proxyCleared)
+		proxyCleared := g.scheduler.noteProxy429Success(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
+		channelCleared := g.scheduler.noteChannelSuccess(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
+		cred429Cleared := g.scheduler.noteCredential429Success(cand.CredID, startedNanos)
+		g.logSchedulerCleared(cand, targetCleared, credCleared, proxyCleared, channelCleared, cred429Cleared)
 		if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
 			wasHealthy := cand.Proxy.healthy.Swap(true)
 			if !wasHealthy && g.logger != nil {
@@ -1683,7 +2033,7 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 		if resp != nil {
 			retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
 		}
-		change := g.scheduler.noteProxy429Failure(cand.PoolName, cand.ProxyRaw, class.Class, status, retryAfter, startedNanos)
+		change := g.scheduler.noteProxy429Failure(cand.Tier, cand.PoolName, cand.ProxyRaw, class.Class, status, retryAfter, startedNanos)
 		g.logProxy429CooldownSet(cand, change)
 		g.verifyProxyAfterError(ctx, cand.Proxy, status)
 	case status == http.StatusForbidden || status >= 500:
@@ -1794,9 +2144,29 @@ func (g *Gateway) logProxy429CooldownSet(cand targetCandidate, change proxy429Ch
 		"remaining_ms", time.Duration(remaining).Milliseconds())
 }
 
+// logChannelCooldownSet emits channel_cooldown_set only when the comparative
+// probe failure actually extended the tier-qualified channel cooldown.
+func (g *Gateway) logChannelCooldownSet(tier Tier, pool, proxyRaw, keyDisplay, failureClass string, status int, change channelChange) {
+	if g.logger == nil || !change.Changed {
+		return
+	}
+	remaining := change.CooldownUntil - time.Now().UnixNano()
+	if remaining < 0 {
+		remaining = 0
+	}
+	g.logger.Debug("channel availability cooldown extended",
+		"component", "scheduler", "event", "channel_cooldown_set",
+		"tier", string(tier), "key_id", keyDisplay,
+		"proxy_pool", pool, "proxy_node", redactURL(proxyRaw),
+		"failure_class", failureClass,
+		"status", status, "failures", change.Failures,
+		"cooldown_until", time.Unix(0, change.CooldownUntil).UTC(),
+		"remaining_ms", time.Duration(remaining).Milliseconds())
+}
+
 // logSchedulerCleared emits clear events only when 2xx actually removed
-// stored credential/target/proxy429 state.
-func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange, proxy proxy429Change) {
+// stored credential/target/proxy429/channel/credential429 state.
+func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange, proxy proxy429Change, channel channelChange, cred429 credentialChange) {
 	if g.logger == nil {
 		return
 	}
@@ -1832,6 +2202,20 @@ func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange,
 			"channel", credentialChannel(cand),
 			"proxy_pool", poolName, "proxy_node", proxyNode,
 			"failures", proxy.Failures)
+	}
+	if cred429.Changed && cred429.Cleared {
+		g.logger.Debug("credential rate-limit cooldown cleared",
+			"component", "scheduler", "event", "credential_rate_limit_cooldown_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"failures", cred429.Failures, "remaining_ms", 0)
+	}
+	if channel.Changed && channel.Cleared {
+		g.logger.Debug("channel availability cooldown cleared",
+			"component", "scheduler", "event", "channel_cooldown_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"channel", credentialChannel(cand),
+			"proxy_pool", poolName, "proxy_node", proxyNode,
+			"failures", channel.Failures)
 	}
 }
 
