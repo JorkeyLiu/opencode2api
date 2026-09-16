@@ -468,6 +468,11 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			if upstreamRoute.Protocol != "" {
 				meta.Protocol = string(upstreamRoute.Protocol)
 			}
+			// Custom fallback serves the channel-configured model, not the
+			// client model. Zen/Go keep the client model untouched.
+			if upstreamRoute.Tier == TierCustom && upstreamRoute.ID != "" {
+				meta.Model = upstreamRoute.ID
+			}
 		}
 		w.Header().Set("x-request-id", ids.Request)
 		if resp.StatusCode/100 != 2 {
@@ -804,6 +809,9 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	effectiveRoute := route
 	effectiveRoute.Tier = TierCustom
 	effectiveRoute.Protocol = fallbackChannelProtocol(FallbackChannelConfig{Protocol: binding.Protocol})
+	if strings.TrimSpace(binding.Model) != "" {
+		effectiveRoute.ID = strings.TrimSpace(binding.Model)
+	}
 	if binding.Name == "" {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
@@ -841,6 +849,9 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom
 		effectiveRoute.Protocol = fallbackChannelProtocol(ch)
+		if strings.TrimSpace(binding.Model) != "" {
+			effectiveRoute.ID = strings.TrimSpace(binding.Model)
+		}
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, true, nil
 	}
 	current, exists := fallbackChannelByName(g.cfg, stored.Name)
@@ -848,6 +859,9 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom
 		effectiveRoute.Protocol = fallbackChannelProtocol(FallbackChannelConfig{Protocol: stored.Protocol})
+		if strings.TrimSpace(stored.Model) != "" {
+			effectiveRoute.ID = strings.TrimSpace(stored.Model)
+		}
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, true, nil
 	}
 	var ex upstreamExtra
@@ -2349,6 +2363,16 @@ func setRequestCredential(ctx context.Context, tier Tier, protocol Protocol, key
 	if proxy != nil {
 		meta.Proxy = redactURL(proxy.name)
 		meta.ProxyPool = proxy.pool
+	}
+}
+
+func setRequestModel(ctx context.Context, model string) {
+	meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta)
+	if meta == nil {
+		return
+	}
+	if model != "" {
+		meta.Model = model
 	}
 }
 

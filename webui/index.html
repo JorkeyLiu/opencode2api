@@ -193,6 +193,12 @@ html,body{max-width:100%;overflow-x:hidden}
   .main>*{max-width:none;margin:0;width:auto}
   .topbar{position:static}
 }
+.fb-list{display:grid;gap:8px}
+.fb-row{display:flex;gap:10px;align-items:center;border:1px solid var(--line);background:#fff;padding:8px 10px;cursor:pointer;min-width:0}
+.fb-row.active{border-color:var(--accent);box-shadow:inset 3px 0 0 var(--accent);background:#f4faf7}
+.fb-row .meta{min-width:0;flex:1}
+.fb-row .name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fb-row .sub{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -391,9 +397,9 @@ html,body{max-width:100%;overflow-x:hidden}
         </div>
         <div class="section config-card">
           <h2>备用模型渠道</h2>
-          <div class="cap">当匿名渠道在已有对话中暂时不可用时，可由已启用的备用渠道继续处理。渠道名称唯一，基础地址仅支持 HTTP/HTTPS，需填写模型与 API 密钥；启用选择经保存后生效。</div>
-          <div id="fallback-editor"></div>
-          <div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><label>当前启用渠道 <select id="c-fallback-active"></select></label><button class="ghost" id="btn-fallback-activate" type="button">启用所选渠道</button><button class="ghost" id="btn-fallback-clear" type="button">停用备用渠道</button></div>
+          <div class="cap">当匿名渠道在已有对话中暂时不可用时，可由已启用的备用渠道继续处理。渠道名称唯一，基础地址仅支持 HTTP/HTTPS，需填写模型与 API 密钥；列表选择经保存后生效。</div>
+          <div id="fallback-editor" class="fb-list"></div>
+          <div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><button class="ghost" id="btn-fallback-clear" type="button">停用备用渠道</button><span class="note" id="fallback-active-note"></span></div>
           <div class="note" id="fallback-error"></div>
         </div>
         <div class="section config-card">
@@ -464,6 +470,12 @@ html,body{max-width:100%;overflow-x:hidden}
   <div class="filters"><strong>敏感值</strong><span class="spacer" style="flex:1"></span><button class="ghost" id="modal-close" type="button">关闭</button></div>
   <pre id="modal-content" class="mono"></pre>
 </div></div>
+<div id="fallback-modal" class="modal hidden"><div class="modal-card">
+  <div class="filters"><strong id="fallback-modal-title">备用渠道</strong><span style="flex:1"></span><button class="ghost" id="fallback-modal-close" type="button">关闭</button></div>
+  <div id="fallback-modal-body"></div>
+  <div class="actions"><button class="primary" id="fallback-modal-save" type="button">保存渠道</button><button class="ghost" id="fallback-modal-delete" type="button">删除渠道</button><button class="ghost" id="fallback-modal-cancel" type="button">取消</button></div>
+  <div class="note" id="fallback-modal-error"></div>
+</div></div>
 <div id="toast" class="toast hidden"></div>
 
 <script>
@@ -479,8 +491,10 @@ function fmtMs(v){ if(v===undefined||v===null)return "—"; return Number(v)+" m
 function fmtSec(v){ if(v===undefined||v===null)return "—"; return Number(v)+"秒"; }
 function fmtBytes(v){ v=Number(v||0); if(v<1024)return v+" B"; if(v<1024*1024)return (v/1024).toFixed(1)+" KB"; return (v/1024/1024).toFixed(1)+" MB"; }
 function protoLabel(p){ p=String(p||"").toLowerCase(); if(p==="chat")return "Chat Completions"; if(p==="responses")return "Responses"; if(p==="anthropic")return "Anthropic"; if(!p||p==="—")return "—"; return "未知"; }
-function tierLabel(t){ t=String(t||"").toLowerCase(); if(t==="zen")return "Zen"; if(t==="go")return "Go"; if(!t||t==="—")return "—"; return "未知"; }
-function channelLabel(c){ c=String(c||"").toLowerCase(); if(c==="anonymous")return "匿名"; if(c==="zen")return "Zen"; if(c==="go")return "Go"; if(!c||c==="—")return "—"; return "未知"; }
+function tierLabel(t){ t=String(t||"").toLowerCase(); if(t==="zen")return "Zen"; if(t==="go")return "Go"; if(t==="custom")return "自定义"; if(!t||t==="—")return "—"; return "未知"; }
+function channelLabel(c){ c=String(c||"").toLowerCase(); if(c==="anonymous")return "匿名"; if(c==="zen")return "Zen"; if(c==="go")return "Go"; if(c==="custom")return "自定义"; if(!c||c==="—")return "—"; return "未知"; }
+function customChannelOf(a){ var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return k.slice(7); return ""; }
+function isCustomRow(a){ var t=String((a&&(a.tier||a.Tier))||"").toLowerCase(); if(t==="custom")return true; var ch=String((a&&(a.channel||a.Channel))||"").toLowerCase(); if(ch==="custom")return true; var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return true; return false; }
 function keyLabel(a){ if(a&&(a.anonymous||a.Anonymous))return "匿名"; var k=(a&&(a.key_id||a.KeyID))||""; return k||"—"; }
 function failureLabel(fc){ fc=String(fc||""); if(!fc||fc==="—")return "—"; if(fc==="success")return "成功"; if(fc==="transport_failure")return "传输失败"; if(fc==="auth_failure")return "认证失败"; if(fc==="rate_limited")return "限流"; if(fc==="upstream_failure")return "上游失败"; if(fc==="transient_client")return "临时重试"; if(fc==="client_rejected")return "客户端拒绝"; if(fc==="other_response")return "其他响应"; return "未知"; }
 function hintLabel(h){ h=String(h||""); if(!h||h==="—")return "—"; if(h==="context_length")return "上下文长度"; if(h==="stale_response_reference")return "陈旧响应引用"; if(h==="session_rejected")return "会话被拒绝"; if(h==="invalid_request")return "无效请求"; if(h==="unknown")return "未知"; return "未知"; }
@@ -669,10 +683,10 @@ function finalUsageFor(attempt, reqById){
 function attemptRowCells(tr, a, tokenReq, isFallback){
   cell(tr,fmtTime(a.time!==undefined?a.time:a.Time));
   cell(tr,a.model||a.Model||"—","wrap");
-  (function(){ var td=document.createElement("td"); var raw=a.tier||a.Tier||"—"; td.textContent=tierLabel(raw); td.title=raw==="—"?"上游未知":("上游："+tierLabel(raw)); tr.appendChild(td); })();
+  (function(){ var td=document.createElement("td"); if(isCustomRow(a)){ var nm=customChannelOf(a)||"自定义"; td.textContent=nm; td.title="自定义渠道："+nm; } else { var raw=a.tier||a.Tier||"—"; td.textContent=tierLabel(raw); td.title=raw==="—"?"上游未知":("上游："+tierLabel(raw)); } tr.appendChild(td); })();
   (function(){ var td=document.createElement("td"); var raw=a.protocol||a.Protocol||"—"; td.textContent=protoLabel(raw); td.title=raw==="—"?"目标协议未知":("目标协议："+protoLabel(raw)); tr.appendChild(td); })();
   (function(){ var td=document.createElement("td"); var label=proxyLabel(a.proxy_pool||a.ProxyPool,a.proxy_node||a.proxy||a.Proxy||a.ProxyNode); td.textContent=label; td.title=label==="—"?"代理未知":("代理池/节点："+label); tr.appendChild(td); })();
-  (function(){ var td=document.createElement("td"); var kl=keyLabel(a); td.textContent=kl; td.title=(kl==="匿名")?"匿名公开凭证":(kl==="—"?"密钥未知":("密钥尾码："+kl)); tr.appendChild(td); })();
+  (function(){ var td=document.createElement("td"); if(isCustomRow(a)){ var cn=customChannelOf(a); td.textContent="自定义"; td.title=cn?("自定义渠道："+cn):"自定义渠道"; } else { var kl=keyLabel(a); td.textContent=kl; td.title=(kl==="匿名")?"匿名公开凭证":(kl==="—"?"密钥未知":("密钥尾码："+kl)); } tr.appendChild(td); })();
   cell(tr,(a.attempt===undefined?(a.Attempt===undefined?"—":a.Attempt):a.attempt));
   (function(){
     var td=document.createElement("td");
@@ -1229,25 +1243,58 @@ function fillConfig(v){
   renderFallbackEditor(v);
 }
 function renderFallbackEditor(v){
-  var host=$("fallback-editor"); if(!host)return; clear(host);
   var fb=(v&&v.fallback)||{active:"",channels:[]};
-  (fb.channels||[]).forEach(function(ch){ host.appendChild(fallbackCard(ch)); });
-  syncFallbackActive(fb.active||"");
+  S.fbDraft={active:String(fb.active||""),channels:[]};
+  (fb.channels||[]).forEach(function(ch){
+    S.fbDraft.channels.push({name:String(ch.name||""),base_url:String(ch.base_url||""),api_key:{id:String((ch.api_key&&ch.api_key.id)||""),display:String((ch.api_key&&ch.api_key.display)||"")},model:String(ch.model||""),protocol:fallbackProtocolValue(ch),reasoning_effort:fallbackEffortValue(ch)});
+  });
+  renderFallbackList();
   var err=$("fallback-error"); if(err)err.textContent="";
 }
 function fallbackChannelNames(){
-  var names=[], cards=document.querySelectorAll("#fallback-editor .fb-card");
-  for(var i=0;i<cards.length;i++){
-    var inp=cards[i].querySelector('[data-role="fb-name"]');
-    names.push(inp?inp.value.trim():cards[i].getAttribute("data-channel"));
-  }
-  return names;
+  if(S.fbDraft&&S.fbDraft.channels)return S.fbDraft.channels.map(function(c){return String(c.name||"").trim();});
+  return [];
 }
 function syncFallbackActive(active){
-  var sel=$("c-fallback-active"); if(!sel)return; var cur=(active!==undefined&&active!==null)?active:(sel.value||""); clear(sel);
-  var empty=document.createElement("option"); empty.value=""; empty.textContent="(未启用)"; sel.appendChild(empty);
-  fallbackChannelNames().forEach(function(n){ if(!n)return; var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o); });
-  if(cur){ var found=false; for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===cur)found=true; sel.value=found?cur:""; } else sel.value="";
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  var cur=(active!==undefined&&active!==null)?String(active):String(S.fbDraft.active||"");
+  var names=fallbackChannelNames();
+  if(cur&&names.indexOf(cur)<0)cur="";
+  S.fbDraft.active=cur;
+  renderFallbackList();
+}
+function renderFallbackList(){
+  var host=$("fallback-editor"); if(!host)return; clear(host);
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  var chans=S.fbDraft.channels||[];
+  if(!chans.length){
+    var empty=document.createElement("div"); empty.className="note"; empty.textContent="暂无备用渠道，可新增后在弹窗中配置。"; host.appendChild(empty);
+  }
+  chans.forEach(function(ch, idx){
+    host.appendChild(fallbackListRow(ch, idx));
+  });
+  var note=$("fallback-active-note"); if(note){ clear(note); var a=String(S.fbDraft.active||""); if(a)note.appendChild(document.createTextNode("当前启用："+a+"（保存后生效），点击行切换，停用按钮可清空。")); else note.appendChild(document.createTextNode("当前未启用备用渠道，点击行选择启用。")); }
+}
+function setFallbackActive(name){
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  S.fbDraft.active=String(name||"");
+  renderFallbackList();
+}
+function fallbackListRow(ch, idx){
+  var row=document.createElement("div"); row.className="fb-row"+(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name?" active":"");
+  var dot=document.createElement("span"); dot.className="pill "+(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name?"ok":"neutral"); dot.textContent=(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name)?"已启用":"未启用"; row.appendChild(dot);
+  var meta=document.createElement("div"); meta.className="meta";
+  var nm=document.createElement("div"); nm.className="name"; nm.textContent=ch.name||"(未命名)"; meta.appendChild(nm);
+  var sub=document.createElement("div"); sub.className="sub"; sub.textContent=(ch.model||"—")+" · "+(fallbackProtocolValue(ch)==="responses"?"Responses":"Chat Completions")+" · "+(ch.base_url||"—"); meta.appendChild(sub);
+  row.appendChild(meta);
+  var edit=document.createElement("button"); edit.type="button"; edit.className="ghost"; edit.textContent="编辑"; edit.setAttribute("data-role","fb-edit");
+  edit.addEventListener("click",function(ev){ if(ev&&ev.stopPropagation)ev.stopPropagation(); openFallbackModal(idx); });
+  row.appendChild(edit);
+  row.addEventListener("click",function(){
+    var n=String(ch.name||"").trim(); if(!n){ toast("请先在编辑弹窗中填写渠道名称",true); return; }
+    setFallbackActive(n); toast("已选择启用 "+n+"，保存后生效");
+  });
+  return row;
 }
 function fallbackNormalizeBase(raw){ return String(raw||"").trim().replace(/\/+$/,""); }
 function fallbackAPIRoot(normalized){
@@ -1317,24 +1364,21 @@ function fallbackDiscoverReasonCN(reason, httpStatus){
   if(reason==="transport_error")return "网络传输失败";
   return "模型发现失败";
 }
-function fallbackCard(ch){
-  ch=ch||{name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat"};
-  var card=document.createElement("div"); card.className="fb-card config-item-card"; card.setAttribute("data-channel",ch.name||"");
-  var head=document.createElement("div"); head.className="config-item-head";
-  head.appendChild(el("strong","备用渠道"));
-  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.setAttribute("autocomplete","off"); nameInput.setAttribute("autocapitalize","off"); nameInput.setAttribute("autocorrect","off"); nameInput.setAttribute("spellcheck","false"); nameInput.style.maxWidth="180px"; head.appendChild(nameInput);
-  var act=document.createElement("button"); act.type="button"; act.className="ghost"; act.textContent="启用此渠道";
-  act.addEventListener("click",function(){
-    var n=nameInput.value.trim(); if(!n){toast("渠道名称不能为空",true);return;}
-    var sel=$("c-fallback-active"); syncFallbackActive(n); if(sel)sel.value=n;
-    toast("已选择启用 "+n+"，保存后生效");
-  });
-  head.appendChild(act);
-  var del=document.createElement("button"); del.type="button"; del.className="ghost"; del.textContent="删除渠道";
-  del.addEventListener("click",function(){ card.remove(); syncFallbackActive($("c-fallback-active").value); });
-  head.appendChild(del);
-  card.appendChild(head);
-  var grid=document.createElement("div"); grid.className="config-item-grid";
+function fallbackModalState(){ return S.fbModal||(S.fbModal={index:null}); }
+function openFallbackModal(idx){
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  var isNew=(idx===null||idx===undefined);
+  var ch=isNew?{name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat",reasoning_effort:""}:S.fbDraft.channels[idx];
+  if(!ch)return;
+  S.fbModal={index:isNew?null:idx,origName:String(ch.name||"")};
+  var title=$("fallback-modal-title"); if(title){ clear(title); title.appendChild(document.createTextNode(isNew?"新增备用渠道":"编辑备用渠道")); }
+  var body=$("fallback-modal-body"); clear(body);
+  var err=$("fallback-modal-error"); if(err)err.textContent="";
+  var grid=document.createElement("div"); grid.className="config-item-grid"; body.appendChild(grid);
+  var nameWrap=document.createElement("div"); nameWrap.className="field span-12";
+  var nameLabel=document.createElement("label"); nameLabel.textContent="渠道名称（唯一）"; nameWrap.appendChild(nameLabel);
+  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.setAttribute("autocomplete","off"); nameInput.setAttribute("autocapitalize","off"); nameInput.setAttribute("autocorrect","off"); nameInput.setAttribute("spellcheck","false"); nameWrap.appendChild(nameInput);
+  grid.appendChild(nameWrap);
   var protoWrap=document.createElement("div"); protoWrap.className="field span-3";
   var protoLabelEl=document.createElement("label"); protoLabelEl.textContent="接口协议"; protoWrap.appendChild(protoLabelEl);
   var protoSel=document.createElement("select"); protoSel.setAttribute("data-role","fb-protocol");
@@ -1358,24 +1402,34 @@ function fallbackCard(ch){
   grid.appendChild(effortWrap);
   var keyWrap=document.createElement("div"); keyWrap.className="field span-6";
   var keyLabel=document.createElement("label"); keyLabel.textContent="API 密钥"; keyWrap.appendChild(keyLabel);
-  var keyInfo=document.createElement("div"); keyInfo.className="note"; keyInfo.setAttribute("data-role","fb-key-status");
-  var savedDisplay=((ch.api_key||{}).display)||"";
-  keyInfo.appendChild(document.createTextNode(savedDisplay?("已保存密钥："+savedDisplay):"未设置，需填写后保存"));
-  keyWrap.appendChild(keyInfo);
+  var savedDisplay=String((ch.api_key&&ch.api_key.display)||"");
+  var savedId=String((ch.api_key&&ch.api_key.id)||"");
+  var pendingNew=String(ch._newKey||"");
   var keyRow=document.createElement("div"); keyRow.className="key-row";
-  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.value=""; keyInput.placeholder="留空保留已保存值，或填新密钥"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="new-password"; keyRow.appendChild(keyInput);
+  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.value=""; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="new-password";
+  if(savedId&&!pendingNew){ keyInput.placeholder=savedDisplay||"已保存，留空保留"; }
+  else if(pendingNew){ keyInput.placeholder="已输入新密钥（保存后生效）"; }
+  else { keyInput.placeholder="填写 API 密钥"; }
+  keyRow.appendChild(keyInput);
   var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="ghost"; keyToggle.textContent="显示"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyRow.appendChild(keyToggle);
   keyWrap.appendChild(keyRow);
+  var keyStatus=document.createElement("div"); keyStatus.className="note"; keyStatus.setAttribute("data-role","fb-key-status");
+  if(savedId&&!pendingNew){ keyStatus.appendChild(document.createTextNode("留空保留已保存值，输入则替换")); }
+  else if(pendingNew){ keyStatus.appendChild(document.createTextNode("已输入新密钥，保存渠道后暂存，提交配置后生效")); }
+  else { keyStatus.appendChild(document.createTextNode("新建渠道需填写密钥")); }
+  keyWrap.appendChild(keyStatus);
   var keyHint=document.createElement("div"); keyHint.className="note"; keyHint.setAttribute("data-role","fb-key-hint"); keyWrap.appendChild(keyHint);
   keyToggle.addEventListener("click",function(){
     if(keyInput.type==="password"){ keyInput.type="text"; keyToggle.textContent="隐藏"; }
     else { keyInput.type="password"; keyToggle.textContent="显示"; }
   });
   keyInput.addEventListener("input",function(){
-    clear(keyHint);
-    if(keyInput.value.trim())keyHint.appendChild(document.createTextNode("保存后将替换已保存密钥"));
+    clear(keyHint); clear(keyStatus);
+    if(keyInput.value.trim()){ keyStatus.appendChild(document.createTextNode("已输入新密钥，保存渠道后暂存")); keyHint.appendChild(document.createTextNode("保存渠道后暂存，提交配置后生效")); }
+    else if(savedId){ keyStatus.appendChild(document.createTextNode("留空保留已保存值，输入则替换")); }
+    else { keyStatus.appendChild(document.createTextNode("新建渠道需填写密钥")); }
   });
-  var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=((ch.api_key||{}).id)||""; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
+  var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=savedId; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
   grid.appendChild(keyWrap);
   var modelWrap=document.createElement("div"); modelWrap.className="field span-6";
   var modelLabel=document.createElement("label"); modelLabel.textContent="模型（仅从列表选择）"; modelWrap.appendChild(modelLabel);
@@ -1394,7 +1448,6 @@ function fallbackCard(ch){
   var prevModelsRow=document.createElement("div"); prevModelsRow.setAttribute("data-role","fb-url-models"); prevModels.appendChild(prevModelsRow);
   var prevReqRow=document.createElement("div"); prevReqRow.setAttribute("data-role","fb-url-request"); prevModels.appendChild(prevReqRow);
   grid.appendChild(prevWrap);
-  card.appendChild(grid);
   function updatePreview(){
     var base=baseInput.value.trim();
     var proto=protoSel.value||"chat";
@@ -1413,10 +1466,11 @@ function fallbackCard(ch){
   discBtn.addEventListener("click",function(){
     var base=baseInput.value.trim();
     var nv=keyInput.value.trim();
-    var payload={base_url:base,channel:card.getAttribute("data-channel")||undefined};
+    var payload={base_url:base};
+    if(!isNew&&ch.name)payload.channel=String(ch.name||"");
     if(nv)payload.api_key={value:nv};
     else if(keyHidden.value)payload.api_key={id:keyHidden.value};
-    else { clear(discStatus); discStatus.appendChild(document.createTextNode("请先填写 API 密钥，或保留已保存值")); toast("请先填写 API 密钥，或保留已保存值",true); return; }
+    else { clear(discStatus); discStatus.appendChild(document.createTextNode("请先填写 API 密钥")); toast("请先填写 API 密钥",true); return; }
     if(!base){ clear(discStatus); discStatus.appendChild(document.createTextNode("请先填写基础地址")); toast("请先填写基础地址",true); return; }
     discBtn.disabled=true; discBtn.textContent="获取中…";
     clear(discStatus); discStatus.appendChild(document.createTextNode("正在获取模型列表…"));
@@ -1468,17 +1522,68 @@ function fallbackCard(ch){
     if(modelSel.value)discStatus.appendChild(document.createTextNode("已选择模型 "+modelSel.value+"，保存后生效"));
     else discStatus.appendChild(document.createTextNode("尚未选择模型，保存前请选择"));
   });
-  nameInput.addEventListener("change",function(){
-    var oldName=card.getAttribute("data-channel")||"";
-    var next=nameInput.value.trim();
-    var sel=$("c-fallback-active");
-    var cur=sel?sel.value:"";
-    var mapped=mapFallbackActiveOnRename(cur,oldName,next);
-    card.setAttribute("data-channel",next);
-    syncFallbackActive(mapped);
-  });
-  return card;
+  var delBtn=$("fallback-modal-delete"); if(delBtn)delBtn.style.display=isNew?"none":"";
+  $("fallback-modal").classList.remove("hidden");
+  S.fbModal.fields={nameInput:nameInput,baseInput:baseInput,protoSel:protoSel,effortSel:effortSel,keyInput:keyInput,keyHidden:keyHidden,modelSel:modelSel};
 }
+function closeFallbackModal(){
+  var m=$("fallback-modal"); if(m)m.classList.add("hidden");
+  var b=$("fallback-modal-body"); if(b)clear(b);
+  var e=$("fallback-modal-error"); if(e)e.textContent="";
+  S.fbModal={index:null};
+}
+function saveFallbackModal(){
+  var st=S.fbModal||{index:null};
+  var f=st.fields||{};
+  var errEl=$("fallback-modal-error"); if(errEl)errEl.textContent="";
+  var name=String((f.nameInput&&f.nameInput.value)||"").trim();
+  var base=String((f.baseInput&&f.baseInput.value)||"").trim();
+  var proto=String((f.protoSel&&f.protoSel.value)||"chat").toLowerCase()!=="responses"?"chat":"responses";
+  var effort=String((f.effortSel&&f.effortSel.value)||"").trim().toLowerCase();
+  if(effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
+  var model=String((f.modelSel&&f.modelSel.value)||"").trim();
+  var nv=String((f.keyInput&&f.keyInput.value)||"").trim();
+  var kid=String((f.keyHidden&&f.keyHidden.value)||"").trim();
+  if(!name){ if(errEl)errEl.textContent="渠道名称不能为空"; toast("渠道名称不能为空",true); return; }
+  if(!base){ if(errEl)errEl.textContent="基础地址不能为空"; toast("基础地址不能为空",true); return; }
+  if(!model){ if(errEl)errEl.textContent="请先获取模型列表并选择模型"; toast("请先获取模型列表并选择模型",true); return; }
+  var isNew=(st.index===null||st.index===undefined);
+  if(!nv&&!kid){ if(errEl)errEl.textContent="请填写 API 密钥"; toast("请填写 API 密钥",true); return; }
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  var chans=S.fbDraft.channels;
+  for(var i=0;i<chans.length;i++){ if(i!==st.index&&String(chans[i].name||"").trim()===name){ if(errEl)errEl.textContent="渠道名称 "+name+" 重复"; toast("渠道名称 "+name+" 重复",true); return; } }
+  var entry={name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
+  if(isNew){
+    var keepId=""; var keepDisplay="";
+    entry.api_key={id:"",display:""};
+    entry._newKey=nv;
+    chans.push(entry);
+  } else {
+    var old=chans[st.index];
+    var oldDisplay=String((old.api_key&&old.api_key.display)||"");
+    entry.api_key={id:kid,display:oldDisplay};
+    if(nv)entry._newKey=nv; else delete entry._newKey;
+    var oldName=String(st.origName||old.name||"");
+    chans[st.index]=entry;
+    var mapped=mapFallbackActiveOnRename(String(S.fbDraft.active||""),oldName,name);
+    S.fbDraft.active=mapped;
+  }
+  closeFallbackModal();
+  renderFallbackList();
+  toast(isNew?"已新增渠道 "+name+"，保存后生效":"已保存渠道 "+name+"（提交配置后生效）");
+}
+function deleteFallbackModal(){
+  var st=S.fbModal||{index:null};
+  if(st.index===null||st.index===undefined)return;
+  if(!S.fbDraft||!S.fbDraft.channels||!S.fbDraft.channels[st.index]){ closeFallbackModal(); return; }
+  var name=String(S.fbDraft.channels[st.index].name||"");
+  S.fbDraft.channels.splice(st.index,1);
+  if(String(S.fbDraft.active||"")===name)S.fbDraft.active="";
+  closeFallbackModal();
+  renderFallbackList();
+  toast("已删除渠道 "+(name||"")+"（保存后生效）");
+}
+
 function renderChips(name){
   var host=$(name+"-chips"); clear(host);
   ((S.config&&S.config[name])||[]).forEach(function(item){
@@ -1633,32 +1738,28 @@ $("btn-pool-add").addEventListener("click",function(){
   syncRoutingSelects(); refreshPoolBadges(); $("pools-error").textContent="";
 });
 (function(){ var b=$("btn-fallback-add"); if(b)b.addEventListener("click",function(){
-  var host=$("fallback-editor"); host.appendChild(fallbackCard({name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat",reasoning_effort:""}));
-  syncFallbackActive($("c-fallback-active").value);
-}); })();
-(function(){ var b=$("btn-fallback-activate"); if(b)b.addEventListener("click",function(){
-  var sel=$("c-fallback-active"); if(sel&&sel.value)toast("已选择启用 "+sel.value+"，保存后生效"); else toast("请选择要启用的渠道",true);
+  openFallbackModal(null);
 }); })();
 (function(){ var b=$("btn-fallback-clear"); if(b)b.addEventListener("click",function(){
-  var sel=$("c-fallback-active"); if(sel)sel.value=""; toast("已停用备用渠道（保存后生效）");
+  setFallbackActive(""); toast("已停用备用渠道（保存后生效）");
 }); })();
+(function(){ var b=$("fallback-modal-close"); if(b)b.addEventListener("click",closeFallbackModal); })();
+(function(){ var b=$("fallback-modal-cancel"); if(b)b.addEventListener("click",closeFallbackModal); })();
+(function(){ var b=$("fallback-modal-save"); if(b)b.addEventListener("click",saveFallbackModal); })();
+(function(){ var b=$("fallback-modal-delete"); if(b)b.addEventListener("click",deleteFallbackModal); })();
 function fallbackInputs(){
-  var out=[], cards=document.querySelectorAll("#fallback-editor .fb-card");
-  for(var i=0;i<cards.length;i++){
-    var name=cards[i].querySelector('[data-role="fb-name"]').value.trim();
-    var base=cards[i].querySelector('[data-role="fb-base"]').value.trim();
-    var modelEl=cards[i].querySelector('[data-role="fb-model"]');
-    var model=modelEl?(modelEl.value||"").trim():"";
-    var protoEl=cards[i].querySelector('[data-role="fb-protocol"]');
-    var proto=protoEl?(protoEl.value||"chat"):"chat";
-    if(String(proto).toLowerCase()!=="responses")proto="chat";
-    else proto="responses";
-    var effEl=cards[i].querySelector('[data-role="fb-effort"]');
-    var effort=effEl?(effEl.value||""):"";
-    effort=String(effort||"").trim().toLowerCase();
+  if(!S.fbDraft||!S.fbDraft.channels)return [];
+  var out=[];
+  for(var i=0;i<S.fbDraft.channels.length;i++){
+    var c=S.fbDraft.channels[i];
+    var name=String(c.name||"").trim();
+    var base=String(c.base_url||"").trim();
+    var model=String(c.model||"").trim();
+    var proto=String(c.protocol||"chat").toLowerCase()!=="responses"?"chat":"responses";
+    var effort=String(c.reasoning_effort||"").trim().toLowerCase();
     if(effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
-    var nv=cards[i].querySelector('[data-role="fb-key-new"]').value.trim();
-    var id=cards[i].querySelector('[data-role="fb-key-id"]').value;
+    var nv=String(c._newKey||"").trim();
+    var id=String((c.api_key&&c.api_key.id)||"").trim();
     var key=nv?{value:nv}:(id?{id:id}:{value:""});
     out.push({name:name,base_url:base,api_key:key,model:model,protocol:proto,reasoning_effort:effort});
   }
@@ -1707,7 +1808,7 @@ $("config-form").addEventListener("submit",function(e){
   var preservedEnabled=(S.config&&S.config.webui)?!!S.config.webui.enabled:true;
   var cfgWebui=((S.config&&S.config.webui)||{});
   var fbChannels=fallbackInputs();
-  var fbActive=$("c-fallback-active")?$("c-fallback-active").value:"";
+  var fbActive=(S.fbDraft&&S.fbDraft.active)||"";
   var seenFb={}, dupFb="";
   fbChannels.forEach(function(c){ if(c.name){ if(seenFb[c.name])dupFb=c.name; seenFb[c.name]=1; } });
   if(dupFb){ toast("备用渠道名称 "+dupFb+" 重复，禁止提交",true); $("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。"; return; }

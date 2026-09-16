@@ -1541,6 +1541,7 @@ func decodeOpenAIUsage(usage map[string]any) bridgeUsage {
 		intAt(usage, "prompt_tokens_details", "cache_creation_input_tokens"),
 		intAt(usage, "prompt_tokens_details", "cache_write_tokens"),
 		intAt(usage, "input_tokens_details", "cache_creation_input_tokens"),
+		intAt(usage, "input_tokens_details", "cache_write_tokens"),
 	)
 	reasoning := firstNonZero(intAt(usage, "completion_tokens_details", "reasoning_tokens"), intAt(usage, "output_tokens_details", "reasoning_tokens"))
 	return bridgeUsage{Input: input, Output: output, Total: total, Cached: cached, CacheCreation: cacheCreation, Reasoning: reasoning}

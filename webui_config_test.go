@@ -28,17 +28,25 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"日志与历史",
 		"监听与管理",
 		"首选上游顺序",
-		"当前启用渠道",
-		"启用此渠道",
 		"停用备用渠道",
-		"当匿名渠道在已有对话中暂时不可用时，可由已启用的备用渠道继续处理",
+		"列表选择经保存后生效",
 		"config-sticky",
-		"config-item-card",
 		"config-item-grid",
 		"完整地址预览",
+		"fallback-active-note",
+		"fallback-modal",
+		"fallback-modal-body",
+		"fallback-modal-save",
+		"fallback-modal-delete",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing config group copy %q", needle)
+		}
+	}
+	// Duplicate enable concepts are gone: only list selection + deactivate remain.
+	for _, stale := range []string{"启用此渠道", "启用所选渠道", "c-fallback-active", "btn-fallback-activate", "当前启用渠道"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("duplicate enable concept must stay removed: %q", stale)
 		}
 	}
 	// Advanced JSON stays inside the form behind a details element.
@@ -71,8 +79,9 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new",
 		"pools-editor", "btn-pool-add", "pools-error",
 		"c-route-anon", "c-route-zen", "c-route-go",
-		"fallback-editor", "btn-fallback-add", "c-fallback-active",
-		"btn-fallback-activate", "btn-fallback-clear", "fallback-error",
+		"fallback-editor", "btn-fallback-add", "btn-fallback-clear", "fallback-error",
+		"fallback-active-note", "fallback-modal", "fallback-modal-body",
+		"fallback-modal-save", "fallback-modal-delete", "fallback-modal-cancel",
 		"c-up-zen", "c-up-go", "c-attempts", "c-timeout",
 		"c-refresh", "c-protocols",
 		"c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown",
@@ -119,8 +128,14 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		"仅从列表选择",
 		"当前配置：",
 		"供应商列表未返回",
-		"保存后将替换已保存密钥",
-		"已保存密钥",
+		"留空保留",
+		"已输入新密钥",
+		"新建渠道需填写",
+		"openFallbackModal",
+		"saveFallbackModal",
+		"deleteFallbackModal",
+		"fallback-modal-save",
+		"fallback-modal-delete",
 		"fallbackAPIRoot",
 		"fallbackEndpointURL",
 		"fallbackModelsURL",
@@ -130,6 +145,13 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing fallback contract %q", needle)
 		}
+	}
+	// Masked tail sentence must be gone; placeholder carries the masked display.
+	if strings.Contains(html, "已保存密钥") {
+		t.Fatal("fallback must not show saved-key tail copy; masked display lives in the input placeholder")
+	}
+	if strings.Contains(html, "保存后将替换已保存密钥") {
+		t.Fatal("legacy replace-key hint must be removed")
 	}
 	// Model select is the sole editable/submitted source: data-role fb-model
 	// must be on a select, never a free-text input; the legacy picker role and
@@ -191,31 +213,32 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 			t.Fatalf("missing fallback rename mapping %q", needle)
 		}
 	}
-	// Rename handler must remap the enabled reference before rebuilding options.
+	// Compact list + modal is the only editor: rename maps active, delete clears it.
 	for _, needle := range []string{
-		`card.getAttribute("data-channel")`,
-		"mapFallbackActiveOnRename(cur,oldName,next)",
-		`card.setAttribute("data-channel",next)`,
-		"syncFallbackActive(mapped)",
+		"function renderFallbackList()",
+		"function fallbackListRow(ch, idx)",
+		"function openFallbackModal(idx)",
+		"function saveFallbackModal()",
+		"function deleteFallbackModal()",
+		"function setFallbackActive(name)",
+		"S.fbDraft",
+		"mapFallbackActiveOnRename(String(S.fbDraft.active",
+		"fallback-active-note",
+		"fb-row",
 	} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("fallback rename handler must contain %q", needle)
+			t.Fatalf("fallback list/modal must contain %q", needle)
 		}
 	}
-	// Old buggy shape (rebuild with the stale value) must be gone.
-	if strings.Contains(html, `card.setAttribute("data-channel",nameInput.value.trim());`+"\n    syncFallbackActive($(\"c-fallback-active\").value);") {
-		t.Fatal("fallback rename must map active through mapFallbackActiveOnRename, not sync stale value directly")
+	// Expanded per-channel cards and duplicate enable buttons are gone.
+	for _, stale := range []string{"function fallbackCard(ch)", "fb-card", "启用此渠道", "btn-fallback-activate"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("expanded fallback card must stay removed: %q", stale)
+		}
 	}
-	// Delete keeps the existing clear-when-enabled semantics.
-	if !strings.Contains(html, "card.remove(); syncFallbackActive(") {
-		t.Fatal("fallback delete must keep sync-after-remove semantics")
-	}
-	// Explicit active must win over stale select value, otherwise rename A->B loses B.
-	if !strings.Contains(html, "(active!==undefined&&active!==null)?active:(sel.value") {
-		t.Fatal("syncFallbackActive must prefer the explicit active so rename A->B selects B")
-	}
-	if !strings.Contains(html, `sel.value=found?cur:""`) {
-		t.Fatal("syncFallbackActive must clear when the active name no longer exists (delete B clears)")
+	// Delete-active clears the selection.
+	if !strings.Contains(html, `if(String(S.fbDraft.active||"")===name)S.fbDraft.active=""`) {
+		t.Fatal("fallback delete must clear active when the enabled channel is removed")
 	}
 }
 
@@ -235,8 +258,11 @@ func TestWebUIConfigNoInternalCopy(t *testing.T) {
 	if !strings.Contains(html, "pool-card config-item-card") {
 		t.Fatal("pool cards must use the unified card style")
 	}
-	if !strings.Contains(html, "fb-card config-item-card") {
-		t.Fatal("fallback cards must use the unified card style")
+	if !strings.Contains(html, "fb-row") {
+		t.Fatal("fallback compact list must use fb-row")
+	}
+	if !strings.Contains(html, "fallback-modal") {
+		t.Fatal("fallback editor must use a dedicated modal")
 	}
 	if strings.Contains(html, `card.style.border="1px solid var(--line)"`) {
 		t.Fatal("dynamic cards must not carry inline temp borders")
@@ -267,8 +293,11 @@ func TestWebUIConfigDesignSystem(t *testing.T) {
 		`.fb-model-row select{min-width:0;max-width:100%;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
 		`var keyWrap=document.createElement("div"); keyWrap.className="field span-6";`,
 		`var modelWrap=document.createElement("div"); modelWrap.className="field span-6";`,
-		`(active!==undefined&&active!==null)?active:(sel.value||"")`,
 		`sel.title=sel.value`,
+		"fb-row",
+		"fallback-modal",
+		"isCustomRow",
+		"customChannelOf",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing design-system contract %q", needle)
@@ -385,6 +414,34 @@ func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
 	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("} {
 		if strings.Contains(html, sink) {
 			t.Fatalf("forbidden DOM sink %q", sink)
+		}
+	}
+}
+
+func TestWebUICustomRealtimeDisplay(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		"function isCustomRow(a)",
+		"function customChannelOf(a)",
+		`k.slice(0,7)==="custom:"`,
+		"自定义渠道",
+		`td.textContent="自定义"`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("custom realtime display must contain %q", needle)
+		}
+	}
+	// Tier/channel labels keep the custom vocabulary without breaking aggregation keys.
+	if !strings.Contains(html, `if(t==="custom")return "自定义"`) {
+		t.Fatal("tierLabel must map custom to display text")
+	}
+	if !strings.Contains(html, `if(c==="custom")return "自定义"`) {
+		t.Fatal("channelLabel must map custom to display text")
+	}
+	// Batch key chips UI stays untouched.
+	for _, needle := range []string{"server_keys-chips", "server_keys-new", "zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new", "每行新增一个密钥", "移除"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("batch key UI must stay intact: %q", needle)
 		}
 	}
 }

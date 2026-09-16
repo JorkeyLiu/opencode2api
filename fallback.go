@@ -712,9 +712,13 @@ func (g *Gateway) fallbackCustomClient() *http.Client {
 // with the existing cross-protocol paths.
 func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int) (*http.Response, modelRoute, int, error) {
 	channelProtocol := fallbackChannelProtocol(ch)
+	channelModel := strings.TrimSpace(ch.Model)
 	effectiveRoute := route
 	effectiveRoute.Tier = TierCustom
 	effectiveRoute.Protocol = channelProtocol
+	if channelModel != "" {
+		effectiveRoute.ID = channelModel
+	}
 	if isContextCancelled(ctx) {
 		return nil, effectiveRoute, attemptOffset, ctx.Err()
 	}
@@ -740,6 +744,7 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	fakeProxy := &proxyTransport{name: normalizeFallbackBaseURL(ch.BaseURL), pool: "fallback"}
 	display := "custom:" + strings.TrimSpace(ch.Name)
 	setRequestCredential(ctx, TierCustom, channelProtocol, display, "custom", false, fakeProxy)
+	setRequestModel(ctx, channelModel)
 	syncAttemptMeta(ctx, TierCustom, channelProtocol, attemptOffset, 1)
 	started := time.Now()
 	resp, sendErr := g.fallbackCustomClient().Do(req)
@@ -755,6 +760,9 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	customRoute := route
 	customRoute.Tier = TierCustom
 	customRoute.Protocol = channelProtocol
+	if channelModel != "" {
+		customRoute.ID = channelModel
+	}
 	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, "custom", false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{})
 	_ = binding
 	if sendErr != nil {
