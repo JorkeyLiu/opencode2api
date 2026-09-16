@@ -803,7 +803,7 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, binding fallbackBinding, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	effectiveRoute := route
 	effectiveRoute.Tier = TierCustom
-	effectiveRoute.Protocol = ProtocolChat
+	effectiveRoute.Protocol = fallbackChannelProtocol(FallbackChannelConfig{Protocol: binding.Protocol})
 	if binding.Name == "" {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
@@ -840,14 +840,14 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 	if full {
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom
-		effectiveRoute.Protocol = ProtocolChat
+		effectiveRoute.Protocol = fallbackChannelProtocol(ch)
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, true, nil
 	}
 	current, exists := fallbackChannelByName(g.cfg, stored.Name)
 	if !exists || !stored.matchesChannel(current) {
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom
-		effectiveRoute.Protocol = ProtocolChat
+		effectiveRoute.Protocol = fallbackChannelProtocol(FallbackChannelConfig{Protocol: stored.Protocol})
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, true, nil
 	}
 	var ex upstreamExtra

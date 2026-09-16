@@ -356,9 +356,10 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	// Apply deterministic state writes (comparative only) and transport
 	// health updates. All other outcomes remain display-only.
 	g.applyBulkWrites(ctx, results)
-	// Custom fallback channels: real minimal chat probes on the same
-	// concurrency budget. Custom results never write scheduler or transport
-	// health and never record inference metrics/history.
+	// Custom fallback channels: real minimal inference probes (per-channel
+	// chat or responses) on the same concurrency budget. Custom results never
+	// write scheduler or transport health and never record inference
+	// metrics/history.
 	customTargets := make([]bulkCustomTarget, 0, len(g.cfg.Fallback.Channels))
 	for _, ch := range g.cfg.Fallback.Channels {
 		if len(targets)+len(customTargets) >= bulkMaxTotalSends {
@@ -366,7 +367,7 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 			truncated = true
 			break
 		}
-		customTargets = append(customTargets, bulkCustomTarget{Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model, APIKey: ch.APIKey})
+		customTargets = append(customTargets, bulkCustomTarget{Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model, APIKey: ch.APIKey, Protocol: fallbackChannelProtocol(ch)})
 	}
 	customResults := make([]bulkCustomResult, len(customTargets))
 	for i, ct := range customTargets {

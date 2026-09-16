@@ -249,30 +249,41 @@
   display-only. Per-send/admin timeouts are diagnostic only. The single-proxy probe
   stays distinct (one proxy, transport connectivity target). Both update health only
   through the existing independent last-healthy protection. All configured custom
-  fallback channels are probed in the same response with their configured chat model;
+  fallback channels are probed in the same response with their configured model
+  plus channel protocol (chat → `/v1/chat/completions`, responses →
+  `/v1/responses`, via the unified API-root rule);
   custom results never write Zen/Go scheduler or transport health and never record
-  inference metrics/history. Model discovery may still use `GET {base}/v1/models`
-  but MUST never be called an availability verdict.
+  inference metrics/history. Model discovery may still use `GET {root}/v1/models`
+  (host, `/v1`, either full inference endpoint all normalize to `/v1/models`)
+  but MUST never be called an availability verdict; discovery failures keep code
+  `discover_failed` with safe `reason` (`dns_error`/`connect_refused`/`timeout`/
+  `tls_error`/`transport_error`/`non_2xx`/`invalid_json`/`empty_list`),
+  `endpoint`, `http_status`, `elapsed_ms`, never body/key/Authorization/raw error.
 - Custom session fallback: strict `fallback` config (`active` + unique-name
-  `channels` with `name`/`base_url` http-https/`api_key`/`model`; active empty or
-  referencing an existing channel) persists via config authority/RuntimeManager.Apply
+  `channels` with `name`/`base_url` http-https/`api_key`/`model`/`protocol`
+  (`chat`=Chat Completions default, `responses`=Responses; empty normalizes to
+  `chat`, other values strictly rejected); active empty or referencing an
+  existing channel) persists via config authority/RuntimeManager.Apply
   with masked GET, password-gated reveal, and full-chain redaction. Only a request
   entering with an existing anonymous session+model pin that gets HTTP 429 on the
   pinned anonymous path (live 429 or tier-qualified proxy429 local 429) may take
   over; unbound anonymous 429 and authenticated-pin 429 never trigger. Without an
   active channel the original 429 stands; with one, the current request retries at
-  once through the then-active custom OpenAI-compatible chat channel (`{base}/v1/chat/completions`,
-  Bearer key, client entry converted to chat via the strict bridge with model rewritten
-  to the channel model, response/stream transcoded back; never listed in public
-  `/v1/models`; no supplier session affinity; never touches Zen/Go scheduler layers)
+  once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
+  for chat, `{root}/v1/responses` for responses via the unified API-root rule,
+  Bearer key, client entry converted to the channel protocol via the strict bridge
+  with model rewritten to the channel model, response/stream transcoded back;
+  never listed in public `/v1/models`; no supplier session affinity; never touches
+  Zen/Go scheduler layers)
   and the session binds first to that full channel identity (name + normalized base
-  URL/authority + key fingerprint/identity + configured model) so later requests for
-  the session serve exclusively there without drifting on active switches. Custom
-  errors return as-is with no fallback to native or other custom channels. Takeover
-  state is session-keyed (not session+model), process-lifetime, unpersisted,
-  unprojected, unexpired, bounded 4096, first-wins, capacity-502 without claiming
-  unrecorded takeover; hot Apply migrates without validity filtering as tombstones and
-  a deleted/identity-mismatched channel fails locally with 502. Restart clears.
+  URL/authority + key fingerprint/identity + configured model + protocol) so later
+  requests for the session serve exclusively there without drifting on active
+  switches. Custom errors return as-is with no fallback to native or other custom
+  channels. Takeover state is session-keyed (not session+model), process-lifetime,
+  unpersisted, unprojected, unexpired, bounded 4096, first-wins, capacity-502
+  without claiming unrecorded takeover; hot Apply migrates without validity
+  filtering as tombstones and a deleted/identity-mismatched (including protocol
+  change) channel fails locally with 502. Restart clears.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
   per-model target cooldowns, proxy429 cooldowns, channel cooldowns, and credential429

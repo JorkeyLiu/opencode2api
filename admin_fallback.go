@@ -9,10 +9,11 @@ import (
 )
 
 type FallbackChannelView struct {
-	Name    string     `json:"name"`
-	BaseURL string     `json:"base_url"`
-	APIKey  SecretView `json:"api_key"`
-	Model   string     `json:"model"`
+	Name     string     `json:"name"`
+	BaseURL  string     `json:"base_url"`
+	APIKey   SecretView `json:"api_key"`
+	Model    string     `json:"model"`
+	Protocol Protocol   `json:"protocol"`
 }
 
 type FallbackView struct {
@@ -21,10 +22,11 @@ type FallbackView struct {
 }
 
 type FallbackChannelInput struct {
-	Name    string      `json:"name"`
-	BaseURL string      `json:"base_url"`
-	APIKey  SecretInput `json:"api_key"`
-	Model   string      `json:"model"`
+	Name     string      `json:"name"`
+	BaseURL  string      `json:"base_url"`
+	APIKey   SecretInput `json:"api_key"`
+	Model    string      `json:"model"`
+	Protocol Protocol    `json:"protocol"`
 }
 
 type FallbackInput struct {
@@ -36,10 +38,11 @@ func fallbackViewFromConfig(cfg Config) FallbackView {
 	view := FallbackView{Active: cfg.Fallback.Active, Channels: []FallbackChannelView{}}
 	for _, ch := range cfg.Fallback.Channels {
 		view.Channels = append(view.Channels, FallbackChannelView{
-			Name:    ch.Name,
-			BaseURL: ch.BaseURL,
-			APIKey:  SecretView{ID: secretFingerprint(ch.APIKey), Display: maskValue(ch.APIKey)},
-			Model:   ch.Model,
+			Name:     ch.Name,
+			BaseURL:  ch.BaseURL,
+			APIKey:   SecretView{ID: secretFingerprint(ch.APIKey), Display: maskValue(ch.APIKey)},
+			Model:    ch.Model,
+			Protocol: fallbackChannelProtocol(ch),
 		})
 	}
 	if view.Channels == nil {
@@ -103,7 +106,7 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 		default:
 			return FallbackConfig{}, errors.New("fallback channel api_key must contain id or value")
 		}
-		out.Channels = append(out.Channels, FallbackChannelConfig{Name: name, BaseURL: base, APIKey: key, Model: model})
+		out.Channels = append(out.Channels, FallbackChannelConfig{Name: name, BaseURL: base, APIKey: key, Model: model, Protocol: ch.Protocol})
 	}
 	if err := validateFallbackConfig(&out); err != nil {
 		return FallbackConfig{}, err
@@ -128,20 +131,59 @@ type fallbackDiscoverResponse struct {
 }
 
 func (a *AdminServer) logFallbackDiscover(channel, base, result string, success bool) {
+	a.logFallbackDiscoverDetailed(channel, base, result, "", 0, 0, success)
+}
+
+// logFallbackDiscoverDetailed records the redacted discovery audit: channel
+// name, redacted endpoint/base, result enum, safe reason, HTTP status, and
+// elapsed_ms. It never logs key material, Authorization values, request
+// bodies, upstream body text, or raw transport errors.
+func (a *AdminServer) logFallbackDiscoverDetailed(channel, base, result, reason string, httpStatus int, elapsedMS int64, success bool) {
 	if a == nil || a.logger == nil {
 		return
 	}
-	// Redacted audit: channel name + redactURL(base) + result only. Never log
-	// key material, Authorization values, or request bodies.
 	fields := []any{
 		"component", "fallback", "event", "fallback_discover_completed",
 		"channel", channel, "base_url", redactURL(base), "result", result,
+	}
+	if reason != "" {
+		fields = append(fields, "reason", reason)
+	}
+	if httpStatus != 0 {
+		fields = append(fields, "http_status", httpStatus)
+	}
+	if elapsedMS != 0 {
+		fields = append(fields, "elapsed_ms", elapsedMS)
 	}
 	if success {
 		a.logger.Info("fallback model discovery completed", fields...)
 	} else {
 		a.logger.Warn("fallback model discovery completed", fields...)
 	}
+}
+
+// writeFallbackDiscoverError keeps code discover_failed for compatibility and
+// adds the safe structured fields reason/endpoint/http_status/elapsed_ms.
+// Endpoint is already redacted; message stays generic and never echoes key
+// material, upstream body, or raw errors.
+func writeFallbackDiscoverError(w http.ResponseWriter, detail *fallbackDiscoverError) {
+	endpoint := ""
+	reason := fallbackDiscoverTransport
+	var httpStatus int
+	var elapsedMS int64
+	if detail != nil {
+		endpoint = detail.Endpoint
+		if detail.Reason != "" {
+			reason = detail.Reason
+		}
+		httpStatus = detail.HTTPStatus
+		elapsedMS = detail.ElapsedMS
+	}
+	payload := map[string]any{"code": "discover_failed", "message": "model discovery failed", "reason": reason, "endpoint": endpoint, "elapsed_ms": elapsedMS}
+	if httpStatus != 0 {
+		payload["http_status"] = httpStatus
+	}
+	writeJSON(w, http.StatusBadGateway, map[string]any{"error": payload})
 }
 
 func (a *AdminServer) handleFallbackDiscover(w http.ResponseWriter, r *http.Request) {
@@ -248,6 +290,11 @@ func (a *AdminServer) handleFallbackDiscover(w http.ResponseWriter, r *http.Requ
 	models, err := fetchFallbackModels(ctx, nil, base, key)
 	if err != nil {
 		// Never leak key material or upstream body text.
+		if detail, ok := asFallbackDiscoverError(err); ok {
+			a.logFallbackDiscoverDetailed(channelName, detail.Endpoint, "discover_failed", detail.Reason, detail.HTTPStatus, detail.ElapsedMS, false)
+			writeFallbackDiscoverError(w, detail)
+			return
+		}
 		a.logFallbackDiscover(channelName, base, "discover_failed", false)
 		writeAdminError(w, http.StatusBadGateway, "discover_failed", "model discovery failed")
 		return

@@ -16,6 +16,9 @@
     "zen": "shared",
     "go": "shared"
   },
+  // fallback channels: protocol "chat" (Chat Completions, default) or "responses" (Responses).
+  // base supports host, host/v1, or the matching full endpoint; e.g.
+  // {"name":"c1","base_url":"https://...","api_key":"...","model":"...","protocol":"chat"}.
   "fallback": {
     "active": "",
     "channels": []

@@ -110,8 +110,30 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .link{background:none;border:none;color:var(--accent);text-decoration:underline;padding:0;font-size:12px;font-family:var(--mono)}
 .compact-id{font-family:var(--mono);font-size:12px}
 .rowcopy{margin-left:6px}
+.config-hero h2{font-size:16px}
+.config-card h2{font-size:15px;margin:0}
+.config-card .cap{font-size:12.5px;color:var(--muted);margin:2px 0 12px}
+.config-card .field label{display:block;font-size:13px;color:#33403a;font-weight:600;margin-bottom:4px}
+.config-card .field .note{font-weight:400}
+.config-card input,.config-card select,.config-card textarea{min-height:34px}
+.config-card input[type="checkbox"]{min-height:0}
+.config-item-card{border:1px solid var(--line);background:#fbfcfb;padding:10px 12px;margin-bottom:10px;min-width:0}
+.config-item-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.config-item-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 14px;min-width:0}
+.config-item-card input,.config-item-card select,.config-item-card textarea{width:100%;padding:7px 9px;border:1px solid var(--line2);background:#fff;color:var(--ink);min-height:34px;min-width:0}
+.config-item-card textarea{min-height:56px;resize:vertical}
+.url-preview{font-family:var(--mono);font-size:12px;color:#33403a;background:#fff;border:1px solid var(--line);padding:7px 9px;word-break:break-all;white-space:normal}
+.url-preview .lbl{color:var(--muted)}
+.fb-err,.pool-err{color:var(--bad);font-size:12.5px}
+.key-row{display:flex;gap:8px;align-items:center}
+.key-row input{flex:1;min-width:0}
+details.advanced{border:1px solid var(--line);padding:8px 10px;background:#fbfcfb}
+details.advanced summary{cursor:pointer;font-size:13px;font-weight:600;color:#33403a}
+.config-sticky{position:sticky;bottom:0;z-index:10;background:#fff;border:1px solid var(--line2);padding:10px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.config-sticky .primary{padding:8px 18px;font-weight:700}
 @media (max-width:1100px){
   .grid2,.grid3,.grid4,.form-grid,.facts,.trend-grid{grid-template-columns:1fr}
+  .config-item-grid{grid-template-columns:1fr}
   .layout{flex-direction:column;min-height:auto}
   .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
@@ -255,7 +277,7 @@ table.table td.wrap{white-space:normal;word-break:break-all}
         <div class="note" id="targets-note"></div>
       </div>
       <div class="section">
-        <h2>自定义 Fallback 可用性</h2>
+        <h2>备用模型渠道可用性</h2>
         <div class="cap">全部自定义渠道真实最小推理探测（chat，stream:false，约 1 token）。不写入 Zen/Go 调度与传输健康。模型发现仍可用 GET /v1/models，但绝不作为可用性判定；无目录探测模型时报告 no_model/inconclusive。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>渠道</th><th>地址</th><th>模型</th><th>状态</th><th>原因</th><th>上次检测</th></tr></thead><tbody id="tbody-custom"></tbody></table></div>
         <div class="note" id="custom-note"></div>
@@ -288,37 +310,73 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 
     <!-- 配置 -->
     <section id="tab-config" class="hidden">
-      <div class="section">
-        <h2>配置编辑 / 保存 / 重载</h2>
-        <div class="cap">修改运行配置。保存时自动校验，失败保留原配置；监听地址需重启生效。</div>
-        <form id="config-form">
+      <div class="section config-hero">
+        <h2>系统配置</h2>
+        <div class="cap">按任务分组查看与修改运行配置。保存时自动校验，失败保留原配置；监听地址与管理开关需重启生效。顶部提示栏会显示需重启的已保存项。</div>
+      </div>
+      <form id="config-form">
+        <div class="section config-card">
+          <h2>接入与鉴权</h2>
+          <div class="cap">决定请求优先走哪个上游，以及匿名试用与各类密钥是否可用。</div>
           <div class="form-grid">
-            <div class="field"><label>认证密钥首选上游</label><select id="c-prefer"><option value="go">Go（失败回退 Zen）</option><option value="zen">Zen（失败回退 Go）</option></select></div>
-            <div class="field"><label>API 监听地址（需重启）</label><input id="c-listen"></div>
-            <div class="field"><label>WebUI 监听地址（需重启）</label><input id="c-web-listen"></div>
-            <div class="field"><label>管理会话有效期（分钟）</label><input id="c-session" type="number" min="1"></div>
-            <div class="field full hidden"><label>WebUI 是否启用</label><input id="c-web-enabled" type="checkbox"></div>
-            <div class="field full"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div>
+            <div class="field"><label>首选上游顺序</label><select id="c-prefer"><option value="go">Go（失败回退 Zen）</option><option value="zen">Zen（失败回退 Go）</option></select></div>
+            <div class="field"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div>
             <div class="field full"><label>服务端密钥（掩码标签；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个密钥"></textarea></div>
             <div class="field"><label>Zen 密钥</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个密钥"></textarea></div>
             <div class="field"><label>Go 密钥</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个密钥"></textarea></div>
-            <div class="field full"><label>具名代理池（代理池名为稳定标识，禁止用 IP/URL 命名；条目仍是代理节点，支持 direct、HTTP(S)、SOCKS5(H)；节点名≠出口 IP）</label><div class="note">未被匿名 / Zen / Go 引用的池为暂存配置，不运行、不可探测、不计容量；仅被引用的池为运行时资源。</div><div id="pools-editor" class="scroll-bound"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增代理池</button></div><div class="note" id="pools-error"></div></div>
+          </div>
+        </div>
+        <div class="section config-card">
+          <h2>代理池与路由</h2>
+          <div class="cap">具名代理池是稳定的池标识，被匿名 / Zen / Go 选中的池为运行中，其余为暂存：不运行、不可探测、不计容量。条目为代理节点，支持 direct、HTTP(S)、SOCKS5(H)；节点名不代表出口 IP。</div>
+          <div class="form-grid">
             <div class="field"><label>匿名路由池</label><select id="c-route-anon"></select></div>
             <div class="field"><label>Zen 路由池</label><select id="c-route-zen"></select></div>
             <div class="field"><label>Go 路由池</label><select id="c-route-go"></select></div>
-            <div class="field full"><label>自定义 Fallback 渠道（OpenAI-compatible chat；仅 pinned 匿名 429 接管，会话级固化，不随 active 漂移）</label><div class="note">命名唯一；active 可空，非空必须引用现有渠道。base_url 仅 http/https。激活走配置保存/应用持久化。</div><div id="fallback-editor" class="scroll-bound"></div><div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><select id="c-fallback-active"></select><button class="ghost" id="btn-fallback-activate" type="button">激活所选渠道</button><button class="ghost" id="btn-fallback-clear" type="button">清空激活</button></div><div class="note" id="fallback-error"></div></div>
+            <div class="field full"><label>具名代理池（代理池名为稳定标识，禁止用 IP/URL 命名；条目仍是代理节点，支持 direct、HTTP(S)、SOCKS5(H)；节点名≠出口 IP）</label><div id="pools-editor"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增代理池</button></div><div class="note" id="pools-error"></div></div>
+          </div>
+        </div>
+        <div class="section config-card">
+          <h2>备用模型渠道</h2>
+          <div class="cap">当匿名渠道在已有对话中暂时不可用时，可由已启用的备用渠道继续处理。渠道名称唯一，基础地址仅支持 HTTP/HTTPS，需填写模型与 API 密钥；启用选择经保存后生效。</div>
+          <div id="fallback-editor"></div>
+          <div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><label>当前启用渠道 <select id="c-fallback-active"></select></label><button class="ghost" id="btn-fallback-activate" type="button">启用所选渠道</button><button class="ghost" id="btn-fallback-clear" type="button">停用备用渠道</button></div>
+          <div class="note" id="fallback-error"></div>
+        </div>
+        <div class="section config-card">
+          <h2>上游服务与重试</h2>
+          <div class="cap">上游服务地址与单密钥重试预算、请求超时。修改后立即生效。</div>
+          <div class="form-grid">
             <div class="field"><label>Zen 地址（URL）</label><input id="c-up-zen"></div>
             <div class="field"><label>Go 地址（URL）</label><input id="c-up-go"></div>
             <div class="field"><label>每个密钥上游最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
             <div class="field"><label>请求超时（秒）</label><input id="c-timeout" type="number" min="1"></div>
+          </div>
+        </div>
+        <div class="section config-card">
+          <h2>模型目录</h2>
+          <div class="cap">模型列表刷新周期；协议覆盖为高级 JSON，一般无需修改。</div>
+          <div class="form-grid">
             <div class="field"><label>模型刷新（秒）</label><input id="c-refresh" type="number" min="10"></div>
-            <div class="field full"><label>模型协议手动指定（JSON）</label><textarea id="c-protocols" class="mono scroll-bound" spellcheck="false"></textarea></div>
+            <div class="field full"><details class="advanced"><summary>协议覆盖（JSON，高级）</summary><div class="note">手动指定模型协议，JSON 格式，保存时校验。</div><textarea id="c-protocols" class="mono scroll-bound" spellcheck="false"></textarea></details></div>
+          </div>
+        </div>
+        <div class="section config-card">
+          <h2>网络与性能</h2>
+          <div class="cap">连接池与超时参数。修改后立即生效。</div>
+          <div class="form-grid">
             <div class="field"><label>最大空闲连接数</label><input id="c-idle" type="number"></div>
             <div class="field"><label>单主机最大空闲连接数</label><input id="c-idle-host" type="number"></div>
             <div class="field"><label>单主机最大连接数</label><input id="c-max-host" type="number"></div>
             <div class="field"><label>空闲超时（秒）</label><input id="c-idle-timeout" type="number"></div>
             <div class="field"><label>连接超时（秒）</label><input id="c-connect" type="number"></div>
             <div class="field"><label>失败冷却（秒）</label><input id="c-cooldown" type="number"></div>
+          </div>
+        </div>
+        <div class="section config-card">
+          <h2>日志与历史</h2>
+          <div class="cap">日志级别与内存保留，以及重启后仍可查询的持久历史。</div>
+          <div class="form-grid">
             <div class="field"><label>日志级别</label><select id="c-level"><option value="debug">调试</option><option value="info">信息</option><option value="warn">警告</option><option value="error">错误</option></select></div>
             <div class="field"><label>日志缓存条数</label><input id="c-ring" type="number" min="100" max="50000"></div>
             <div class="field full"><label class="check-label"><input id="c-hist-enabled" type="checkbox"><span>启用历史记录（重启后仍可查询）</span></label></div>
@@ -326,13 +384,24 @@ table.table td.wrap{white-space:normal;word-break:break-all}
             <div class="field"><label>历史保留天数（1-90）</label><input id="c-hist-retention" type="number" min="1" max="90"></div>
             <div class="field"><label>历史上限 MB（16-2048）</label><input id="c-hist-max" type="number" min="16" max="2048"></div>
           </div>
-          <div class="actions">
-            <button class="primary" type="submit">验证、保存并应用</button>
-            <button class="ghost" id="btn-reload" type="button">从磁盘重载</button>
-            <button class="ghost" id="btn-reveal" type="button">二次验证查看敏感值</button>
+        </div>
+        <div class="section config-card">
+          <h2>监听与管理</h2>
+          <div class="cap">网关与管理面监听地址、管理会话有效期。保存后需重启进程才生效。</div>
+          <div class="form-grid">
+            <div class="field"><label>API 监听地址（需重启）</label><input id="c-listen"></div>
+            <div class="field"><label>WebUI 监听地址（需重启）</label><input id="c-web-listen"></div>
+            <div class="field"><label>管理会话有效期（分钟）</label><input id="c-session" type="number" min="1"></div>
+            <div class="field full hidden"><label>WebUI 是否启用</label><input id="c-web-enabled" type="checkbox"></div>
           </div>
-        </form>
-      </div>
+        </div>
+        <div class="config-sticky">
+          <button class="primary" type="submit">验证、保存并应用</button>
+          <button class="ghost" id="btn-reload" type="button">从磁盘重载</button>
+          <button class="ghost" id="btn-reveal" type="button">二次验证查看敏感值</button>
+          <span class="note">保存前会自动校验；监听类修改需重启。</span>
+        </div>
+      </form>
     </section>
   </main>
   </div>
@@ -1123,74 +1192,201 @@ function fallbackChannelNames(){
 }
 function syncFallbackActive(active){
   var sel=$("c-fallback-active"); if(!sel)return; var cur=sel.value||active||""; clear(sel);
-  var empty=document.createElement("option"); empty.value=""; empty.textContent="(无激活)"; sel.appendChild(empty);
+  var empty=document.createElement("option"); empty.value=""; empty.textContent="(未启用)"; sel.appendChild(empty);
   fallbackChannelNames().forEach(function(n){ if(!n)return; var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o); });
   if(cur){ var found=false; for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===cur)found=true; sel.value=found?cur:""; } else sel.value="";
 }
+function fallbackNormalizeBase(raw){ return String(raw||"").trim().replace(/\/+$/,""); }
+function fallbackAPIRoot(normalized){
+  normalized=fallbackNormalizeBase(normalized);
+  if(!normalized)return "";
+  if(normalized.slice(-10)==="/v1/models")return normalized.slice(0,-10);
+  if(normalized.slice(-20)==="/v1/chat/completions")return normalized.slice(0,-20);
+  if(normalized.slice(-13)==="/v1/responses")return normalized.slice(0,-13);
+  if(normalized.slice(-17)==="/chat/completions")return normalized.slice(0,-17);
+  if(normalized.slice(-10)==="/responses")return normalized.slice(0,-10);
+  if(normalized.slice(-3)==="/v1")return normalized.slice(0,-3);
+  return normalized;
+}
+function fallbackModelsURL(base){
+  var normalized=fallbackNormalizeBase(base);
+  if(!normalized)return "";
+  var root=fallbackAPIRoot(normalized);
+  if(!root)return "";
+  if(normalized.slice(-10)==="/v1/models")return normalized;
+  return root+"/v1/models";
+}
+function fallbackEndpointURL(base, protocol){
+  var normalized=fallbackNormalizeBase(base);
+  if(!normalized)return "";
+  var root=fallbackAPIRoot(normalized);
+  if(!root)return "";
+  if(String(protocol||"chat").toLowerCase()==="responses")return root+"/v1/responses";
+  return root+"/v1/chat/completions";
+}
+function fallbackProtocolValue(ch){ var p=String((ch&&ch.protocol)||"chat").trim().toLowerCase(); if(p==="responses")return "responses"; return "chat"; }
+function fallbackDiscoverReasonCN(reason, httpStatus){
+  reason=String(reason||"");
+  if(reason==="dns_error")return "DNS解析失败";
+  if(reason==="connect_refused")return "连接被拒绝";
+  if(reason==="timeout")return "请求超时";
+  if(reason==="tls_error")return "TLS错误";
+  if(reason==="invalid_json")return "响应不是有效JSON";
+  if(reason==="empty_list")return "模型列表为空";
+  if(reason==="non_2xx"){ if(httpStatus)return "上游HTTP "+httpStatus; return "上游请求失败"; }
+  if(reason==="invalid_request")return "请求参数无效";
+  if(reason==="transport_error")return "网络传输失败";
+  return "模型发现失败";
+}
 function fallbackCard(ch){
-  ch=ch||{name:"",base_url:"",api_key:{id:"",display:""},model:""};
-  var card=document.createElement("div"); card.className="fb-card"; card.setAttribute("data-channel",ch.name||"");
-  card.style.border="1px solid var(--line)"; card.style.padding="8px 10px"; card.style.marginBottom="8px";
-  var head=document.createElement("div"); head.style.display="flex"; head.style.gap="8px"; head.style.alignItems="center"; head.style.flexWrap="wrap";
-  head.appendChild(el("strong","渠道"));
-  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.style.maxWidth="160px"; head.appendChild(nameInput);
+  ch=ch||{name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat"};
+  var card=document.createElement("div"); card.className="fb-card config-item-card"; card.setAttribute("data-channel",ch.name||"");
+  var head=document.createElement("div"); head.className="config-item-head";
+  head.appendChild(el("strong","备用渠道"));
+  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.style.maxWidth="180px"; head.appendChild(nameInput);
+  var act=document.createElement("button"); act.type="button"; act.className="ghost"; act.textContent="启用此渠道";
+  act.addEventListener("click",function(){
+    var n=nameInput.value.trim(); if(!n){toast("渠道名称不能为空",true);return;}
+    var sel=$("c-fallback-active"); syncFallbackActive(n); if(sel)sel.value=n;
+    toast("已选择启用 "+n+"，保存后生效");
+  });
+  head.appendChild(act);
   var del=document.createElement("button"); del.type="button"; del.className="ghost"; del.textContent="删除渠道";
   del.addEventListener("click",function(){ card.remove(); syncFallbackActive($("c-fallback-active").value); });
   head.appendChild(del);
-  var act=document.createElement("button"); act.type="button"; act.className="ghost"; act.textContent="激活此渠道";
-  act.addEventListener("click",function(){
-    var n=nameInput.value.trim(); if(!n){toast("渠道名不能为空",true);return;}
-    var sel=$("c-fallback-active"); syncFallbackActive(n); if(sel)sel.value=n;
-  });
-  head.appendChild(act);
   card.appendChild(head);
-  var grid=document.createElement("div"); grid.className="form-grid";
+  var grid=document.createElement("div"); grid.className="config-item-grid";
+  var nameWrap=document.createElement("div"); nameWrap.className="field";
+  var nameLabel=document.createElement("label"); nameLabel.textContent="渠道名称"; nameWrap.appendChild(nameLabel);
+  var nameHint=document.createElement("div"); nameHint.className="note"; nameHint.textContent="在上方标题行编辑，与启用选择联动。"; nameWrap.appendChild(nameHint);
+  grid.appendChild(nameWrap);
+  var protoWrap=document.createElement("div"); protoWrap.className="field";
+  var protoLabelEl=document.createElement("label"); protoLabelEl.textContent="接口协议"; protoWrap.appendChild(protoLabelEl);
+  var protoSel=document.createElement("select"); protoSel.setAttribute("data-role","fb-protocol");
+  var optChat=document.createElement("option"); optChat.value="chat"; optChat.textContent="Chat Completions"; protoSel.appendChild(optChat);
+  var optResp=document.createElement("option"); optResp.value="responses"; optResp.textContent="Responses"; protoSel.appendChild(optResp);
+  protoSel.value=fallbackProtocolValue(ch);
+  protoWrap.appendChild(protoSel);
+  grid.appendChild(protoWrap);
   var baseWrap=document.createElement("div"); baseWrap.className="field";
-  var baseLabel=document.createElement("label"); baseLabel.textContent="base_url（http/https）"; baseWrap.appendChild(baseLabel);
-  var baseInput=document.createElement("input"); baseInput.value=ch.base_url||""; baseInput.placeholder="https://api.example.com"; baseInput.setAttribute("data-role","fb-base"); baseWrap.appendChild(baseInput);
+  var baseLabel=document.createElement("label"); baseLabel.textContent="基础地址（URL）"; baseWrap.appendChild(baseLabel);
+  var baseInput=document.createElement("input"); baseInput.value=ch.base_url||""; baseInput.placeholder="https://api.example.com"; baseInput.setAttribute("data-role","fb-base"); baseInput.setAttribute("inputmode","url"); baseWrap.appendChild(baseInput);
+  var baseHint=document.createElement("div"); baseHint.className="note"; baseHint.textContent="仅支持 HTTP/HTTPS，可填服务地址、/v1 或完整请求地址。"; baseWrap.appendChild(baseHint);
   grid.appendChild(baseWrap);
   var modelWrap=document.createElement("div"); modelWrap.className="field";
-  var modelLabel=document.createElement("label"); modelLabel.textContent="模型（渠道配置模型）"; modelWrap.appendChild(modelLabel);
+  var modelLabel=document.createElement("label"); modelLabel.textContent="模型"; modelWrap.appendChild(modelLabel);
   var modelInput=document.createElement("input"); modelInput.value=ch.model||""; modelInput.placeholder="provider-model"; modelInput.setAttribute("data-role","fb-model"); modelWrap.appendChild(modelInput);
   grid.appendChild(modelWrap);
   var keyWrap=document.createElement("div"); keyWrap.className="field";
-  var keyLabel=document.createElement("label"); keyLabel.textContent="api_key（掩码保留，填新值替换）"; keyWrap.appendChild(keyLabel);
-  var keyInfo=document.createElement("div"); keyInfo.className="note";
-  keyInfo.appendChild(document.createTextNode("已保存："+(((ch.api_key||{}).display)||"—")));
+  var keyLabel=document.createElement("label"); keyLabel.textContent="API 密钥"; keyWrap.appendChild(keyLabel);
+  var keyInfo=document.createElement("div"); keyInfo.className="note"; keyInfo.setAttribute("data-role","fb-key-status");
+  var savedDisplay=((ch.api_key||{}).display)||"";
+  keyInfo.appendChild(document.createTextNode(savedDisplay?("已保存密钥："+savedDisplay):"未设置，需填写后保存"));
   keyWrap.appendChild(keyInfo);
-  var keyInput=document.createElement("input"); keyInput.placeholder="留空保留已保存值，或填新 key"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="off"; keyWrap.appendChild(keyInput);
+  var keyRow=document.createElement("div"); keyRow.className="key-row";
+  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.value=""; keyInput.placeholder="留空保留已保存值，或填新密钥"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="off"; keyRow.appendChild(keyInput);
+  var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="ghost"; keyToggle.textContent="显示"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyRow.appendChild(keyToggle);
+  keyWrap.appendChild(keyRow);
+  var keyHint=document.createElement("div"); keyHint.className="note"; keyHint.setAttribute("data-role","fb-key-hint"); keyWrap.appendChild(keyHint);
+  keyToggle.addEventListener("click",function(){
+    if(keyInput.type==="password"){ keyInput.type="text"; keyToggle.textContent="隐藏"; }
+    else { keyInput.type="password"; keyToggle.textContent="显示"; }
+  });
+  keyInput.addEventListener("input",function(){
+    clear(keyHint);
+    if(keyInput.value.trim())keyHint.appendChild(document.createTextNode("保存后将替换已保存密钥"));
+  });
   var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=((ch.api_key||{}).id)||""; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
   grid.appendChild(keyWrap);
-  var discWrap=document.createElement("div"); discWrap.className="field";
-  var discLabel=document.createElement("label"); discLabel.textContent="模型发现（GET base/v1/models，仅下拉）"; discWrap.appendChild(discLabel);
-  var discRow=document.createElement("div"); discRow.style.display="flex"; discRow.style.gap="8px";
-  var discBtn=document.createElement("button"); discBtn.type="button"; discBtn.className="ghost"; discBtn.textContent="获取模型列表";
+  var prevWrap=document.createElement("div"); prevWrap.className="field"; prevWrap.style.gridColumn="1/-1";
+  var prevLabel=document.createElement("label"); prevLabel.textContent="完整地址预览"; prevWrap.appendChild(prevLabel);
+  var prevModels=document.createElement("div"); prevModels.className="url-preview"; prevModels.setAttribute("data-role","fb-url-preview"); prevWrap.appendChild(prevModels);
+  var prevModelsRow=document.createElement("div"); prevModelsRow.setAttribute("data-role","fb-url-models"); prevModels.appendChild(prevModelsRow);
+  var prevReqRow=document.createElement("div"); prevReqRow.setAttribute("data-role","fb-url-request"); prevModels.appendChild(prevReqRow);
+  grid.appendChild(prevWrap);
+  var discWrap=document.createElement("div"); discWrap.className="field"; discWrap.style.gridColumn="1/-1";
+  var discLabel=document.createElement("label"); discLabel.textContent="模型发现"; discWrap.appendChild(discLabel);
+  var discRow=document.createElement("div"); discRow.className="key-row";
+  var discBtn=document.createElement("button"); discBtn.type="button"; discBtn.className="ghost"; discBtn.textContent="获取模型列表"; discBtn.setAttribute("data-role","fb-discover");
   var discSel=document.createElement("select"); discSel.setAttribute("data-role","fb-models"); discSel.style.flex="1";
-  var discUse=document.createElement("button"); discUse.type="button"; discUse.className="ghost"; discUse.textContent="选用";
+  var discUse=document.createElement("button"); discUse.type="button"; discUse.className="ghost"; discUse.textContent="选用"; discUse.setAttribute("data-role","fb-use-model");
+  discRow.appendChild(discBtn); discRow.appendChild(discSel); discRow.appendChild(discUse);
+  discWrap.appendChild(discRow);
+  var discStatus=document.createElement("div"); discStatus.className="note"; discStatus.setAttribute("data-role","fb-discover-status"); discWrap.appendChild(discStatus);
+  grid.appendChild(discWrap);
+  card.appendChild(grid);
+  function updatePreview(){
+    var base=baseInput.value.trim();
+    var proto=protoSel.value||"chat";
+    clear(prevModelsRow); clear(prevReqRow);
+    if(!base){
+      prevModelsRow.appendChild(document.createTextNode("模型列表地址：—"));
+      prevReqRow.appendChild(document.createTextNode("请求地址：—"));
+      return;
+    }
+    prevModelsRow.appendChild(document.createTextNode("模型列表地址："+(fallbackModelsURL(base)||"—")));
+    prevReqRow.appendChild(document.createTextNode("请求地址："+(fallbackEndpointURL(base,proto)||"—")));
+  }
+  baseInput.addEventListener("input",updatePreview);
+  protoSel.addEventListener("change",updatePreview);
+  updatePreview();
   discBtn.addEventListener("click",function(){
     var base=baseInput.value.trim();
     var nv=keyInput.value.trim();
     var payload={base_url:base,channel:card.getAttribute("data-channel")||undefined};
     if(nv)payload.api_key={value:nv};
     else if(keyHidden.value)payload.api_key={id:keyHidden.value};
-    else { toast("请先填写 api_key 或保留已保存值",true); return; }
-    if(!base){ toast("请先填写 base_url",true); return; }
+    else { clear(discStatus); discStatus.appendChild(document.createTextNode("请先填写 API 密钥，或保留已保存值")); toast("请先填写 API 密钥，或保留已保存值",true); return; }
+    if(!base){ clear(discStatus); discStatus.appendChild(document.createTextNode("请先填写基础地址")); toast("请先填写基础地址",true); return; }
     discBtn.disabled=true; discBtn.textContent="获取中…";
-    api("/api/fallback/discover",{method:"POST",body:JSON.stringify(payload)}).then(function(res){
+    clear(discStatus); discStatus.appendChild(document.createTextNode("正在获取模型列表…"));
+    (function(){
+      var headers={"Accept":"application/json","Content-Type":"application/json"};
+      if(S.csrf)headers["X-CSRF-Token"]=S.csrf;
+      return fetch("/api/fallback/discover",{method:"POST",headers:headers,body:JSON.stringify(payload)}).then(function(resp){
+        return resp.json().catch(function(){return {};}).then(function(data){
+          if(!resp.ok){
+            var errObj=(data&&data.error)||{};
+            var reason=String(errObj.reason||"");
+            var httpStatus=Number(errObj.http_status||0)||0;
+            var endpoint=String(errObj.endpoint||"");
+            var elapsed=errObj.elapsed_ms;
+            var msg=fallbackDiscoverReasonCN(reason,httpStatus);
+            var detail="（"+msg;
+            if(httpStatus)detail+="，HTTP "+httpStatus;
+            if(endpoint)detail+="，"+endpoint;
+            if(elapsed!==undefined&&elapsed!==null&&elapsed!=="")detail+="，耗时 "+elapsed+" ms";
+            detail+="）";
+            var ex=new Error(msg);
+            ex.fbDetail=detail; ex.fbReason=reason; ex.fbStatus=httpStatus;
+            throw ex;
+          }
+          return data;
+        });
+      });
+    })().then(function(res){
       clear(discSel);
       (res.models||[]).forEach(function(m){ var o=document.createElement("option"); o.value=m; o.textContent=m; discSel.appendChild(o); });
-      if(!(res.models||[]).length)toast("未返回模型",true);
-    }).catch(function(err){ toast("模型发现失败："+err.message,true); })
+      clear(discStatus);
+      if(!(res.models||[]).length){ discStatus.appendChild(document.createTextNode("模型列表为空")); toast("未返回模型",true); }
+      else discStatus.appendChild(document.createTextNode("已获取 "+(res.models||[]).length+" 个模型，请从下拉中选用"));
+    }).catch(function(err){
+      var msg=String((err&&err.message)||"模型发现失败");
+      if(err&&err.fbDetail)msg=err.fbDetail;
+      clear(discStatus); discStatus.appendChild(document.createTextNode(msg));
+      toast(msg,true);
+    })
     .then(function(){ discBtn.disabled=false; discBtn.textContent="获取模型列表"; });
   });
-  discUse.addEventListener("click",function(){ if(discSel.value)modelInput.value=discSel.value; });
-  discRow.appendChild(discBtn); discRow.appendChild(discSel); discRow.appendChild(discUse);
-  discWrap.appendChild(discRow);
-  grid.appendChild(discWrap);
-  card.appendChild(grid);
+  discUse.addEventListener("click",function(){ if(discSel.value){ modelInput.value=discSel.value; clear(discStatus); discStatus.appendChild(document.createTextNode("已选用模型，请保存后生效")); } });
   nameInput.addEventListener("change",function(){
-    card.setAttribute("data-channel",nameInput.value.trim());
-    syncFallbackActive($("c-fallback-active").value);
+    var oldName=card.getAttribute("data-channel")||"";
+    var next=nameInput.value.trim();
+    var sel=$("c-fallback-active");
+    var cur=sel?sel.value:"";
+    var mapped=mapFallbackActiveOnRename(cur,oldName,next);
+    card.setAttribute("data-channel",next);
+    syncFallbackActive(mapped);
   });
   return card;
 }
@@ -1262,6 +1458,10 @@ function mapRoutingOnRename(sel, oldName, newName){
   if(out.g===oldName)out.g=newName;
   return out;
 }
+function mapFallbackActiveOnRename(active, oldName, newName){
+  if(active===oldName)return newName;
+  return active;
+}
 function duplicatePoolName(names){
   var seen={};
   for(var i=0;i<names.length;i++){
@@ -1271,12 +1471,11 @@ function duplicatePoolName(names){
   return "";
 }
 function poolCard(name, view){
-  var card=document.createElement("div"); card.className="pool-card"; card.setAttribute("data-pool",name);
-  card.style.border="1px solid var(--line)"; card.style.padding="8px 10px"; card.style.marginBottom="8px";
-  var head=document.createElement("div"); head.style.display="flex"; head.style.gap="8px"; head.style.alignItems="center"; head.style.flexWrap="wrap";
+  var card=document.createElement("div"); card.className="pool-card config-item-card"; card.setAttribute("data-pool",name);
+  var head=document.createElement("div"); head.className="config-item-head";
   var title=el("strong","代理池："+name); head.appendChild(title);
   var badge=el("span","暂存","pill neutral"); badge.setAttribute("data-role","pool-badge"); head.appendChild(badge);
-  var nameInput=document.createElement("input"); nameInput.value=name; nameInput.placeholder="代理池名（字母/数字/_/-/.)"; nameInput.style.maxWidth="220px";
+  var nameInput=document.createElement("input"); nameInput.value=name; nameInput.placeholder="代理池名称（字母/数字/_/-/.)"; nameInput.style.maxWidth="220px";
   nameInput.setAttribute("data-role","pool-name");
   nameInput.title="代理池名为稳定标识，禁止用 IP/URL 命名";
   head.appendChild(nameInput);
@@ -1289,6 +1488,9 @@ function poolCard(name, view){
   });
   head.appendChild(del);
   card.appendChild(head);
+  var grid=document.createElement("div"); grid.className="config-item-grid";
+  var nodesWrap=document.createElement("div"); nodesWrap.className="field"; nodesWrap.style.gridColumn="1/-1";
+  var nodesLabel=document.createElement("label"); nodesLabel.textContent="代理节点"; nodesWrap.appendChild(nodesLabel);
   var chips=document.createElement("div"); chips.className="chips"; chips.setAttribute("data-role","chips");
   ((view&&view.proxies)||[]).forEach(function(item){
     var chip=document.createElement("span"); chip.className="chip"; chip.setAttribute("data-id",item.id);
@@ -1297,13 +1499,24 @@ function poolCard(name, view){
     rm.addEventListener("click",function(){chip.remove();});
     chip.appendChild(rm); chips.appendChild(chip);
   });
-  card.appendChild(chips);
+  nodesWrap.appendChild(chips);
   var add=document.createElement("textarea"); add.placeholder="每行新增一个代理（direct / HTTP(S) / SOCKS5(H)）"; add.setAttribute("data-role","new");
   add.title="支持直连、HTTP(S)、SOCKS5(H)；节点名不代表出口 IP";
-  card.appendChild(add);
-  var fileLabel=el("div","代理文件（相对配置目录，可空）","note"); card.appendChild(fileLabel);
+  nodesWrap.appendChild(add);
+  var nodesHint=document.createElement("div"); nodesHint.className="note"; nodesHint.textContent="移除后保存生效；节点名不代表出口 IP。"; nodesWrap.appendChild(nodesHint);
+  grid.appendChild(nodesWrap);
+  var fileWrap=document.createElement("div"); fileWrap.className="field";
+  var fileLabel=document.createElement("label"); fileLabel.textContent="代理文件"; fileWrap.appendChild(fileLabel);
   var fileInput=document.createElement("input"); fileInput.value=(view&&view.proxyfile)||""; fileInput.placeholder="proxies.txt"; fileInput.setAttribute("data-role","proxyfile");
-  card.appendChild(fileInput);
+  fileInput.title="相对配置目录，可空";
+  fileWrap.appendChild(fileInput);
+  var fileHint=document.createElement("div"); fileHint.className="note"; fileHint.textContent="代理文件（相对配置目录，可空）"; fileWrap.appendChild(fileHint);
+  grid.appendChild(fileWrap);
+  var stateWrap=document.createElement("div"); stateWrap.className="field";
+  var stateLabel=document.createElement("label"); stateLabel.textContent="运行状态"; stateWrap.appendChild(stateLabel);
+  var stateNote=document.createElement("div"); stateNote.className="note"; stateNote.textContent="被匿名 / Zen / Go 引用即运行中，否则为暂存。"; stateWrap.appendChild(stateNote);
+  grid.appendChild(stateWrap);
+  card.appendChild(grid);
   nameInput.addEventListener("change",function(){
     var cur=card.getAttribute("data-pool");
     var next=nameInput.value.trim();
@@ -1334,10 +1547,10 @@ $("btn-pool-add").addEventListener("click",function(){
   syncFallbackActive($("c-fallback-active").value);
 }); })();
 (function(){ var b=$("btn-fallback-activate"); if(b)b.addEventListener("click",function(){
-  var sel=$("c-fallback-active"); if(sel&&sel.value)toast("已选择激活 "+sel.value+"，保存后生效"); else toast("请选择要激活的渠道",true);
+  var sel=$("c-fallback-active"); if(sel&&sel.value)toast("已选择启用 "+sel.value+"，保存后生效"); else toast("请选择要启用的渠道",true);
 }); })();
 (function(){ var b=$("btn-fallback-clear"); if(b)b.addEventListener("click",function(){
-  var sel=$("c-fallback-active"); if(sel)sel.value=""; toast("已清空激活（保存后生效）");
+  var sel=$("c-fallback-active"); if(sel)sel.value=""; toast("已停用备用渠道（保存后生效）");
 }); })();
 function fallbackInputs(){
   var out=[], cards=document.querySelectorAll("#fallback-editor .fb-card");
@@ -1345,10 +1558,14 @@ function fallbackInputs(){
     var name=cards[i].querySelector('[data-role="fb-name"]').value.trim();
     var base=cards[i].querySelector('[data-role="fb-base"]').value.trim();
     var model=cards[i].querySelector('[data-role="fb-model"]').value.trim();
+    var protoEl=cards[i].querySelector('[data-role="fb-protocol"]');
+    var proto=protoEl?(protoEl.value||"chat"):"chat";
+    if(String(proto).toLowerCase()!=="responses")proto="chat";
+    else proto="responses";
     var nv=cards[i].querySelector('[data-role="fb-key-new"]').value.trim();
     var id=cards[i].querySelector('[data-role="fb-key-id"]').value;
     var key=nv?{value:nv}:(id?{id:id}:{value:""});
-    out.push({name:name,base_url:base,api_key:key,model:model});
+    out.push({name:name,base_url:base,api_key:key,model:model,protocol:proto});
   }
   return out;
 }
@@ -1398,7 +1615,7 @@ $("config-form").addEventListener("submit",function(e){
   var fbActive=$("c-fallback-active")?$("c-fallback-active").value:"";
   var seenFb={}, dupFb="";
   fbChannels.forEach(function(c){ if(c.name){ if(seenFb[c.name])dupFb=c.name; seenFb[c.name]=1; } });
-  if(dupFb){ toast("Fallback 渠道名 "+dupFb+" 重复，禁止提交",true); $("fallback-error").textContent="渠道名 "+dupFb+" 重复，请先去重再保存。"; return; }
+  if(dupFb){ toast("备用渠道名称 "+dupFb+" 重复，禁止提交",true); $("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。"; return; }
   var update={
     listen:$("c-listen").value, server_keys:secretInputs("server_keys"),
     zen_keys:secretInputs("zen_keys"), go_keys:secretInputs("go_keys"),

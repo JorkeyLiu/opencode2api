@@ -118,10 +118,11 @@ func bulkProbeSuccessBody(protocol Protocol, body []byte) bool {
 }
 
 type bulkCustomTarget struct {
-	Name    string
-	BaseURL string
-	Model   string
-	APIKey  string
+	Name     string
+	BaseURL  string
+	Model    string
+	APIKey   string
+	Protocol Protocol
 }
 
 type bulkCustomResult struct {
@@ -167,13 +168,14 @@ func bulkCustomOutcomeLabel(r bulkCustomResult) string {
 }
 
 func (g *Gateway) bulkCustomProbeOnce(parent context.Context, tgt bulkCustomTarget) bulkCustomResult {
-	endpoint := fallbackChatURL(tgt.BaseURL)
+	proto := fallbackChannelProtocol(FallbackChannelConfig{Protocol: tgt.Protocol})
+	endpoint := fallbackEndpointURL(tgt.BaseURL, proto)
 	started := time.Now()
 	startedNanos := started.UnixNano()
 	if endpoint == "" || strings.TrimSpace(tgt.APIKey) == "" || strings.TrimSpace(tgt.Model) == "" {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: 0, Cancelled: parent.Err() != nil}
 	}
-	body, err := bulkProbeRequestBody(strings.TrimSpace(tgt.Model), ProtocolChat)
+	body, err := bulkProbeRequestBody(strings.TrimSpace(tgt.Model), proto)
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, Cancelled: parent.Err() != nil}
 	}
@@ -203,7 +205,7 @@ func (g *Gateway) bulkCustomProbeOnce(parent context.Context, tgt bulkCustomTarg
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, ParseError: true}
 	}
-	if !bulkProbeSuccessBody(ProtocolChat, raw) {
+	if !bulkProbeSuccessBody(proto, raw) {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, ParseError: true}
 	}
 	return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, Success: true}
