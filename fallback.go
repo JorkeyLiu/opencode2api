@@ -29,12 +29,16 @@ const TierCustom Tier = "custom"
 // FallbackChannelConfig is one operator-defined OpenAI-compatible channel.
 // Protocol selects the upstream inference endpoint: "chat" (Chat Completions)
 // or "responses" (Responses). Empty/legacy configs normalize to "chat".
+// ReasoningEffort is an optional per-channel thinking-strength override:
+// "" (supplier default), "low", "medium", or "high". Anything else is
+// strictly rejected. It never participates in the takeover binding identity.
 type FallbackChannelConfig struct {
-	Name     string   `json:"name"`
-	BaseURL  string   `json:"base_url"`
-	APIKey   string   `json:"api_key"`
-	Model    string   `json:"model"`
-	Protocol Protocol `json:"protocol"`
+	Name            string   `json:"name"`
+	BaseURL         string   `json:"base_url"`
+	APIKey          string   `json:"api_key"`
+	Model           string   `json:"model"`
+	Protocol        Protocol `json:"protocol"`
+	ReasoningEffort string   `json:"reasoning_effort,omitempty"`
 }
 
 // FallbackConfig is the strict fallback object: {"active":"name","channels":[...]}.
@@ -186,11 +190,65 @@ func validateFallbackBaseURL(raw string) error {
 	}
 }
 
+// fallbackNormalizeReasoningEffort canonicalizes the per-channel thinking
+// strength. Empty normalizes to "" (supplier default); low/medium/high
+// (case-insensitive, trimmed) normalize to lowercase; anything else is
+// strictly rejected.
+func fallbackNormalizeReasoningEffort(raw string) (string, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(raw))
+	if trimmed == "" {
+		return "", nil
+	}
+	switch trimmed {
+	case "low", "medium", "high":
+		return trimmed, nil
+	default:
+		return "", fmt.Errorf("fallback channel reasoning_effort %q must be \"\", \"low\", \"medium\" or \"high\"", raw)
+	}
+}
+
+// fallbackChannelEffort returns the effective reasoning effort for a channel.
+// Normalized configs always carry ""/low/medium/high; unexpected values
+// defensively read as "" without failing.
+func fallbackChannelEffort(ch FallbackChannelConfig) string {
+	if effort, err := fallbackNormalizeReasoningEffort(ch.ReasoningEffort); err == nil {
+		return effort
+	}
+	return ""
+}
+
+// applyFallbackReasoningEffort overlays the channel effort on a converted
+// request body built by prepareUpstreamRequest. Chat sets the
+// reasoning_effort string; Responses merges/creates reasoning:{effort} while
+// preserving other reasoning map keys. Empty effort never injects or
+// overwrites, so existing client fields or the supplier default survive.
+func applyFallbackReasoningEffort(converted map[string]any, effort string, target Protocol) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	if effort == "" || converted == nil {
+		return
+	}
+	if fallbackChannelProtocol(FallbackChannelConfig{Protocol: target}) == ProtocolResponses {
+		if existing, ok := converted["reasoning"].(map[string]any); ok && existing != nil {
+			clone := make(map[string]any, len(existing)+1)
+			for k, v := range existing {
+				clone[k] = v
+			}
+			clone["effort"] = effort
+			converted["reasoning"] = clone
+			return
+		}
+		converted["reasoning"] = map[string]any{"effort": effort}
+		return
+	}
+	converted["reasoning_effort"] = effort
+}
+
 // validateFallbackConfig normalizes in place and validates the fallback object.
 // Names are unique; active may be empty but when non-empty must reference an
 // existing channel; every channel requires name/base_url/api_key/model.
 // Empty/missing protocol normalizes to chat; any other value besides chat or
-// responses is strictly rejected.
+// responses is strictly rejected. Empty/missing reasoning_effort normalizes
+// to "" (supplier default); only low/medium/high are accepted otherwise.
 func validateFallbackConfig(fb *FallbackConfig) error {
 	if fb == nil {
 		return nil
@@ -211,6 +269,11 @@ func validateFallbackConfig(fb *FallbackConfig) error {
 			return fmt.Errorf("fallback channel %q: %w", ch.Name, err)
 		}
 		ch.Protocol = proto
+		effort, err := fallbackNormalizeReasoningEffort(ch.ReasoningEffort)
+		if err != nil {
+			return fmt.Errorf("fallback channel %q: %w", ch.Name, err)
+		}
+		ch.ReasoningEffort = effort
 		if ch.Name == "" {
 			return errors.New("fallback channel name must not be empty")
 		}
@@ -266,6 +329,9 @@ type fallbackBinding struct {
 	Protocol Protocol
 }
 
+// fallbackBindingFor freezes the takeover identity. ReasoningEffort is
+// intentionally excluded: an effort change never drifts or invalidates a
+// bound session and never affects hot-Apply tombstone migration.
 func fallbackBindingFor(ch FallbackChannelConfig) fallbackBinding {
 	return fallbackBinding{
 		Name:     strings.TrimSpace(ch.Name),
@@ -436,6 +502,7 @@ func buildFallbackRequestBody(ex upstreamExtra, hasEx bool, bodies map[Tier][]by
 		return nil, err
 	}
 	converted["model"] = model
+	applyFallbackReasoningEffort(converted, fallbackChannelEffort(ch), target)
 	encoded, err := json.Marshal(converted)
 	if err != nil {
 		return nil, errors.New("request contains unsupported JSON values")

@@ -93,9 +93,9 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		"fb-name",
 		"fb-base",
 		"fb-model",
+		"fb-effort",
 		"fb-key-new",
 		"fb-key-id",
-		"fb-models",
 		"fb-key-toggle",
 		"fb-key-status",
 		"fb-key-hint",
@@ -103,13 +103,22 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		"fb-url-models",
 		"fb-url-request",
 		"fb-discover-status",
+		"fb-discover",
 		`value="chat"`,
 		`value="responses"`,
 		"Chat Completions",
 		"Responses",
 		"fallbackProtocolValue",
+		"fallbackEffortValue",
+		"fillModelSelect",
 		"ch.protocol",
 		"protocol:proto",
+		"reasoning_effort:effort",
+		"思考强度",
+		"供应商默认",
+		"仅从列表选择",
+		"当前配置：",
+		"供应商列表未返回",
 		"保存后将替换已保存密钥",
 		"已保存密钥",
 		"fallbackAPIRoot",
@@ -120,6 +129,27 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing fallback contract %q", needle)
+		}
+	}
+	// Model select is the sole editable/submitted source: data-role fb-model
+	// must be on a select, never a free-text input; the legacy picker role and
+	// the redundant apply button must be gone.
+	if !strings.Contains(html, `modelSel.setAttribute("data-role","fb-model")`) && !strings.Contains(html, `setAttribute("data-role","fb-model")`) {
+		t.Fatal("fb-model select creation missing")
+	}
+	if strings.Contains(html, `modelInput.setAttribute("data-role","fb-model")`) {
+		t.Fatal("free-text fb-model input must be removed; select is the sole source")
+	}
+	if strings.Contains(html, `data-role","fb-models"`) || strings.Contains(html, `data-role="fb-models"`) {
+		t.Fatal("legacy fb-models role must be removed; fb-model select is the sole source")
+	}
+	if strings.Contains(html, "fb-use-model") || strings.Contains(html, "选用") {
+		t.Fatal("redundant apply-model button must be removed; select change submits directly")
+	}
+	// Effort select carries the four options with Low/Medium/High display.
+	for _, needle := range []string{`"low"`, `"medium"`, `"high"`, `"Low"`, `"Medium"`, `"High"`} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("effort selector must contain %q", needle)
 		}
 	}
 	// Key entry is a fresh password input, never prefilled with masked material.
@@ -180,6 +210,13 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 	if !strings.Contains(html, "card.remove(); syncFallbackActive(") {
 		t.Fatal("fallback delete must keep sync-after-remove semantics")
 	}
+	// Explicit active must win over stale select value, otherwise rename A->B loses B.
+	if !strings.Contains(html, "(active!==undefined&&active!==null)?active:(sel.value") {
+		t.Fatal("syncFallbackActive must prefer the explicit active so rename A->B selects B")
+	}
+	if !strings.Contains(html, `sel.value=found?cur:""`) {
+		t.Fatal("syncFallbackActive must clear when the active name no longer exists (delete B clears)")
+	}
 }
 
 func TestWebUIConfigNoInternalCopy(t *testing.T) {
@@ -203,5 +240,62 @@ func TestWebUIConfigNoInternalCopy(t *testing.T) {
 	}
 	if strings.Contains(html, `card.style.border="1px solid var(--line)"`) {
 		t.Fatal("dynamic cards must not carry inline temp borders")
+	}
+}
+
+func TestWebUIConfigDesignSystem(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		"repeat(12,minmax(0,1fr))",
+		"minmax(0,1fr)",
+		"span-3", "span-4", "span-5", "span-6", "span-8", "span-12",
+		"check-field", "check-row",
+		"pool-status", "status-panel",
+		"fb-model-row",
+		"min-height:36px",
+		"min-width:0",
+		"text-overflow:ellipsis",
+		"config-item-grid",
+		"(min-width:800px) and (max-width:1199px)",
+		"(max-width:799px)",
+		"max-width:1280px",
+		"匿名通道",
+		"运行状态",
+		"代理文件",
+		`.key-row{display:flex;gap:8px;align-items:center;min-width:0;max-width:100%;width:100%}`,
+		`.fb-model-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;max-width:100%;width:100%;min-width:0}`,
+		`.fb-model-row select{min-width:0;max-width:100%;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
+		`var keyWrap=document.createElement("div"); keyWrap.className="field span-6";`,
+		`var modelWrap=document.createElement("div"); modelWrap.className="field span-6";`,
+		`(active!==undefined&&active!==null)?active:(sel.value||"")`,
+		`sel.title=sel.value`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing design-system contract %q", needle)
+		}
+	}
+	if strings.Contains(html, "repeat(auto-fit") {
+		t.Fatal("unstable auto-fit layout must be replaced by explicit 12-col grid")
+	}
+	if strings.Contains(html, "(max-width:1100px)") {
+		t.Fatal("legacy single breakpoint must be replaced by 800/1200 breakpoints")
+	}
+	// Key/model must share one row on desktop/tablet (span-6 each), never full-row span-12.
+	if strings.Contains(html, `keyWrap.className="field span-12"`) {
+		t.Fatal("fallback key field must be span-6, not span-12 full row")
+	}
+	if strings.Contains(html, `modelWrap.className="field span-12"`) {
+		t.Fatal("fallback model field must be span-6, not span-12 full row")
+	}
+	// Model row must fill its half column, never a fixed 720px or full-card width.
+	if strings.Contains(html, ".fb-model-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;max-width:720px") {
+		t.Fatal("fb-model-row must not use fixed 720px; it must fill its half column with max-width:100%")
+	}
+	if strings.Contains(html, ".config-item-grid>.field.span-3,.config-item-grid>.field.span-4,.config-item-grid>.field.span-5{grid-column:span 6}") {
+		t.Fatal("tablet must keep proto/base/effort 3/5/4 on one row, not collapse to span 6")
+	}
+	// Mobile stacks via the single 799px rule; no extra full-card model max-width.
+	if !strings.Contains(html, ".fb-model-row{grid-template-columns:1fr;max-width:100%;width:100%}") {
+		t.Fatal("mobile fb-model-row must stack full width within its field")
 	}
 }

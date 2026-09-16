@@ -17,8 +17,9 @@
     "go": "shared"
   },
   // fallback channels: protocol "chat" (Chat Completions, default) or "responses" (Responses).
+  // reasoning_effort "" (supplier default), "low", "medium" or "high" per channel.
   // base supports host, host/v1, or the matching full endpoint; e.g.
-  // {"name":"c1","base_url":"https://...","api_key":"...","model":"...","protocol":"chat"}.
+  // {"name":"c1","base_url":"https://...","api_key":"...","model":"...","protocol":"chat","reasoning_effort":""}.
   "fallback": {
     "active": "",
     "channels": []

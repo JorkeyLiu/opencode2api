@@ -84,12 +84,17 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .fact dt{font-size:11.5px;color:var(--muted);margin:0}
 .fact dd{margin:2px 0 0;font-family:var(--mono);font-size:12.8px;word-break:break-all}
 .fact dd.ok{color:var(--ok)}.fact dd.bad{color:var(--bad)}.fact dd.warn{color:var(--warn)}
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+/* ---- config lightweight design system: explicit 12-col grid, no framework ---- */
+.form-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px 14px;min-width:0}
+.form-grid>.field{grid-column:span 6;min-width:0;max-width:100%}
 .form-grid .full{grid-column:1/-1}
-/* checkbox-label spacing: input adjacent to label text, robust alignment */
-.check-label{display:flex;align-items:center;gap:0;font-size:13.5px;font-weight:normal}
+/* reusable spans for 12-col grids (desktop >=1200 default) */
+.span-3{grid-column:span 3}.span-4{grid-column:span 4}.span-5{grid-column:span 5}.span-6{grid-column:span 6}.span-8{grid-column:span 8}.span-12{grid-column:1/-1}
+/* standard checkbox container: title label + 36px control row, same baseline as selects */
+.check-field>.check-row{display:flex;align-items:center;min-height:36px}
+.check-label{display:flex;align-items:center;gap:0;font-size:13.5px;font-weight:normal;min-width:0}
 .check-label input{margin:0 8px 0 0;flex:none;width:auto;padding:0;vertical-align:middle}
-.check-label span{line-height:1.5}
+.check-label span{line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .scroll-bound{max-height:360px;overflow-y:auto;border:1px solid var(--line)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
 .chip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);border:1px solid var(--line2);padding:3px 4px 3px 8px;font-family:var(--mono);font-size:12px}
@@ -113,27 +118,62 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .config-hero h2{font-size:16px}
 .config-card h2{font-size:15px;margin:0}
 .config-card .cap{font-size:12.5px;color:var(--muted);margin:2px 0 12px}
-.config-card .field label{display:block;font-size:13px;color:#33403a;font-weight:600;margin-bottom:4px}
-.config-card .field .note{font-weight:400}
-.config-card input,.config-card select,.config-card textarea{min-height:34px}
-.config-card input[type="checkbox"]{min-height:0}
-.config-item-card{border:1px solid var(--line);background:#fbfcfb;padding:10px 12px;margin-bottom:10px;min-width:0}
-.config-item-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
-.config-item-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 14px;min-width:0}
-.config-item-card input,.config-item-card select,.config-item-card textarea{width:100%;padding:7px 9px;border:1px solid var(--line2);background:#fff;color:var(--ink);min-height:34px;min-width:0}
+.config-card .field{margin:0;min-width:0;max-width:100%}
+.config-card .field>label{display:flex;align-items:center;min-height:20px;font-size:13px;line-height:20px;color:#33403a;font-weight:600;margin:0 0 4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.config-card .field .note{font-weight:400;margin:4px 0 0;font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
+.config-card input:not([type="checkbox"]),.config-card select{height:36px;min-height:36px;max-width:100%;min-width:0}
+.config-card textarea{min-height:56px;max-width:100%;min-width:0}
+.config-card input[type="checkbox"]{min-height:0;height:auto}
+.config-card select{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.config-card select option{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.config-card .ghost,.config-card .primary{min-height:36px}
+.config-item-card{border:1px solid var(--line);background:#fbfcfb;padding:10px 12px;margin-bottom:10px;min-width:0;max-width:100%}
+.config-item-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px;min-width:0}
+.config-item-head input{min-width:0;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.config-item-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px 14px;min-width:0}
+.config-item-grid>.field{grid-column:span 6;min-width:0;max-width:100%}
+.config-item-grid>.field.span-3{grid-column:span 3}.config-item-grid>.field.span-4{grid-column:span 4}.config-item-grid>.field.span-5{grid-column:span 5}.config-item-grid>.field.span-6{grid-column:span 6}.config-item-grid>.field.span-8{grid-column:span 8}.config-item-grid>.field.span-12{grid-column:1/-1}
+.config-item-card input,.config-item-card select,.config-item-card textarea{width:100%;padding:7px 9px;border:1px solid var(--line2);background:#fff;color:var(--ink);min-height:36px;min-width:0;max-width:100%}
 .config-item-card textarea{min-height:56px;resize:vertical}
-.url-preview{font-family:var(--mono);font-size:12px;color:#33403a;background:#fff;border:1px solid var(--line);padding:7px 9px;word-break:break-all;white-space:normal}
-.url-preview .lbl{color:var(--muted)}
+.url-preview{font-family:var(--mono);font-size:12px;color:#33403a;background:#fff;border:1px solid var(--line);padding:7px 9px;word-break:break-all;white-space:normal;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;min-width:0;max-width:100%}
+.url-preview>div{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .fb-err,.pool-err{color:var(--bad);font-size:12.5px}
-.key-row{display:flex;gap:8px;align-items:center}
+.key-row{display:flex;gap:8px;align-items:center;min-width:0;max-width:100%;width:100%}
 .key-row input{flex:1;min-width:0}
+.key-row button{flex:none;min-width:0;min-height:36px}
+.fb-model-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;max-width:100%;width:100%;min-width:0}
+.fb-model-row button{flex:none;white-space:nowrap;min-width:0;min-height:36px}
+.fb-model-row select{min-width:0;max-width:100%;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status-panel{display:flex;align-items:center;min-height:36px;background:#fff;border:1px solid var(--line);padding:6px 9px;font-size:12.5px;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 details.advanced{border:1px solid var(--line);padding:8px 10px;background:#fbfcfb}
 details.advanced summary{cursor:pointer;font-size:13px;font-weight:600;color:#33403a}
 .config-sticky{position:sticky;bottom:0;z-index:10;background:#fff;border:1px solid var(--line2);padding:10px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .config-sticky .primary{padding:8px 18px;font-weight:700}
-@media (max-width:1100px){
-  .grid2,.grid3,.grid4,.form-grid,.facts,.trend-grid{grid-template-columns:1fr}
-  .config-item-grid{grid-template-columns:1fr}
+html,body{max-width:100%;overflow-x:hidden}
+.main{min-width:0;overflow-x:hidden}
+/* tablet 800-1199: fallback keeps 12-col spans (proto 3/5/4 same row, key/model 6+6 same row) */
+@media (min-width:800px) and (max-width:1199px){
+  .grid2,.grid3,.grid4,.facts,.trend-grid{grid-template-columns:1fr}
+  .form-grid>.field{grid-column:span 6}
+  .form-grid .full{grid-column:1/-1}
+  .config-item-grid>.field{grid-column:span 6}
+  .config-item-grid>.field.span-8,.config-item-grid>.field.span-12{grid-column:1/-1}
+  .url-preview{grid-template-columns:1fr 1fr}
+  .fb-model-row{max-width:100%;width:100%}
+  .layout{flex-direction:column;min-height:auto}
+  .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
+  .nav button{width:auto;text-align:center}
+  .main{padding:12px}
+  .topbar{position:static}
+}
+/* mobile <800: everything stacks full width, no horizontal overflow */
+@media (max-width:799px){
+  .grid2,.grid3,.grid4,.facts,.trend-grid{grid-template-columns:1fr}
+  .form-grid>.field{grid-column:1/-1}
+  .config-item-grid>.field{grid-column:1/-1!important}
+  .url-preview{grid-template-columns:1fr}
+  .fb-model-row{grid-template-columns:1fr;max-width:100%;width:100%}
+  .config-item-head input{max-width:100%}
   .layout{flex-direction:column;min-height:auto}
   .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
@@ -320,7 +360,7 @@ details.advanced summary{cursor:pointer;font-size:13px;font-weight:600;color:#33
           <div class="cap">决定请求优先走哪个上游，以及匿名试用与各类密钥是否可用。</div>
           <div class="form-grid">
             <div class="field"><label>首选上游顺序</label><select id="c-prefer"><option value="go">Go（失败回退 Zen）</option><option value="zen">Zen（失败回退 Go）</option></select></div>
-            <div class="field"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div>
+            <div class="field check-field"><label>匿名通道</label><div class="check-row"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div></div>
             <div class="field full"><label>服务端密钥（掩码标签；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个密钥"></textarea></div>
             <div class="field"><label>Zen 密钥</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个密钥"></textarea></div>
             <div class="field"><label>Go 密钥</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个密钥"></textarea></div>
@@ -1191,7 +1231,7 @@ function fallbackChannelNames(){
   return names;
 }
 function syncFallbackActive(active){
-  var sel=$("c-fallback-active"); if(!sel)return; var cur=sel.value||active||""; clear(sel);
+  var sel=$("c-fallback-active"); if(!sel)return; var cur=(active!==undefined&&active!==null)?active:(sel.value||""); clear(sel);
   var empty=document.createElement("option"); empty.value=""; empty.textContent="(未启用)"; sel.appendChild(empty);
   fallbackChannelNames().forEach(function(n){ if(!n)return; var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o); });
   if(cur){ var found=false; for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===cur)found=true; sel.value=found?cur:""; } else sel.value="";
@@ -1225,6 +1265,32 @@ function fallbackEndpointURL(base, protocol){
   return root+"/v1/chat/completions";
 }
 function fallbackProtocolValue(ch){ var p=String((ch&&ch.protocol)||"chat").trim().toLowerCase(); if(p==="responses")return "responses"; return "chat"; }
+function fallbackEffortValue(ch){ var e=String((ch&&ch.reasoning_effort)||"").trim().toLowerCase(); if(e==="low"||e==="medium"||e==="high")return e; return ""; }
+function fallbackEffortLabel(e){ if(e==="low")return "Low"; if(e==="medium")return "Medium"; if(e==="high")return "High"; return "供应商默认"; }
+function fillModelSelect(sel, current, list){
+  clear(sel);
+  current=String(current||"").trim();
+  function syncTitle(){ try{ sel.title=sel.value||sel.textContent||""; }catch(e){} }
+  if(list===null||list===undefined){
+    if(current){ var o=document.createElement("option"); o.value=current; o.textContent=current; o.title=current; sel.appendChild(o); sel.value=current; }
+    else { var p=document.createElement("option"); p.value=""; p.textContent="(请获取模型列表后选择)"; p.title="(请获取模型列表后选择)"; sel.appendChild(p); sel.value=""; }
+    syncTitle();
+    return;
+  }
+  if(!current){
+    var ph=document.createElement("option"); ph.value=""; ph.textContent="(请选择模型)"; ph.title="(请选择模型)"; sel.appendChild(ph);
+    (list||[]).forEach(function(m){ var o=document.createElement("option"); o.value=m; o.textContent=m; o.title=m; sel.appendChild(o); });
+    sel.value="";
+    syncTitle();
+    return;
+  }
+  var found=false;
+  (list||[]).forEach(function(m){ if(m===current)found=true; });
+  if(!found){ var k=document.createElement("option"); k.value=current; k.textContent="当前配置："+current+"（供应商列表未返回）"; k.title="当前配置："+current+"（供应商列表未返回）"; sel.appendChild(k); }
+  (list||[]).forEach(function(m){ var o=document.createElement("option"); o.value=m; o.textContent=m; o.title=m; sel.appendChild(o); });
+  sel.value=current;
+  syncTitle();
+}
 function fallbackDiscoverReasonCN(reason, httpStatus){
   reason=String(reason||"");
   if(reason==="dns_error")return "DNS解析失败";
@@ -1256,11 +1322,7 @@ function fallbackCard(ch){
   head.appendChild(del);
   card.appendChild(head);
   var grid=document.createElement("div"); grid.className="config-item-grid";
-  var nameWrap=document.createElement("div"); nameWrap.className="field";
-  var nameLabel=document.createElement("label"); nameLabel.textContent="渠道名称"; nameWrap.appendChild(nameLabel);
-  var nameHint=document.createElement("div"); nameHint.className="note"; nameHint.textContent="在上方标题行编辑，与启用选择联动。"; nameWrap.appendChild(nameHint);
-  grid.appendChild(nameWrap);
-  var protoWrap=document.createElement("div"); protoWrap.className="field";
+  var protoWrap=document.createElement("div"); protoWrap.className="field span-3";
   var protoLabelEl=document.createElement("label"); protoLabelEl.textContent="接口协议"; protoWrap.appendChild(protoLabelEl);
   var protoSel=document.createElement("select"); protoSel.setAttribute("data-role","fb-protocol");
   var optChat=document.createElement("option"); optChat.value="chat"; optChat.textContent="Chat Completions"; protoSel.appendChild(optChat);
@@ -1268,16 +1330,20 @@ function fallbackCard(ch){
   protoSel.value=fallbackProtocolValue(ch);
   protoWrap.appendChild(protoSel);
   grid.appendChild(protoWrap);
-  var baseWrap=document.createElement("div"); baseWrap.className="field";
+  var baseWrap=document.createElement("div"); baseWrap.className="field span-5";
   var baseLabel=document.createElement("label"); baseLabel.textContent="基础地址（URL）"; baseWrap.appendChild(baseLabel);
   var baseInput=document.createElement("input"); baseInput.value=ch.base_url||""; baseInput.placeholder="https://api.example.com"; baseInput.setAttribute("data-role","fb-base"); baseInput.setAttribute("inputmode","url"); baseWrap.appendChild(baseInput);
   var baseHint=document.createElement("div"); baseHint.className="note"; baseHint.textContent="仅支持 HTTP/HTTPS，可填服务地址、/v1 或完整请求地址。"; baseWrap.appendChild(baseHint);
   grid.appendChild(baseWrap);
-  var modelWrap=document.createElement("div"); modelWrap.className="field";
-  var modelLabel=document.createElement("label"); modelLabel.textContent="模型"; modelWrap.appendChild(modelLabel);
-  var modelInput=document.createElement("input"); modelInput.value=ch.model||""; modelInput.placeholder="provider-model"; modelInput.setAttribute("data-role","fb-model"); modelWrap.appendChild(modelInput);
-  grid.appendChild(modelWrap);
-  var keyWrap=document.createElement("div"); keyWrap.className="field";
+  var effortWrap=document.createElement("div"); effortWrap.className="field span-4";
+  var effortLabel=document.createElement("label"); effortLabel.textContent="思考强度"; effortWrap.appendChild(effortLabel);
+  var effortSel=document.createElement("select"); effortSel.setAttribute("data-role","fb-effort");
+  [["","供应商默认"],["low","Low"],["medium","Medium"],["high","High"]].forEach(function(pair){ var o=document.createElement("option"); o.value=pair[0]; o.textContent=pair[1]; effortSel.appendChild(o); });
+  effortSel.value=fallbackEffortValue(ch);
+  effortWrap.appendChild(effortSel);
+  var effortHint=document.createElement("div"); effortHint.className="note"; effortHint.textContent="空=供应商默认，仅覆盖本渠道。"; effortWrap.appendChild(effortHint);
+  grid.appendChild(effortWrap);
+  var keyWrap=document.createElement("div"); keyWrap.className="field span-6";
   var keyLabel=document.createElement("label"); keyLabel.textContent="API 密钥"; keyWrap.appendChild(keyLabel);
   var keyInfo=document.createElement("div"); keyInfo.className="note"; keyInfo.setAttribute("data-role","fb-key-status");
   var savedDisplay=((ch.api_key||{}).display)||"";
@@ -1298,22 +1364,23 @@ function fallbackCard(ch){
   });
   var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=((ch.api_key||{}).id)||""; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
   grid.appendChild(keyWrap);
-  var prevWrap=document.createElement("div"); prevWrap.className="field"; prevWrap.style.gridColumn="1/-1";
+  var modelWrap=document.createElement("div"); modelWrap.className="field span-6";
+  var modelLabel=document.createElement("label"); modelLabel.textContent="模型（仅从列表选择）"; modelWrap.appendChild(modelLabel);
+  var modelRow=document.createElement("div"); modelRow.className="fb-model-row";
+  var discBtn=document.createElement("button"); discBtn.type="button"; discBtn.className="ghost"; discBtn.textContent="获取模型列表"; discBtn.setAttribute("data-role","fb-discover");
+  var modelSel=document.createElement("select"); modelSel.setAttribute("data-role","fb-model");
+  modelRow.appendChild(discBtn); modelRow.appendChild(modelSel);
+  modelWrap.appendChild(modelRow);
+  var discStatus=document.createElement("div"); discStatus.className="note"; discStatus.setAttribute("data-role","fb-discover-status"); modelWrap.appendChild(discStatus);
+  var modelHint=document.createElement("div"); modelHint.className="note"; modelHint.textContent="新建渠道请先获取列表再选择；已有模型已预置，切换即生效。"; modelWrap.appendChild(modelHint);
+  fillModelSelect(modelSel, ch.model||"", null);
+  grid.appendChild(modelWrap);
+  var prevWrap=document.createElement("div"); prevWrap.className="field span-12";
   var prevLabel=document.createElement("label"); prevLabel.textContent="完整地址预览"; prevWrap.appendChild(prevLabel);
   var prevModels=document.createElement("div"); prevModels.className="url-preview"; prevModels.setAttribute("data-role","fb-url-preview"); prevWrap.appendChild(prevModels);
   var prevModelsRow=document.createElement("div"); prevModelsRow.setAttribute("data-role","fb-url-models"); prevModels.appendChild(prevModelsRow);
   var prevReqRow=document.createElement("div"); prevReqRow.setAttribute("data-role","fb-url-request"); prevModels.appendChild(prevReqRow);
   grid.appendChild(prevWrap);
-  var discWrap=document.createElement("div"); discWrap.className="field"; discWrap.style.gridColumn="1/-1";
-  var discLabel=document.createElement("label"); discLabel.textContent="模型发现"; discWrap.appendChild(discLabel);
-  var discRow=document.createElement("div"); discRow.className="key-row";
-  var discBtn=document.createElement("button"); discBtn.type="button"; discBtn.className="ghost"; discBtn.textContent="获取模型列表"; discBtn.setAttribute("data-role","fb-discover");
-  var discSel=document.createElement("select"); discSel.setAttribute("data-role","fb-models"); discSel.style.flex="1";
-  var discUse=document.createElement("button"); discUse.type="button"; discUse.className="ghost"; discUse.textContent="选用"; discUse.setAttribute("data-role","fb-use-model");
-  discRow.appendChild(discBtn); discRow.appendChild(discSel); discRow.appendChild(discUse);
-  discWrap.appendChild(discRow);
-  var discStatus=document.createElement("div"); discStatus.className="note"; discStatus.setAttribute("data-role","fb-discover-status"); discWrap.appendChild(discStatus);
-  grid.appendChild(discWrap);
   card.appendChild(grid);
   function updatePreview(){
     var base=baseInput.value.trim();
@@ -1365,11 +1432,15 @@ function fallbackCard(ch){
         });
       });
     })().then(function(res){
-      clear(discSel);
-      (res.models||[]).forEach(function(m){ var o=document.createElement("option"); o.value=m; o.textContent=m; discSel.appendChild(o); });
+      var cur=modelSel.value||"";
+      fillModelSelect(modelSel, cur, res.models||[]);
       clear(discStatus);
       if(!(res.models||[]).length){ discStatus.appendChild(document.createTextNode("模型列表为空")); toast("未返回模型",true); }
-      else discStatus.appendChild(document.createTextNode("已获取 "+(res.models||[]).length+" 个模型，请从下拉中选用"));
+      else {
+        var kept=(res.models||[]).indexOf(cur)>=0;
+        if(cur&&!kept)discStatus.appendChild(document.createTextNode("已获取 "+(res.models||[]).length+" 个模型，当前配置不在列表中，已保留当前值，可保留或改选后保存"));
+        else discStatus.appendChild(document.createTextNode("已获取 "+(res.models||[]).length+" 个模型，已选中当前值，切换即生效，保存后持久化"));
+      }
     }).catch(function(err){
       var msg=String((err&&err.message)||"模型发现失败");
       if(err&&err.fbDetail)msg=err.fbDetail;
@@ -1378,7 +1449,12 @@ function fallbackCard(ch){
     })
     .then(function(){ discBtn.disabled=false; discBtn.textContent="获取模型列表"; });
   });
-  discUse.addEventListener("click",function(){ if(discSel.value){ modelInput.value=discSel.value; clear(discStatus); discStatus.appendChild(document.createTextNode("已选用模型，请保存后生效")); } });
+  modelSel.addEventListener("change",function(){
+    try{ modelSel.title=modelSel.value||""; }catch(e){}
+    clear(discStatus);
+    if(modelSel.value)discStatus.appendChild(document.createTextNode("已选择模型 "+modelSel.value+"，保存后生效"));
+    else discStatus.appendChild(document.createTextNode("尚未选择模型，保存前请选择"));
+  });
   nameInput.addEventListener("change",function(){
     var oldName=card.getAttribute("data-channel")||"";
     var next=nameInput.value.trim();
@@ -1424,11 +1500,11 @@ function refreshPoolBadges(){
     var nameInput=cards[i].querySelector('[data-role="pool-name"]');
     if(nameInput&&nameInput.value.trim())name=nameInput.value.trim();
     var badge=cards[i].querySelector('[data-role="pool-badge"]');
-    if(!badge)continue;
+    var panel=cards[i].querySelector('[data-role="pool-status"]');
     var active=(name===refs.a||name===refs.z||name===refs.g);
-    clear(badge);
-    badge.appendChild(document.createTextNode(active?"运行中":"暂存：不运行、不可探测、不计容量"));
-    badge.className="pill "+(active?"ok":"neutral");
+    var text=active?"运行中":"暂存：不运行、不可探测、不计容量";
+    if(badge){ clear(badge); badge.appendChild(document.createTextNode(text)); badge.className="pill "+(active?"ok":"neutral"); }
+    if(panel){ clear(panel); panel.appendChild(document.createTextNode(text)); }
   }
 }
 function renderPoolsEditor(v){
@@ -1489,7 +1565,7 @@ function poolCard(name, view){
   head.appendChild(del);
   card.appendChild(head);
   var grid=document.createElement("div"); grid.className="config-item-grid";
-  var nodesWrap=document.createElement("div"); nodesWrap.className="field"; nodesWrap.style.gridColumn="1/-1";
+  var nodesWrap=document.createElement("div"); nodesWrap.className="field span-12";
   var nodesLabel=document.createElement("label"); nodesLabel.textContent="代理节点"; nodesWrap.appendChild(nodesLabel);
   var chips=document.createElement("div"); chips.className="chips"; chips.setAttribute("data-role","chips");
   ((view&&view.proxies)||[]).forEach(function(item){
@@ -1505,15 +1581,16 @@ function poolCard(name, view){
   nodesWrap.appendChild(add);
   var nodesHint=document.createElement("div"); nodesHint.className="note"; nodesHint.textContent="移除后保存生效；节点名不代表出口 IP。"; nodesWrap.appendChild(nodesHint);
   grid.appendChild(nodesWrap);
-  var fileWrap=document.createElement("div"); fileWrap.className="field";
+  var fileWrap=document.createElement("div"); fileWrap.className="field span-6";
   var fileLabel=document.createElement("label"); fileLabel.textContent="代理文件"; fileWrap.appendChild(fileLabel);
   var fileInput=document.createElement("input"); fileInput.value=(view&&view.proxyfile)||""; fileInput.placeholder="proxies.txt"; fileInput.setAttribute("data-role","proxyfile");
   fileInput.title="相对配置目录，可空";
   fileWrap.appendChild(fileInput);
   var fileHint=document.createElement("div"); fileHint.className="note"; fileHint.textContent="代理文件（相对配置目录，可空）"; fileWrap.appendChild(fileHint);
   grid.appendChild(fileWrap);
-  var stateWrap=document.createElement("div"); stateWrap.className="field";
+  var stateWrap=document.createElement("div"); stateWrap.className="field span-6";
   var stateLabel=document.createElement("label"); stateLabel.textContent="运行状态"; stateWrap.appendChild(stateLabel);
+  var statePanel=document.createElement("div"); statePanel.className="status-panel"; statePanel.setAttribute("data-role","pool-status"); statePanel.textContent="暂存：不运行、不可探测、不计容量"; stateWrap.appendChild(statePanel);
   var stateNote=document.createElement("div"); stateNote.className="note"; stateNote.textContent="被匿名 / Zen / Go 引用即运行中，否则为暂存。"; stateWrap.appendChild(stateNote);
   grid.appendChild(stateWrap);
   card.appendChild(grid);
@@ -1543,7 +1620,7 @@ $("btn-pool-add").addEventListener("click",function(){
   syncRoutingSelects(); refreshPoolBadges(); $("pools-error").textContent="";
 });
 (function(){ var b=$("btn-fallback-add"); if(b)b.addEventListener("click",function(){
-  var host=$("fallback-editor"); host.appendChild(fallbackCard({name:"",base_url:"",api_key:{id:"",display:""},model:""}));
+  var host=$("fallback-editor"); host.appendChild(fallbackCard({name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat",reasoning_effort:""}));
   syncFallbackActive($("c-fallback-active").value);
 }); })();
 (function(){ var b=$("btn-fallback-activate"); if(b)b.addEventListener("click",function(){
@@ -1557,15 +1634,20 @@ function fallbackInputs(){
   for(var i=0;i<cards.length;i++){
     var name=cards[i].querySelector('[data-role="fb-name"]').value.trim();
     var base=cards[i].querySelector('[data-role="fb-base"]').value.trim();
-    var model=cards[i].querySelector('[data-role="fb-model"]').value.trim();
+    var modelEl=cards[i].querySelector('[data-role="fb-model"]');
+    var model=modelEl?(modelEl.value||"").trim():"";
     var protoEl=cards[i].querySelector('[data-role="fb-protocol"]');
     var proto=protoEl?(protoEl.value||"chat"):"chat";
     if(String(proto).toLowerCase()!=="responses")proto="chat";
     else proto="responses";
+    var effEl=cards[i].querySelector('[data-role="fb-effort"]');
+    var effort=effEl?(effEl.value||""):"";
+    effort=String(effort||"").trim().toLowerCase();
+    if(effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
     var nv=cards[i].querySelector('[data-role="fb-key-new"]').value.trim();
     var id=cards[i].querySelector('[data-role="fb-key-id"]').value;
     var key=nv?{value:nv}:(id?{id:id}:{value:""});
-    out.push({name:name,base_url:base,api_key:key,model:model,protocol:proto});
+    out.push({name:name,base_url:base,api_key:key,model:model,protocol:proto,reasoning_effort:effort});
   }
   return out;
 }
@@ -1616,6 +1698,8 @@ $("config-form").addEventListener("submit",function(e){
   var seenFb={}, dupFb="";
   fbChannels.forEach(function(c){ if(c.name){ if(seenFb[c.name])dupFb=c.name; seenFb[c.name]=1; } });
   if(dupFb){ toast("备用渠道名称 "+dupFb+" 重复，禁止提交",true); $("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。"; return; }
+  var emptyFb=""; fbChannels.forEach(function(c){ if(!c.model)emptyFb=c.name||"(未命名渠道)"; });
+  if(emptyFb){ toast("备用渠道 "+emptyFb+" 尚未选择模型，请先获取模型列表并选择",true); $("fallback-error").textContent="渠道 "+emptyFb+" 尚未选择模型：请先获取模型列表并从下拉选择，保存已被拦截。"; return; }
   var update={
     listen:$("c-listen").value, server_keys:secretInputs("server_keys"),
     zen_keys:secretInputs("zen_keys"), go_keys:secretInputs("go_keys"),

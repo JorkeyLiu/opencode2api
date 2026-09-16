@@ -9,11 +9,12 @@ import (
 )
 
 type FallbackChannelView struct {
-	Name     string     `json:"name"`
-	BaseURL  string     `json:"base_url"`
-	APIKey   SecretView `json:"api_key"`
-	Model    string     `json:"model"`
-	Protocol Protocol   `json:"protocol"`
+	Name            string     `json:"name"`
+	BaseURL         string     `json:"base_url"`
+	APIKey          SecretView `json:"api_key"`
+	Model           string     `json:"model"`
+	Protocol        Protocol   `json:"protocol"`
+	ReasoningEffort string     `json:"reasoning_effort"`
 }
 
 type FallbackView struct {
@@ -22,11 +23,12 @@ type FallbackView struct {
 }
 
 type FallbackChannelInput struct {
-	Name     string      `json:"name"`
-	BaseURL  string      `json:"base_url"`
-	APIKey   SecretInput `json:"api_key"`
-	Model    string      `json:"model"`
-	Protocol Protocol    `json:"protocol"`
+	Name            string      `json:"name"`
+	BaseURL         string      `json:"base_url"`
+	APIKey          SecretInput `json:"api_key"`
+	Model           string      `json:"model"`
+	Protocol        Protocol    `json:"protocol"`
+	ReasoningEffort string      `json:"reasoning_effort"`
 }
 
 type FallbackInput struct {
@@ -38,11 +40,12 @@ func fallbackViewFromConfig(cfg Config) FallbackView {
 	view := FallbackView{Active: cfg.Fallback.Active, Channels: []FallbackChannelView{}}
 	for _, ch := range cfg.Fallback.Channels {
 		view.Channels = append(view.Channels, FallbackChannelView{
-			Name:     ch.Name,
-			BaseURL:  ch.BaseURL,
-			APIKey:   SecretView{ID: secretFingerprint(ch.APIKey), Display: maskValue(ch.APIKey)},
-			Model:    ch.Model,
-			Protocol: fallbackChannelProtocol(ch),
+			Name:            ch.Name,
+			BaseURL:         ch.BaseURL,
+			APIKey:          SecretView{ID: secretFingerprint(ch.APIKey), Display: maskValue(ch.APIKey)},
+			Model:           ch.Model,
+			Protocol:        fallbackChannelProtocol(ch),
+			ReasoningEffort: fallbackChannelEffort(ch),
 		})
 	}
 	if view.Channels == nil {
@@ -106,7 +109,7 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 		default:
 			return FallbackConfig{}, errors.New("fallback channel api_key must contain id or value")
 		}
-		out.Channels = append(out.Channels, FallbackChannelConfig{Name: name, BaseURL: base, APIKey: key, Model: model, Protocol: ch.Protocol})
+		out.Channels = append(out.Channels, FallbackChannelConfig{Name: name, BaseURL: base, APIKey: key, Model: model, Protocol: ch.Protocol, ReasoningEffort: ch.ReasoningEffort})
 	}
 	if err := validateFallbackConfig(&out); err != nil {
 		return FallbackConfig{}, err

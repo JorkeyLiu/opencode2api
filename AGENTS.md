@@ -262,7 +262,10 @@
 - Custom session fallback: strict `fallback` config (`active` + unique-name
   `channels` with `name`/`base_url` http-https/`api_key`/`model`/`protocol`
   (`chat`=Chat Completions default, `responses`=Responses; empty normalizes to
-  `chat`, other values strictly rejected); active empty or referencing an
+  `chat`, other values strictly rejected) plus optional per-channel
+  `reasoning_effort` (`""`=supplier default, `low`/`medium`/`high`; empty
+  normalizes to `""`, other values strictly rejected; never in the binding
+  identity, never migrates as identity, never probed); active empty or referencing an
   existing channel) persists via config authority/RuntimeManager.Apply
   with masked GET, password-gated reveal, and full-chain redaction. Only a request
   entering with an existing anonymous session+model pin that gets HTTP 429 on the
@@ -272,7 +275,9 @@
   once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
   for chat, `{root}/v1/responses` for responses via the unified API-root rule,
   Bearer key, client entry converted to the channel protocol via the strict bridge
-  with model rewritten to the channel model, response/stream transcoded back;
+  with model rewritten to the channel model plus the channel reasoning_effort
+  override (chat sets `reasoning_effort`, responses merges/creates
+  `reasoning:{effort}`, empty never injects), response/stream transcoded back;
   never listed in public `/v1/models`; no supplier session affinity; never touches
   Zen/Go scheduler layers)
   and the session binds first to that full channel identity (name + normalized base
