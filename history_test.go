@@ -580,11 +580,14 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	if !strings.Contains(html, `String(a.request_id||"")`) || !strings.Contains(html, `String(a.client_session_hash||"")`) {
 		t.Fatal("search must match both Request ID and client session hash")
 	}
-	// Shared row: compact status code with title detail; duration uses ` ms`.
-	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+" ms"`} {
+	// Shared row: compact status code with title detail; duration uses `ms` without space.
+	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+"ms"`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
 		}
+	}
+	if strings.Contains(html, `+" ms"`) {
+		t.Fatal("duration must not contain spaced `+\" ms\"`")
 	}
 	if strings.Contains(html, "毫秒") {
 		t.Fatal("stale duration unit 毫秒 must be removed")

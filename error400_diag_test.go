@@ -328,10 +328,13 @@ func TestError400HistoryWebUICompat(t *testing.T) {
 	if strings.Count(html, "<th>时间</th><th>模型</th><th>上游</th>") < 1 {
 		t.Fatal("realtime table must keep the header without HTTP400 diagnosis")
 	}
-	for _, needle := range []string{"attemptRowCells", "pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+" ms"`} {
+	for _, needle := range []string{"attemptRowCells", "pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", `+"ms"`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
 		}
+	}
+	if strings.Contains(html, `+" ms"`) {
+		t.Fatal("duration must not contain spaced `+\" ms\"`")
 	}
 	if strings.Contains(html, "毫秒") {
 		t.Fatal("stale duration unit 毫秒 must be removed")

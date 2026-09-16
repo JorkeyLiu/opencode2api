@@ -29,7 +29,6 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"监听与管理",
 		"首选上游顺序",
 		"停用备用渠道",
-		"列表选择经保存后生效",
 		"config-sticky",
 		"config-item-grid",
 		"完整地址预览",
@@ -38,10 +37,18 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"fallback-modal-body",
 		"fallback-modal-save",
 		"fallback-modal-delete",
+		"pool-modal",
+		"pool-modal-body",
+		"pool-modal-save",
+		"pool-modal-delete",
+		"保存并应用",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing config group copy %q", needle)
 		}
+	}
+	if strings.Contains(html, "验证、保存并应用") {
+		t.Fatal("global submit must read 保存并应用, legacy 验证、保存并应用 must be removed")
 	}
 	// Duplicate enable concepts are gone: only list selection + deactivate remain.
 	for _, stale := range []string{"启用此渠道", "启用所选渠道", "c-fallback-active", "btn-fallback-activate", "当前启用渠道"} {
@@ -82,6 +89,8 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"fallback-editor", "btn-fallback-add", "btn-fallback-clear", "fallback-error",
 		"fallback-active-note", "fallback-modal", "fallback-modal-body",
 		"fallback-modal-save", "fallback-modal-delete", "fallback-modal-cancel",
+		"pool-modal", "pool-modal-body",
+		"pool-modal-save", "pool-modal-delete", "pool-modal-cancel",
 		"c-up-zen", "c-up-go", "c-attempts", "c-timeout",
 		"c-refresh", "c-protocols",
 		"c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown",
@@ -106,12 +115,9 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		"fb-key-new",
 		"fb-key-id",
 		"fb-key-toggle",
-		"fb-key-status",
-		"fb-key-hint",
 		"fb-url-preview",
 		"fb-url-models",
 		"fb-url-request",
-		"fb-discover-status",
 		"fb-discover",
 		`value="chat"`,
 		`value="responses"`,
@@ -125,12 +131,8 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		"reasoning_effort:effort",
 		"思考强度",
 		"供应商默认",
-		"仅从列表选择",
 		"当前配置：",
 		"供应商列表未返回",
-		"留空保留",
-		"已输入新密钥",
-		"新建渠道需填写",
 		"openFallbackModal",
 		"saveFallbackModal",
 		"deleteFallbackModal",
@@ -146,9 +148,9 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 			t.Fatalf("missing fallback contract %q", needle)
 		}
 	}
-	// Masked tail sentence must be gone; placeholder carries the masked display.
+	// Masked tail sentence must be gone.
 	if strings.Contains(html, "已保存密钥") {
-		t.Fatal("fallback must not show saved-key tail copy; masked display lives in the input placeholder")
+		t.Fatal("fallback must not show saved-key tail copy")
 	}
 	if strings.Contains(html, "保存后将替换已保存密钥") {
 		t.Fatal("legacy replace-key hint must be removed")
@@ -174,19 +176,15 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 			t.Fatalf("effort selector must contain %q", needle)
 		}
 	}
-	// Key entry is a fresh password input, never prefilled with masked material.
+	// Key entry defaults to password with masked value, never placeholder-masked.
 	if !strings.Contains(html, `keyInput.type="password"`) {
 		t.Fatal("fallback key input must default to password")
 	}
-	if !strings.Contains(html, `keyInput.value=""`) {
-		t.Fatal("fallback key input must start empty, never masked material")
+	if !strings.Contains(html, `keyInput.value=pendingNew||savedDisplay`) {
+		t.Fatal("editing channel must default input value to masked display, not placeholder")
 	}
-	if !strings.Contains(html, "显示") || !strings.Contains(html, "隐藏") {
-		t.Fatal("fallback key toggle must carry show/hide copy")
-	}
-	// Empty base renders an em-dash placeholder.
-	if !strings.Contains(html, "—") {
-		t.Fatal("URL preview must render em-dash for empty base")
+	if strings.Contains(html, `placeholder=savedDisplay`) {
+		t.Fatal("masked display must live in input value, never placeholder")
 	}
 	// Discovery consumes the safe structured error fields.
 	for _, needle := range []string{"errObj.reason", "errObj.http_status", "errObj.endpoint", "errObj.elapsed_ms", "fallbackDiscoverReasonCN"} {
@@ -198,6 +196,80 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing diagnosable discover copy %q", needle)
 		}
+	}
+}
+
+func TestWebUIFallbackEyeReauthMasked(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		`keyToggle.className="icon-btn"`,
+		`aria-label","显示密钥"`,
+		`aria-label","隐藏密钥"`,
+		`setEye(false)`,
+		`st.revealed`,
+		`st.originalSecret`,
+		`origDisplay`,
+		`revealConfig(pw)`,
+		`prompt("请再次输入管理密码`,
+		`String(c.name||"")===String(st.origName`,
+		`keyInput.value=pendingNew||savedDisplay`,
+		`keyInput.value=savedDisplay`,
+		`delete entry._newKey`,
+		`entry._newKey=nv`,
+		`S.fbModal={index:null,origName:"",origDisplay`,
+		`X-CSRF-Token`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing eye/re-auth contract %q", needle)
+		}
+	}
+	if strings.Contains(html, `keyToggle.textContent="显示"`) || strings.Contains(html, `keyToggle.textContent="隐藏"`) {
+		t.Fatal("eye toggle must be an icon button without 显示/隐藏 text content")
+	}
+	if !strings.Contains(html, "👁") {
+		t.Fatal("eye icon button must render an eye glyph")
+	}
+	for _, stale := range []string{"fb-key-status", "fb-key-hint", "留空保留", "已输入新密钥", "新建渠道需填写", "已保存密钥", "留空保留已保存"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("redundant key helper must stay removed: %q", stale)
+		}
+	}
+	if strings.Contains(html, `toast(found`) || strings.Contains(html, `toast(st.originalSecret`) {
+		t.Fatal("plaintext must never enter toast")
+	}
+}
+
+func TestWebUIFallbackDiscoverToastOnly(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		`toast("已获取 "`,
+		`toast("未返回模型"`,
+		`toast("已选择模型 "`,
+		`discBtn.textContent="获取中`,
+		`discBtn.disabled=true`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("discovery toast contract must contain %q", needle)
+		}
+	}
+	for _, stale := range []string{
+		"fb-discover-status",
+		"仅从列表选择",
+		"新建渠道请先获取",
+		"已选中当前值",
+		"切换即生效",
+		"保存后持久化",
+		"保存后生效",
+		"提交配置后生效",
+		"仅支持 HTTP/HTTPS",
+		"空=供应商默认",
+	} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("simplified modal must not contain %q", stale)
+		}
+	}
+	if strings.Contains(html, `modelLabel.textContent="模型（`) {
+		t.Fatal("model label must be plain 模型 without parenthetical")
 	}
 }
 
@@ -242,6 +314,62 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 	}
 }
 
+func TestWebUIPoolListModal(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		"pool-list",
+		"pool-row",
+		"pool-modal",
+		"pool-modal-body",
+		"pool-modal-save",
+		"pool-modal-delete",
+		"pool-modal-cancel",
+		"function renderPoolsList()",
+		"function poolListRow(p, idx)",
+		"function openPoolModal(idx)",
+		"function savePoolModal()",
+		"function deletePoolModal()",
+		"function closePoolModal()",
+		"S.poolDraft",
+		"S.poolModal",
+		"节点 ",
+		"运行中",
+		"暂存",
+		"每行新增一个代理节点",
+		"代理文件",
+		"运行状态",
+		"仍被路由引用",
+		"mapRoutingOnRename(oldSel,oldName,name)",
+		"c-route-anon",
+		"c-route-zen",
+		"c-route-go",
+		"poolInputs",
+		"poolInputNames",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("pool list/modal must contain %q", needle)
+		}
+	}
+	for _, stale := range []string{"pool-card", "function poolCard("} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("inline pool card must stay removed: %q", stale)
+		}
+	}
+	if strings.Contains(html, "fb-discover") && strings.Contains(html, "pool-discover") {
+		t.Fatal("proxy pools must not gain model discovery")
+	}
+	// Routing guards: three routes required, delete blocked while referenced.
+	for _, needle := range []string{
+		"匿名 / Zen / Go 必须各选择一个代理池",
+		"至少需要一个代理池",
+		"refs.a===cur||refs.z===cur||refs.g===cur",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("pool routing guard must contain %q", needle)
+		}
+	}
+}
+
 func TestWebUIConfigNoInternalCopy(t *testing.T) {
 	html := readConfigWebUI(t)
 	for _, stale := range []string{"pinned", "429接管", "会话级固化", "不随active"} {
@@ -254,15 +382,17 @@ func TestWebUIConfigNoInternalCopy(t *testing.T) {
 			t.Fatalf("forbidden DOM sink %q", sink)
 		}
 	}
-	// Pool cards share the unified card style, no inline temp styling.
-	if !strings.Contains(html, "pool-card config-item-card") {
-		t.Fatal("pool cards must use the unified card style")
+	if !strings.Contains(html, "pool-row") {
+		t.Fatal("pool compact list must use pool-row")
 	}
 	if !strings.Contains(html, "fb-row") {
 		t.Fatal("fallback compact list must use fb-row")
 	}
 	if !strings.Contains(html, "fallback-modal") {
 		t.Fatal("fallback editor must use a dedicated modal")
+	}
+	if !strings.Contains(html, "pool-modal") {
+		t.Fatal("pool editor must use a dedicated modal")
 	}
 	if strings.Contains(html, `card.style.border="1px solid var(--line)"`) {
 		t.Fatal("dynamic cards must not carry inline temp borders")

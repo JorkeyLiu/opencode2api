@@ -352,14 +352,17 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 	if strings.Contains(html, "— 无hash") {
 		t.Fatal("stale no-hash copy must be removed")
 	}
-	// Shared row: compact status code with title detail; duration uses ` ms`.
+	// Shared row: compact status code with title detail; duration uses `ms` without space.
 	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", "上游：", "目标协议：", "代理池/节点：", "密钥尾码："} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
 		}
 	}
-	if !strings.Contains(html, `+" ms"`) {
-		t.Fatal("duration must use ` ms`")
+	if !strings.Contains(html, `+"ms"`) {
+		t.Fatal("duration must use `+\"ms\"`")
+	}
+	if strings.Contains(html, `+" ms"`) {
+		t.Fatal("duration must not contain spaced `+\" ms\"`")
 	}
 	if strings.Contains(html, "毫秒") {
 		t.Fatal("stale duration unit 毫秒 must be removed")
