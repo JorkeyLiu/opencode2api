@@ -168,14 +168,15 @@ func TestWebUICustomChannelHelpers(t *testing.T) {
 		`function isCustomRow(a)`,
 		`custom:`,
 		`tbody-usage-tier`,
-		`chanTokens`,
+		`S.usageAggregate`,
+		`function usageAggregateDisplay`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("webui custom helper missing %q", needle)
 		}
 	}
-	// New channel form must be understood alongside the legacy merged row.
-	if !strings.Contains(html, `k==="custom"||k.slice(0,7)==="custom:"`) && !strings.Contains(html, `k.slice(0,7)==="custom:"`) {
-		t.Fatal("usage table must handle old and new custom keys")
+	// Range aggregate keeps the legacy merged row alongside per-channel rows.
+	if !strings.Contains(html, `upstream==="custom"`) || !strings.Contains(html, `upstream.slice(0,7)==="custom:"`) {
+		t.Fatal("range usage table must handle old and new custom keys")
 	}
 }

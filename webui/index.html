@@ -97,6 +97,7 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .check-label input{margin:0 8px 0 0;flex:none;width:auto;padding:0;vertical-align:middle}
 .check-label span{line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .scroll-bound{max-height:360px;overflow-y:auto;border:1px solid var(--line)}
+.table-wrap.scroll-bound table thead th{position:sticky;top:0;z-index:5;background:#f2f4f2;box-shadow:0 1px 0 var(--line2)}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
 .chip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);border:1px solid var(--line2);padding:3px 4px 3px 8px;font-family:var(--mono);font-size:12px}
 .chip button{border:1px solid var(--line2);background:#fff;padding:0 7px;line-height:1.6}
@@ -298,13 +299,15 @@ html,body{max-width:100%;overflow-x:hidden}
       </div>
       <div class="section">
         <h2>按模型用量</h2>
-        <div class="cap">按模型汇总已上报用量，未上报显示“—”。调用数为最近一小时窗口。</div>
+        <div class="cap">按模型汇总所选时间范围内的已上报用量，未上报显示“—”。调用数为所选范围内的持久历史请求数，Token 仅统计上游已上报。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>模型</th><th>调用</th><th>输入</th><th>输出</th><th>缓存</th><th>推理</th><th>总量</th></tr></thead><tbody id="tbody-usage-model"></tbody></table></div>
+        <div class="note" id="usage-model-note"></div>
       </div>
       <div class="section">
         <h2>按上游用量</h2>
-        <div class="cap">按上游汇总已上报用量，未上报显示“—”。调用数为最近一小时窗口。</div>
+        <div class="cap">按上游汇总所选时间范围内的已上报用量，未上报显示“—”。调用数为所选范围内的持久历史请求数，自定义渠道按具体名称展示（旧自定义合并显示为“自定义”）。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>上游</th><th>调用</th><th>输入</th><th>输出</th><th>缓存</th><th>推理</th><th>总量</th></tr></thead><tbody id="tbody-usage-tier"></tbody></table></div>
+        <div class="note" id="usage-tier-note"></div>
       </div>
       <div class="section" id="proxy-stats-wrap">
         <h2>代理统计</h2>
@@ -548,6 +551,7 @@ var S = {
   realtimePaused:false,
   historyPeriod:"today", history:null, persistedSeries:[],
   proxyStats:[], proxyTruncated:false, proxyTotal:0, histLoading:false, histSeq:0,
+  usageAggregate:null, usageAggregateError:"", usageAggregateLoading:false,
   logEvents:[], logPaused:false, logGap:"", logFail:0,
   es:null, timer:null,
   secretReveal:{seq:0,promise:null,data:null}
@@ -942,7 +946,7 @@ function copyText(text){
 }
 
 /* ---------- usage ---------- */
-(function(){ var sel=$("h-period"); if(sel){ sel.value=S.historyPeriod; sel.addEventListener("change",function(){ S.historyPeriod=sel.value; S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.histSeq++; renderUsage(); loadPersistedHistory(true); }); } })();
+(function(){ var sel=$("h-period"); if(sel){ sel.value=S.historyPeriod; sel.addEventListener("change",function(){ S.historyPeriod=sel.value; S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.usageAggregate=null; S.usageAggregateError=""; S.usageAggregateLoading=true; S.histSeq++; renderUsage(); loadPersistedHistory(true); }); } })();
 function periodStart(kind){
   var now=new Date();
   if(kind==="today"){ var s=new Date(now); s.setHours(0,0,0,0); return s; }
@@ -965,13 +969,12 @@ function usageAvailability(){
 }
 function renderUsage(){
   var m=S.metrics; if(!m)return;
-  var use=((m.usage&&m.usage.last_hour)||{});
   var avail=usageAvailability();
   var ua=$("usage-avail"); if(ua){ clear(ua); if(!avail.ok||avail.partial||avail.text)ua.appendChild(document.createTextNode(avail.text)); }
   renderPersistedKPIs();
-  renderUsageTables(use);
+  renderUsageAggregateTables();
   renderProxyStats();
-  if(!S.persistedSeries.length&&!S.proxyStats.length&&!S.histLoading)loadPersistedHistory(true);
+  if(!S.persistedSeries.length&&!S.proxyStats.length&&!S.usageAggregate&&!S.histLoading&&!S.usageAggregateLoading)loadPersistedHistory(true);
   else if(S.persistedSeries.length)renderPersistedSeries(S.persistedSeries);
 }
 function renderPersistedKPIs(){
@@ -1017,68 +1020,82 @@ function renderPersistedKPIs(){
   kpi("上游尝试平均耗时",avg,"尝试耗时加权平均");
   kpi("上游用量返回率",fmtInt(rep)+" / "+retRate,"已返回用量的请求 / 请求数，按请求数统计，非 Token 占比；— 表示上游未返回用量");
 }
-function renderUsageTables(use){
-  var m=S.metrics||{};
-  var tm=$("tbody-usage-model"); clear(tm);
-  var models=Object.keys((use&&use.models)||{});
-  if(!models.length){emptyRow(tm,7,"暂无用量（仅统计上游已上报）");}
+/* Range usage tables come only from persisted /api/history/usage-aggregate.
+   refreshMonitor never writes S.usageAggregate, so the 5s poll cannot
+   overwrite the selected range. Calls use aggregate.calls (all range
+   requests); tokens accumulate only usage_reported lines, never estimated. */
+function usageAggregateDisplay(upstream){
+  upstream=String(upstream||"");
+  if(upstream==="custom")return {label:"自定义",title:"上游：自定义"};
+  if(upstream.slice(0,7)==="custom:")return {label:upstream.slice(7),title:"自定义渠道："+upstream.slice(7)};
+  return {label:tierLabel(upstream),title:"上游："+tierLabel(upstream)};
+}
+function renderUsageAggregateTables(){
+  var tm=$("tbody-usage-model"); if(tm)clear(tm);
+  var tt=$("tbody-usage-tier"); if(tt)clear(tt);
+  var mn=$("usage-model-note"); if(mn)clear(mn);
+  var tn=$("usage-tier-note"); if(tn)clear(tn);
+  var avail=usageAvailability();
+  function note(n,text){ if(n&&text)n.appendChild(document.createTextNode(text)); }
+  if(!avail.ok){
+    if(tm)emptyRow(tm,7,"历史记录未启用");
+    if(tt)emptyRow(tt,7,"历史记录未启用");
+    note(mn,avail.text); note(tn,avail.text);
+    return;
+  }
+  var agg=S.usageAggregate;
+  if(!agg){
+    var loading=S.usageAggregateLoading?"加载中…":"暂无范围用量";
+    if(S.usageAggregateError){
+      if(tm)emptyRow(tm,7,"范围用量加载失败");
+      if(tt)emptyRow(tt,7,"范围用量加载失败");
+      note(mn,S.usageAggregateError); note(tn,S.usageAggregateError);
+      return;
+    }
+    if(tm)emptyRow(tm,7,loading);
+    if(tt)emptyRow(tt,7,loading);
+    if(S.usageAggregateLoading){ note(mn,"范围用量加载中…"); note(tn,"范围用量加载中…"); }
+    else { note(mn,"暂无范围用量"); note(tn,"暂无范围用量"); }
+    return;
+  }
+  var models=agg.models||[];
+  if(!models.length){ if(tm)emptyRow(tm,7,"暂无范围用量（所选时间范围内无持久历史请求）"); }
   else{
-    models.sort(function(a,b){return (((use.models[b]||{}).total_tokens)||0)-(((use.models[a]||{}).total_tokens)||0);}).slice(0,50).forEach(function(name){
-      var c=use.models[name]||{};
+    models.forEach(function(r){
       var tr=document.createElement("tr");
-      cell(tr,name,"wrap");
-      (function(){ var td=document.createElement("td"); var v=(m.models||{})[name]; if(v===undefined){ td.textContent="—"; td.title="最近一小时内无调用"; } else { td.textContent=fmtInt(v); td.title="最近一小时调用数"; } tr.appendChild(td); })();
-      cell(tr,fmtToken(c.input_tokens)); cell(tr,fmtToken(c.output_tokens));
-      cell(tr,fmtToken(c.cached_tokens)); cell(tr,fmtToken(c.reasoning_tokens)); cell(tr,fmtToken(c.total_tokens));
+      cell(tr,r.model||"—","wrap");
+      (function(){ var td=document.createElement("td"); td.textContent=fmtInt(r.calls); td.title="所选时间范围内的调用数"; tr.appendChild(td); })();
+      cell(tr,fmtToken(r.input_tokens)); cell(tr,fmtToken(r.output_tokens));
+      cell(tr,fmtToken(r.cached_tokens)); cell(tr,fmtToken(r.reasoning_tokens)); cell(tr,fmtToken(r.total_tokens));
       tm.appendChild(tr);
     });
   }
-  var tt=$("tbody-usage-tier"); clear(tt);
-  var tiers=Object.keys((use&&use.tiers)||{});
-  var chanTokens=(use&&use.channels)||{};
-  var chanCounts=(m.channels||{});
-  function usageRow(label, title, tokens, calls){
-    var tr=document.createElement("tr");
-    (function(){ var td=document.createElement("td"); td.textContent=label; td.title=title; tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); if(calls===undefined){ td.textContent="—"; td.title="最近一小时内无调用"; } else { td.textContent=fmtInt(calls); td.title="最近一小时调用数"; } tr.appendChild(td); })();
-    cell(tr,fmtToken(tokens.input_tokens)); cell(tr,fmtToken(tokens.output_tokens));
-    cell(tr,fmtToken(tokens.cached_tokens)); cell(tr,fmtToken(tokens.reasoning_tokens)); cell(tr,fmtToken(tokens.total_tokens));
-    tt.appendChild(tr);
-  }
-  if(!tiers.length && !Object.keys(chanTokens).length){emptyRow(tt,7,"暂无上游用量");}
+  var ups=agg.upstreams||[];
+  if(!ups.length){ if(tt)emptyRow(tt,7,"暂无范围用量"); }
   else{
-    tiers.sort(function(a,b){return (((use.tiers[b]||{}).total_tokens)||0)-(((use.tiers[a]||{}).total_tokens)||0);}).forEach(function(name){
-      if(name==="custom"){
-        var ckeys=Object.keys(chanTokens).filter(function(k){ return k==="custom"||k.slice(0,7)==="custom:"; });
-        if(!ckeys.length){
-          usageRow(tierLabel(name),"上游："+tierLabel(name),use.tiers[name]||{},(m.tiers||{})[name]);
-        } else {
-          ckeys.sort(function(a,b){return (((chanTokens[b]||{}).total_tokens)||0)-(((chanTokens[a]||{}).total_tokens)||0);}).forEach(function(ck){
-            var disp=ck==="custom"?"自定义":ck.slice(7);
-            var title=ck==="custom"?"上游：自定义":"自定义渠道："+disp;
-            usageRow(disp,title,chanTokens[ck]||{},chanCounts[ck]);
-          });
-        }
-        return;
-      }
-      usageRow(tierLabel(name),"上游："+tierLabel(name),use.tiers[name]||{},(m.tiers||{})[name]);
+    ups.forEach(function(r){
+      var d=usageAggregateDisplay(r.upstream);
+      var tr=document.createElement("tr");
+      (function(){ var td=document.createElement("td"); td.textContent=d.label; td.title=d.title; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.textContent=fmtInt(r.calls); td.title="所选时间范围内的调用数"; tr.appendChild(td); })();
+      cell(tr,fmtToken(r.input_tokens)); cell(tr,fmtToken(r.output_tokens));
+      cell(tr,fmtToken(r.cached_tokens)); cell(tr,fmtToken(r.reasoning_tokens)); cell(tr,fmtToken(r.total_tokens));
+      tt.appendChild(tr);
     });
-    var hasCustomTier=tiers.indexOf("custom")>=0;
-    if(!hasCustomTier){
-      Object.keys(chanTokens).filter(function(k){ return k==="custom"||k.slice(0,7)==="custom:"; }).sort(function(a,b){return (((chanTokens[b]||{}).total_tokens)||0)-(((chanTokens[a]||{}).total_tokens)||0);}).forEach(function(ck){
-        var disp=ck==="custom"?"自定义":ck.slice(7);
-        var title=ck==="custom"?"上游：自定义":"自定义渠道："+disp;
-        usageRow(disp,title,chanTokens[ck]||{},chanCounts[ck]);
-      });
-    }
-    if(!tiers.length && !tt.children.length){emptyRow(tt,7,"暂无上游用量");}
   }
+  var suffix=(agg.truncated?("，仅展示前 "+models.length+" / "+ups.length+"（共 "+agg.total_models+" 模型 / "+agg.total_upstreams+" 上游，已截断）"):"");
+  suffix+=(agg.legacy_incomplete?(" · 旧历史用量缺推理/总量，仅累计输入/输出/缓存，不做估算"):"");
+  if(avail.partial)suffix+=(" · "+avail.text);
+  if(S.usageAggregateLoading)suffix+=(" · 加载中…");
+  var label=periodLabel(S.historyPeriod)+"范围内共 "+fmtInt((agg.totals||{}).calls)+" 次调用"+suffix;
+  note(mn,label); note(tn,label);
 }
 function histQueryRange(){ var to=new Date(); var from=periodStart(S.historyPeriod||"today"); return {from:from.toISOString(),to:to.toISOString()}; }
 function loadPersistedHistory(reset){
   var seq=++S.histSeq; S.histLoading=true;
-  if(reset){ S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; }
-  renderProxyStats(); renderPersistedKPIs();
+  if(reset){ S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.usageAggregate=null; S.usageAggregateError=""; }
+  S.usageAggregateLoading=true;
+  renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
   var rg=histQueryRange();
   api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
     if(seq!==S.histSeq)return;
@@ -1092,8 +1109,13 @@ function loadPersistedHistory(reset){
     S.proxyTruncated=!!res.truncated;
     S.proxyTotal=(res.total_proxies===undefined||res.total_proxies===null)?S.proxyStats.length:res.total_proxies;
     S.histLoading=false;
-    renderProxyStats(); renderPersistedKPIs();
-  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; renderProxyStats(); renderPersistedKPIs(); });
+    renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
+  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables(); });
+  api("/api/history/usage-aggregate?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq)return;
+    S.usageAggregate=res; S.usageAggregateError=""; S.usageAggregateLoading=false;
+    renderUsageAggregateTables();
+  }).catch(function(err){ if(seq!==S.histSeq)return; S.usageAggregate=null; S.usageAggregateError="范围用量加载失败，已保留当前范围空状态"; S.usageAggregateLoading=false; renderUsageAggregateTables(); });
 }
 function aggregatePersistedSeries(items, maxBuckets){
   maxBuckets=maxBuckets||120;

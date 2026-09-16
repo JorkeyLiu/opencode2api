@@ -80,30 +80,40 @@ type historyEnvelope struct {
 // Per-request cache fields are additive schema v1: UsageReported false means
 // unknown (old lines decode the same way); hit/miss follow the shared
 // cacheHitMiss semantics (miss bundles cache-write plus ordinary uncached).
+// Reasoning/total are additive v1 fields persisted only from real upstream
+// usage; old usage-reported lines decode them as zero and must never be
+// estimated (aggregates surface legacy_incomplete instead).
+// UsageDetailComplete is the explicit additive v1 marker distinguishing new
+// complete lines (true for every UsageReported=true write, even when
+// reasoning/total are zero and omitted by omitempty) from old lines where
+// the key is absent (false). Optional omitempty keeps v1 compatibility.
 type historyRequestLine struct {
-	V                 int    `json:"v"`
-	Kind              string `json:"kind"`
-	Time              string `json:"time"`
-	RequestID         string `json:"request_id"`
-	Model             string `json:"model"`
-	Tier              string `json:"tier,omitempty"`
-	Protocol          string `json:"protocol,omitempty"`
-	ClientSessionHash string `json:"client_session_hash,omitempty"`
-	KeyID             string `json:"key_id,omitempty"`
-	Channel           string `json:"channel"`
-	Anonymous         bool   `json:"anonymous"`
-	ProxyPool         string `json:"proxy_pool,omitempty"`
-	ProxyNode         string `json:"proxy_node,omitempty"`
-	Attempts          int    `json:"attempts"`
-	Status            int    `json:"status"`
-	DurationMS        int64  `json:"duration_ms"`
-	Success           bool   `json:"success"`
-	Outcome           string `json:"outcome,omitempty"`
-	UsageReported     bool   `json:"usage_reported,omitempty"`
-	InputTokens       int    `json:"input_tokens,omitempty"`
-	OutputTokens      int    `json:"output_tokens,omitempty"`
-	CacheHitTokens    int    `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens   int    `json:"cache_miss_tokens,omitempty"`
+	V                   int    `json:"v"`
+	Kind                string `json:"kind"`
+	Time                string `json:"time"`
+	RequestID           string `json:"request_id"`
+	Model               string `json:"model"`
+	Tier                string `json:"tier,omitempty"`
+	Protocol            string `json:"protocol,omitempty"`
+	ClientSessionHash   string `json:"client_session_hash,omitempty"`
+	KeyID               string `json:"key_id,omitempty"`
+	Channel             string `json:"channel"`
+	Anonymous           bool   `json:"anonymous"`
+	ProxyPool           string `json:"proxy_pool,omitempty"`
+	ProxyNode           string `json:"proxy_node,omitempty"`
+	Attempts            int    `json:"attempts"`
+	Status              int    `json:"status"`
+	DurationMS          int64  `json:"duration_ms"`
+	Success             bool   `json:"success"`
+	Outcome             string `json:"outcome,omitempty"`
+	UsageReported       bool   `json:"usage_reported,omitempty"`
+	InputTokens         int    `json:"input_tokens,omitempty"`
+	OutputTokens        int    `json:"output_tokens,omitempty"`
+	CacheHitTokens      int    `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens     int    `json:"cache_miss_tokens,omitempty"`
+	ReasoningTokens     int    `json:"reasoning_tokens,omitempty"`
+	TotalTokens         int    `json:"total_tokens,omitempty"`
+	UsageDetailComplete bool   `json:"usage_detail_complete,omitempty"`
 }
 
 // historyAttemptLine carries the safe subset of UpstreamAttempt.
@@ -449,6 +459,8 @@ func (s *HistoryStore) EnqueueRequest(r UpstreamRequest) {
 		Success: r.Success, Outcome: r.Outcome,
 		UsageReported: r.UsageReported, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
 		CacheHitTokens: r.CacheHitTokens, CacheMissTokens: r.CacheMissTokens,
+		ReasoningTokens: r.ReasoningTokens, TotalTokens: r.TotalTokens,
+		UsageDetailComplete: r.UsageReported,
 	}
 	if line.Channel == "" {
 		line.Channel = "not_routed"

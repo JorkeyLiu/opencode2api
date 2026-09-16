@@ -91,8 +91,10 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 | `GET` | `/api/history/requests?from=&to=&limit=&cursor=&model=&tier=&channel=&success=&proxy_pool=` | 24h，limit 100 cap 200 |
 | `GET` | `/api/history/attempts?…&request_id=&failure_class=` | 24h，limit 100 cap 200 |
 | `GET` | `/api/history/series?from=&to=&limit=&cursor=` | 7d，limit/cap 10080 |
+| `GET` | `/api/history/proxy-stats?from=&to=&limit=` | 24h，limit 200 cap 500 |
+| `GET` | `/api/history/usage-aggregate?from=&to=&limit=` | 24h，limit 200 cap 500 |
 
-范围上限为 `retention_days`；`cursor` 为不透明 base64（稳定倒序分页）；禁用时返回 200 空 items 与 `active:false`；参数错 400。WebUI 历史页提供 `1小时(内存)|24小时|7天` 切换，24h/7d 显示持久趋势与请求表（分页加载更多，点 request 拉 attempt 链），memory-only 时显示清晰空状态。
+范围上限为 `retention_days`；`cursor` 为不透明 base64（稳定倒序分页）；禁用时返回 200 空 items 与 `active:false`；参数错 400。`usage-aggregate` 单遍扫描所选范围的 `requests-*.ndjson`，按模型与上游聚合（上游为 `tier`，`tier=custom` 时为完整渠道：旧 `custom` 保留合并行，新 `custom:<名>` 分行）：每项含 `calls`（范围内全部请求数）、`usage_calls`（已上报数）与仅已上报累计的 `input/output/cached/reasoning/total_tokens`，按 `total_tokens` 倒序、limit 截断并返回 `total_models/total_upstreams/truncated/gap/dropped/active/last_error/from/to`；旧历史用量行缺 `reasoning/total` 时计零且置 `legacy_incomplete:true`，不做估算，新请求已持久化真实上游上报的 `reasoning_tokens`/`total_tokens`（additive v1，旧行仍可读）。WebUI 使用统计页提供`今天|最近 24 小时|最近 7 天|本月`切换，按模型/按上游表均来自所选范围的 `usage-aggregate`（不再使用内存最近一小时），趋势/KPI/代理统计来源不变。
 
 ### Playground 与诊断 API
 

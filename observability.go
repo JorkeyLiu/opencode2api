@@ -544,7 +544,9 @@ func outcomeFromClass(class string, success bool) string {
 // Cache hit is bridgeUsage.Cached; cache miss is
 // max(bridgeUsage.Input-bridgeUsage.Cached, 0) and therefore includes cache
 // creation/write plus ordinary uncached prompt tokens (not an exact
-// uncached-vs-creation split). Attempts never receive request-final usage.
+// uncached-vs-creation split). Reasoning/total ride the same reported gate:
+// old persisted lines lack them (zero, legacy_incomplete) and are never
+// estimated. Attempts never receive request-final usage.
 type UpstreamRequest struct {
 	Time              time.Time `json:"time"`
 	RequestID         string    `json:"request_id"`
@@ -567,6 +569,8 @@ type UpstreamRequest struct {
 	OutputTokens      int       `json:"output_tokens,omitempty"`
 	CacheHitTokens    int       `json:"cache_hit_tokens,omitempty"`
 	CacheMissTokens   int       `json:"cache_miss_tokens,omitempty"`
+	ReasoningTokens   int       `json:"reasoning_tokens,omitempty"`
+	TotalTokens       int       `json:"total_tokens,omitempty"`
 }
 
 // cacheHitMiss derives the per-request cache display pair from reported
@@ -848,6 +852,8 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 				request.OutputTokens = max(meta.Usage.Output, 0)
 				request.CacheHitTokens = hit
 				request.CacheMissTokens = miss
+				request.ReasoningTokens = max(meta.Usage.Reasoning, 0)
+				request.TotalTokens = max(meta.Usage.Total, 0)
 			}
 			if request.Channel == "" {
 				request.Channel = "not_routed"

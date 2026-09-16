@@ -35,10 +35,11 @@ func TestWebUIGlobalFormatRules(t *testing.T) {
 		t.Fatal("usage KPI must format input/output/cache/reasoning tokens with fmtToken")
 	}
 
-	// 3. Usage tables (by model & by tier)
+	// 3. Usage tables (by model & by upstream, range aggregate source)
 	for _, needle := range []string{
-		`cell(tr,fmtToken(c.input_tokens)); cell(tr,fmtToken(c.output_tokens));`,
-		`cell(tr,fmtToken(c.cached_tokens)); cell(tr,fmtToken(c.reasoning_tokens)); cell(tr,fmtToken(c.total_tokens));`,
+		`cell(tr,fmtToken(r.input_tokens)); cell(tr,fmtToken(r.output_tokens));`,
+		`cell(tr,fmtToken(r.cached_tokens)); cell(tr,fmtToken(r.reasoning_tokens)); cell(tr,fmtToken(r.total_tokens));`,
+		`td.textContent=fmtInt(r.calls);`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("usage table tokens must contain %q", needle)
