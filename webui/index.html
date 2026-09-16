@@ -25,7 +25,7 @@ button{cursor:pointer}
 .primary{background:var(--accent);color:var(--accent-ink);border:1px solid var(--accent);padding:7px 14px}
 .ghost{background:#fff;border:1px solid var(--line2);color:var(--ink);padding:6px 12px}
 .wide{width:100%}
-.topbar{position:sticky;top:0;z-index:20;background:#16382f;color:#eef4ef;border-bottom:3px solid #0f2822;display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:10px 18px}
+.topbar{flex:none;position:sticky;top:0;z-index:20;background:#16382f;color:#eef4ef;border-bottom:3px solid #0f2822;display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:10px 18px}
 .topbar .brand{font-weight:700;font-size:15px;margin-right:8px}
 .topbar .stat{font-family:var(--mono);font-size:12px;color:#cfddd5}
 .topbar .stat b{color:#fff;font-weight:600}
@@ -34,13 +34,14 @@ button{cursor:pointer}
 .topbar .conn.bad{color:#f2b8b0}
 .topbar button{background:transparent;color:#fff;border:1px solid #ffffff55;padding:5px 10px;font-size:12.5px}
 .topbar button:hover{background:#ffffff18}
-.layout{position:relative;isolation:isolate;display:flex;align-items:stretch;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px)}
-.nav{background:var(--chip);border-right:1px solid var(--line2);box-shadow:2px 0 6px rgba(28,36,32,.06);display:flex;flex-direction:column;gap:8px;padding:14px 12px;width:212px;flex:none;position:sticky;top:52px;align-self:flex-start;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px);z-index:15}
+#view-app{height:100vh;height:100dvh;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.layout{flex:1;min-height:0;overflow:hidden;position:relative;isolation:isolate;display:flex;align-items:stretch}
+.nav{background:var(--chip);border-right:1px solid var(--line2);box-shadow:2px 0 6px rgba(28,36,32,.06);display:flex;flex-direction:column;gap:8px;padding:14px 12px;width:212px;flex:none;min-height:0;overflow-y:auto;overflow-x:hidden;z-index:15}
 .nav button{border:1px solid var(--line2);background:#fff;padding:9px 12px;font-size:13.5px;text-align:left;width:100%}
 .nav button:hover{background:#e2e8e2}
 .nav button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .nav button.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;box-shadow:inset 3px 0 0 #0f2822}
-.main{flex:1;min-width:0;max-width:1280px;margin:0 auto;padding:18px;width:100%;position:relative;z-index:1}
+.main{flex:1;min-width:0;min-height:0;overflow-y:auto;overflow-x:hidden;max-width:1280px;margin:0 auto;padding:18px;width:100%;position:relative;z-index:1}
 .notice{background:#fff8e6;border:1px solid #e3c46a;color:#5c4a00;padding:9px 12px;font-size:13px;margin-bottom:12px}
 .banner{background:#fff;border:1px solid var(--line2);padding:8px 12px;font-size:12.5px;color:var(--muted);margin-bottom:12px}
 .banner.bad{border-color:var(--bad);color:var(--bad)}
@@ -99,6 +100,10 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
 .chip{display:inline-flex;align-items:center;gap:6px;background:var(--chip);border:1px solid var(--line2);padding:3px 4px 3px 8px;font-family:var(--mono);font-size:12px}
 .chip button{border:1px solid var(--line2);background:#fff;padding:0 7px;line-height:1.6}
+.chip .secret-label{cursor:pointer}
+.chip .secret-label:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.topbar #save-status{font-size:12px;color:#cfddd5}
+.topbar #save-status[data-tone="bad"]{color:#f2b8b0}
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .code-card{border:1px solid var(--line);margin:8px 0}
 .code-head{display:flex;justify-content:space-between;align-items:center;background:#f2f4f2;padding:6px 10px;font-size:12.5px}
@@ -138,30 +143,33 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .url-preview{font-family:var(--mono);font-size:12px;color:#33403a;background:#fff;border:1px solid var(--line);padding:7px 9px;word-break:break-all;white-space:normal;display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;min-width:0;max-width:100%}
 .url-preview>div{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .fb-err,.pool-err{color:var(--bad);font-size:12.5px}
-.key-row{display:flex;gap:8px;align-items:center;min-width:0;max-width:100%;width:100%}
-.key-row input{flex:1;min-width:0}
-.key-row button{flex:none;min-width:0;min-height:36px}
+.key-row{position:relative;display:block;min-width:0;max-width:100%;width:100%}
+.key-row input{width:100%;min-width:0;padding-right:40px;box-sizing:border-box}
+.key-row button{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:none;background:transparent;min-width:32px;min-height:32px;line-height:1;font-size:16px;padding:4px 8px;cursor:pointer}
+.key-row button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.key-row button:disabled{opacity:.6;cursor:default}
+.key-row button svg{width:18px;height:18px;display:block;pointer-events:none}
 .fb-model-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;max-width:100%;width:100%;min-width:0}
 .fb-model-row button{flex:none;white-space:nowrap;min-width:0;min-height:36px}
 .fb-model-row select{min-width:0;max-width:100%;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .status-panel{display:flex;align-items:center;min-height:36px;background:#fff;border:1px solid var(--line);padding:6px 9px;font-size:12.5px;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 details.advanced{border:1px solid var(--line);padding:8px 10px;background:#fbfcfb}
 details.advanced summary{cursor:pointer;font-size:13px;font-weight:600;color:#33403a}
-.config-sticky{position:sticky;bottom:0;z-index:10;background:#fff;border:1px solid var(--line2);padding:10px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
-.config-sticky .primary{padding:8px 18px;font-weight:700}
 html,body{max-width:100%;overflow-x:hidden}
-.main{min-width:0;overflow-x:hidden}
-/* desktop >=1200: sidebar fixed to viewport left, content offset by sidebar width */
+/* desktop >=1200: viewport shell fills screen; sidebar + content columns share flex row, only main scrolls */
 @media (min-width:1200px){
-  .layout{display:block;padding:0;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px)}
+  #view-app{height:100vh;height:100dvh;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+  .topbar{flex:none;position:sticky;top:0}
+  .layout{flex:1;min-height:0;overflow:hidden;display:flex;align-items:stretch;padding:0}
   .layout::before{display:none}
-  .nav{position:fixed;left:0;top:52px;width:212px;height:calc(100vh - 52px);height:calc(100dvh - 52px);overflow-y:auto;overflow-x:hidden;z-index:30;flex:none;flex-direction:column;flex-wrap:nowrap;min-height:0;align-self:auto;border-right:1px solid var(--line2);border-bottom:none;box-shadow:2px 0 6px rgba(28,36,32,.06)}
+  .nav{flex:none;width:212px;min-height:0;overflow-y:auto;overflow-x:hidden;flex-direction:column;flex-wrap:nowrap;border-right:1px solid var(--line2);border-bottom:none;box-shadow:2px 0 6px rgba(28,36,32,.06)}
   .nav button{width:100%;text-align:left}
-  .main{margin:0 0 0 212px;width:calc(100% - 212px);max-width:none}
+  .main{flex:1;min-width:0;min-height:0;overflow-y:auto;overflow-x:hidden;max-width:none}
   .main>*{max-width:1280px;margin-left:auto;margin-right:auto;width:100%}
 }
 /* tablet 800-1199: fallback keeps 12-col spans (proto 3/5/4 same row, key/model 6+6 same row) */
 @media (min-width:800px) and (max-width:1199px){
+  #view-app{height:auto;min-height:100vh;min-height:100dvh;overflow:visible;display:block}
   .grid2,.grid3,.grid4,.facts,.trend-grid{grid-template-columns:1fr}
   .form-grid>.field{grid-column:span 6}
   .form-grid .full{grid-column:1/-1}
@@ -169,27 +177,28 @@ html,body{max-width:100%;overflow-x:hidden}
   .config-item-grid>.field.span-8,.config-item-grid>.field.span-12{grid-column:1/-1}
   .url-preview{grid-template-columns:1fr 1fr}
   .fb-model-row{max-width:100%;width:100%}
-  .layout{display:flex;flex-direction:column;min-height:auto;padding-left:0}
+  .layout{display:flex;flex-direction:column;min-height:auto;overflow:visible;padding-left:0}
   .layout::before{display:none}
   .nav{flex-direction:row;flex-wrap:wrap;width:auto;height:auto;min-height:auto;max-height:none;overflow:visible;position:static;top:auto;left:auto;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
-  .main{margin:0;width:100%;max-width:none;padding:12px}
+  .main{margin:0;width:100%;max-width:none;min-height:auto;overflow:visible;padding:12px}
   .main>*{max-width:none;margin:0;width:auto}
   .topbar{position:static}
 }
 /* mobile <800: everything stacks full width, no horizontal overflow */
 @media (max-width:799px){
+  #view-app{height:auto;min-height:100vh;min-height:100dvh;overflow:visible;display:block}
   .grid2,.grid3,.grid4,.facts,.trend-grid{grid-template-columns:1fr}
   .form-grid>.field{grid-column:1/-1}
   .config-item-grid>.field{grid-column:1/-1!important}
   .url-preview{grid-template-columns:1fr}
   .fb-model-row{grid-template-columns:1fr;max-width:100%;width:100%}
   .config-item-head input{max-width:100%}
-  .layout{display:flex;flex-direction:column;min-height:auto;padding-left:0}
+  .layout{display:flex;flex-direction:column;min-height:auto;overflow:visible;padding-left:0}
   .layout::before{display:none}
   .nav{flex-direction:row;flex-wrap:wrap;width:auto;height:auto;min-height:auto;max-height:none;overflow:visible;position:static;top:auto;left:auto;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
-  .main{margin:0;width:100%;max-width:none;padding:12px}
+  .main{margin:0;width:100%;max-width:none;min-height:auto;overflow:visible;padding:12px}
   .main>*{max-width:none;margin:0;width:auto}
   .topbar{position:static}
 }
@@ -228,7 +237,8 @@ html,body{max-width:100%;overflow-x:hidden}
     <span class="stat">活跃流 <b id="t-streams">—</b></span>
     <span class="spacer"></span>
     <span class="conn" id="t-conn">未连接</span>
-    <button id="btn-refresh" type="button">立即刷新</button>
+    <span class="conn" id="save-status"></span>
+    <button id="btn-refresh" type="button">从磁盘重载</button>
     <button id="btn-logout" type="button">退出</button>
   </header>
   <div class="layout">
@@ -320,7 +330,7 @@ html,body{max-width:100%;overflow-x:hidden}
       </div>
       <div class="section">
         <h2>凭证可用性</h2>
-        <div class="cap">按通道统计的密钥可用性：上游、所属池、状态、可用/全部目标、原因与上次检测。完整密钥不在页面显示，二次验证查看仍走敏感值接口。</div>
+        <div class="cap">按通道统计的密钥可用性：上游、所属池、状态、可用/全部目标、原因与上次检测。完整密钥不在页面显示，查看仍走敏感值接口。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>密钥尾码</th><th>上游</th><th>代理池</th><th>状态</th><th>可用/全部</th><th>失败次数</th><th>原因</th><th>上次检测</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
       </div>
       <div class="section">
@@ -386,9 +396,9 @@ html,body{max-width:100%;overflow-x:hidden}
           <div class="form-grid">
             <div class="field"><label>首选上游顺序</label><select id="c-prefer"><option value="go">Go（失败回退 Zen）</option><option value="zen">Zen（失败回退 Go）</option></select></div>
             <div class="field check-field"><label>匿名通道</label><div class="check-row"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div></div>
-            <div class="field full"><label>服务端密钥（掩码标签；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个密钥"></textarea></div>
-            <div class="field"><label>Zen 密钥</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个密钥"></textarea></div>
-            <div class="field"><label>Go 密钥</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个密钥"></textarea></div>
+            <div class="field full"><label>服务端密钥（掩码标签，点击显示明文；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个密钥"></textarea></div>
+            <div class="field"><label>Zen 密钥（掩码标签，点击显示明文）</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个密钥"></textarea></div>
+            <div class="field"><label>Go 密钥（掩码标签，点击显示明文）</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个密钥"></textarea></div>
           </div>
         </div>
         <div class="section config-card">
@@ -405,7 +415,7 @@ html,body{max-width:100%;overflow-x:hidden}
           <h2>备用模型渠道</h2>
           <div class="cap">匿名会话受限时由已启用渠道接续。</div>
           <div id="fallback-editor" class="fb-list"></div>
-          <div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><button class="ghost" id="btn-fallback-clear" type="button">停用备用渠道</button><span class="note" id="fallback-active-note"></span></div>
+          <div class="actions"><button class="ghost" id="btn-fallback-add" type="button">新增渠道</button><button class="ghost" id="btn-fallback-clear" type="button">停用备用渠道</button></div>
           <div class="note" id="fallback-error"></div>
         </div>
         <div class="section config-card">
@@ -460,22 +470,12 @@ html,body{max-width:100%;overflow-x:hidden}
             <div class="field full hidden"><label>WebUI 是否启用</label><input id="c-web-enabled" type="checkbox"></div>
           </div>
         </div>
-        <div class="config-sticky">
-          <button class="primary" type="submit">保存并应用</button>
-          <button class="ghost" id="btn-reload" type="button">从磁盘重载</button>
-          <button class="ghost" id="btn-reveal" type="button">二次验证查看敏感值</button>
-          <span class="note">监听类修改需重启。</span>
-        </div>
       </form>
     </section>
   </main>
   </div>
 </div>
 
-<div id="modal" class="modal hidden"><div class="modal-card">
-  <div class="filters"><strong>敏感值</strong><span class="spacer" style="flex:1"></span><button class="ghost" id="modal-close" type="button">关闭</button></div>
-  <pre id="modal-content" class="mono"></pre>
-</div></div>
 <div id="fallback-modal" class="modal hidden"><div class="modal-card">
   <div class="filters"><strong id="fallback-modal-title">备用渠道</strong><span style="flex:1"></span><button class="ghost" id="fallback-modal-close" type="button">关闭</button></div>
   <div id="fallback-modal-body"></div>
@@ -542,7 +542,8 @@ var S = {
   historyPeriod:"today", history:null, persistedSeries:[],
   proxyStats:[], proxyTruncated:false, proxyTotal:0, histLoading:false, histSeq:0,
   logEvents:[], logPaused:false, logGap:"", logFail:0,
-  es:null, timer:null
+  es:null, timer:null,
+  secretReveal:{seq:0,promise:null,data:null}
 };
 
 function api(path, opts){
@@ -559,7 +560,128 @@ function api(path, opts){
     });
   });
 }
+function clearSecretRevealCache(){
+  try{ if(S&&S.secretReveal){ S.secretReveal.seq=(S.secretReveal.seq||0)+1; S.secretReveal.promise=null; S.secretReveal.data=null; } }catch(e){}
+}
+function resetSecretChipLabels(){
+  try{
+    var labels=document.querySelectorAll('.secret-label[data-revealed="1"]');
+    for(var i=0;i<labels.length;i++){
+      var lb=labels[i];
+      var disp=lb.getAttribute("data-display")||"";
+      clear(lb); lb.appendChild(document.createTextNode(disp));
+      lb.setAttribute("data-revealed","0");
+      lb.setAttribute("aria-pressed","false");
+      lb.setAttribute("title","点击显示完整密钥");
+      lb.setAttribute("aria-label","显示完整密钥");
+      try{lb.removeAttribute("aria-busy");}catch(e){}
+    }
+  }catch(e){}
+}
+function clearSecretChipsForLogin(){
+  try{resetSecretChipLabels();}catch(e){}
+  try{clearSecretRevealCache();}catch(e){}
+}
+function secretRevealShared(){
+  if(!S.secretReveal)S.secretReveal={seq:0,promise:null,data:null};
+  if(S.secretReveal.data)return Promise.resolve(S.secretReveal.data);
+  if(S.secretReveal.promise)return S.secretReveal.promise;
+  var mySeq=S.secretReveal.seq||0;
+  var p=revealConfig().then(function(v){
+    if(!S.secretReveal||S.secretReveal.seq!==mySeq)throw new Error("登录已失效，请重新登录");
+    S.secretReveal.data=v;
+    S.secretReveal.promise=null;
+    return v;
+  }).catch(function(err){
+    if(S.secretReveal&&S.secretReveal.seq===mySeq)S.secretReveal.promise=null;
+    throw err;
+  });
+  S.secretReveal.promise=p;
+  return p;
+}
+function secretByFingerprint(candidates, wantId){
+  wantId=String(wantId||"");
+  var list=(candidates||[]).slice();
+  if(!list.length||!wantId)return Promise.resolve("");
+  var chain=Promise.resolve("");
+  list.forEach(function(secret){
+    chain=chain.then(function(matched){
+      if(matched)return matched;
+      return fallbackSecretFingerprint(secret).then(function(fp){ return fp===wantId?secret:""; });
+    });
+  });
+  return chain;
+}
+function toggleSecretChip(labelEl, group){
+  var chipEl=labelEl?labelEl.parentNode:null;
+  var fid=chipEl&&chipEl.getAttribute?String(chipEl.getAttribute("data-id")||""):"";
+  var revealed=labelEl.getAttribute("data-revealed")==="1";
+  if(revealed){
+    var disp=labelEl.getAttribute("data-display")||"";
+    clear(labelEl); labelEl.appendChild(document.createTextNode(disp));
+    labelEl.setAttribute("data-revealed","0");
+    labelEl.setAttribute("aria-pressed","false");
+    labelEl.setAttribute("title","点击显示完整密钥");
+    labelEl.setAttribute("aria-label","显示完整密钥");
+    return;
+  }
+  if(!fid){ toast("未找到该密钥",true); return; }
+  try{labelEl.setAttribute("aria-busy","true");}catch(e){}
+  secretRevealShared().then(function(v){
+    var list=(v&&v[group])||[];
+    var strs=[];
+    for(var i=0;i<list.length;i++)strs.push(String(list[i]||""));
+    return secretByFingerprint(strs,fid);
+  }).then(function(found){
+    try{labelEl.removeAttribute("aria-busy");}catch(e){}
+    if(!found){ toast("未找到该密钥",true); return; }
+    clear(labelEl); labelEl.appendChild(document.createTextNode(found));
+    labelEl.setAttribute("data-revealed","1");
+    labelEl.setAttribute("aria-pressed","true");
+    labelEl.setAttribute("title","点击隐藏完整密钥");
+    labelEl.setAttribute("aria-label","隐藏完整密钥");
+  }).catch(function(err){
+    try{labelEl.removeAttribute("aria-busy");}catch(e){}
+    toast((err&&err.message)||"查看失败",true);
+  });
+}
+function makeSecretChip(item, group){
+  var chip=document.createElement("span"); chip.className="chip"; chip.setAttribute("data-id",String((item&&item.id)||""));
+  var label=document.createElement("span"); label.className="secret-label";
+  label.setAttribute("role","button"); label.setAttribute("tabindex","0");
+  label.setAttribute("aria-pressed","false"); label.setAttribute("title","点击显示完整密钥"); label.setAttribute("aria-label","显示完整密钥");
+  label.setAttribute("data-display",String((item&&item.display)||"")); label.setAttribute("data-revealed","0"); label.setAttribute("data-group",String(group||""));
+  label.appendChild(document.createTextNode(String((item&&item.display)||"")));
+  (function(lb,g){
+    lb.addEventListener("click",function(ev){ if(ev&&ev.stopPropagation)ev.stopPropagation(); toggleSecretChip(lb,g); });
+    lb.addEventListener("keydown",function(ev){
+      if(!ev)return;
+      var k=ev.key!==undefined?ev.key:ev.keyCode;
+      if(k==="Enter"||k===" "||k==="Spacebar"||k===13||k===32){ if(ev.preventDefault)ev.preventDefault(); toggleSecretChip(lb,g); }
+    });
+  })(label,group);
+  chip.appendChild(label);
+  var rm=document.createElement("button"); rm.type="button"; rm.textContent="移除"; rm.title="移除";
+  rm.addEventListener("click",function(ev){ if(ev&&ev.stopPropagation)ev.stopPropagation(); chip.remove(); queueConfigSave(true); });
+  chip.appendChild(rm);
+  return chip;
+}
+function clearSensitiveModalsForLogin(){
+  try{resetSecretChipLabels();}catch(e){}
+  try{clearSecretRevealCache();}catch(e){}
+  try{ if(typeof closeFallbackModal==="function"){ closeFallbackModal(); return; } }catch(e){}
+  try{ var fm=$("fallback-modal"); if(fm)fm.classList.add("hidden"); }catch(e){}
+  try{ var fb=$("fallback-modal-body"); if(fb)clear(fb); }catch(e){}
+  try{ var fe=$("fallback-modal-error"); if(fe)fe.textContent=""; }catch(e){}
+  try{
+    var st=(typeof S!=="undefined"&&S&&S.fbModal)?S.fbModal:null;
+    var ki=st&&st.fields&&st.fields.keyInput;
+    if(ki){ try{ki.value="";}catch(e){} try{ki.type="password";}catch(e){} }
+  }catch(e){}
+  try{ if(typeof S!=="undefined"&&S)S.fbModal={index:null,origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}; }catch(e){}
+}
 function showLogin(){
+  try{ if(typeof clearSensitiveModalsForLogin==="function")clearSensitiveModalsForLogin(); }catch(e){}
   S.csrf=""; $("view-app").classList.add("hidden"); $("view-login").classList.remove("hidden");
   if(S.es){try{S.es.close();}catch(e){} S.es=null;}
   if(S.timer){clearInterval(S.timer); S.timer=null;}
@@ -619,8 +741,43 @@ function enterConsole(sess){
 })();
 
 /* ---------- topbar / monitor ---------- */
+function reloadConfigFromDisk(btn){
+  if(S.cfgSave&&S.cfgSave.reloading)return Promise.resolve();
+  if(btn)btn.disabled=true;
+  try{clearTimeout(S.cfgSave.debounce);}catch(e){}
+  if(S.cfgSave)S.cfgSave.debounce=null;
+  function doReload(){
+    S.cfgSave.reloading=true;
+    setSaveStatus("重载中…","");
+    return api("/api/config/reload",{method:"POST",body:"{}"}).then(function(){
+      return loadConfig().then(function(){
+        S.cfgSave.dirty=false; S.cfgSave.seq++;
+        setSaveStatus("","");
+        toast("磁盘配置已重载");
+      });
+    }).catch(function(err){ toast((err&&err.message)||"重载失败",true); throw err; }).then(function(){
+      S.cfgSave.reloading=false;
+      if(btn)btn.disabled=false;
+    },function(err){
+      S.cfgSave.reloading=false;
+      if(btn)btn.disabled=false;
+      throw err;
+    });
+  }
+  var wait=(S.cfgSave&&S.cfgSave.inFlight)||Promise.resolve();
+  wait=wait.catch(function(){});
+  return wait.then(function(){
+    if(S.cfgSave&&S.cfgSave.dirty){
+      return flushConfigSave().catch(function(err){
+        if(btn)btn.disabled=false;
+        toast((err&&err.message)||"保存失败",true);
+        throw err;
+      });
+    }
+  }).then(function(){ return doReload(); }).catch(function(){});
+}
 $("btn-refresh").addEventListener("click",function(){
-  Promise.all([refreshMonitor(),loadConfig(),loadDebugModels()]).then(function(){toast("状态已刷新");}).catch(function(e){toast(e.message,true);});
+  reloadConfigFromDisk($("btn-refresh"));
 });
 function refreshMonitor(){
   return api("/api/monitor",{method:"GET"}).then(function(data){
@@ -1220,10 +1377,17 @@ function manualRefresh(scope){
 /* ---------- config ---------- */
 function loadConfig(){
   return api("/api/config",{method:"GET"}).then(function(cfg){
+    try{clearSecretRevealCache();}catch(e){}
     S.config=cfg; fillConfig(cfg); renderTopbar();
+    try{
+      ["server_keys","zen_keys","go_keys"].forEach(function(n){ var t=$(n+"-new"); if(t)t.value=""; });
+      if(S.cfgSave){ try{clearTimeout(S.cfgSave.debounce);}catch(e){} S.cfgSave.debounce=null; S.cfgSave.dirty=false; }
+      setSaveStatus("","");
+    }catch(e){}
   });
 }
 function fillConfig(v){
+  try{clearSecretRevealCache();}catch(e){}
   v=v||{};
   var wv=(v&&v.webui)||{};
   $("c-prefer").value=v.prefer||"go";
@@ -1287,7 +1451,6 @@ function renderFallbackList(){
   chans.forEach(function(ch, idx){
     host.appendChild(fallbackListRow(ch, idx));
   });
-  var note=$("fallback-active-note"); if(note){ clear(note); var a=String(S.fbDraft.active||""); if(a)note.appendChild(document.createTextNode("当前启用："+a)); else note.appendChild(document.createTextNode("当前未启用备用渠道")); }
 }
 function setFallbackActive(name){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
@@ -1306,7 +1469,9 @@ function fallbackListRow(ch, idx){
   row.appendChild(edit);
   row.addEventListener("click",function(){
     var n=String(ch.name||"").trim(); if(!n){ toast("请先在编辑弹窗中填写渠道名称",true); return; }
-    setFallbackActive(n); toast("已选择启用 "+n);
+    if(String((S.fbDraft&&S.fbDraft.active)||"")===n)return;
+    setFallbackActive(n);
+    queueConfigSave(true);
   });
   return row;
 }
@@ -1379,6 +1544,30 @@ function fallbackDiscoverReasonCN(reason, httpStatus){
   return "模型发现失败";
 }
 function fallbackModalState(){ return S.fbModal||(S.fbModal={index:null}); }
+function fallbackSecretFingerprint(secret){
+  try{
+    if(!window.crypto||!crypto.subtle||!crypto.subtle.digest||!window.TextEncoder)return Promise.resolve("");
+    var bytes=new TextEncoder().encode(String(secret||""));
+    return crypto.subtle.digest("SHA-256",bytes).then(function(buf){
+      var arr=new Uint8Array(buf); var hex="";
+      for(var i=0;i<arr.length;i++){ var h=arr[i].toString(16); if(h.length<2)h="0"+h; hex+=h; }
+      return hex.slice(0,10);
+    }).catch(function(){ return ""; });
+  }catch(e){ return Promise.resolve(""); }
+}
+function fallbackSecretById(candidates,savedId){
+  var list=(candidates||[]).slice();
+  var want=String(savedId||"");
+  if(!list.length||!want)return Promise.resolve(list[0]||"");
+  var chain=Promise.resolve("");
+  list.forEach(function(secret){
+    chain=chain.then(function(matched){
+      if(matched)return matched;
+      return fallbackSecretFingerprint(secret).then(function(fp){ return fp===want?secret:""; });
+    });
+  });
+  return chain;
+}
 function openFallbackModal(idx){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
   var isNew=(idx===null||idx===undefined);
@@ -1422,11 +1611,20 @@ function openFallbackModal(idx){
   if(!isNew&&(savedDisplay||savedId)){ keyInput.value=pendingNew||savedDisplay||""; }
   else { keyInput.value=pendingNew||""; keyInput.placeholder="填写 API 密钥"; }
   keyRow.appendChild(keyInput);
-  var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="icon-btn"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); keyToggle.textContent="👁"; keyRow.appendChild(keyToggle);
-  keyWrap.appendChild(keyRow);
+  var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="icon-btn"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); keyRow.appendChild(keyToggle);
+  var eyeSvgNS="http://www.w3.org/2000/svg";
+  function fbEyeIcon(open){
+    var svg=document.createElementNS(eyeSvgNS,"svg");
+    svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("width","18"); svg.setAttribute("height","18"); svg.setAttribute("fill","none"); svg.setAttribute("stroke","currentColor"); svg.setAttribute("stroke-width","2"); svg.setAttribute("stroke-linecap","round"); svg.setAttribute("stroke-linejoin","round"); svg.setAttribute("aria-hidden","true"); svg.setAttribute("focusable","false");
+    var eyePath=document.createElementNS(eyeSvgNS,"path"); eyePath.setAttribute("d","M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"); svg.appendChild(eyePath);
+    var eyeDot=document.createElementNS(eyeSvgNS,"circle"); eyeDot.setAttribute("cx","12"); eyeDot.setAttribute("cy","12"); eyeDot.setAttribute("r","3"); svg.appendChild(eyeDot);
+    if(open){ var eyeSlash=document.createElementNS(eyeSvgNS,"line"); eyeSlash.setAttribute("x1","1"); eyeSlash.setAttribute("y1","1"); eyeSlash.setAttribute("x2","23"); eyeSlash.setAttribute("y2","23"); svg.appendChild(eyeSlash); }
+    return svg;
+  }
   function setEye(open){
-    if(open){ keyToggle.setAttribute("aria-label","隐藏密钥"); keyToggle.setAttribute("title","隐藏密钥"); keyToggle.textContent="🙈"; }
-    else { keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); keyToggle.textContent="👁"; }
+    if(open){ keyToggle.setAttribute("aria-label","隐藏密钥"); keyToggle.setAttribute("title","隐藏密钥"); }
+    else { keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); }
+    clear(keyToggle); keyToggle.appendChild(fbEyeIcon(open));
   }
   setEye(false);
   keyToggle.addEventListener("click",function(){
@@ -1444,23 +1642,25 @@ function openFallbackModal(idx){
       return;
     }
     if(!savedId){ keyInput.type=(keyInput.type==="password"?"text":"password"); setEye(keyInput.type==="text"); return; }
-    var pw=prompt("请再次输入管理密码以查看该渠道密钥"); if(pw===null)return;
     keyToggle.disabled=true;
-    revealConfig(pw).then(function(v){
+    revealConfig().then(function(v){
       var chans=((v&&v.fallback&&v.fallback.channels)||[]);
-      var found="";
+      function rawOf(c){ var k=c.api_key; if(typeof k==="string")return String(k||""); if(k&&typeof k==="object")return String(k.value||k.api_key||""); return ""; }
+      var savedSecretId=String((st.origId||savedId)||"");
+      var candidates=[];
       for(var i=0;i<chans.length;i++){
-        var c=chans[i];
-        if(String(c.name||"")===String(st.origName||"")){
-          var k=c.api_key;
-          if(typeof k==="string"){ found=String(k||""); break; }
-          if(k&&typeof k==="object"){ found=String(k.value||k.api_key||""); break; }
+        if(String(chans[i].name||"")===String(st.origName||"")){
+          var rk=rawOf(chans[i]); if(rk)candidates.push(rk);
         }
       }
+      if(!candidates.length)throw new Error("未找到该渠道密钥");
+      if(candidates.length===1||!savedSecretId)return candidates[0];
+      return fallbackSecretById(candidates,savedSecretId).then(function(matched){ return matched||candidates[0]; });
+    }).then(function(found){
       if(!found)throw new Error("未找到该渠道密钥");
       st.originalSecret=found; st.revealed=true;
       keyInput.value=found; keyInput.type="text"; setEye(true);
-    }).catch(function(err){ toast(err.message||"验证失败",true); })
+    }).catch(function(err){ toast((err&&err.message)||"查看失败",true); })
     .then(function(){ keyToggle.disabled=false; });
   });
   var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=savedId; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
@@ -1561,6 +1761,11 @@ function openFallbackModal(idx){
   S.fbModal.fields={nameInput:nameInput,baseInput:baseInput,protoSel:protoSel,effortSel:effortSel,keyInput:keyInput,keyHidden:keyHidden,modelSel:modelSel};
 }
 function closeFallbackModal(){
+  try{
+    var st0=(typeof S!=="undefined"&&S&&S.fbModal)?S.fbModal:null;
+    var ki=st0&&st0.fields&&st0.fields.keyInput;
+    if(ki){ try{ki.value="";}catch(e){} try{ki.type="password";}catch(e){} try{ki.removeAttribute("value");}catch(e){} }
+  }catch(e){}
   var m=$("fallback-modal"); if(m)m.classList.add("hidden");
   var b=$("fallback-modal-body"); if(b)clear(b);
   var e=$("fallback-modal-error"); if(e)e.textContent="";
@@ -1586,11 +1791,13 @@ function saveFallbackModal(){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
   var chans=S.fbDraft.channels;
   for(var i=0;i<chans.length;i++){ if(i!==st.index&&String(chans[i].name||"").trim()===name){ if(errEl)errEl.textContent="渠道名称 "+name+" 重复"; toast("渠道名称 "+name+" 重复",true); return; } }
+  var backup={channels:chans.slice(),active:String(S.fbDraft.active||"")};
+  var pushed=false;
   var entry={name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
   if(isNew){
     entry.api_key={id:"",display:""};
     entry._newKey=nv;
-    chans.push(entry);
+    chans.push(entry); pushed=true;
   } else {
     var old=chans[st.index];
     var oldDisplay=String((old.api_key&&old.api_key.display)||"");
@@ -1605,30 +1812,69 @@ function saveFallbackModal(){
     var mapped=mapFallbackActiveOnRename(String(S.fbDraft.active||""),oldName,name);
     S.fbDraft.active=mapped;
   }
-  closeFallbackModal();
-  renderFallbackList();
-  toast(isNew?"已新增渠道 "+name:"已保存渠道 "+name);
+  var saveBtn=$("fallback-modal-save"); if(saveBtn)saveBtn.disabled=true;
+  saveConfigAndWait().then(function(res){
+    if(saveBtn)saveBtn.disabled=false;
+    closeFallbackModal();
+    renderFallbackList();
+  }).catch(function(err){
+    if(saveBtn)saveBtn.disabled=false;
+    S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
+    if(!pushed&&st.index!==null&&st.index!==undefined){
+      try{
+        var cur=S.fbDraft.channels[st.index];
+        if(cur){
+          var re={name:name,base_url:base,api_key:{id:kid,display:String((cur.api_key&&cur.api_key.display)||"")},model:model,protocol:proto,reasoning_effort:effort};
+          if(nv&&nv!==String(st.origDisplay||"")&&nv!==String(st.originalSecret||""))re._newKey=nv;
+          S.fbDraft.channels[st.index]=re;
+        }
+      }catch(e){}
+    } else if(pushed){
+      try{
+        for(var k=S.fbDraft.channels.length-1;k>=0;k--){
+          if(String(S.fbDraft.channels[k].name||"")===name&&S.fbDraft.channels[k]._newKey===nv){ S.fbDraft.channels.splice(k,1); break; }
+        }
+      }catch(e){}
+      try{
+        var draftEntry={name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
+        if(nv)draftEntry._newKey=nv;
+        S.fbDraft.channels.push(draftEntry);
+      }catch(e){}
+    }
+    if(errEl)errEl.textContent=(err&&err.message)||"保存失败";
+  });
 }
 function deleteFallbackModal(){
   var st=S.fbModal||{index:null};
   if(st.index===null||st.index===undefined)return;
   if(!S.fbDraft||!S.fbDraft.channels||!S.fbDraft.channels[st.index]){ closeFallbackModal(); return; }
+  var errEl=$("fallback-modal-error"); if(errEl)errEl.textContent="";
+  var backup={channels:S.fbDraft.channels.slice(),active:String(S.fbDraft.active||"")};
   var name=String(S.fbDraft.channels[st.index].name||"");
   S.fbDraft.channels.splice(st.index,1);
   if(String(S.fbDraft.active||"")===name)S.fbDraft.active="";
-  closeFallbackModal();
-  renderFallbackList();
-  toast("已删除渠道 "+(name||""));
+  var delBtn=$("fallback-modal-delete"); if(delBtn)delBtn.disabled=true;
+  saveConfigAndWait().then(function(){
+    if(delBtn)delBtn.disabled=false;
+    closeFallbackModal();
+    renderFallbackList();
+  }).catch(function(err){
+    if(delBtn)delBtn.disabled=false;
+    S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
+    if(errEl)errEl.textContent=(err&&err.message)||"删除失败";
+  });
 }
 
 function renderChips(name){
   var host=$(name+"-chips"); clear(host);
   ((S.config&&S.config[name])||[]).forEach(function(item){
-    var chip=document.createElement("span"); chip.className="chip"; chip.setAttribute("data-id",item.id);
-    chip.appendChild(document.createTextNode(item.display+" "));
-    var rm=document.createElement("button"); rm.type="button"; rm.textContent="移除"; rm.title="移除";
-    rm.addEventListener("click",function(){chip.remove();});
-    chip.appendChild(rm); host.appendChild(chip);
+    host.appendChild(makeSecretChip(item,name));
+  });
+}
+function appendPromotedChips(name, views){
+  var host=$(name+"-chips"); if(!host)return;
+  (views||[]).forEach(function(item){
+    host.appendChild(makeSecretChip(item,name));
   });
 }
 function secretInputs(name){
@@ -1818,6 +2064,7 @@ function savePoolModal(){
   if(!S.poolDraft)S.poolDraft={pools:[]};
   var pools=S.poolDraft.pools||[];
   for(var i=0;i<pools.length;i++){ if(i!==st.index&&String(pools[i].name||"")===name){ if(errEl)errEl.textContent="代理池名 "+name+" 已存在"; toast("代理池名 "+name+" 已存在",true); return; } }
+  var backup={pools:pools.slice(),routeA:$("c-route-anon")?$("c-route-anon").value:"",routeZ:$("c-route-zen")?$("c-route-zen").value:"",routeG:$("c-route-go")?$("c-route-go").value:""};
   var rawNew=String((f.newInput&&f.newInput.value||""));
   var lines=rawNew.split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean).map(function(s){return {value:s};});
   var mergedAdded=(d.added||[]).concat(lines);
@@ -1835,32 +2082,53 @@ function savePoolModal(){
     if(mapped.z)$("c-route-zen").value=mapped.z;
     if(mapped.g)$("c-route-go").value=mapped.g;
   }
-  closePoolModal();
-  renderPoolsList(); syncRoutingSelects();
+  syncRoutingSelects();
   (function(){
     var refs=currentRoutingRefs();
     if(refs.a&&poolNamesFromEditor().indexOf(refs.a)<0)$("c-route-anon").value=poolNamesFromEditor()[0]||"";
     if(refs.z&&poolNamesFromEditor().indexOf(refs.z)<0)$("c-route-zen").value=poolNamesFromEditor()[0]||"";
     if(refs.g&&poolNamesFromEditor().indexOf(refs.g)<0)$("c-route-go").value=poolNamesFromEditor()[0]||"";
   })();
-  refreshPoolBadges();
-  toast(isNew?"已新增代理池 "+name:"已保存代理池 "+name);
+  var saveBtn=$("pool-modal-save"); if(saveBtn)saveBtn.disabled=true;
+  saveConfigAndWait().then(function(){
+    if(saveBtn)saveBtn.disabled=false;
+    closePoolModal();
+    renderPoolsList(); syncRoutingSelects(); refreshPoolBadges();
+  }).catch(function(err){
+    if(saveBtn)saveBtn.disabled=false;
+    S.poolDraft.pools=backup.pools;
+    try{ if($("c-route-anon"))$("c-route-anon").value=backup.routeA; }catch(e){}
+    try{ if($("c-route-zen"))$("c-route-zen").value=backup.routeZ; }catch(e){}
+    try{ if($("c-route-go"))$("c-route-go").value=backup.routeG; }catch(e){}
+    renderPoolsList(); refreshPoolBadges();
+    if(errEl)errEl.textContent=(err&&err.message)||"保存失败";
+  });
 }
 function deletePoolModal(){
   var st=S.poolModal||{index:null};
   if(st.index===null||st.index===undefined)return;
   if(!S.poolDraft||!S.poolDraft.pools||!S.poolDraft.pools[st.index]){ closePoolModal(); return; }
+  var errEl=$("pool-modal-error"); if(errEl)errEl.textContent="";
   var cur=String(S.poolDraft.pools[st.index].name||"");
   var refs=currentRoutingRefs();
   if(refs.a===cur||refs.z===cur||refs.g===cur){
-    var errEl=$("pool-modal-error"); if(errEl)errEl.textContent="代理池 "+cur+" 仍被路由引用，请先切换路由再删除。";
+    if(errEl)errEl.textContent="代理池 "+cur+" 仍被路由引用，请先切换路由再删除。";
     toast("代理池 "+cur+" 仍被路由引用，请先切换路由再删除。",true);
     return;
   }
+  var backup={pools:S.poolDraft.pools.slice()};
   S.poolDraft.pools.splice(st.index,1);
-  closePoolModal();
-  renderPoolsList(); syncRoutingSelects(); refreshPoolBadges();
-  toast("已删除代理池 "+cur);
+  var delBtn=$("pool-modal-delete"); if(delBtn)delBtn.disabled=true;
+  saveConfigAndWait().then(function(){
+    if(delBtn)delBtn.disabled=false;
+    closePoolModal();
+    renderPoolsList(); syncRoutingSelects(); refreshPoolBadges();
+  }).catch(function(err){
+    if(delBtn)delBtn.disabled=false;
+    S.poolDraft.pools=backup.pools;
+    renderPoolsList(); refreshPoolBadges();
+    if(errEl)errEl.textContent=(err&&err.message)||"删除失败";
+  });
 }
 $("btn-pool-add").addEventListener("click",function(){
   openPoolModal(null);
@@ -1869,7 +2137,10 @@ $("btn-pool-add").addEventListener("click",function(){
   openFallbackModal(null);
 }); })();
 (function(){ var b=$("btn-fallback-clear"); if(b)b.addEventListener("click",function(){
-  setFallbackActive(""); toast("已停用备用渠道");
+  if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
+  if(!String(S.fbDraft.active||""))return;
+  setFallbackActive("");
+  queueConfigSave(true);
 }); })();
 (function(){ var b=$("pool-modal-close"); if(b)b.addEventListener("click",closePoolModal); })();
 (function(){ var b=$("pool-modal-cancel"); if(b)b.addEventListener("click",closePoolModal); })();
@@ -1898,7 +2169,7 @@ function fallbackInputs(){
   return out;
 }
 ["c-route-anon","c-route-zen","c-route-go"].forEach(function(id){
-  var sel=$(id); if(sel)sel.addEventListener("change",refreshPoolBadges);
+  var sel=$(id); if(sel)sel.addEventListener("change",function(){ refreshPoolBadges(); queueConfigSave(true); });
 });
 function poolInputs(){
   var out={};
@@ -1917,28 +2188,28 @@ function poolInputs(){
 function poolInputNames(){
   return poolNamesFromEditor();
 }
-$("config-form").addEventListener("submit",function(e){
-  e.preventDefault();
+function collectConfigUpdate(){
   var protocols={};
-  try{protocols=JSON.parse($("c-protocols").value||"{}");}catch(err){toast("模型协议手动指定 JSON 无效："+err.message,true);return;}
+  try{protocols=JSON.parse($("c-protocols").value||"{}");}catch(err){ return {ok:false,error:"模型协议手动指定 JSON 无效："+err.message,field:"c-protocols"}; }
   var pools=poolInputs();
   var names=Object.keys(pools);
-  if(!names.length){ toast("至少需要一个代理池",true); return; }
+  if(!names.length){ return {ok:false,error:"至少需要一个代理池"}; }
   var rawNames=poolInputNames();
   var dup=duplicatePoolName(rawNames);
-  if(dup||rawNames.length!==names.length){ toast("代理池名 "+(dup||"?")+" 重复，禁止提交（重命名后名称必须唯一）",true); $("pools-error").textContent="代理池名 "+(dup||"?")+" 重复，请先去重再保存。"; return; }
+  if(dup||rawNames.length!==names.length){ try{$("pools-error").textContent="代理池名 "+(dup||"?")+" 重复，请先去重再保存。";}catch(e){} return {ok:false,error:"代理池名 "+(dup||"?")+" 重复，禁止保存（重命名后名称必须唯一）"}; }
+  try{ if($("pools-error"))$("pools-error").textContent=""; }catch(e){}
   var anon=$("c-route-anon").value, zen=$("c-route-zen").value, go=$("c-route-go").value;
-  if(!anon||!zen||!go){ toast("匿名 / Zen / Go 必须各选择一个代理池",true); return; }
-  /* hidden-enabled-preserved: 启用 WebUI 控件已隐藏，提交时保留后端当前值，不因隐藏发送 false */
+  if(!anon||!zen||!go){ return {ok:false,error:"匿名 / Zen / Go 必须各选择一个代理池"}; }
   var preservedEnabled=(S.config&&S.config.webui)?!!S.config.webui.enabled:true;
   var cfgWebui=((S.config&&S.config.webui)||{});
   var fbChannels=fallbackInputs();
   var fbActive=(S.fbDraft&&S.fbDraft.active)||"";
   var seenFb={}, dupFb="";
   fbChannels.forEach(function(c){ if(c.name){ if(seenFb[c.name])dupFb=c.name; seenFb[c.name]=1; } });
-  if(dupFb){ toast("备用渠道名称 "+dupFb+" 重复，禁止提交",true); $("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。"; return; }
+  if(dupFb){ try{$("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。";}catch(e){} return {ok:false,error:"备用渠道名称 "+dupFb+" 重复，禁止保存"}; }
   var emptyFb=""; fbChannels.forEach(function(c){ if(!c.model)emptyFb=c.name||"(未命名渠道)"; });
-  if(emptyFb){ toast("备用渠道 "+emptyFb+" 尚未选择模型，请先获取模型列表并选择",true); $("fallback-error").textContent="渠道 "+emptyFb+" 尚未选择模型。"; return; }
+  if(emptyFb){ try{$("fallback-error").textContent="渠道 "+emptyFb+" 尚未选择模型。";}catch(e){} return {ok:false,error:"备用渠道 "+emptyFb+" 尚未选择模型，请先获取模型列表并选择"}; }
+  try{ if($("fallback-error"))$("fallback-error").textContent=""; }catch(e){}
   var update={
     listen:$("c-listen").value, server_keys:secretInputs("server_keys"),
     zen_keys:secretInputs("zen_keys"), go_keys:secretInputs("go_keys"),
@@ -1953,29 +2224,242 @@ $("config-form").addEventListener("submit",function(e){
     history:{enabled:$("c-hist-enabled").checked,directory:$("c-hist-dir").value.trim(),retention_days:num("c-hist-retention"),max_bytes_mb:num("c-hist-max")},
     webui:{enabled:preservedEnabled,listen:$("c-web-listen").value,username:cfgWebui.username||"",session_ttl_minutes:num("c-session")}
   };
-  api("/api/config",{method:"PUT",body:JSON.stringify(update)}).then(function(res){
-    S.config=res.config;
-    ["server_keys","zen_keys","go_keys"].forEach(function(n){$(n+"-new").value="";});
-    fillConfig(S.config); renderTopbar();
-    (function(){ var msg="配置已保存并应用"; if(res.result&&res.result.restart_required){ var rf=res.result.restart_fields||[]; var dl=[]; for(var i=0;i<rf.length;i++)dl.push(restartFieldLabel(rf[i])); msg="已应用；"+dl.join("、")+" 需重启"; } toast(msg); })();
-  }).catch(function(err){toast(err.message,true);});
-});
-$("btn-reload").addEventListener("click",function(){
-  api("/api/config/reload",{method:"POST",body:"{}"}).then(function(res){
-    return loadConfig().then(function(){toast(res.restart_required?"磁盘配置已重载，监听字段需重启":"磁盘配置已重载");});
-  }).catch(function(err){toast(err.message,true);});
-});
-function revealConfig(password){
-  return api("/api/config/reveal",{method:"POST",body:JSON.stringify({password:password})});
+  return {ok:true,update:update};
 }
-$("btn-reveal").addEventListener("click",function(){
-  var pw=prompt("请再次输入管理密码以查看敏感值"); if(pw===null)return;
-  revealConfig(pw).then(function(v){
-    $("modal-content").textContent=JSON.stringify(v,null,2);
-    $("modal").classList.remove("hidden");
-  }).catch(function(err){toast(err.message,true);});
+function validateConfigUpdate(){
+  return collectConfigUpdate();
+}
+function setSaveStatus(text, tone){
+  var n=$("save-status"); if(!n)return; clear(n);
+  if(text)n.appendChild(document.createTextNode(text));
+  n.setAttribute("data-tone",tone||"");
+}
+if(!S.cfgSave)S.cfgSave={seq:0,inFlightSeq:0,inFlight:null,debounce:null,dirty:false,reloading:false,lastResult:null};
+function queueConfigSave(immediate){
+  if(S.cfgSave.reloading)return S.cfgSave.inFlight||Promise.resolve();
+  S.cfgSave.seq++;
+  S.cfgSave.dirty=true;
+  setSaveStatus("未保存","");
+  if(immediate){
+    try{clearTimeout(S.cfgSave.debounce);}catch(e){}
+    S.cfgSave.debounce=null;
+    return flushConfigSave();
+  }
+  try{clearTimeout(S.cfgSave.debounce);}catch(e){}
+  S.cfgSave.debounce=setTimeout(function(){ S.cfgSave.debounce=null; flushConfigSave(); },600);
+  return S.cfgSave.inFlight||Promise.resolve();
+}
+function saveConfigNow(){
+  return queueConfigSave(true);
+}
+function saveConfigAndWait(){
+  if(S.cfgSave.reloading)return Promise.reject(new Error("正在重载，请稍后"));
+  S.cfgSave.seq++;
+  var target=S.cfgSave.seq;
+  S.cfgSave.dirty=true;
+  try{clearTimeout(S.cfgSave.debounce);}catch(e){}
+  S.cfgSave.debounce=null;
+  setSaveStatus("保存中…","");
+  return flushConfigSave().then(function loop(res){
+    if(S.cfgSave.seq>target&&S.cfgSave.dirty){
+      target=S.cfgSave.seq;
+      return flushConfigSave().then(loop);
+    }
+    if(S.cfgSave.inFlight&&S.cfgSave.inFlightSeq<target){
+      return S.cfgSave.inFlight.then(loop);
+    }
+    return res;
+  });
+}
+function flushConfigSave(){
+  if(S.cfgSave.reloading)return S.cfgSave.inFlight||Promise.resolve(S.cfgSave.lastResult);
+  if(S.cfgSave.inFlight)return S.cfgSave.inFlight;
+  if(!S.cfgSave.dirty)return Promise.resolve(S.cfgSave.lastResult);
+  var collected=collectConfigUpdate();
+  if(!collected.ok){
+    S.cfgSave.dirty=false;
+    setSaveStatus("保存失败","");
+    toast(collected.error,true);
+    return Promise.reject(new Error(collected.error));
+  }
+  var sentUpdate=collected.update;
+  var sentSeq=S.cfgSave.seq;
+  S.cfgSave.dirty=false;
+  S.cfgSave.inFlightSeq=sentSeq;
+  setSaveStatus("保存中…","");
+  var p=api("/api/config",{method:"PUT",body:JSON.stringify(sentUpdate)}).then(function(res){
+    return handleConfigSaveSuccess(sentUpdate,res);
+  }).catch(function(err){
+    S.cfgSave.inFlight=null;
+    S.cfgSave.dirty=true;
+    setSaveStatus("保存失败","");
+    toast((err&&err.message)||"保存失败",true);
+    var msg=String((err&&err.message)||"");
+    if(msg.indexOf("unknown or stale secret id")>=0&&!S.cfgSave.dirty){
+      void 0;
+    }
+    if(msg.indexOf("unknown or stale secret id")>=0){
+      var hasPending=false;
+      try{ hasPending=!!S.cfgSave.dirty||!!S.cfgSave.debounce; }catch(e){}
+      if(!hasPending&&!modalOpen()){
+        loadConfig().catch(function(){});
+      }
+    }
+    throw err;
+  }).then(function(res){
+    S.cfgSave.inFlight=null;
+    S.cfgSave.lastResult=res||null;
+    if(S.cfgSave.dirty){
+      return flushConfigSave().then(function(){ return S.cfgSave.lastResult; });
+    }
+    return S.cfgSave.lastResult;
+  },function(err){
+    S.cfgSave.inFlight=null;
+    throw err;
+  });
+  S.cfgSave.inFlight=p;
+  return p;
+}
+function modalOpen(){
+  try{
+    var fm=$("fallback-modal"); if(fm&&!fm.classList.contains("hidden"))return true;
+    var pm=$("pool-modal"); if(pm&&!pm.classList.contains("hidden"))return true;
+  }catch(e){}
+  return false;
+}
+function handleConfigSaveSuccess(sentUpdate,res){
+  var hadDirtyDuring=false;
+  try{ hadDirtyDuring=!!S.cfgSave.dirty; }catch(e){}
+  S.config=res.config;
+  renderTopbar();
+  var restart=false, restartFields=[];
+  try{ restart=!!(res.result&&res.result.restart_required); restartFields=(res.result&&res.result.restart_fields)||[]; }catch(e){}
+  function okToast(){
+    if(!restart){ toast("配置已更新"); return; }
+    var dl=[]; for(var i=0;i<restartFields.length;i++)dl.push(restartFieldLabel(restartFields[i]));
+    if(dl.length)toast("配置已更新；"+dl.join("、")+" 需重启");
+    else toast("配置已更新，需重启");
+  }
+  if(!hadDirtyDuring){
+    ["server_keys","zen_keys","go_keys"].forEach(function(n){ try{$(n+"-new").value="";}catch(e){} });
+    fillConfig(S.config); renderTopbar();
+    setSaveStatus("已保存","");
+    okToast();
+    return res;
+  }
+  reconcileAfterSuccess(sentUpdate,res.config);
+  renderTopbar();
+  setSaveStatus("保存中…","");
+  okToast();
+  return res;
+}
+function reconcileAfterSuccess(sentUpdate, serverConfig){
+  try{ S.config=serverConfig; }catch(e){}
+  try{resetSecretChipLabels();}catch(e){}
+  try{clearSecretRevealCache();}catch(e){}
+  ["server_keys","zen_keys","go_keys"].forEach(function(n){
+    try{
+      var sentList=(sentUpdate&&sentUpdate[n])||[];
+      var sentKept={};
+      var sentAdded=[];
+      sentList.forEach(function(it){ if(it&&it.id)sentKept[String(it.id)]=1; else if(it&&it.value!==undefined&&String(it.value).trim())sentAdded.push(String(it.value).trim()); });
+      var views=(serverConfig&&serverConfig[n])||[];
+      var fresh=[];
+      views.forEach(function(v){ if(!sentKept[String(v.id||"")])fresh.push(v); });
+      var ta=$(n+"-new");
+      var curLines=[];
+      if(ta)curLines=String(ta.value||"").split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean);
+      sentAdded.forEach(function(v){
+        var idx=curLines.indexOf(v);
+        if(idx>=0)curLines.splice(idx,1);
+      });
+      if(ta)ta.value=curLines.join("\n");
+      appendPromotedChips(n,fresh);
+    }catch(e){}
+  });
+  try{
+    var serverPools=(serverConfig&&serverConfig.proxy_pools)||{};
+    var sentPools=(sentUpdate&&sentUpdate.proxy_pools)||{};
+    (S.poolDraft.pools||[]).forEach(function(p){
+      var nm=String(p.name||"");
+      var sv=serverPools[nm];
+      if(!sv)return;
+      var sent=(sentPools[nm]&&sentPools[nm].proxies)||[];
+      var kept={};
+      var addedVals=[];
+      sent.forEach(function(it){ if(it&&it.id)kept[String(it.id)]=1; else if(it&&it.value!==undefined&&String(it.value).trim())addedVals.push(String(it.value).trim()); });
+      var freshP=[];
+      ((sv&&sv.proxies)||[]).forEach(function(v){ if(!kept[String(v.id||"")])freshP.push({id:String(v.id||""),display:String(v.display||"")}); });
+      freshP.forEach(function(fv){
+        var exists=false;
+        (p.proxies||[]).forEach(function(ex){ if(String(ex.id||"")===String(fv.id||""))exists=true; });
+        if(!exists)(p.proxies||[]).push(fv);
+      });
+      if((p.added||[]).length&&addedVals.length){
+        var remain=[];
+        (p.added||[]).forEach(function(a){
+          var vv=String(a.value||"").trim();
+          var idx=addedVals.indexOf(vv);
+          if(idx>=0)addedVals.splice(idx,1);
+          else remain.push(a);
+        });
+        p.added=remain;
+      }
+      if(sv.proxyfile!==undefined)p.proxyfile=String(sv.proxyfile||"");
+    });
+  }catch(e){}
+  try{
+    var serverChans=((serverConfig&&serverConfig.fallback&&serverConfig.fallback.channels)||[]);
+    var byName={};
+    serverChans.forEach(function(c){ byName[String(c.name||"")]=c; });
+    (S.fbDraft.channels||[]).forEach(function(c){
+      var sc=byName[String(c.name||"")];
+      if(!sc)return;
+      var skid=String((sc.api_key&&sc.api_key.id)||"");
+      var sdisp=String((sc.api_key&&sc.api_key.display)||"");
+      if(skid){ c.api_key={id:skid,display:sdisp}; }
+      if(c._newKey)delete c._newKey;
+    });
+  }catch(e){}
+  try{ renderPoolsList(); refreshPoolBadges(); }catch(e){}
+  try{ renderFallbackList(); }catch(e){}
+}
+$("config-form").addEventListener("submit",function(e){
+  e.preventDefault();
+  queueConfigSave(true).catch(function(){});
 });
-$("modal-close").addEventListener("click",function(){$("modal").classList.add("hidden");$("modal-content").textContent="";});
+(function bindConfigAutosave(){
+  function on(id, ev, fn){ try{ var n=$(id); if(n)n.addEventListener(ev,fn); }catch(e){} }
+  ["c-prefer","c-level"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
+  ["c-anonymous","c-hist-enabled"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
+  ["c-listen","c-web-listen","c-session","c-up-zen","c-up-go","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ring","c-hist-dir","c-hist-retention","c-hist-max"].forEach(function(id){
+    on(id,"input",function(){ queueConfigSave(false).catch(function(){}); });
+    on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
+    on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
+  });
+  on("c-protocols","input",function(){
+    var raw=""; try{ raw=$("c-protocols").value||"{}"; }catch(e){}
+    try{ JSON.parse(raw); queueConfigSave(false).catch(function(){}); }
+    catch(e){ try{clearTimeout(S.cfgSave.debounce);}catch(ee){} S.cfgSave.debounce=null; }
+  });
+  on("c-protocols","change",function(){
+    var raw=""; try{ raw=$("c-protocols").value||"{}"; }catch(e){}
+    try{ JSON.parse(raw); queueConfigSave(true).catch(function(){}); }
+    catch(e){ toast("模型协议手动指定 JSON 无效："+e.message,true); }
+  });
+  on("c-protocols","blur",function(){
+    var raw=""; try{ raw=$("c-protocols").value||"{}"; }catch(e){}
+    try{ JSON.parse(raw); }catch(e){ toast("模型协议手动指定 JSON 无效："+e.message,true); return; }
+    if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){});
+  });
+  ["server_keys","zen_keys","go_keys"].forEach(function(n){
+    on(n+"-new","change",function(){ queueConfigSave(true).catch(function(){}); });
+    on(n+"-new","blur",function(){ queueConfigSave(true).catch(function(){}); });
+  });
+})();
+function revealConfig(){
+  return api("/api/config/reveal",{method:"POST",body:"{}"});
+}
 
 /* ---------- metadata (catalog freshness for health) ---------- */
 function loadDebugModels(){

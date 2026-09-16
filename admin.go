@@ -389,18 +389,12 @@ func (a *AdminServer) handleReload(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *AdminServer) handleReveal(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		Password string `json:"password"`
-	}
+	var input struct{}
 	if err := decodeAdminJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	cfg := a.manager.Config()
-	if !verifyPassword(cfg.WebUI.PasswordHash, input.Password) {
-		writeAdminError(w, http.StatusForbidden, "verification_failed", "password verification failed")
-		return
-	}
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("sensitive configuration revealed", "component", "auth", "event", "secrets_revealed", "client_ip", clientIP(r))
 	pools := make(map[string]any, len(cfg.ProxyPools))

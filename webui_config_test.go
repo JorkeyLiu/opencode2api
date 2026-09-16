@@ -29,10 +29,8 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"监听与管理",
 		"首选上游顺序",
 		"停用备用渠道",
-		"config-sticky",
 		"config-item-grid",
 		"完整地址预览",
-		"fallback-active-note",
 		"fallback-modal",
 		"fallback-modal-body",
 		"fallback-modal-save",
@@ -41,14 +39,18 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"pool-modal-body",
 		"pool-modal-save",
 		"pool-modal-delete",
-		"保存并应用",
+		"save-status",
+		"从磁盘重载",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing config group copy %q", needle)
 		}
 	}
-	if strings.Contains(html, "验证、保存并应用") {
-		t.Fatal("global submit must read 保存并应用, legacy 验证、保存并应用 must be removed")
+	// Unified bottom save is gone: autosave persists, modals save independently.
+	for _, stale := range []string{"保存并应用", "验证、保存并应用", "fallback-active-note", "当前启用：", "当前未启用备用渠道"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("unified save / active-note copy must stay removed: %q", stale)
+		}
 	}
 	// Duplicate enable concepts are gone: only list selection + deactivate remain.
 	for _, stale := range []string{"启用此渠道", "启用所选渠道", "c-fallback-active", "btn-fallback-activate", "当前启用渠道"} {
@@ -75,11 +77,11 @@ func TestWebUIConfigGroups(t *testing.T) {
 	if !strings.Contains(form, "<details") {
 		t.Fatal("details must wrap the advanced JSON inside the form")
 	}
-	// Single submit in the whole bundle: login + config save only.
-	if got := strings.Count(html, `type="submit"`); got != 2 {
-		t.Fatalf("submit count=%d want 2 (login + config save)", got)
+	// Only the login form keeps a submit button; config persists via autosave.
+	if got := strings.Count(html, `type="submit"`); got != 1 {
+		t.Fatalf("submit count=%d want 1 (login only, config autosaves)", got)
 	}
-	// All long-lived config element IDs preserved.
+	// All long-lived config element IDs preserved (sticky/reveal removed, topbar reload + status remain).
 	for _, id := range []string{
 		"c-prefer", "c-listen", "c-web-listen", "c-session", "c-web-enabled",
 		"c-anonymous", "server_keys-chips", "server_keys-new",
@@ -87,7 +89,7 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"pools-editor", "btn-pool-add", "pools-error",
 		"c-route-anon", "c-route-zen", "c-route-go",
 		"fallback-editor", "btn-fallback-add", "btn-fallback-clear", "fallback-error",
-		"fallback-active-note", "fallback-modal", "fallback-modal-body",
+		"fallback-modal", "fallback-modal-body",
 		"fallback-modal-save", "fallback-modal-delete", "fallback-modal-cancel",
 		"pool-modal", "pool-modal-body",
 		"pool-modal-save", "pool-modal-delete", "pool-modal-cancel",
@@ -96,11 +98,27 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown",
 		"c-level", "c-ring",
 		"c-hist-enabled", "c-hist-dir", "c-hist-retention", "c-hist-max",
-		"config-form", "btn-reload", "btn-reveal",
+		"config-form", "btn-refresh", "save-status",
 	} {
 		if !strings.Contains(html, id) {
 			t.Fatalf("missing config id %q", id)
 		}
+	}
+	// Global sensitive-value button/modal and bottom sticky bar are gone.
+	for _, stale := range []string{"config-sticky", "btn-reveal", "btn-reload", "查看敏感值", "二次验证"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("global reveal/sticky must stay removed: %q", stale)
+		}
+	}
+	if strings.Contains(html, `<div id="modal"`) || strings.Contains(html, `id="modal-content"`) || strings.Contains(html, `id="modal-close"`) {
+		t.Fatal("global sensitive modal must stay removed (fallback/pool modals remain)")
+	}
+	if strings.Contains(html, `$("modal")`) || strings.Contains(html, `$("modal-content")`) || strings.Contains(html, `$("modal-close")`) {
+		t.Fatal("global sensitive modal must stay removed (fallback/pool modals remain)")
+	}
+	// Topbar reload entry lives in the header.
+	if !strings.Contains(html, `id="btn-refresh"`) || !strings.Contains(html, "从磁盘重载") {
+		t.Fatal("topbar must carry 从磁盘重载 reload entry")
 	}
 }
 
@@ -209,25 +227,90 @@ func TestWebUIFallbackEyeReauthMasked(t *testing.T) {
 		`st.revealed`,
 		`st.originalSecret`,
 		`origDisplay`,
-		`revealConfig(pw)`,
-		`prompt("请再次输入管理密码`,
-		`String(c.name||"")===String(st.origName`,
+		`origId`,
+		`revealConfig()`,
+		`body:"{}"`,
+		`String(chans[i].name||"")===String(st.origName`,
+		`fallbackSecretById(candidates,savedSecretId)`,
 		`keyInput.value=pendingNew||savedDisplay`,
 		`keyInput.value=savedDisplay`,
+		`st.originalSecret=""`,
 		`delete entry._newKey`,
 		`entry._newKey=nv`,
 		`S.fbModal={index:null,origName:"",origDisplay`,
 		`X-CSRF-Token`,
 	} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("missing eye/re-auth contract %q", needle)
+			t.Fatalf("missing eye/reveal contract %q", needle)
 		}
 	}
-	if strings.Contains(html, `keyToggle.textContent="显示"`) || strings.Contains(html, `keyToggle.textContent="隐藏"`) {
-		t.Fatal("eye toggle must be an icon button without 显示/隐藏 text content")
+	// Logged-in session reveals directly: no second password prompt, no password payload.
+	for _, stale := range []string{
+		`prompt("请再次输入管理密码`,
+		`请再次输入管理密码以查看该渠道密钥`,
+		`请再次输入管理密码以查看敏感值`,
+		`revealConfig(pw)`,
+		`revealConfig(password)`,
+		`function revealConfig(password)`,
+		`password:password`,
+		`{password:`,
+		`二次验证`,
+	} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("password-gated reveal must stay removed: %q", stale)
+		}
 	}
-	if !strings.Contains(html, "👁") {
-		t.Fatal("eye icon button must render an eye glyph")
+	// Reveal stays POST-only behind the login session: never a GET.
+	if strings.Contains(html, `/api/config/reveal",{method:"GET"`) || strings.Contains(html, `api("/api/config/reveal",{method:"GET"`) {
+		t.Fatal("reveal must stay POST-only, never GET")
+	}
+	// Plaintext must never enter toast/console or a long-lived draft.
+	if strings.Contains(html, `toast(found`) || strings.Contains(html, `toast(st.originalSecret`) {
+		t.Fatal("plaintext must never enter toast")
+	}
+	if strings.Contains(html, `console.log(found`) || strings.Contains(html, `console.log(st.originalSecret`) {
+		t.Fatal("plaintext must never enter console")
+	}
+	if strings.Contains(html, `keyToggle.textContent`) {
+		t.Fatal("eye toggle must render SVG icons, not textContent glyphs")
+	}
+	if strings.Contains(html, `keyToggle.innerHTML`) {
+		t.Fatal("eye toggle must build SVG via DOM, not innerHTML")
+	}
+	// Standard dependency-free eye / eye-off inline SVG built via createElementNS.
+	for _, needle := range []string{
+		`createElementNS(eyeSvgNS,"svg")`,
+		`createElementNS(eyeSvgNS,"path")`,
+		`createElementNS(eyeSvgNS,"circle")`,
+		`createElementNS(eyeSvgNS,"line")`,
+		`M1 12s4-8 11-8`,
+		`fbEyeIcon(open)`,
+		`clear(keyToggle); keyToggle.appendChild(fbEyeIcon(open))`,
+		`.key-row button svg{width:18px`,
+		`aria-hidden","true"`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("eye icon contract must contain %q", needle)
+		}
+	}
+	// Masked state renders plain eye; visible state adds the slash line for eye-off.
+	if !strings.Contains(html, `eyeSlash.setAttribute("x1","1")`) {
+		t.Fatal("visible state must render eye-off slash line")
+	}
+	// Overlay/adornment: eye lives inside the key input on the right, input keeps right padding.
+	for _, needle := range []string{
+		`keyToggle.type="button"`,
+		`.key-row{position:relative`,
+		`padding-right:40px`,
+		`position:absolute;right:4px`,
+		`transform:translateY(-50%)`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("eye overlay contract must contain %q", needle)
+		}
+	}
+	if strings.Contains(html, `.key-row{display:flex;gap:8px;align-items:center`) {
+		t.Fatal("eye button must be an input-internal overlay, not an external flex row")
 	}
 	for _, stale := range []string{"fb-key-status", "fb-key-hint", "留空保留", "已输入新密钥", "新建渠道需填写", "已保存密钥", "留空保留已保存"} {
 		if strings.Contains(html, stale) {
@@ -286,6 +369,7 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 		}
 	}
 	// Compact list + modal is the only editor: rename maps active, delete clears it.
+	// Enabled state is expressed only by list highlight (.active) and pill (已启用/未启用).
 	for _, needle := range []string{
 		"function renderFallbackList()",
 		"function fallbackListRow(ch, idx)",
@@ -295,11 +379,18 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 		"function setFallbackActive(name)",
 		"S.fbDraft",
 		"mapFallbackActiveOnRename(String(S.fbDraft.active",
-		"fallback-active-note",
 		"fb-row",
+		`row.className="fb-row"+(String(S.fbDraft.active`,
+		`"已启用"`,
+		`"未启用"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("fallback list/modal must contain %q", needle)
+		}
+	}
+	for _, stale := range []string{"fallback-active-note", "当前启用：", "当前未启用备用渠道"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("active-note text must stay removed: %q", stale)
 		}
 	}
 	// Expanded per-channel cards and duplicate enable buttons are gone.
@@ -418,7 +509,10 @@ func TestWebUIConfigDesignSystem(t *testing.T) {
 		"匿名通道",
 		"运行状态",
 		"代理文件",
-		`.key-row{display:flex;gap:8px;align-items:center;min-width:0;max-width:100%;width:100%}`,
+		`.key-row{position:relative;display:block;min-width:0;max-width:100%;width:100%}`,
+		`.key-row input{width:100%;min-width:0;padding-right:40px;box-sizing:border-box}`,
+		`.key-row button{position:absolute;right:4px;top:50%;transform:translateY(-50%)`,
+		`.key-row button:focus-visible`,
 		`.fb-model-row{display:grid;grid-template-columns:auto minmax(0,1fr);gap:8px;align-items:center;max-width:100%;width:100%;min-width:0}`,
 		`.fb-model-row select{min-width:0;max-width:100%;width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}`,
 		`var keyWrap=document.createElement("div"); keyWrap.className="field span-6";`,
@@ -461,31 +555,144 @@ func TestWebUIConfigDesignSystem(t *testing.T) {
 
 func TestWebUISidebarScrollBackground(t *testing.T) {
 	html := readConfigWebUI(t)
+	// Viewport shell: app fills viewport, body/shell do not page-scroll on desktop.
 	for _, needle := range []string{
-		`.layout{position:relative;`,
-		`min-height:calc(100dvh - 52px)`,
-		`.layout::before{display:none}`,
+		`#view-app{height:100vh;height:100dvh;display:flex;flex-direction:column;min-height:0;overflow:hidden}`,
+		`.layout{flex:1;min-height:0;overflow:hidden;`,
+		`.main{flex:1;min-width:0;min-height:0;overflow-y:auto;`,
+		`.topbar{flex:none;position:sticky;top:0;`,
 		`@media (min-width:1200px){`,
-		`.nav{position:fixed;left:0;top:52px;`,
-		`height:calc(100dvh - 52px);overflow-y:auto;overflow-x:hidden;z-index:30;`,
-		`.main{margin:0 0 0 212px;width:calc(100% - 212px);`,
+		`.layout::before{display:none}`,
 		`.main>*{max-width:1280px;`,
 	} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("missing sidebar scroll-background contract %q", needle)
+			t.Fatalf("missing viewport shell contract %q", needle)
 		}
 	}
 	if got := strings.Count(html, ".layout::before{display:none}"); got != 3 {
-		t.Fatalf("layout backdrop must be disabled in desktop, tablet and mobile queries, got %d", got)
+		t.Fatalf("layout backdrop must stay disabled in desktop, tablet and mobile queries, got %d", got)
 	}
 	if strings.Contains(html, `.layout::before{content:"";position:absolute;`) {
-		t.Fatal("legacy absolute layout backdrop must be removed; fixed nav carries its own background")
+		t.Fatal("legacy absolute layout backdrop must stay removed")
 	}
-	if !strings.Contains(html, ".main{margin:0;width:100%;") {
-		t.Fatal("tablet/mobile must reset the desktop 212px left offset")
+	// Grid/flex only: no fixed sidebar with magic margin offset.
+	if strings.Contains(html, `.nav{position:fixed;`) {
+		t.Fatal("sidebar must use flex column, not fixed+magic offset")
 	}
-	if !strings.Contains(html, ".main{flex:1;") || !strings.Contains(html, "position:relative;z-index:1}") {
-		t.Fatal("main must sit above the layout backdrop without covering the sidebar")
+	if strings.Contains(html, `.main{margin:0 0 0 212px;`) {
+		t.Fatal("content must not use 212px left-offset margin; flex row carries the sidebar")
+	}
+	// min-height:0 lets flex scroll children shrink correctly.
+	for _, needle := range []string{
+		`.layout{flex:1;min-height:0;`,
+		`min-height:0;overflow-y:auto;overflow-x:hidden;z-index:15}`,
+		`.main{flex:1;min-width:0;min-height:0;overflow-y:auto;`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("scroll flex child must carry min-height:0 %q", needle)
+		}
+	}
+	// Narrow breakpoints keep top-nav behavior without forcing a fixed full-height sidebar.
+	for _, needle := range []string{
+		`@media (min-width:800px) and (max-width:1199px){`,
+		`@media (max-width:799px){`,
+		`#view-app{height:auto;min-height:100vh;min-height:100dvh;overflow:visible;display:block}`,
+		`.topbar{position:static}`,
+		`.main{margin:0;width:100%;`,
+		`overflow:visible;`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("responsive override must contain %q", needle)
+		}
+	}
+	// Login view must not be captured by the app shell layout.
+	if !strings.Contains(html, `.login{min-height:100vh;`) {
+		t.Fatal("login view must keep its own full-height centered layout")
+	}
+	if !strings.Contains(html, `<section id="view-login"`) {
+		t.Fatal("login section must stay outside the app shell")
+	}
+}
+
+func TestWebUIAppShellScrollToastModal(t *testing.T) {
+	html := readConfigWebUI(t)
+	// Only the main content scrolls; sidebar/topbar stay visible via flex shell.
+	for _, needle := range []string{
+		`#view-app{height:100vh;height:100dvh;display:flex;flex-direction:column;min-height:0;overflow:hidden}`,
+		`.layout{flex:1;min-height:0;overflow:hidden;`,
+		`.main{flex:1;min-width:0;min-height:0;overflow-y:auto;`,
+		`.toast{position:fixed;`,
+		`.modal{position:fixed;`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("app shell scroll contract must contain %q", needle)
+		}
+	}
+	// Toast/modal stay viewport-relative siblings outside the scrolling main.
+	mainClose := strings.Index(html, "</main>")
+	if mainClose < 0 {
+		t.Fatal("missing </main> boundary")
+	}
+	afterMain := html[mainClose:]
+	for _, id := range []string{`id="toast"`, `id="fallback-modal"`, `id="pool-modal"`} {
+		if !strings.Contains(afterMain, id) {
+			t.Fatalf("overlay %q must live outside scrolling main for viewport display", id)
+		}
+	}
+	if strings.Contains(afterMain, `id="modal"`) || strings.Contains(html, `id="modal-content"`) {
+		t.Fatal("global sensitive modal must stay removed")
+	}
+	mainOpen := strings.Index(html, "<main")
+	if mainOpen < 0 {
+		t.Fatal("missing <main")
+	}
+	mainBlock := html[mainOpen:mainClose]
+	for _, id := range []string{`id="toast"`, `class="toast"`, `class="modal"`} {
+		if strings.Contains(mainBlock, id) {
+			t.Fatalf("overlay %q must not be nested inside scrolling content", id)
+		}
+	}
+	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("} {
+		if strings.Contains(html, sink) {
+			t.Fatalf("forbidden DOM sink %q", sink)
+		}
+	}
+}
+
+func TestWebUIConfigUpdateToastSingleFlight(t *testing.T) {
+	html := readConfigWebUI(t)
+	if !strings.Contains(html, `toast("配置已更新")`) {
+		t.Fatal("PUT success must toast 配置已更新")
+	}
+	successIdx := strings.Index(html, "function handleConfigSaveSuccess(sentUpdate,res)")
+	if successIdx < 0 {
+		t.Fatal("missing handleConfigSaveSuccess")
+	}
+	if !strings.Contains(html[successIdx:], `toast("配置已更新")`) {
+		t.Fatal("配置已更新 toast must live on the server-success path")
+	}
+	// Modal open/close and pure GET/load/reload must not toast success.
+	for _, fn := range []string{"function openFallbackModal(", "function closeFallbackModal()", "function openPoolModal(", "function closePoolModal()", "function loadConfig()"} {
+		idx := strings.Index(html, fn)
+		if idx < 0 {
+			continue
+		}
+		end := strings.Index(html[idx:], "\nfunction ")
+		var block string
+		if end < 0 {
+			block = html[idx:]
+		} else {
+			block = html[idx : idx+end]
+		}
+		if strings.Contains(block, "配置已更新") {
+			t.Fatalf("%s must not toast 配置已更新 (GET/open/close only)", fn)
+		}
+	}
+	// Modal persistence reuses the single PUT toast: no second channel/pool success toast.
+	for _, dup := range []string{"已保存渠道", "已新增渠道", "已删除渠道", "已保存代理池", "已新增代理池", "已删除代理池"} {
+		if strings.Contains(html, dup) {
+			t.Fatalf("modal must not emit duplicate success toast %q", dup)
+		}
 	}
 }
 
@@ -572,6 +779,200 @@ func TestWebUICustomRealtimeDisplay(t *testing.T) {
 	for _, needle := range []string{"server_keys-chips", "server_keys-new", "zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new", "每行新增一个密钥", "移除"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("batch key UI must stay intact: %q", needle)
+		}
+	}
+}
+
+func TestWebUILoginClearsPlaintextModals(t *testing.T) {
+	html := readConfigWebUI(t)
+	// Login-entry path must purge plaintext holders: fallback channel modal
+	// and revealed secret-chip labels (global modal is gone).
+	showIdx := strings.Index(html, "function showLogin()")
+	if showIdx < 0 {
+		t.Fatal("missing showLogin")
+	}
+	showEnd := strings.Index(html[showIdx:], "function switchTab(")
+	if showEnd < 0 {
+		t.Fatal("missing switchTab boundary for showLogin block")
+	}
+	showBlock := html[showIdx : showIdx+showEnd]
+	if !strings.Contains(showBlock, "clearSensitiveModalsForLogin") {
+		t.Fatal("showLogin must invoke the shared sensitive-modal cleanup helper")
+	}
+	// Helper exists and reuses closeFallbackModal with init-safe guards
+	// (typeof check, no showLogin recursion).
+	helperIdx := strings.Index(html, "function clearSensitiveModalsForLogin()")
+	if helperIdx < 0 {
+		t.Fatal("missing clearSensitiveModalsForLogin helper")
+	}
+	helperEnd := strings.Index(html[helperIdx:], "function showLogin()")
+	if helperEnd < 0 {
+		t.Fatal("missing showLogin boundary for helper block")
+	}
+	helper := html[helperIdx : helperIdx+helperEnd]
+	for _, needle := range []string{
+		`typeof closeFallbackModal`,
+		`closeFallbackModal()`,
+		`$("fallback-modal")`,
+		`$("fallback-modal-body")`,
+		`keyInput`,
+		`value=""`,
+		`revealed:false`,
+		`originalSecret:""`,
+		`resetSecretChipLabels`,
+		`clearSecretRevealCache`,
+	} {
+		if !strings.Contains(helper, needle) {
+			t.Fatalf("login cleanup helper must contain %q", needle)
+		}
+	}
+	for _, stale := range []string{`$("modal")`, `$("modal-content")`, `$("modal-close")`, `id="modal"`} {
+		if strings.Contains(helper, stale) {
+			t.Fatalf("global modal reference must stay removed from helper: %q", stale)
+		}
+	}
+	if strings.Contains(helper, "showLogin()") {
+		t.Fatal("cleanup helper must not call showLogin (no recursion)")
+	}
+	// Helper fallback path resets fbModal state even when closeFallbackModal
+	// is unavailable at init time.
+	if !strings.Contains(helper, `S.fbModal={index:null,origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}`) {
+		t.Fatal("helper fallback path must reset S.fbModal plaintext state")
+	}
+	// closeFallbackModal itself wipes the live DOM key value before dropping
+	// the body, so detached nodes keep no plaintext.
+	closeIdx := strings.Index(html, "function closeFallbackModal()")
+	if closeIdx < 0 {
+		t.Fatal("missing closeFallbackModal")
+	}
+	closeEnd := strings.Index(html[closeIdx:], "function saveFallbackModal()")
+	if closeEnd < 0 {
+		t.Fatal("missing saveFallbackModal boundary for close block")
+	}
+	closeBlock := html[closeIdx : closeIdx+closeEnd]
+	for _, needle := range []string{
+		`fields&&st`,
+		`keyInput`,
+		`value=""`,
+		`$("fallback-modal")`,
+		`$("fallback-modal-body")`,
+		`revealed:false`,
+		`originalSecret:""`,
+	} {
+		if !strings.Contains(closeBlock, needle) {
+			t.Fatalf("closeFallbackModal must contain %q", needle)
+		}
+	}
+	// Login, reveal, eye and save behaviour stays intact.
+	for _, needle := range []string{
+		`$("login-form")`,
+		`api("/api/auth/login"`,
+		`function revealConfig()`,
+		`api("/api/config/reveal"`,
+		`fbEyeIcon(open)`,
+		`function saveFallbackModal()`,
+		`function makeSecretChip(`,
+		`function toggleSecretChip(`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("login/reveal/eye/save contract must stay intact: %q", needle)
+		}
+	}
+}
+
+func TestWebUISecretChipToggle(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		`function makeSecretChip(item, group)`,
+		`function toggleSecretChip(labelEl, group)`,
+		`function secretRevealShared()`,
+		`function secretByFingerprint(candidates, wantId)`,
+		`function clearSecretRevealCache()`,
+		`function resetSecretChipLabels()`,
+		`secret-label`,
+		`setAttribute("role","button")`,
+		`setAttribute("tabindex","0")`,
+		`aria-pressed`,
+		`data-display`,
+		`data-revealed`,
+		`data-group`,
+		`revealConfig().then`,
+		`fallbackSecretFingerprint(secret)`,
+		`toast("未找到该密钥"`,
+		`stopPropagation)ev.stopPropagation`,
+		`chip.remove(); queueConfigSave(true)`,
+		`cursor:pointer`,
+		`label.className="secret-label"`,
+		`S.secretReveal`,
+		`S.secretReveal={seq:0,promise:null,data:null}`,
+		`clearSecretRevealCache();`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("secret chip toggle must contain %q", needle)
+		}
+	}
+	// Fingerprint matching is exact by data-id; never blind positional.
+	if !strings.Contains(html, `chipEl.getAttribute("data-id")`) {
+		t.Fatal("chip toggle must read data-id fingerprint from the chip")
+	}
+	if !strings.Contains(html, `fp===wantId?secret:""`) {
+		t.Fatal("chip reveal must match by SHA-256 fingerprint equality")
+	}
+	// Keyboard access: Enter and Space toggle.
+	if !strings.Contains(html, `k==="Enter"`) || !strings.Contains(html, `k===13`) {
+		t.Fatal("secret label must toggle on Enter/Space")
+	}
+	// Toggle never writes drafts or triggers autosave.
+	toggleIdx := strings.Index(html, "function toggleSecretChip(labelEl, group)")
+	if toggleIdx < 0 {
+		t.Fatal("missing toggleSecretChip")
+	}
+	toggleEnd := strings.Index(html[toggleIdx:], "function makeSecretChip(")
+	if toggleEnd < 0 {
+		t.Fatal("missing makeSecretChip boundary for toggle block")
+	}
+	toggleBlock := html[toggleIdx : toggleIdx+toggleEnd]
+	if strings.Contains(toggleBlock, "queueConfigSave") {
+		t.Fatal("chip toggle must not trigger queueConfigSave")
+	}
+	if strings.Contains(toggleBlock, ".value=") {
+		t.Fatal("chip toggle must not write textarea/input values")
+	}
+	// Plaintext stays in memory/DOM only.
+	for _, bad := range []string{`toast(found`, `console.log(found`, `localStorage`} {
+		if strings.Contains(toggleBlock, bad) {
+			t.Fatalf("chip plaintext must never enter %q", bad)
+		}
+	}
+	// fillConfig/loadConfig/reconcile clear the shared reveal cache.
+	for _, fn := range []string{"function loadConfig()", "function fillConfig(v)", "function reconcileAfterSuccess(sentUpdate, serverConfig)"} {
+		idx := strings.Index(html, fn)
+		if idx < 0 {
+			t.Fatalf("missing %s", fn)
+		}
+		end := strings.Index(html[idx:], "function ")
+		var block string
+		if end < 0 {
+			block = html[idx:]
+		} else {
+			next := strings.Index(html[idx+len(fn):], "function ")
+			if next < 0 {
+				block = html[idx:]
+			} else {
+				block = html[idx : idx+len(fn)+next]
+			}
+		}
+		if !strings.Contains(block, "clearSecretRevealCache") {
+			t.Fatalf("%s must clear the shared reveal cache", fn)
+		}
+	}
+	// Promoted chips reuse the same clickable builder.
+	if !strings.Contains(html, "host.appendChild(makeSecretChip(item,name))") {
+		t.Fatal("renderChips/appendPromotedChips must share makeSecretChip")
+	}
+	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("} {
+		if strings.Contains(html, sink) {
+			t.Fatalf("forbidden DOM sink %q", sink)
 		}
 	}
 }

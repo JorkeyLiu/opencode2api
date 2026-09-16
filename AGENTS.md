@@ -267,7 +267,9 @@
   normalizes to `""`, other values strictly rejected; never in the binding
   identity, never migrates as identity, never probed); active empty or referencing an
   existing channel) persists via config authority/RuntimeManager.Apply
-  with masked GET, password-gated reveal, and full-chain redaction. Only a request
+  with masked GET, authenticated-session reveal (POST-only non-GET behind admin
+  session auth + CSRF + Origin, no-store response, and full-chain
+  redaction without plaintext logging). Only a request
   entering with an existing anonymous session+model pin that gets HTTP 429 on the
   pinned anonymous path (live 429 or tier-qualified proxy429 local 429) may take
   over; unbound anonymous 429 and authenticated-pin 429 never trigger. Without an
@@ -347,9 +349,7 @@
 - Sensitive-data handling: NEVER log or return full local keys, upstream
   keys, Authorization/Cookie/password values, or proxy credentials. Request
   message bodies MUST NOT be logged by default. Sensitive admin responses
-  MUST carry `no-store` (or `no-cache, no-store`); full secret values require
-  re-authentication with the admin password, and onboarding examples MUST use
-  the `YOUR_API_KEY` placeholder.
+  MUST carry `no-store` (or `no-cache, no-store`).
 - Logging: stdout is single-line JSON (time, level, component, event, plus
   request/model/tier/status/latency/attempts/key-tail where applicable);
   established requests log a routing event at the right level. The memory ring
