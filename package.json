@@ -1,0 +1,20 @@
+{
+  "name": "opencode2api",
+  "version": "1.0.0",
+  "description": "`opencode2api` 是一个使用 Go 编写的 OpenCode Zen / Zen Go 协议代理。它对外提供标准 OpenAI 与 Anthropic API，并自动添加 OpenCode 客户端请求头。",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JorkeyLiu/opencode2api.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/JorkeyLiu/opencode2api/issues"
+  },
+  "homepage": "https://github.com/JorkeyLiu/opencode2api#readme"
+}

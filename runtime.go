@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -185,6 +186,12 @@ func cloneConfig(cfg Config) Config {
 	cfg.ServerKeys = append([]string(nil), cfg.ServerKeys...)
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
+	cfg.Fallback.Active = strings.TrimSpace(cfg.Fallback.Active)
+	if cfg.Fallback.Channels != nil {
+		channels := make([]FallbackChannelConfig, len(cfg.Fallback.Channels))
+		copy(channels, cfg.Fallback.Channels)
+		cfg.Fallback.Channels = channels
+	}
 	cfg.Proxies = append([]string(nil), cfg.Proxies...)
 	if cfg.ProxyPools != nil {
 		pools := make(map[string]ProxyPoolConfig, len(cfg.ProxyPools))
@@ -240,7 +247,7 @@ func (m *RuntimeManager) Apply(candidate Config, persist bool) (ApplyResult, err
 		next.gateway.catalog.CopyState(current.gateway.catalog)
 		summary := migrateGatewaySchedulerState(current.gateway, next.gateway)
 		m.logger.Info("scheduler state migrated", "component", "scheduler", "event", "scheduler_state_migrated",
-			"credentials", summary.Credentials, "credential_rate_limits", summary.Credential429, "targets", summary.Targets, "proxy_rate_limits", summary.Proxy429, "channel_availability", summary.Channel, "proxies", summary.Proxies, "pins", summary.Pins)
+			"credentials", summary.Credentials, "credential_rate_limits", summary.Credential429, "targets", summary.Targets, "proxy_rate_limits", summary.Proxy429, "channel_availability", summary.Channel, "proxies", summary.Proxies, "pins", summary.Pins, "fallbacks", summary.Fallbacks)
 	}
 	if persist || hadPlaintextPassword {
 		if err := SaveConfigAtomic(m.configPath, normalized); err != nil {
@@ -350,6 +357,7 @@ type gatewayMigrationSummary struct {
 	Channel       int
 	Proxies       int
 	Pins          int
+	Fallbacks     int
 }
 
 // migrateGatewaySchedulerState moves scheduler and proxy-transport state
@@ -485,6 +493,9 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	}
 	if oldGateway.scheduler.pins != nil && newGateway.scheduler.pins != nil {
 		summary.Pins = newGateway.scheduler.pins.migratePinsFrom(oldGateway.scheduler.pins)
+	}
+	if oldGateway.scheduler.fallbacks != nil && newGateway.scheduler.fallbacks != nil {
+		summary.Fallbacks = newGateway.scheduler.fallbacks.migrateFallbackFrom(oldGateway.scheduler.fallbacks)
 	}
 	return summary
 }

@@ -43,6 +43,18 @@ func bulkAdmin(t *testing.T, pools map[string][]string, routing ProxyRoutingConf
 	return manager, admin, token, csrf
 }
 
+func seedBulkProbeCatalog(gw *Gateway) {
+	if gw == nil || gw.catalog == nil {
+		return
+	}
+	model := "bulk-free-model"
+	gw.catalog.ReplaceWithCapabilities([]string{model}, []string{model}, map[Tier]map[string]Protocol{TierZen: {model: ProtocolChat}, TierGo: {model: ProtocolChat}}, map[Tier]map[string]bool{TierZen: {}, TierGo: {}}, nil)
+}
+
+func bulkChatSuccessBody(model string) string {
+	return `{"id":"chatcmpl-bulk","object":"chat.completion","created":1,"model":"` + model + `","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+}
+
 func TestBulkAuthCSRFOriginStrictNoStore(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
@@ -405,14 +417,22 @@ func TestBulkRedactionAndConcurrencyCap(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
 		[]string{"sk-live-secret-abcdef-12345"}, []string{"go-live-secret-67890"})
 	// Fast local upstream that always succeeds.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || (r.URL.Path != "/v1/chat/completions" && r.URL.Path != "/zen/v1/chat/completions" && r.URL.Path != "/zen/go/v1/chat/completions") {
+			// Accept any chat path under the test upstream base.
+			if r.URL.Path == "" {
+				w.WriteHeader(404)
+				return
+			}
+		}
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"data":[{"id":"m1"}]}`))
+		_, _ = w.Write([]byte(bulkChatSuccessBody("bulk-free-model")))
 	}))
 	defer srv.Close()
 	rt := manager.current.Load()
 	rt.gateway.cfg.Upstream.Zen = srv.URL
 	rt.gateway.cfg.Upstream.Go = srv.URL
+	seedBulkProbeCatalog(rt.gateway)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", `{}`, token, csrf))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("bulk code=%d body=%s", rec.Code, rec.Body.String())
@@ -655,11 +675,12 @@ func TestBulkStrictEmptyObject(t *testing.T) {
 		// external network.
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(200)
-			_, _ = w.Write([]byte(`{"data":[{"id":"m1"}]}`))
+			_, _ = w.Write([]byte(bulkChatSuccessBody("bulk-free-model")))
 		}))
 		rt := admin.manager.current.Load()
 		rt.gateway.cfg.Upstream.Zen = srv.URL
 		rt.gateway.cfg.Upstream.Go = srv.URL
+		seedBulkProbeCatalog(rt.gateway)
 		rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", tc.body, token, csrf))
 		srv.Close()
 		if rec.Code != tc.want {
@@ -808,12 +829,13 @@ func TestBulkFullHTTPRunLeavesMonitorHistoryUntouched(t *testing.T) {
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{"data":[{"id":"m1"}]}`))
+		_, _ = w.Write([]byte(bulkChatSuccessBody("bulk-free-model")))
 	}))
 	defer srv.Close()
 	rt := manager.current.Load()
 	rt.gateway.cfg.Upstream.Zen = srv.URL
 	rt.gateway.cfg.Upstream.Go = srv.URL
+	seedBulkProbeCatalog(rt.gateway)
 	beforeReqs := len(manager.monitor.Snapshot().Upstream.Requests)
 	beforeRecent := len(manager.monitor.Snapshot().Upstream.Recent)
 	beforeHist := manager.monitor.HistoryStatus()
@@ -855,6 +877,7 @@ func TestBulkLargePoolSendCapTruncation(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	gw := manager.current.Load().gateway
+	seedBulkProbeCatalog(gw)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	resp := gw.runBulkCheck(ctx)

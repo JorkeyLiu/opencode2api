@@ -16,6 +16,10 @@
     "zen": "shared",
     "go": "shared"
   },
+  "fallback": {
+    "active": "",
+    "channels": []
+  },
   "upstream": {
     "zen": "https://opencode.ai/zen",
     "go": "https://opencode.ai/zen/go"

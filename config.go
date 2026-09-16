@@ -20,6 +20,7 @@ var allowedConfigKeys = map[string]bool{
 	"proxy_pools": true, "proxy_routing": true,
 	"upstream": true, "retry": true, "models": true, "performance": true,
 	"logging": true, "webui": true, "prefer": true, "history": true,
+	"fallback": true,
 }
 
 type ProxyPoolConfig struct {
@@ -42,6 +43,7 @@ type Config struct {
 	Anonymous    bool                       `json:"anonymous"`
 	ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
 	ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
+	Fallback     FallbackConfig             `json:"fallback"`
 	Upstream     UpstreamConfig             `json:"upstream"`
 	Retry        RetryConfig                `json:"retry"`
 	Models       ModelsConfig               `json:"models"`
@@ -153,6 +155,7 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 		Anonymous    bool                       `json:"anonymous"`
 		ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
 		ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
+		Fallback     FallbackConfig             `json:"fallback"`
 		Upstream     UpstreamConfig             `json:"upstream"`
 		Retry        RetryConfig                `json:"retry"`
 		Models       ModelsConfig               `json:"models"`
@@ -166,9 +169,13 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 	if pools == nil {
 		pools = map[string]ProxyPoolConfig{}
 	}
+	fb := cfg.Fallback
+	if fb.Channels == nil {
+		fb.Channels = []FallbackChannelConfig{}
+	}
 	return json.Marshal(diskConfig{
 		Listen: cfg.Listen, ServerKeys: cfg.ServerKeys, ZenKeys: cfg.ZenKeys, GoKeys: cfg.GoKeys,
-		Anonymous: cfg.Anonymous, ProxyPools: pools, ProxyRouting: cfg.ProxyRouting,
+		Anonymous: cfg.Anonymous, ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Fallback: fb,
 		Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models, Performance: cfg.Performance,
 		Logging: cfg.Logging, WebUI: cfg.WebUI, Prefer: cfg.Prefer, History: cfg.History,
 	})
@@ -233,6 +240,9 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := decodeStrict("proxy_routing", &cfg.ProxyRouting); err != nil {
+		return err
+	}
+	if err := decodeStrict("fallback", &cfg.Fallback); err != nil {
 		return err
 	}
 	if err := decodeStrict("upstream", &cfg.Upstream); err != nil {
@@ -378,6 +388,9 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		if model == "" || !validProtocol(Protocol(protocol)) {
 			return Config{}, fmt.Errorf("models.protocols contains invalid mapping %q: %q", model, protocol)
 		}
+	}
+	if err := validateFallbackConfig(&cfg.Fallback); err != nil {
+		return Config{}, err
 	}
 	if cfg.History.RetentionDays < 1 || cfg.History.RetentionDays > 90 {
 		return Config{}, errors.New("history.retention_days must be between 1 and 90")

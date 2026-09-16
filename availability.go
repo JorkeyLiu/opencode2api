@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -69,6 +68,15 @@ type bulkCredentialAvailability struct {
 	CredID      string     `json:"-"`
 }
 
+type bulkCustomAvailability struct {
+	Name        string     `json:"name"`
+	BaseURL     string     `json:"base_url"`
+	Model       string     `json:"model"`
+	Status      string     `json:"status"`
+	Reason      string     `json:"reason,omitempty"`
+	LastChecked *time.Time `json:"last_checked,omitempty"`
+}
+
 type bulkAvailabilitySnapshot struct {
 	CheckedAt    time.Time                    `json:"checked_at"`
 	TotalNodes   int                          `json:"total_nodes"`
@@ -78,6 +86,8 @@ type bulkAvailabilitySnapshot struct {
 	Partial      bool                         `json:"partial,omitempty"`
 	Nodes        []bulkNodeAvailability       `json:"nodes,omitempty"`
 	Credentials  []bulkCredentialAvailability `json:"credentials,omitempty"`
+	Custom       []bulkCustomAvailability     `json:"custom,omitempty"`
+	NoModel      []string                     `json:"no_model,omitempty"`
 }
 
 type bulkCheckRequest struct{}
@@ -92,6 +102,8 @@ type bulkCheckResponse struct {
 	Error        string                       `json:"error,omitempty"`
 	Nodes        []bulkNodeAvailability       `json:"nodes,omitempty"`
 	Credentials  []bulkCredentialAvailability `json:"credentials,omitempty"`
+	Custom       []bulkCustomAvailability     `json:"custom,omitempty"`
+	NoModel      []string                     `json:"no_model,omitempty"`
 }
 
 type bulkSendTarget struct {
@@ -104,6 +116,11 @@ type bulkSendTarget struct {
 	CredID   string
 	CredDisp string
 	IsPublic bool
+	// ProbeModel/ProbeProtocol select the real minimal inference request for
+	// this tier. Empty ProbeModel means no directory model was available and
+	// the target must not be built (caller reports no_model instead).
+	ProbeModel    string
+	ProbeProtocol Protocol
 }
 
 type bulkSendResult struct {
@@ -118,7 +135,6 @@ type bulkSendResult struct {
 	RetryAfter         time.Duration
 	Success            bool
 	ParseError         bool
-	EmptyModels        bool
 	Models             int
 }
 
@@ -221,11 +237,29 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 			totalNodes++
 		}
 	}
+	// Real-inference probe models per lane (directory-driven, never hardcoded).
+	// A lane without a servable model reports no_model/inconclusive and sends nothing.
+	anonModel, anonProto, anonOK := g.bulkProbeModel(TierZen, true)
+	zenModel, zenProto, zenOK := g.bulkProbeModel(TierZen, false)
+	goModel, goProto, goOK := g.bulkProbeModel(TierGo, false)
+	noModel := map[string]bool{}
+	if !anonOK {
+		noModel["anonymous"] = true
+	}
+	if !zenOK {
+		noModel["zen"] = true
+	}
+	if !goOK {
+		noModel["go"] = true
+	}
 	// Build send targets with bounded amplification.
 	targets := make([]bulkSendTarget, 0, bulkMaxTotalSends)
 	skipped := 0
 	truncated := false
-	addTargets := func(poolName string, tier Tier, credKey, credID, credDisp string, isPublic bool, cap int) int {
+	addTargets := func(poolName string, tier Tier, credKey, credID, credDisp string, isPublic bool, cap int, probeModel string, probeProto Protocol, probeOK bool) int {
+		if !probeOK {
+			return 0
+		}
 		nodes, ok := poolNodes[poolName]
 		if !ok || len(nodes) == 0 {
 			return 0
@@ -249,6 +283,7 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 			targets = append(targets, bulkSendTarget{
 				PoolName: n.poolName, Index: n.index, Proxy: n.proxy, Raw: n.raw,
 				Tier: tier, CredKey: credKey, CredID: credID, CredDisp: credDisp, IsPublic: isPublic,
+				ProbeModel: probeModel, ProbeProtocol: probeProto,
 			})
 			added++
 		}
@@ -276,16 +311,16 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 			truncated = true
 			continue
 		}
-		publicTested += addTargets(p, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, remaining)
+		publicTested += addTargets(p, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, remaining, anonModel, anonProto, anonOK)
 	}
 	// Configured credentials: each key across enough nodes in its assigned
 	// pool to establish success, node-specific failure, or two-distinct-429
 	// evidence. Caps keep amplification bounded; truncation is reported.
 	for _, cred := range zenCreds {
-		addTargets(zenPoolName, TierZen, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential)
+		addTargets(zenPoolName, TierZen, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, zenModel, zenProto, zenOK)
 	}
 	for _, cred := range goCreds {
-		addTargets(goPoolName, TierGo, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential)
+		addTargets(goPoolName, TierGo, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, goModel, goProto, goOK)
 	}
 	tested := len(targets)
 	// Bounded concurrency execution.
@@ -321,8 +356,43 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	// Apply deterministic state writes (comparative only) and transport
 	// health updates. All other outcomes remain display-only.
 	g.applyBulkWrites(ctx, results)
+	// Custom fallback channels: real minimal chat probes on the same
+	// concurrency budget. Custom results never write scheduler or transport
+	// health and never record inference metrics/history.
+	customTargets := make([]bulkCustomTarget, 0, len(g.cfg.Fallback.Channels))
+	for _, ch := range g.cfg.Fallback.Channels {
+		if len(targets)+len(customTargets) >= bulkMaxTotalSends {
+			skipped++
+			truncated = true
+			break
+		}
+		customTargets = append(customTargets, bulkCustomTarget{Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model, APIKey: ch.APIKey})
+	}
+	customResults := make([]bulkCustomResult, len(customTargets))
+	for i, ct := range customTargets {
+		if ctx.Err() != nil {
+			customResults[i] = bulkCustomResult{Target: ct, Cancelled: true}
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, c bulkCustomTarget) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				customResults[idx] = bulkCustomResult{Target: c, Cancelled: true}
+				return
+			}
+			customResults[idx] = g.bulkCustomProbeOnce(ctx, c)
+		}(i, ct)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		partial = true
+	}
 	// Build redacted per-node/per-credential projection.
-	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results)
+	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results, customResults, sortedNoModelList(noModel))
 	// Atomically replace the admin-only latest-result snapshot (fixed
 	// bounded). It is a projection and never routing authority. Preserve
 	// useful partial node rows but visibly mark partial; never overwrite a
@@ -330,6 +400,7 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	snap := &bulkAvailabilitySnapshot{
 		CheckedAt: checkedAt, TotalNodes: totalNodes, TestedNodes: tested,
 		SkippedNodes: skipped, Truncated: truncated, Partial: partial,
+		Custom: resp.Custom, NoModel: resp.NoModel,
 	}
 	if len(resp.Nodes) > bulkMaxSnapshotNodes {
 		snap.Nodes = append([]bulkNodeAvailability(nil), resp.Nodes[:bulkMaxSnapshotNodes]...)
@@ -359,24 +430,47 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	if tgt.Tier == TierGo {
 		base = g.cfg.Upstream.Go
 	}
+	protocol := tgt.ProbeProtocol
+	if protocol != ProtocolChat && protocol != ProtocolResponses && protocol != ProtocolAnthropic {
+		protocol = ProtocolChat
+	}
+	model := tgt.ProbeModel
+	if strings.TrimSpace(model) == "" {
+		return bulkSendResult{Target: tgt, StartedNanos: time.Now().UnixNano(), ParseError: true}
+	}
+	body, err := bulkProbeRequestBody(strings.TrimSpace(model), protocol)
+	if err != nil {
+		return bulkSendResult{Target: tgt, StartedNanos: time.Now().UnixNano(), ParseError: true}
+	}
 	sendCtx, cancel := context.WithTimeout(parent, bulkPerSendTimeout)
 	defer cancel()
 	started := time.Now()
 	startedNanos := started.UnixNano()
-	req, err := http.NewRequestWithContext(sendCtx, http.MethodGet, strings.TrimRight(base, "/")+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(sendCtx, http.MethodPost, strings.TrimRight(base, "/")+protocolPath(protocol), bytes.NewReader(body))
 	if err != nil {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: max(time.Since(started).Milliseconds(), 0), TransportErr: err, AdminCancelled: parent.Err() != nil, ProbeContextCaused: sendCtx.Err() != nil}
 	}
-	req.Header.Set("Authorization", "Bearer "+tgt.CredKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if tgt.Tier == TierGo && protocol == ProtocolAnthropic {
+		req.Header.Set("x-api-key", tgt.CredKey)
+	} else if protocol == ProtocolAnthropic {
+		req.Header.Set("x-api-key", tgt.CredKey)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+tgt.CredKey)
+	}
 	req.Header.Set("User-Agent", opencodeUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-session", "bulk-probe")
+	req.Header.Set("x-session-affinity", "bulk-probe")
+	req.Header.Set("X-Session-Id", "bulk-probe")
 	resp, err := tgt.Proxy.client.Do(req)
 	durationMS := max(time.Since(started).Milliseconds(), 0)
 	if err != nil {
 		adminCancelled := parent.Err() != nil
-		// Per-send /v1/models timeout, cancel, or DeadlineExceeded from the
-		// probe context itself is diagnostic-only for transport health: it
-		// must not flip proxy healthy. Only independent conclusive transport
+		// Per-send timeout, cancel, or DeadlineExceeded from the probe
+		// context itself is diagnostic-only for transport health: it must
+		// not flip proxy healthy. Only independent conclusive transport
 		// evidence not caused by operation/per-send context may use the
 		// existing applyProxyHealthResult semantics. Any HTTP response below
 		// still counts as reachability evidence.
@@ -394,21 +488,14 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter}
 	}
-	var payload modelsResponse
-	dec := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
-	if err := dec.Decode(&payload); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
 	}
-	count := 0
-	for _, item := range payload.Data {
-		if item.ID != "" {
-			count++
-		}
+	if !bulkProbeSuccessBody(protocol, raw) {
+		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
 	}
-	if count == 0 {
-		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, EmptyModels: true}
-	}
-	return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, Success: true, Models: count}
+	return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, Success: true, Models: 1}
 }
 
 func (g *Gateway) applyBulkWrites(parent context.Context, results []bulkSendResult) {
@@ -459,13 +546,13 @@ func (g *Gateway) applyBulkWrites(parent context.Context, results []bulkSendResu
 	})
 	groupOrder := []groupKey{}
 	for _, r := range results {
-		if r.AdminCancelled || r.TransportErr != nil || r.ParseError || r.EmptyModels {
+		if r.AdminCancelled || r.TransportErr != nil || r.ParseError {
 			continue
 		}
 		if r.Status == 0 {
 			continue
 		}
-		// 408/425/other4xx/parse/empty/timeout/cancel are diagnostic only.
+		// 408/425/other4xx/parse/timeout/cancel are diagnostic only.
 		if r.Status == 408 || r.Status == 425 {
 			continue
 		}
@@ -652,7 +739,7 @@ func bulkOutcomeLabel(r bulkSendResult) string {
 		}
 		return "inconclusive"
 	}
-	if r.ParseError || r.EmptyModels {
+	if r.ParseError {
 		return "parse_error"
 	}
 	switch {
@@ -675,7 +762,19 @@ func bulkOutcomeLabel(r bulkSendResult) string {
 	}
 }
 
-func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped int, truncated, partial bool, results []bulkSendResult) bulkCheckResponse {
+func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped int, truncated, partial bool, results []bulkSendResult, extraCustom ...any) bulkCheckResponse {
+	var customResults []bulkCustomResult
+	var noModel []string
+	if len(extraCustom) > 0 {
+		if v, ok := extraCustom[0].([]bulkCustomResult); ok {
+			customResults = v
+		}
+	}
+	if len(extraCustom) > 1 {
+		if v, ok := extraCustom[1].([]string); ok {
+			noModel = v
+		}
+	}
 	// Per pool-qualified node aggregation for the unified proxy view.
 	// Within one bulk run any observed HTTP response proves reachable for
 	// display and must never be overwritten by another credential's
@@ -791,11 +890,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 				ca.success++
 			}
 			ca.lastCode = r.Status
-			if r.TransportErr != nil {
-				ca.lastErr = bulkOutcomeLabel(r)
-			} else {
-				ca.lastErr = bulkOutcomeLabel(r)
-			}
+			ca.lastErr = bulkOutcomeLabel(r)
 		}
 	}
 	sort.Strings(aggOrder)
@@ -845,9 +940,57 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			break
 		}
 	}
+	custom := make([]bulkCustomAvailability, 0, len(customResults))
+	for _, r := range customResults {
+		label := bulkCustomOutcomeLabel(r)
+		status, reason := bulkCustomStatusFor(label)
+		custom = append(custom, bulkCustomAvailability{
+			Name: r.Target.Name, BaseURL: redactURL(r.Target.BaseURL), Model: r.Target.Model,
+			Status: status, Reason: reason, LastChecked: &checkedAt,
+		})
+	}
+	// Lanes without a directory probe model surface explicit no_model rows
+	// so callers never mistake an untested lane for success.
+	if len(noModel) > 0 {
+		noSet := map[string]bool{}
+		for _, n := range noModel {
+			noSet[n] = true
+		}
+		// Synthesize per-credential inconclusive rows for tiers that sent nothing.
+		// The no_model list itself still carries the anonymous lane; no
+		// per-node synthesis is needed for it.
+		if noSet["zen"] {
+			for _, cred := range g.zenCreds {
+				found := false
+				for _, c := range credentials {
+					if c.Tier == string(TierZen) && c.CredID == cred.id {
+						found = true
+						break
+					}
+				}
+				if !found && len(credentials) < bulkMaxSnapshotCreds {
+					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierZen), KeyTail: cred.display, Pool: g.cfg.ProxyRouting.Zen, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
+				}
+			}
+		}
+		if noSet["go"] {
+			for _, cred := range g.goCreds {
+				found := false
+				for _, c := range credentials {
+					if c.Tier == string(TierGo) && c.CredID == cred.id {
+						found = true
+						break
+					}
+				}
+				if !found && len(credentials) < bulkMaxSnapshotCreds {
+					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierGo), KeyTail: cred.display, Pool: g.cfg.ProxyRouting.Go, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
+				}
+			}
+		}
+	}
 	return bulkCheckResponse{
 		CheckedAt: checkedAt, TotalNodes: total, TestedNodes: tested,
 		SkippedNodes: skipped, Truncated: truncated, Partial: partial,
-		Nodes: nodes, Credentials: credentials,
+		Nodes: nodes, Credentials: credentials, Custom: custom, NoModel: noModel,
 	}
 }

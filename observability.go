@@ -172,6 +172,11 @@ func (r *SecretRedactor) Replace(cfg Config) {
 			appendProxySecrets(value)
 		}
 	}
+	for _, ch := range cfg.Fallback.Channels {
+		if key := strings.TrimSpace(ch.APIKey); key != "" {
+			values = append(values, key)
+		}
+	}
 	for _, value := range cfg.effectivePools {
 		for _, item := range value {
 			appendProxySecrets(item)

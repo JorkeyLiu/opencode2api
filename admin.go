@@ -52,11 +52,12 @@ type AdminServer struct {
 	debugAttempts map[string]loginWindow
 	// probeAttempts and refreshAttempts are independent per-client rate
 	// limit windows for the management probe and manual refresh endpoints.
-	probeAttempts   map[string]loginWindow
-	refreshAttempts map[string]loginWindow
-	historyAttempts map[string]loginWindow
-	bulkAttempts    map[string]loginWindow
-	lastInference   *DebugInferenceResult
+	probeAttempts    map[string]loginWindow
+	refreshAttempts  map[string]loginWindow
+	historyAttempts  map[string]loginWindow
+	bulkAttempts     map[string]loginWindow
+	fallbackAttempts map[string]loginWindow
+	lastInference    *DebugInferenceResult
 }
 
 func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, logger *slog.Logger) *AdminServer {
@@ -65,6 +66,7 @@ func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, log
 		attempts: make(map[string]loginWindow), debugAttempts: make(map[string]loginWindow),
 		probeAttempts: make(map[string]loginWindow), refreshAttempts: make(map[string]loginWindow),
 		historyAttempts: make(map[string]loginWindow), bulkAttempts: make(map[string]loginWindow),
+		fallbackAttempts: make(map[string]loginWindow),
 	}
 }
 
@@ -85,6 +87,7 @@ func (a *AdminServer) Handler() http.Handler {
 	mux.Handle("GET /api/logs/stream", a.authenticate(http.HandlerFunc(a.handleLogStream)))
 	mux.Handle("POST /api/proxies/probe", a.authenticate(a.csrf(http.HandlerFunc(a.handleProxyProbe))))
 	mux.Handle("POST /api/availability/check", a.authenticate(a.csrf(http.HandlerFunc(a.handleBulkCheck))))
+	mux.Handle("POST /api/fallback/discover", a.authenticate(a.csrf(http.HandlerFunc(a.handleFallbackDiscover))))
 	mux.Handle("POST /api/models/refresh", a.authenticate(a.csrf(http.HandlerFunc(a.handleModelsRefresh))))
 	mux.Handle("GET /api/history/requests", a.authenticate(http.HandlerFunc(a.handleHistoryRequests)))
 	mux.Handle("GET /api/history/attempts", a.authenticate(http.HandlerFunc(a.handleHistoryAttempts)))
@@ -267,6 +270,7 @@ type ConfigView struct {
 	Anonymous    bool                     `json:"anonymous"`
 	ProxyPools   map[string]ProxyPoolView `json:"proxy_pools"`
 	ProxyRouting ProxyRoutingConfig       `json:"proxy_routing"`
+	Fallback     FallbackView             `json:"fallback"`
 	Upstream     UpstreamConfig           `json:"upstream"`
 	Retry        RetryConfig              `json:"retry"`
 	Models       ModelsConfig             `json:"models"`
@@ -310,6 +314,7 @@ type ConfigUpdate struct {
 	Anonymous    bool                      `json:"anonymous"`
 	ProxyPools   map[string]ProxyPoolInput `json:"proxy_pools"`
 	ProxyRouting ProxyRoutingConfig        `json:"proxy_routing"`
+	Fallback     FallbackInput             `json:"fallback"`
 	Upstream     UpstreamConfig            `json:"upstream"`
 	Retry        RetryConfig               `json:"retry"`
 	Models       ModelsConfig              `json:"models"`
@@ -352,8 +357,13 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
 		return
 	}
+	fallback, err := resolveFallbackInput(update.Fallback, current.Fallback)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_fallback", err.Error())
+		return
+	}
 	candidate := Config{
-		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting,
+		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting, Fallback: fallback,
 		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
 		History: update.History,
 		WebUI:   WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
@@ -397,7 +407,11 @@ func (a *AdminServer) handleReveal(w http.ResponseWriter, r *http.Request) {
 	for name, pool := range cfg.ProxyPools {
 		pools[name] = map[string]any{"proxies": pool.Proxies, "proxyfile": pool.ProxyFile}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxy_pools": pools})
+	fallbackChannels := make([]any, 0, len(cfg.Fallback.Channels))
+	for _, ch := range cfg.Fallback.Channels {
+		fallbackChannels = append(fallbackChannels, map[string]any{"name": ch.Name, "base_url": ch.BaseURL, "api_key": ch.APIKey, "model": ch.Model})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxy_pools": pools, "fallback": map[string]any{"active": cfg.Fallback.Active, "channels": fallbackChannels}})
 }
 
 func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
@@ -690,7 +704,7 @@ func (a *AdminServer) configView() ConfigView {
 	}
 	return ConfigView{
 		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
-		ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
+		ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Fallback: fallbackViewFromConfig(cfg), Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
 		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, History: cfg.History,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},

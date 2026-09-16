@@ -231,6 +231,7 @@ type targetScheduler struct {
 	roundRobin    atomic.Uint64
 	routeSessions *routeSessionStore
 	pins          *sessionPinStore
+	fallbacks     *fallbackTakeoverStore
 }
 
 func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
@@ -247,6 +248,7 @@ func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
 		credDisplay:   make(map[string]string),
 		routeSessions: newRouteSessionStore(),
 		pins:          newSessionPinStore(),
+		fallbacks:     newFallbackTakeoverStore(),
 	}
 }
 

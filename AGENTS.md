@@ -233,17 +233,46 @@
   clears/sets proxy429); manual refresh shares the scheduled stateless path
   and its concurrency gate, so it never reads or writes proxy or foreground
   scheduler state.
-- Availability management: `POST /api/availability/check` is Models-only (no inference),
-  active nodes only, and inherits admin auth/CSRF/Origin checks, `no-store`, strict `{}`,
-  rate/concurrency/send caps, partial-result reporting, and redaction. Zen public probes
-  the Zen-channel nodes and never affects Go or configured credentials; a real-credential
-  401 cools that tier+credential; success clears tier-qualified proxy/channel state
-  (stale-fenced) while success+429 writes proxy429 and success+403/5xx writes channel state;
-  two 429s without success write credential429 while a single 429 stays display-only;
-  ambiguous outcomes (transport-inconclusive, 408/425, ordinary 4xx, parse/empty, timeouts)
-  stay display-only. Per-send/admin timeouts are diagnostic only. The single-proxy probe
-  stays distinct (one proxy, transport connectivity target). Both update health only through
-  the existing independent last-healthy protection.
+- Availability management: `POST /api/availability/check` sends real minimal
+  inference (`stream:false`, minimal messages, ~1 token max output) per lane, never
+  `GET /v1/models` as an availability verdict. Probe models are directory-driven
+  (anonymous: free + Zen-servable; Zen/Go: actually served by that tier; never
+  hardcoded IDs); a lane without a directory model reports `no_model`/`inconclusive`
+  without fake success. Active nodes only, inherits admin auth/CSRF/Origin checks,
+  `no-store`, strict `{}`, rate/concurrency/send caps, partial-result reporting,
+  and redaction. Zen public probes the Zen-channel nodes and never affects Go or
+  configured credentials; a real-credential 401 cools that tier+credential; success
+  clears tier-qualified proxy/channel state (stale-fenced) while success+429 writes
+  proxy429 and success+403/5xx writes channel state; two 429s without success write
+  credential429 while a single 429 stays display-only; ambiguous outcomes
+  (transport-inconclusive, 408/425, ordinary 4xx, parse/empty, timeouts) stay
+  display-only. Per-send/admin timeouts are diagnostic only. The single-proxy probe
+  stays distinct (one proxy, transport connectivity target). Both update health only
+  through the existing independent last-healthy protection. All configured custom
+  fallback channels are probed in the same response with their configured chat model;
+  custom results never write Zen/Go scheduler or transport health and never record
+  inference metrics/history. Model discovery may still use `GET {base}/v1/models`
+  but MUST never be called an availability verdict.
+- Custom session fallback: strict `fallback` config (`active` + unique-name
+  `channels` with `name`/`base_url` http-https/`api_key`/`model`; active empty or
+  referencing an existing channel) persists via config authority/RuntimeManager.Apply
+  with masked GET, password-gated reveal, and full-chain redaction. Only a request
+  entering with an existing anonymous session+model pin that gets HTTP 429 on the
+  pinned anonymous path (live 429 or tier-qualified proxy429 local 429) may take
+  over; unbound anonymous 429 and authenticated-pin 429 never trigger. Without an
+  active channel the original 429 stands; with one, the current request retries at
+  once through the then-active custom OpenAI-compatible chat channel (`{base}/v1/chat/completions`,
+  Bearer key, client entry converted to chat via the strict bridge with model rewritten
+  to the channel model, response/stream transcoded back; never listed in public
+  `/v1/models`; no supplier session affinity; never touches Zen/Go scheduler layers)
+  and the session binds first to that full channel identity (name + normalized base
+  URL/authority + key fingerprint/identity + configured model) so later requests for
+  the session serve exclusively there without drifting on active switches. Custom
+  errors return as-is with no fallback to native or other custom channels. Takeover
+  state is session-keyed (not session+model), process-lifetime, unpersisted,
+  unprojected, unexpired, bounded 4096, first-wins, capacity-502 without claiming
+  unrecorded takeover; hot Apply migrates without validity filtering as tombstones and
+  a deleted/identity-mismatched channel fails locally with 502. Restart clears.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
   per-model target cooldowns, proxy429 cooldowns, channel cooldowns, and credential429
@@ -356,7 +385,8 @@
   build matrix.
 - Source of truth for behavior: `gateway.go`, `scheduler.go`, `availability.go`, `convert.go`, `stream.go`,
   `models.go`, `model_metadata.go`, `pool.go`, `runtime.go`, `config.go`,
-  `admin.go`, `observability.go`, `password.go`, `ids.go`, `main.go`
+  `admin.go`, `observability.go`, `password.go`, `ids.go`, `main.go`,
+  `fallback.go`, `availability_probe.go`, `admin_fallback.go`
   (read them; this guide states relationships, not code locations).
 - No `CLAUDE.md` exists in this repo and none SHOULD be created; tool-specific
   entries, if ever needed, MUST be pointers to or synchronized copies of this
