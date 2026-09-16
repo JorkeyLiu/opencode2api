@@ -45,7 +45,7 @@ func TestWebUIConfigGroups(t *testing.T) {
 	if !strings.Contains(html, "<details") {
 		t.Fatal("advanced JSON must use details")
 	}
-	formStart := strings.Index(html, `<form id="config-form">`)
+	formStart := strings.Index(html, `<form id="config-form"`)
 	if formStart < 0 {
 		t.Fatal("missing config-form")
 	}
@@ -297,5 +297,94 @@ func TestWebUIConfigDesignSystem(t *testing.T) {
 	// Mobile stacks via the single 799px rule; no extra full-card model max-width.
 	if !strings.Contains(html, ".fb-model-row{grid-template-columns:1fr;max-width:100%;width:100%}") {
 		t.Fatal("mobile fb-model-row must stack full width within its field")
+	}
+}
+
+func TestWebUISidebarScrollBackground(t *testing.T) {
+	html := readConfigWebUI(t)
+	for _, needle := range []string{
+		`.layout{position:relative;`,
+		`min-height:calc(100dvh - 52px)`,
+		`.layout::before{display:none}`,
+		`@media (min-width:1200px){`,
+		`.nav{position:fixed;left:0;top:52px;`,
+		`height:calc(100dvh - 52px);overflow-y:auto;overflow-x:hidden;z-index:30;`,
+		`.main{margin:0 0 0 212px;width:calc(100% - 212px);`,
+		`.main>*{max-width:1280px;`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing sidebar scroll-background contract %q", needle)
+		}
+	}
+	if got := strings.Count(html, ".layout::before{display:none}"); got != 3 {
+		t.Fatalf("layout backdrop must be disabled in desktop, tablet and mobile queries, got %d", got)
+	}
+	if strings.Contains(html, `.layout::before{content:"";position:absolute;`) {
+		t.Fatal("legacy absolute layout backdrop must be removed; fixed nav carries its own background")
+	}
+	if !strings.Contains(html, ".main{margin:0;width:100%;") {
+		t.Fatal("tablet/mobile must reset the desktop 212px left offset")
+	}
+	if !strings.Contains(html, ".main{flex:1;") || !strings.Contains(html, "position:relative;z-index:1}") {
+		t.Fatal("main must sit above the layout backdrop without covering the sidebar")
+	}
+}
+
+func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
+	html := readConfigWebUI(t)
+	if !strings.Contains(html, `<form id="config-form" autocomplete="off">`) {
+		t.Fatal("config-form must carry autocomplete=off to suppress credential capture")
+	}
+	if !strings.Contains(html, `keyInput.autocomplete="new-password"`) {
+		t.Fatal("fallback key input must use autocomplete new-password, not off")
+	}
+	if strings.Contains(html, `keyInput.autocomplete="off"`) {
+		t.Fatal("fallback key input must not use autocomplete off; new-password suppresses save")
+	}
+	for _, needle := range []string{
+		`nameInput.setAttribute("autocomplete","off")`,
+		`nameInput.setAttribute("autocapitalize","off")`,
+		`nameInput.setAttribute("autocorrect","off")`,
+		`nameInput.setAttribute("spellcheck","false")`,
+		`baseInput.setAttribute("autocomplete","off")`,
+		`baseInput.setAttribute("autocapitalize","off")`,
+		`baseInput.setAttribute("autocorrect","off")`,
+		`baseInput.setAttribute("spellcheck","false")`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("missing fallback non-credential hygiene %q", needle)
+		}
+	}
+	for _, bad := range []string{
+		`nameInput.setAttribute("name"`,
+		`baseInput.setAttribute("name"`,
+		`setAttribute("username"`,
+	} {
+		if strings.Contains(html, bad) {
+			t.Fatalf("fallback name/base must not carry credential-ish attribute %q", bad)
+		}
+	}
+	if strings.Contains(html, "fb-name\"].autocomplete=\"username\"") || strings.Contains(html, "fb-base\"].autocomplete=\"username\"") {
+		t.Fatal("fallback name/base must not use username autocomplete")
+	}
+	// Login keeps credential semantics; key toggle/masked-id/model discovery stay intact.
+	for _, needle := range []string{
+		`autocomplete="username"`,
+		`autocomplete="current-password"`,
+		`keyInput.type="password"`,
+		`data-role","fb-key-toggle"`,
+		`data-role","fb-key-id"`,
+		`fallbackInputs`,
+		`fallbackDiscoverReasonCN`,
+		`/api/fallback/discover`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("login/key/discovery contract must stay intact: %q", needle)
+		}
+	}
+	for _, sink := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("} {
+		if strings.Contains(html, sink) {
+			t.Fatalf("forbidden DOM sink %q", sink)
+		}
 	}
 }

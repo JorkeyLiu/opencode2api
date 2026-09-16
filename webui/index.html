@@ -34,13 +34,13 @@ button{cursor:pointer}
 .topbar .conn.bad{color:#f2b8b0}
 .topbar button{background:transparent;color:#fff;border:1px solid #ffffff55;padding:5px 10px;font-size:12.5px}
 .topbar button:hover{background:#ffffff18}
-.layout{display:flex;align-items:stretch;min-height:calc(100vh - 52px)}
-.nav{background:var(--chip);border-right:1px solid var(--line2);box-shadow:2px 0 6px rgba(28,36,32,.06);display:flex;flex-direction:column;gap:8px;padding:14px 12px;width:212px;flex:none;position:sticky;top:52px;align-self:flex-start;min-height:calc(100vh - 52px);z-index:15}
+.layout{position:relative;isolation:isolate;display:flex;align-items:stretch;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px)}
+.nav{background:var(--chip);border-right:1px solid var(--line2);box-shadow:2px 0 6px rgba(28,36,32,.06);display:flex;flex-direction:column;gap:8px;padding:14px 12px;width:212px;flex:none;position:sticky;top:52px;align-self:flex-start;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px);z-index:15}
 .nav button{border:1px solid var(--line2);background:#fff;padding:9px 12px;font-size:13.5px;text-align:left;width:100%}
 .nav button:hover{background:#e2e8e2}
 .nav button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .nav button.active{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700;box-shadow:inset 3px 0 0 #0f2822}
-.main{flex:1;min-width:0;max-width:1280px;margin:0 auto;padding:18px;width:100%}
+.main{flex:1;min-width:0;max-width:1280px;margin:0 auto;padding:18px;width:100%;position:relative;z-index:1}
 .notice{background:#fff8e6;border:1px solid #e3c46a;color:#5c4a00;padding:9px 12px;font-size:13px;margin-bottom:12px}
 .banner{background:#fff;border:1px solid var(--line2);padding:8px 12px;font-size:12.5px;color:var(--muted);margin-bottom:12px}
 .banner.bad{border-color:var(--bad);color:var(--bad)}
@@ -151,6 +151,15 @@ details.advanced summary{cursor:pointer;font-size:13px;font-weight:600;color:#33
 .config-sticky .primary{padding:8px 18px;font-weight:700}
 html,body{max-width:100%;overflow-x:hidden}
 .main{min-width:0;overflow-x:hidden}
+/* desktop >=1200: sidebar fixed to viewport left, content offset by sidebar width */
+@media (min-width:1200px){
+  .layout{display:block;padding:0;min-height:calc(100vh - 52px);min-height:calc(100dvh - 52px)}
+  .layout::before{display:none}
+  .nav{position:fixed;left:0;top:52px;width:212px;height:calc(100vh - 52px);height:calc(100dvh - 52px);overflow-y:auto;overflow-x:hidden;z-index:30;flex:none;flex-direction:column;flex-wrap:nowrap;min-height:0;align-self:auto;border-right:1px solid var(--line2);border-bottom:none;box-shadow:2px 0 6px rgba(28,36,32,.06)}
+  .nav button{width:100%;text-align:left}
+  .main{margin:0 0 0 212px;width:calc(100% - 212px);max-width:none}
+  .main>*{max-width:1280px;margin-left:auto;margin-right:auto;width:100%}
+}
 /* tablet 800-1199: fallback keeps 12-col spans (proto 3/5/4 same row, key/model 6+6 same row) */
 @media (min-width:800px) and (max-width:1199px){
   .grid2,.grid3,.grid4,.facts,.trend-grid{grid-template-columns:1fr}
@@ -160,10 +169,12 @@ html,body{max-width:100%;overflow-x:hidden}
   .config-item-grid>.field.span-8,.config-item-grid>.field.span-12{grid-column:1/-1}
   .url-preview{grid-template-columns:1fr 1fr}
   .fb-model-row{max-width:100%;width:100%}
-  .layout{flex-direction:column;min-height:auto}
-  .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
+  .layout{display:flex;flex-direction:column;min-height:auto;padding-left:0}
+  .layout::before{display:none}
+  .nav{flex-direction:row;flex-wrap:wrap;width:auto;height:auto;min-height:auto;max-height:none;overflow:visible;position:static;top:auto;left:auto;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
-  .main{padding:12px}
+  .main{margin:0;width:100%;max-width:none;padding:12px}
+  .main>*{max-width:none;margin:0;width:auto}
   .topbar{position:static}
 }
 /* mobile <800: everything stacks full width, no horizontal overflow */
@@ -174,10 +185,12 @@ html,body{max-width:100%;overflow-x:hidden}
   .url-preview{grid-template-columns:1fr}
   .fb-model-row{grid-template-columns:1fr;max-width:100%;width:100%}
   .config-item-head input{max-width:100%}
-  .layout{flex-direction:column;min-height:auto}
-  .nav{flex-direction:row;flex-wrap:wrap;width:auto;min-height:auto;position:static;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
+  .layout{display:flex;flex-direction:column;min-height:auto;padding-left:0}
+  .layout::before{display:none}
+  .nav{flex-direction:row;flex-wrap:wrap;width:auto;height:auto;min-height:auto;max-height:none;overflow:visible;position:static;top:auto;left:auto;border-right:none;border-bottom:1px solid var(--line2);box-shadow:0 2px 6px rgba(28,36,32,.06);padding:10px 12px}
   .nav button{width:auto;text-align:center}
-  .main{padding:12px}
+  .main{margin:0;width:100%;max-width:none;padding:12px}
+  .main>*{max-width:none;margin:0;width:auto}
   .topbar{position:static}
 }
 </style>
@@ -354,7 +367,7 @@ html,body{max-width:100%;overflow-x:hidden}
         <h2>系统配置</h2>
         <div class="cap">按任务分组查看与修改运行配置。保存时自动校验，失败保留原配置；监听地址与管理开关需重启生效。顶部提示栏会显示需重启的已保存项。</div>
       </div>
-      <form id="config-form">
+      <form id="config-form" autocomplete="off">
         <div class="section config-card">
           <h2>接入与鉴权</h2>
           <div class="cap">决定请求优先走哪个上游，以及匿名试用与各类密钥是否可用。</div>
@@ -1309,7 +1322,7 @@ function fallbackCard(ch){
   var card=document.createElement("div"); card.className="fb-card config-item-card"; card.setAttribute("data-channel",ch.name||"");
   var head=document.createElement("div"); head.className="config-item-head";
   head.appendChild(el("strong","备用渠道"));
-  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.style.maxWidth="180px"; head.appendChild(nameInput);
+  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.setAttribute("autocomplete","off"); nameInput.setAttribute("autocapitalize","off"); nameInput.setAttribute("autocorrect","off"); nameInput.setAttribute("spellcheck","false"); nameInput.style.maxWidth="180px"; head.appendChild(nameInput);
   var act=document.createElement("button"); act.type="button"; act.className="ghost"; act.textContent="启用此渠道";
   act.addEventListener("click",function(){
     var n=nameInput.value.trim(); if(!n){toast("渠道名称不能为空",true);return;}
@@ -1332,7 +1345,7 @@ function fallbackCard(ch){
   grid.appendChild(protoWrap);
   var baseWrap=document.createElement("div"); baseWrap.className="field span-5";
   var baseLabel=document.createElement("label"); baseLabel.textContent="基础地址（URL）"; baseWrap.appendChild(baseLabel);
-  var baseInput=document.createElement("input"); baseInput.value=ch.base_url||""; baseInput.placeholder="https://api.example.com"; baseInput.setAttribute("data-role","fb-base"); baseInput.setAttribute("inputmode","url"); baseWrap.appendChild(baseInput);
+  var baseInput=document.createElement("input"); baseInput.value=ch.base_url||""; baseInput.placeholder="https://api.example.com"; baseInput.setAttribute("data-role","fb-base"); baseInput.setAttribute("inputmode","url"); baseInput.setAttribute("autocomplete","off"); baseInput.setAttribute("autocapitalize","off"); baseInput.setAttribute("autocorrect","off"); baseInput.setAttribute("spellcheck","false"); baseWrap.appendChild(baseInput);
   var baseHint=document.createElement("div"); baseHint.className="note"; baseHint.textContent="仅支持 HTTP/HTTPS，可填服务地址、/v1 或完整请求地址。"; baseWrap.appendChild(baseHint);
   grid.appendChild(baseWrap);
   var effortWrap=document.createElement("div"); effortWrap.className="field span-4";
@@ -1350,7 +1363,7 @@ function fallbackCard(ch){
   keyInfo.appendChild(document.createTextNode(savedDisplay?("已保存密钥："+savedDisplay):"未设置，需填写后保存"));
   keyWrap.appendChild(keyInfo);
   var keyRow=document.createElement("div"); keyRow.className="key-row";
-  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.value=""; keyInput.placeholder="留空保留已保存值，或填新密钥"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="off"; keyRow.appendChild(keyInput);
+  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.value=""; keyInput.placeholder="留空保留已保存值，或填新密钥"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="new-password"; keyRow.appendChild(keyInput);
   var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="ghost"; keyToggle.textContent="显示"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyRow.appendChild(keyToggle);
   keyWrap.appendChild(keyRow);
   var keyHint=document.createElement("div"); keyHint.className="note"; keyHint.setAttribute("data-role","fb-key-hint"); keyWrap.appendChild(keyHint);
