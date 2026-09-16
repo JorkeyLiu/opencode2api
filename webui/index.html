@@ -214,6 +214,12 @@ html,body{max-width:100%;overflow-x:hidden}
 .pool-row .name{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pool-row .sub{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .icon-btn{background:#fff;border:1px solid var(--line2);min-width:36px;min-height:36px;line-height:1;font-size:16px;padding:4px 8px}
+.probe-btn{min-width:78px;position:relative;white-space:nowrap}
+.probe-btn .probe-label{white-space:nowrap}
+.probe-btn .probe-spin{display:inline-block;width:11px;height:11px;margin-left:6px;vertical-align:-1px;border:2px solid var(--line2);border-top-color:var(--accent);border-radius:50%;visibility:hidden}
+.probe-btn.is-busy .probe-spin{visibility:visible;animation:probe-spin .8s linear infinite}
+@keyframes probe-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.probe-btn.is-busy .probe-spin{animation:none;opacity:.7;border-top-color:currentColor}}
 </style>
 </head>
 <body>
@@ -446,6 +452,7 @@ html,body{max-width:100%;overflow-x:hidden}
             <div class="field"><label>空闲超时（秒）</label><input id="c-idle-timeout" type="number"></div>
             <div class="field"><label>连接超时（秒）</label><input id="c-connect" type="number"></div>
             <div class="field"><label>失败冷却（秒）</label><input id="c-cooldown" type="number"></div>
+            <div class="field"><label>429 冷却基准（秒）</label><input id="c-ratelimit-cooldown" type="number" min="1" max="300"></div>
           </div>
         </div>
         <div class="section config-card">
@@ -506,9 +513,9 @@ function fmtSec(v){ if(v===undefined||v===null)return "—"; return Number(v)+"�
 function fmtBytes(v){ v=Number(v||0); if(v<1024)return v+" B"; if(v<1024*1024)return (v/1024).toFixed(1)+" KB"; return (v/1024/1024).toFixed(1)+" MB"; }
 function protoLabel(p){ p=String(p||"").toLowerCase(); if(p==="chat")return "Chat Completions"; if(p==="responses")return "Responses"; if(p==="anthropic")return "Anthropic"; if(!p||p==="—")return "—"; return "未知"; }
 function tierLabel(t){ t=String(t||"").toLowerCase(); if(t==="zen")return "Zen"; if(t==="go")return "Go"; if(t==="custom")return "自定义"; if(!t||t==="—")return "—"; return "未知"; }
-function channelLabel(c){ c=String(c||"").toLowerCase(); if(c==="anonymous")return "匿名"; if(c==="zen")return "Zen"; if(c==="go")return "Go"; if(c==="custom")return "自定义"; if(!c||c==="—")return "—"; return "未知"; }
-function customChannelOf(a){ var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return k.slice(7); return ""; }
-function isCustomRow(a){ var t=String((a&&(a.tier||a.Tier))||"").toLowerCase(); if(t==="custom")return true; var ch=String((a&&(a.channel||a.Channel))||"").toLowerCase(); if(ch==="custom")return true; var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return true; return false; }
+function channelLabel(c){ var s=String(c||""); var l=s.toLowerCase(); if(l==="anonymous")return "匿名"; if(l==="zen")return "Zen"; if(l==="go")return "Go"; if(l==="custom"||l.slice(0,7)==="custom:")return "自定义"; if(!s||s==="—")return "—"; return "未知"; }
+function customChannelOf(a){ var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return k.slice(7); var ch=String((a&&(a.channel||a.Channel))||""); if(ch.slice(0,7)==="custom:")return ch.slice(7); var chl=ch.toLowerCase(); if(chl.slice(0,7)==="custom:")return ch.slice(7); return ""; }
+function isCustomRow(a){ var t=String((a&&(a.tier||a.Tier))||"").toLowerCase(); if(t==="custom")return true; var ch=String((a&&(a.channel||a.Channel))||""); var chl=ch.toLowerCase(); if(chl==="custom"||chl.slice(0,7)==="custom:")return true; var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return true; return false; }
 function keyLabel(a){ if(a&&(a.anonymous||a.Anonymous))return "匿名"; var k=(a&&(a.key_id||a.KeyID))||""; return k||"—"; }
 function failureLabel(fc){ fc=String(fc||""); if(!fc||fc==="—")return "—"; if(fc==="success")return "成功"; if(fc==="transport_failure")return "传输失败"; if(fc==="auth_failure")return "认证失败"; if(fc==="rate_limited")return "限流"; if(fc==="upstream_failure")return "上游失败"; if(fc==="transient_client")return "临时重试"; if(fc==="client_rejected")return "客户端拒绝"; if(fc==="other_response")return "其他响应"; return "未知"; }
 function hintLabel(h){ h=String(h||""); if(!h||h==="—")return "—"; if(h==="context_length")return "上下文长度"; if(h==="stale_response_reference")return "陈旧响应引用"; if(h==="session_rejected")return "会话被拒绝"; if(h==="invalid_request")return "无效请求"; if(h==="unknown")return "未知"; return "未知"; }
@@ -915,7 +922,7 @@ function renderRealtime(){
     if(st==="failed"&&ok)return false;
     if(px&&proxyLabel(a.proxy_pool,a.proxy_node||a.proxy)!==px)return false;
     if(q){
-      var hay=(String(a.request_id||"").toLowerCase()+" "+String(a.client_session_hash||"").toLowerCase()+" "+String(a.model||"").toLowerCase()+" "+String(a.protocol||"").toLowerCase()+" "+String(a.proxy_pool||"").toLowerCase()+" "+String(a.proxy_node||a.proxy||"").toLowerCase()+" "+String(a.key_id||"").toLowerCase());
+      var hay=(String(a.request_id||"").toLowerCase()+" "+String(a.client_session_hash||"").toLowerCase()+" "+String(a.model||"").toLowerCase()+" "+String(a.protocol||a.Protocol||"").toLowerCase()+" "+String(a.tier||a.Tier||"").toLowerCase()+" "+String(a.channel||a.Channel||"").toLowerCase()+" "+String(a.proxy_pool||a.ProxyPool||"").toLowerCase()+" "+String(a.proxy_node||a.proxy||a.Proxy||"").toLowerCase()+" "+String(a.key_id||a.KeyID||"").toLowerCase());
       if(hay.indexOf(q)<0)return false;
     }
     return true;
@@ -1028,17 +1035,43 @@ function renderUsageTables(use){
   }
   var tt=$("tbody-usage-tier"); clear(tt);
   var tiers=Object.keys((use&&use.tiers)||{});
-  if(!tiers.length){emptyRow(tt,7,"暂无上游用量");}
+  var chanTokens=(use&&use.channels)||{};
+  var chanCounts=(m.channels||{});
+  function usageRow(label, title, tokens, calls){
+    var tr=document.createElement("tr");
+    (function(){ var td=document.createElement("td"); td.textContent=label; td.title=title; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); if(calls===undefined){ td.textContent="—"; td.title="最近一小时内无调用"; } else { td.textContent=fmtInt(calls); td.title="最近一小时调用数"; } tr.appendChild(td); })();
+    cell(tr,fmtToken(tokens.input_tokens)); cell(tr,fmtToken(tokens.output_tokens));
+    cell(tr,fmtToken(tokens.cached_tokens)); cell(tr,fmtToken(tokens.reasoning_tokens)); cell(tr,fmtToken(tokens.total_tokens));
+    tt.appendChild(tr);
+  }
+  if(!tiers.length && !Object.keys(chanTokens).length){emptyRow(tt,7,"暂无上游用量");}
   else{
     tiers.sort(function(a,b){return (((use.tiers[b]||{}).total_tokens)||0)-(((use.tiers[a]||{}).total_tokens)||0);}).forEach(function(name){
-      var c=use.tiers[name]||{};
-      var tr=document.createElement("tr");
-      (function(){ var td=document.createElement("td"); td.textContent=tierLabel(name); td.title="上游："+tierLabel(name); tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); var v=(m.tiers||{})[name]; if(v===undefined){ td.textContent="—"; td.title="最近一小时内无调用"; } else { td.textContent=fmtInt(v); td.title="最近一小时调用数"; } tr.appendChild(td); })();
-      cell(tr,fmtToken(c.input_tokens)); cell(tr,fmtToken(c.output_tokens));
-      cell(tr,fmtToken(c.cached_tokens)); cell(tr,fmtToken(c.reasoning_tokens)); cell(tr,fmtToken(c.total_tokens));
-      tt.appendChild(tr);
+      if(name==="custom"){
+        var ckeys=Object.keys(chanTokens).filter(function(k){ return k==="custom"||k.slice(0,7)==="custom:"; });
+        if(!ckeys.length){
+          usageRow(tierLabel(name),"上游："+tierLabel(name),use.tiers[name]||{},(m.tiers||{})[name]);
+        } else {
+          ckeys.sort(function(a,b){return (((chanTokens[b]||{}).total_tokens)||0)-(((chanTokens[a]||{}).total_tokens)||0);}).forEach(function(ck){
+            var disp=ck==="custom"?"自定义":ck.slice(7);
+            var title=ck==="custom"?"上游：自定义":"自定义渠道："+disp;
+            usageRow(disp,title,chanTokens[ck]||{},chanCounts[ck]);
+          });
+        }
+        return;
+      }
+      usageRow(tierLabel(name),"上游："+tierLabel(name),use.tiers[name]||{},(m.tiers||{})[name]);
     });
+    var hasCustomTier=tiers.indexOf("custom")>=0;
+    if(!hasCustomTier){
+      Object.keys(chanTokens).filter(function(k){ return k==="custom"||k.slice(0,7)==="custom:"; }).sort(function(a,b){return (((chanTokens[b]||{}).total_tokens)||0)-(((chanTokens[a]||{}).total_tokens)||0);}).forEach(function(ck){
+        var disp=ck==="custom"?"自定义":ck.slice(7);
+        var title=ck==="custom"?"上游：自定义":"自定义渠道："+disp;
+        usageRow(disp,title,chanTokens[ck]||{},chanCounts[ck]);
+      });
+    }
+    if(!tiers.length && !tt.children.length){emptyRow(tt,7,"暂无上游用量");}
   }
 }
 function histQueryRange(){ var to=new Date(); var from=periodStart(S.historyPeriod||"today"); return {from:from.toISOString(),to:to.toISOString()}; }
@@ -1161,6 +1194,60 @@ function renderProxyStats(){
 }
 
 /* ---------- health ---------- */
+function proxyRoutingHas(p,name){
+  p=p||{}; var r=p.routing!==undefined?p.routing:p.Routing;
+  if(Object.prototype.toString.call(r)!=="[object Array]")return false;
+  name=String(name||"").toLowerCase();
+  for(var i=0;i<r.length;i++){ if(String(r[i]||"").toLowerCase()===name)return true; }
+  return false;
+}
+function proxyZenLaneOn(p){
+  p=p||{};
+  var anonRouted=proxyRoutingHas(p,"anonymous");
+  var zenRouted=proxyRoutingHas(p,"zen");
+  var anonActive=!!(p.anonymous||p.Anonymous);
+  var zk=Number((p.zen_keys!==undefined?p.zen_keys:(p.ZenKeys!==undefined?p.ZenKeys:0))||0);
+  var hasR=p.routing!==undefined?p.routing:p.Routing;
+  if(Object.prototype.toString.call(hasR)==="[object Array]"){
+    if(!anonRouted&&!zenRouted)return false;
+    return anonActive||zk>0;
+  }
+  return anonActive||zk>0;
+}
+function proxyGoLaneOn(p){
+  p=p||{};
+  var gk=Number((p.go_keys!==undefined?p.go_keys:(p.GoKeys!==undefined?p.GoKeys:0))||0);
+  if(!(gk>0))return false;
+  var hasR=p.routing!==undefined?p.routing:p.Routing;
+  if(Object.prototype.toString.call(hasR)==="[object Array]"){
+    return proxyRoutingHas(p,"go");
+  }
+  return gk>0;
+}
+function proxyZenDashTitle(p){
+  p=p||{};
+  if(p.healthy===false)return "传输不可用";
+  if(!proxyRoutingHas(p,"anonymous")&&!proxyRoutingHas(p,"zen"))return "该池未用于该通道";
+  return "未配置该通道";
+}
+function proxyGoDashTitle(p){
+  p=p||{};
+  if(p.healthy===false)return "传输不可用";
+  if(!proxyRoutingHas(p,"go"))return "该池未用于该通道";
+  return "未配置该通道";
+}
+function proxyZenDisplay(p){
+  p=p||{};
+  if(p.healthy===false)return "—";
+  if(!proxyZenLaneOn(p))return "—";
+  return channelStatusLabel(p.zen!==undefined?p.zen:(p.Zen!==undefined?p.Zen:"untested"));
+}
+function proxyGoDisplay(p){
+  p=p||{};
+  if(p.healthy===false)return "—";
+  if(!proxyGoLaneOn(p))return "—";
+  return channelStatusLabel(p.go!==undefined?p.go:(p.Go!==undefined?p.Go:"untested"));
+}
 function channelStatusLabel(v){
   v=String(v||"");
   if(v==="available")return "可用";
@@ -1207,19 +1294,25 @@ function renderHealth(){
     (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由引用（该池被哪些通道使用）："+routingRefsLabel(p.routing); td.className="wrap"; tr.appendChild(td); })();
     (function(){ var td=document.createElement("td"); var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用（连通性）"; td.appendChild(h); tr.appendChild(td); })();
     (function(){
-      var td=document.createElement("td"); var v=p.zen||"untested";
+      var td=document.createElement("td");
+      if(p.healthy===false||!proxyZenLaneOn(p)){ td.textContent="—"; td.title=proxyZenDashTitle(p); tr.appendChild(td); return; }
+      var v=p.zen!==undefined?p.zen:(p.Zen!==undefined?p.Zen:"untested");
       var s=el("span",channelStatusLabel(v),"pill "+(v==="available"?"ok":(v==="untested"?"neutral":"warn")));
       s.title="Zen 通道（含匿名与认证 Zen）："+channelStatusLabel(v); td.appendChild(s); tr.appendChild(td);
     })();
     (function(){
-      var td=document.createElement("td"); var v=p.go||"untested";
+      var td=document.createElement("td");
+      if(p.healthy===false||!proxyGoLaneOn(p)){ td.textContent="—"; td.title=proxyGoDashTitle(p); tr.appendChild(td); return; }
+      var v=p.go!==undefined?p.go:(p.Go!==undefined?p.Go:"untested");
       var s=el("span",channelStatusLabel(v),"pill "+(v==="available"?"ok":(v==="untested"?"neutral":"warn")));
       s.title="Go 通道："+channelStatusLabel(v)+"；同一节点可因通道不同而状态不同"; td.appendChild(s); tr.appendChild(td);
     })();
     (function(){ var td=document.createElement("td"); var v=p.cooldown_reason||"—"; td.textContent=v; td.title="活跃冷却原因："+v; td.className="wrap"; tr.appendChild(td); })();
     (function(){ var td=document.createElement("td"); td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
     var op=document.createElement("td");
-    var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost"; probeBtn.textContent="探测";
+    var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost probe-btn"; probeBtn.setAttribute("aria-label","检测单节点传输");
+    var probeLabel=document.createElement("span"); probeLabel.className="probe-label"; probeLabel.textContent="检测"; probeBtn.appendChild(probeLabel);
+    var probeSpin=document.createElement("span"); probeSpin.className="probe-spin"; probeSpin.setAttribute("aria-hidden","true"); probeBtn.appendChild(probeSpin);
     (function(proxy,btn){
       btn.addEventListener("click",function(ev){ ev.stopPropagation(); probeProxy(proxy,btn); });
     })(p,probeBtn);
@@ -1327,13 +1420,15 @@ function renderHealth(){
 }
 function probeProxy(p, btn){
   var pool=p.proxy_pool||p.pool||"";
-  btn.disabled=true; var label=btn.textContent; btn.textContent="探测中…";
+  btn.disabled=true; btn.classList.add("is-busy");
+  try{btn.setAttribute("aria-busy","true");}catch(e){}
+  try{btn.setAttribute("aria-label","正在检测");}catch(e){}
   api("/api/proxies/probe",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
     var pr=String(res.result||""); var prCN=(pr==="healthy"?"健康":(pr==="unhealthy"?"不可用":(pr==="inconclusive"?"未定":(pr||"未知"))));
-    toast("探测 "+pool+"#"+p.index+": "+prCN+"（健康 "+boolCN(res.healthy)+"，变化 "+boolCN(res.changed)+"，"+res.duration_ms+"ms）");
+    toast("检测 "+pool+"#"+p.index+": "+prCN+"（健康 "+boolCN(res.healthy)+"，变化 "+boolCN(res.changed)+"，"+res.duration_ms+"ms）");
     refreshMonitor();
-  }).catch(function(err){ toast("探测失败："+err.message,true); })
-  .then(function(){ btn.disabled=false; btn.textContent=label; });
+  }).catch(function(err){ toast("检测失败："+err.message,true); })
+  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测单节点传输");}catch(e){} });
 }
 function bulkCheck(){
   var btn=$("btn-bulk-check"); var note=$("bulk-state");
@@ -1409,6 +1504,7 @@ function fillConfig(v){
   $("c-idle-timeout").value=v.performance.idle_conn_timeout_seconds||"";
   $("c-connect").value=v.performance.connect_timeout_seconds||"";
   $("c-cooldown").value=v.performance.failure_cooldown_seconds||"";
+  $("c-ratelimit-cooldown").value=v.performance.rate_limit_cooldown_seconds||"";
   $("c-level").value=v.logging.level||"info";
   $("c-ring").value=v.logging.ring_size||"";
   var hh=(v&&v.history)||{};
@@ -2219,7 +2315,7 @@ function collectConfigUpdate(){
     upstream:{zen:$("c-up-zen").value,go:$("c-up-go").value},
     retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout")},
     models:{refresh_seconds:num("c-refresh"),protocols:protocols},
-    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown")},
+    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown")},
     logging:{level:$("c-level").value,ring_size:num("c-ring")},
     history:{enabled:$("c-hist-enabled").checked,directory:$("c-hist-dir").value.trim(),retention_days:num("c-hist-retention"),max_bytes_mb:num("c-hist-max")},
     webui:{enabled:preservedEnabled,listen:$("c-web-listen").value,username:cfgWebui.username||"",session_ttl_minutes:num("c-session")}
@@ -2432,7 +2528,7 @@ $("config-form").addEventListener("submit",function(e){
   function on(id, ev, fn){ try{ var n=$(id); if(n)n.addEventListener(ev,fn); }catch(e){} }
   ["c-prefer","c-level"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
   ["c-anonymous","c-hist-enabled"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
-  ["c-listen","c-web-listen","c-session","c-up-zen","c-up-go","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ring","c-hist-dir","c-hist-retention","c-hist-max"].forEach(function(id){
+  ["c-listen","c-web-listen","c-session","c-up-zen","c-up-go","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-dir","c-hist-retention","c-hist-max"].forEach(function(id){
     on(id,"input",function(){ queueConfigSave(false).catch(function(){}); });
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });

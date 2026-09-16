@@ -36,7 +36,7 @@ func TestCustomFallbackUsesChannelModel(t *testing.T) {
 	if meta == nil || meta.Model != "chan-model" {
 		t.Fatalf("request meta model=%+v want chan-model", meta)
 	}
-	if meta.Tier != "custom" || meta.Channel != "custom" || meta.KeyID != "custom:c1" {
+	if meta.Tier != "custom" || meta.Channel != "custom:c1" || meta.KeyID != "custom:c1" {
 		t.Fatalf("custom observability identity changed: %+v", meta)
 	}
 	recent := gw.monitor.Snapshot().Upstream.Recent
@@ -47,7 +47,7 @@ func TestCustomFallbackUsesChannelModel(t *testing.T) {
 	if last.Model != "chan-model" {
 		t.Fatalf("attempt model=%q want chan-model", last.Model)
 	}
-	if last.Tier != "custom" || last.Channel != "custom" || last.KeyID != "custom:c1" {
+	if last.Tier != "custom" || last.Channel != "custom:c1" || last.KeyID != "custom:c1" {
 		t.Fatalf("attempt identity changed: %+v", last)
 	}
 }

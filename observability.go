@@ -343,19 +343,22 @@ type metricBucket struct {
 	endpoints     map[string]uint64
 	models        map[string]uint64
 	tiers         map[string]uint64
+	channels      map[string]uint64
 	statuses      map[string]uint64
 	usageRequests uint64
 	usageReported uint64
 	tokens        TokenCounts
 	usageModels   map[string]TokenCounts
 	usageTiers    map[string]TokenCounts
+	usageChannels map[string]TokenCounts
 }
 
 func (b *metricBucket) reset(minute int64) {
 	*b = metricBucket{
 		minute: minute, endpoints: make(map[string]uint64), models: make(map[string]uint64),
-		tiers: make(map[string]uint64), statuses: make(map[string]uint64),
+		tiers: make(map[string]uint64), channels: make(map[string]uint64), statuses: make(map[string]uint64),
 		usageModels: make(map[string]TokenCounts), usageTiers: make(map[string]TokenCounts),
+		usageChannels: make(map[string]TokenCounts),
 	}
 }
 
@@ -374,6 +377,12 @@ type UsagePeriod struct {
 	Tokens   TokenCounts            `json:"tokens"`
 	Models   map[string]TokenCounts `json:"models"`
 	Tiers    map[string]TokenCounts `json:"tiers"`
+	// Channels is the additive channel-qualified usage map. For custom
+	// fallback traffic the key is "custom:<channelName>" (old "custom"
+	// records keep that key); zen/go traffic uses its observability
+	// channel ("anonymous"/"key"). Tiers stays aggregated for
+	// compatibility (tiers.custom remains the total).
+	Channels map[string]TokenCounts `json:"channels,omitempty"`
 }
 
 type UsageSnapshot struct {
@@ -794,6 +803,12 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		}
 		if meta.Tier != "" {
 			bucket.tiers[meta.Tier]++
+			if meta.Channel != "" {
+				if bucket.channels == nil {
+					bucket.channels = make(map[string]uint64)
+				}
+				bucket.channels[meta.Channel]++
+			}
 			bucket.usageRequests++
 			m.lifetimeUsage.Requests++
 			if meta.UsageReported {
@@ -807,6 +822,16 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 			addTokenMap(bucket.usageTiers, meta.Tier, tokens)
 			addTokenMap(m.lifetimeUsage.Models, meta.Model, tokens)
 			addTokenMap(m.lifetimeUsage.Tiers, meta.Tier, tokens)
+			if meta.Channel != "" {
+				if bucket.usageChannels == nil {
+					bucket.usageChannels = make(map[string]TokenCounts)
+				}
+				addTokenMap(bucket.usageChannels, meta.Channel, tokens)
+				if m.lifetimeUsage.Channels == nil {
+					m.lifetimeUsage.Channels = make(map[string]TokenCounts)
+				}
+				addTokenMap(m.lifetimeUsage.Channels, meta.Channel, tokens)
+			}
 		}
 		if meta.Request != "" && meta.Model != "" {
 			request := UpstreamRequest{
@@ -942,7 +967,9 @@ func normalizeProxyLabel(value string) string {
 // resourceCredentialID maps one attempt to its credential view key. Both
 // future credential types collapse here: the shared public credential uses
 // the stable literal, authenticated keys use their (already suffix-only)
-// display ID qualified by channel.
+// display ID qualified by channel. Custom channels never double-prefix:
+// KeyID already carries "custom:<name>" (old and new records), so it is
+// returned directly instead of "custom:custom:<name>".
 func resourceCredentialID(attempt UpstreamAttempt) string {
 	if attempt.Anonymous || attempt.KeyID == anonymousCredentialID || attempt.Channel == anonymousCredentialID {
 		return anonymousCredentialID
@@ -950,7 +977,16 @@ func resourceCredentialID(attempt UpstreamAttempt) string {
 	if attempt.KeyID == "" {
 		return "not_routed"
 	}
+	if strings.HasPrefix(attempt.KeyID, string(TierCustom)+":") {
+		return attempt.KeyID
+	}
 	if attempt.Channel == "" {
+		return attempt.KeyID
+	}
+	if strings.HasPrefix(attempt.Channel, string(TierCustom)+":") || attempt.Channel == string(TierCustom) {
+		if strings.HasPrefix(attempt.Channel, string(TierCustom)+":") {
+			return attempt.Channel
+		}
 		return attempt.KeyID
 	}
 	return attempt.Channel + ":" + attempt.KeyID
@@ -1073,6 +1109,7 @@ type MonitorSnapshot struct {
 	Endpoints        map[string]uint64 `json:"endpoints"`
 	Models           map[string]uint64 `json:"models"`
 	Tiers            map[string]uint64 `json:"tiers"`
+	Channels         map[string]uint64 `json:"channels,omitempty"`
 	Statuses         map[string]uint64 `json:"statuses"`
 	Usage            UsageSnapshot     `json:"usage"`
 	Upstream         UpstreamSnapshot  `json:"upstream"`
@@ -1107,7 +1144,7 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	nowMinute := time.Now().Unix() / 60
 	window := MetricSummary{}
 	var histogram [11]uint64
-	endpoints, models, tiers, statuses := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
+	endpoints, models, tiers, channels, statuses := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
 	series := make([]MetricSeries, 0, 60)
 	usageWindow := newUsagePeriod()
 	upstreamWindow := newAttemptAggregate()
@@ -1138,12 +1175,14 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 			mergeCounts(endpoints, bucket.endpoints)
 			mergeCounts(models, bucket.models)
 			mergeCounts(tiers, bucket.tiers)
+			mergeCounts(channels, bucket.channels)
 			mergeCounts(statuses, bucket.statuses)
 			usageWindow.Requests += bucket.usageRequests
 			usageWindow.Reported += bucket.usageReported
 			addTokenCounts(&usageWindow.Tokens, bucket.tokens)
 			mergeTokenMaps(usageWindow.Models, bucket.usageModels)
 			mergeTokenMaps(usageWindow.Tiers, bucket.usageTiers)
+			mergeTokenMaps(usageWindow.Channels, bucket.usageChannels)
 		}
 		attemptBucket := &m.attemptBuckets[minute%60]
 		if attemptBucket.minute == minute {
@@ -1186,7 +1225,7 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	return MonitorSnapshot{
 		StartedAt: m.started, UptimeSeconds: int64(time.Since(m.started).Seconds()), Active: m.active.Load(),
 		ActiveStreams: m.activeStreams.Load(), Lifetime: lifetime, Window: window, Series: series,
-		Endpoints: endpoints, Models: models, Tiers: tiers, Statuses: statuses,
+		Endpoints: endpoints, Models: models, Tiers: tiers, Channels: channels, Statuses: statuses,
 		Usage:            UsageSnapshot{Lifetime: usageLifetime, Window: usageWindow},
 		Upstream:         UpstreamSnapshot{Lifetime: upstreamLifetime, Window: upstreamWindow, Requests: recentRequests, Recent: recentAttempts},
 		AttemptResources: windowResources,
@@ -1200,7 +1239,7 @@ func mergeCounts(target, source map[string]uint64) {
 }
 
 func newUsagePeriod() UsagePeriod {
-	return UsagePeriod{Models: make(map[string]TokenCounts), Tiers: make(map[string]TokenCounts)}
+	return UsagePeriod{Models: make(map[string]TokenCounts), Tiers: make(map[string]TokenCounts), Channels: make(map[string]TokenCounts)}
 }
 
 func tokenCounts(usage bridgeUsage) TokenCounts {
@@ -1238,6 +1277,7 @@ func cloneUsagePeriod(source UsagePeriod) UsagePeriod {
 	result.Requests, result.Reported, result.Tokens = source.Requests, source.Reported, source.Tokens
 	mergeTokenMaps(result.Models, source.Models)
 	mergeTokenMaps(result.Tiers, source.Tiers)
+	mergeTokenMaps(result.Channels, source.Channels)
 	return result
 }
 

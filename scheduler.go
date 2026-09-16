@@ -220,35 +220,45 @@ func parseChannelIdentity(identity string) (tier Tier, pool, proxyRaw string) {
 }
 
 type targetScheduler struct {
-	mu            sync.Mutex
-	baseCooldown  time.Duration
-	credState     map[string]*credentialEntry
-	cred429State  map[string]*credential429Entry
-	targetState   map[string]*targetEntry
-	proxy429State map[string]*proxy429Entry
-	channelState  map[string]*channelEntry
-	credDisplay   map[string]string
-	roundRobin    atomic.Uint64
-	routeSessions *routeSessionStore
-	pins          *sessionPinStore
-	fallbacks     *fallbackTakeoverStore
+	mu                sync.Mutex
+	baseCooldown      time.Duration
+	rateLimitCooldown time.Duration
+	credState         map[string]*credentialEntry
+	cred429State      map[string]*credential429Entry
+	targetState       map[string]*targetEntry
+	proxy429State     map[string]*proxy429Entry
+	channelState      map[string]*channelEntry
+	credDisplay       map[string]string
+	roundRobin        atomic.Uint64
+	routeSessions     *routeSessionStore
+	pins              *sessionPinStore
+	fallbacks         *fallbackTakeoverStore
 }
 
-func newTargetScheduler(baseCooldown time.Duration) *targetScheduler {
+func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Duration) *targetScheduler {
 	if baseCooldown <= 0 {
 		baseCooldown = 15 * time.Second
 	}
+	rateLimitCooldown := baseCooldown
+	if len(rateLimitBases) > 0 {
+		if rateLimitBases[0] > 0 {
+			rateLimitCooldown = rateLimitBases[0]
+		} else {
+			rateLimitCooldown = baseCooldown
+		}
+	}
 	return &targetScheduler{
-		baseCooldown:  baseCooldown,
-		credState:     make(map[string]*credentialEntry),
-		cred429State:  make(map[string]*credential429Entry),
-		targetState:   make(map[string]*targetEntry),
-		proxy429State: make(map[string]*proxy429Entry),
-		channelState:  make(map[string]*channelEntry),
-		credDisplay:   make(map[string]string),
-		routeSessions: newRouteSessionStore(),
-		pins:          newSessionPinStore(),
-		fallbacks:     newFallbackTakeoverStore(),
+		baseCooldown:      baseCooldown,
+		rateLimitCooldown: rateLimitCooldown,
+		credState:         make(map[string]*credentialEntry),
+		cred429State:      make(map[string]*credential429Entry),
+		targetState:       make(map[string]*targetEntry),
+		proxy429State:     make(map[string]*proxy429Entry),
+		channelState:      make(map[string]*channelEntry),
+		credDisplay:       make(map[string]string),
+		routeSessions:     newRouteSessionStore(),
+		pins:              newSessionPinStore(),
+		fallbacks:         newFallbackTakeoverStore(),
 	}
 }
 
@@ -547,6 +557,19 @@ func deterministicJitter(delay time.Duration, identity string, failures uint32) 
 // backoffDelay computes base*2^min(failures-1,3) with deterministic jitter,
 // taking the larger of the jittered backoff and retryAfter, capped at 5min.
 func (s *targetScheduler) backoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
+	return backoffDelayForBase(s.failureBase(), failures, identity, retryAfter)
+}
+
+// rateLimitBackoffDelay uses the rate-limit base (429 proxy/credential) with
+// the same exponential/jitter/Retry-After/cap conventions as backoffDelay.
+func (s *targetScheduler) rateLimitBackoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
+	return backoffDelayForBase(s.rateLimitBase(), failures, identity, retryAfter)
+}
+
+func backoffDelayForBase(base time.Duration, failures uint32, identity string, retryAfter time.Duration) time.Duration {
+	if base <= 0 {
+		base = 15 * time.Second
+	}
 	if failures < 1 {
 		failures = 1
 	}
@@ -554,7 +577,7 @@ func (s *targetScheduler) backoffDelay(failures uint32, identity string, retryAf
 	if shift > 3 {
 		shift = 3
 	}
-	delay := s.baseCooldown * time.Duration(1<<shift)
+	delay := base * time.Duration(1<<shift)
 	if delay > targetBackoffCap {
 		delay = targetBackoffCap
 	}
@@ -569,6 +592,20 @@ func (s *targetScheduler) backoffDelay(failures uint32, identity string, retryAf
 		delay = 0
 	}
 	return delay
+}
+
+func (s *targetScheduler) failureBase() time.Duration {
+	if s == nil || s.baseCooldown <= 0 {
+		return 15 * time.Second
+	}
+	return s.baseCooldown
+}
+
+func (s *targetScheduler) rateLimitBase() time.Duration {
+	if s == nil || s.rateLimitCooldown <= 0 {
+		return s.failureBase()
+	}
+	return s.rateLimitCooldown
 }
 
 // credentialCoolUntil returns the credential cooldown deadline (nanos), or 0.
@@ -828,7 +865,7 @@ func (s *targetScheduler) noteCredential429Failure(credID, failureClass string, 
 		previous = entry.cooldownUntil
 	}
 	entry.failures++
-	delay := s.backoffDelayLocked(entry.failures, "cred429\x00"+credID, retryAfter)
+	delay := s.rateLimitDelayLocked(entry.failures, "cred429\x00"+credID, retryAfter)
 	entry.cooldownUntil = now.Add(delay).UnixNano()
 	entry.lastFailureAt = nowNanos
 	if startedNanos > entry.lastStartedNanos {
@@ -960,7 +997,7 @@ func (s *targetScheduler) noteProxy429Failure(tier Tier, pool, proxyRaw, failure
 		previous = entry.cooldownUntil
 	}
 	entry.failures++
-	delay := s.backoffDelayLocked(entry.failures, identity, retryAfter)
+	delay := s.rateLimitDelayLocked(entry.failures, identity, retryAfter)
 	entry.cooldownUntil = now.Add(delay).UnixNano()
 	entry.lastFailureAt = nowNanos
 	if startedNanos > entry.lastStartedNanos {
@@ -1203,32 +1240,12 @@ func (s *targetScheduler) evictOldestIdleChannelLocked(nowNanos int64) bool {
 
 func (s *targetScheduler) backoffDelayLocked(failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	// Caller holds s.mu; baseCooldown is immutable after construction.
-	base := s.baseCooldown
-	if base <= 0 {
-		base = 15 * time.Second
-	}
-	if failures < 1 {
-		failures = 1
-	}
-	shift := failures - 1
-	if shift > 3 {
-		shift = 3
-	}
-	delay := base * time.Duration(1<<shift)
-	if delay > targetBackoffCap {
-		delay = targetBackoffCap
-	}
-	delay = deterministicJitter(delay, identity, failures)
-	if retryAfter > delay {
-		delay = retryAfter
-	}
-	if delay > targetBackoffCap {
-		delay = targetBackoffCap
-	}
-	if delay < 0 {
-		delay = 0
-	}
-	return delay
+	return backoffDelayForBase(s.failureBase(), failures, identity, retryAfter)
+}
+
+func (s *targetScheduler) rateLimitDelayLocked(failures uint32, identity string, retryAfter time.Duration) time.Duration {
+	// Caller holds s.mu; rateLimitCooldown is immutable after construction.
+	return backoffDelayForBase(s.rateLimitBase(), failures, identity, retryAfter)
 }
 
 // hrwScore is a pure Rendezvous/HRW score over the full target identity plus

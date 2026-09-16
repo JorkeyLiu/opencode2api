@@ -352,6 +352,23 @@ func (a *AdminServer) handleHistorySeries(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// historyChannelMatches implements the custom-channel compatibility rule:
+// "custom" matches the legacy merged "custom" row plus every
+// "custom:<name>" series, while "custom:<name>" matches only that series.
+// Old "custom" records never forge a name; new series never collapse.
+func historyChannelMatches(stored, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	if stored == filter {
+		return true
+	}
+	if filter == string(TierCustom) && strings.HasPrefix(stored, string(TierCustom)+":") {
+		return true
+	}
+	return false
+}
+
 func applyHistoryCursorDesc(times []time.Time, ids []string, cursor string) ([]int, string) {
 	if cursor == "" {
 		idx := make([]int, len(times))
@@ -456,7 +473,7 @@ outer:
 			if f.Tier != "" && v.Tier != f.Tier {
 				continue
 			}
-			if f.Channel != "" && v.Channel != f.Channel {
+			if !historyChannelMatches(v.Channel, f.Channel) {
 				continue
 			}
 			if f.ProxyPool != "" && v.ProxyPool != f.ProxyPool {
@@ -573,7 +590,7 @@ outer:
 			if f.Tier != "" && v.Tier != f.Tier {
 				continue
 			}
-			if f.Channel != "" && v.Channel != f.Channel {
+			if !historyChannelMatches(v.Channel, f.Channel) {
 				continue
 			}
 			if f.ProxyPool != "" && v.ProxyPool != f.ProxyPool {

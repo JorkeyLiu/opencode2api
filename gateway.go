@@ -120,13 +120,20 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		return nil, fmt.Errorf("proxy_routing must reference existing pools")
 	}
 	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
+	rateCooldown := time.Duration(cfg.Performance.RateLimitCooldownSeconds) * time.Second
+	if rateCooldown <= 0 {
+		rateCooldown = cooldown
+		if rateCooldown <= 0 {
+			rateCooldown = 15 * time.Second
+		}
+	}
 	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	return &Gateway{
 		cfg:       cfg,
 		logger:    logger,
 		pools:     pools,
-		scheduler: newTargetScheduler(cooldown),
+		scheduler: newTargetScheduler(cooldown, rateCooldown),
 		zenCreds:  credentialsForKeys(TierZen, cfg.ZenKeys),
 		goCreds:   credentialsForKeys(TierGo, cfg.GoKeys),
 		catalog:   catalog,

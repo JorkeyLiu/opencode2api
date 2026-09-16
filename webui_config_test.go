@@ -772,8 +772,8 @@ func TestWebUICustomRealtimeDisplay(t *testing.T) {
 	if !strings.Contains(html, `if(t==="custom")return "自定义"`) {
 		t.Fatal("tierLabel must map custom to display text")
 	}
-	if !strings.Contains(html, `if(c==="custom")return "自定义"`) {
-		t.Fatal("channelLabel must map custom to display text")
+	if !strings.Contains(html, `return "自定义"`) || !strings.Contains(html, `custom:`) {
+		t.Fatal("channelLabel must map custom and custom:<name> to display text")
 	}
 	// Batch key chips UI stays untouched.
 	for _, needle := range []string{"server_keys-chips", "server_keys-new", "zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new", "每行新增一个密钥", "移除"} {

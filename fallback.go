@@ -696,6 +696,19 @@ func fetchFallbackModels(ctx context.Context, client *http.Client, baseURL, apiK
 	return out, nil
 }
 
+// fallbackObservabilityChannel names the observability channel for one custom
+// fallback channel. Tier stays "custom"; Channel carries the concrete name
+// ("custom:<channelName>") so per-channel usage/attempts split while
+// tiers.custom still aggregates the total. Old "custom" records keep their
+// merged row and are never rewritten.
+func fallbackObservabilityChannel(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return string(TierCustom)
+	}
+	return string(TierCustom) + ":" + trimmed
+}
+
 // fallbackCustomClient returns the Gateway custom-channel HTTP client,
 // defaulting to a direct client when unset (tests may override).
 func (g *Gateway) fallbackCustomClient() *http.Client {
@@ -743,7 +756,8 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	// client-provided history in the chat body.
 	fakeProxy := &proxyTransport{name: normalizeFallbackBaseURL(ch.BaseURL), pool: "fallback"}
 	display := "custom:" + strings.TrimSpace(ch.Name)
-	setRequestCredential(ctx, TierCustom, channelProtocol, display, "custom", false, fakeProxy)
+	channel := fallbackObservabilityChannel(ch.Name)
+	setRequestCredential(ctx, TierCustom, channelProtocol, display, channel, false, fakeProxy)
 	setRequestModel(ctx, channelModel)
 	syncAttemptMeta(ctx, TierCustom, channelProtocol, attemptOffset, 1)
 	started := time.Now()
@@ -763,7 +777,7 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	if channelModel != "" {
 		customRoute.ID = channelModel
 	}
-	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, "custom", false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{})
+	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{})
 	_ = binding
 	if sendErr != nil {
 		// Custom transport errors stay on the bound channel: return the
