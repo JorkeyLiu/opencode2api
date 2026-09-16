@@ -17,7 +17,11 @@ import (
 //   - usage_calls counts only usage_reported lines; all token sums accumulate
 //     only usage_reported lines. No estimation; old usage lines without the
 //     explicit usage_detail_complete marker stay zero and set
-//     legacy_incomplete.
+//     legacy_incomplete. Each model/upstream row additionally carries
+//     total_complete/reasoning_complete: false when any included
+//     usage-bearing record lacks complete detail (UI renders —), true when
+//     all included usage records are complete (including legitimate zero)
+//     or when the row has no usage-bearing records.
 //
 // Identity: per model plus per upstream where upstream is the tier for
 // zen/go and the full channel for tier custom (legacy "custom" keeps its
@@ -40,6 +44,16 @@ type usageAggregateRow struct {
 	Cached     uint64 `json:"cached_tokens"`
 	Reasoning  uint64 `json:"reasoning_tokens"`
 	Total      uint64 `json:"total_tokens"`
+	// Row-level completeness for total/reasoning detail. False when any
+	// included usage-bearing history record lacks complete usage detail
+	// (UsageDetailComplete=false / legacy row predating persisted
+	// total/reasoning fields); the summed numeric total/reasoning is then a
+	// partial sum and the UI must render — instead of 0 or the partial sum.
+	// True when all included usage records are complete (including
+	// legitimate zero), or when the row has no usage-bearing records.
+	// Additive: old clients ignore these fields.
+	TotalComplete     bool `json:"total_complete"`
+	ReasoningComplete bool `json:"reasoning_complete"`
 }
 
 type usageAggregateModel struct {
@@ -86,6 +100,10 @@ type usageAggregateAccum struct {
 	cached     uint64
 	reasoning  uint64
 	total      uint64
+	// Set when any included usage-bearing record lacks complete detail.
+	// Completeness output is !incomplete (vacuously complete when no usage).
+	totalIncomplete     bool
+	reasoningIncomplete bool
 }
 
 func historyUsageUpstream(tier, channel string) string {
@@ -208,8 +226,17 @@ func queryHistoryUsageAggregate(ctx context.Context, store *HistoryStore, from, 
 			// reasoning/total are incomplete. New complete writes set the
 			// marker even when reasoning/total are zero, so zeros stay
 			// complete. Never infer from omitempty keys or zero values.
-			if !legacyIncomplete && v.UsageReported && !v.UsageDetailComplete {
-				legacyIncomplete = true
+			// Never synthesize totals from input+output: keep the persisted
+			// (possibly zero) total/reasoning sums and mark the row
+			// incomplete instead.
+			if v.UsageReported && !v.UsageDetailComplete {
+				if !legacyIncomplete {
+					legacyIncomplete = true
+				}
+				macc.totalIncomplete = true
+				macc.reasoningIncomplete = true
+				uacc.totalIncomplete = true
+				uacc.reasoningIncomplete = true
 			}
 		}
 	}
@@ -224,6 +251,7 @@ func queryHistoryUsageAggregate(ctx context.Context, store *HistoryStore, from, 
 				Calls: acc.calls, UsageCalls: acc.usageCalls,
 				Input: acc.input, Output: acc.output, Cached: acc.cached,
 				Reasoning: acc.reasoning, Total: acc.total,
+				TotalComplete: !acc.totalIncomplete, ReasoningComplete: !acc.reasoningIncomplete,
 			},
 		})
 	}
@@ -241,6 +269,7 @@ func queryHistoryUsageAggregate(ctx context.Context, store *HistoryStore, from, 
 				Calls: acc.calls, UsageCalls: acc.usageCalls,
 				Input: acc.input, Output: acc.output, Cached: acc.cached,
 				Reasoning: acc.reasoning, Total: acc.total,
+				TotalComplete: !acc.totalIncomplete, ReasoningComplete: !acc.reasoningIncomplete,
 			},
 		})
 	}

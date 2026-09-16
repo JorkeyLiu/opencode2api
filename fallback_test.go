@@ -688,7 +688,9 @@ func TestFallbackAvailabilityCustomAndNoModel(t *testing.T) {
 	cfg.ZenKeys = []string{"zen-key-12345"}
 	cfg.GoKeys = []string{"go-key-12345"}
 	cfg.Anonymous = true
+	var customHits atomic.Int32
 	customOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(fallbackChatOK("cm")))
 	}))
@@ -718,12 +720,36 @@ func TestFallbackAvailabilityCustomAndNoModel(t *testing.T) {
 	gw.cfg.Upstream.Go = native.URL
 	manager.current.Store(&gatewayRuntime{config: normalized, gateway: gw})
 	manager.redactor.Replace(normalized)
+	// Seed a stored custom row; batch must preserve it without sending.
+	storedAt := time.Now().UTC().Add(-time.Hour)
+	gw.bulkSnapshot.Store(&bulkAvailabilitySnapshot{
+		CheckedAt: storedAt,
+		Custom:    []bulkCustomAvailability{{Name: "c1", BaseURL: redactURL(customOK.URL), Model: "cm", Status: "available", Reason: "success", LastChecked: &storedAt}},
+	})
 	resp := gw.runBulkCheck(context.Background())
-	if len(resp.Custom) != 1 || resp.Custom[0].Status != "available" {
-		t.Fatalf("custom must be available: %+v", resp)
+	if len(resp.Custom) != 0 {
+		t.Fatalf("batch must exclude custom results, got %+v", resp.Custom)
 	}
-	if strings.Contains(strings.ToLower(resp.Custom[0].BaseURL), "ck-secret") {
+	if customHits.Load() != 0 {
+		t.Fatalf("batch must not send to custom channels, hits=%d", customHits.Load())
+	}
+	kept := gw.bulkSnapshot.Load()
+	if kept == nil || len(kept.Custom) != 1 || kept.Custom[0].Name != "c1" {
+		t.Fatalf("batch must preserve stored custom rows: %+v", kept)
+	}
+	if kept.Custom[0].LastChecked == nil || !kept.Custom[0].LastChecked.Equal(storedAt) {
+		t.Fatalf("stored custom time must not move on batch")
+	}
+	// Per-row custom check provides the custom result with existing helpers.
+	customResp := gw.runCustomCheck(context.Background(), gw.cfg.Fallback.Channels[0])
+	if customResp.Custom.Status != "available" {
+		t.Fatalf("per-row custom must be available: %+v", customResp)
+	}
+	if strings.Contains(strings.ToLower(customResp.Custom.BaseURL), "ck-secret") {
 		t.Fatal("custom must not leak key")
+	}
+	if customHits.Load() == 0 {
+		t.Fatal("per-row custom must send one real probe")
 	}
 	if len(resp.NoModel) != 0 {
 		t.Fatalf("no_model must be empty when directory has probes: %+v", resp.NoModel)

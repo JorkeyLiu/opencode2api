@@ -276,8 +276,10 @@ func TestStateMatrix(t *testing.T) {
 			t.Fatalf("429 must cool pool-qualified proxy")
 		}
 		remaining := time.Until(time.Unix(0, until))
-		if remaining < 100*time.Second || remaining > 5*time.Minute {
-			t.Fatalf("Retry-After not honored within cap: %v", remaining)
+		// Default gateway uses 429 min 300s: backoff (~240-360s) wins over
+		// the smaller 120s Retry-After.
+		if remaining < 200*time.Second || remaining > 400*time.Second {
+			t.Fatalf("429 backoff not honored within 429 max: %v", remaining)
 		}
 		_ = before
 		// 429 never cools the per-target or credential layers.
@@ -290,7 +292,8 @@ func TestStateMatrix(t *testing.T) {
 		if !cand.Proxy.healthy.Load() {
 			t.Fatalf("429 must not mark proxy unhealthy")
 		}
-		// Huge Retry-After is capped at 5 minutes.
+		// Huge Retry-After clamps at the configured 429 max (3600s), not
+		// the generic 5-minute cap.
 		gateway2, cand2 := setup()
 		resp2 := responseWithStatus(429)
 		resp2.Header.Set("Retry-After", "3600")
@@ -300,8 +303,8 @@ func TestStateMatrix(t *testing.T) {
 			t.Fatalf("429 must cool proxy")
 		}
 		remaining2 := time.Until(time.Unix(0, until2))
-		if remaining2 > 5*time.Minute {
-			t.Fatalf("cooldown exceeds cap: %v", remaining2)
+		if remaining2 < 3500*time.Second || remaining2 > 3600*time.Second {
+			t.Fatalf("429 Retry-After must clamp to 429 max: %v", remaining2)
 		}
 	})
 

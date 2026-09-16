@@ -92,13 +92,14 @@ type WebUIConfig struct {
 }
 
 type PerformanceConfig struct {
-	MaxIdleConns             int `json:"max_idle_conns"`
-	MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
-	MaxConnsPerHost          int `json:"max_conns_per_host"`
-	IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
-	ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
-	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
-	RateLimitCooldownSeconds int `json:"rate_limit_cooldown_seconds"`
+	MaxIdleConns                int `json:"max_idle_conns"`
+	MaxIdleConnsPerHost         int `json:"max_idle_conns_per_host"`
+	MaxConnsPerHost             int `json:"max_conns_per_host"`
+	IdleConnTimeoutSeconds      int `json:"idle_conn_timeout_seconds"`
+	ConnectTimeoutSeconds       int `json:"connect_timeout_seconds"`
+	FailureCooldownSeconds      int `json:"failure_cooldown_seconds"`
+	RateLimitCooldownSeconds    int `json:"rate_limit_cooldown_seconds"`
+	RateLimitCooldownMaxSeconds int `json:"rate_limit_cooldown_max_seconds"`
 }
 
 // HistoryConfig is a bounded, redacted, embedded projection of recent
@@ -116,7 +117,7 @@ func defaultConfig() Config {
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 15},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300, RateLimitCooldownMaxSeconds: 3600},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		Prefer:      TierGo,
@@ -361,10 +362,19 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		return Config{}, errors.New("performance values must be positive (max_conns_per_host may be zero for unlimited)")
 	}
 	if cfg.Performance.RateLimitCooldownSeconds == 0 {
-		cfg.Performance.RateLimitCooldownSeconds = 15
+		cfg.Performance.RateLimitCooldownSeconds = 300
 	}
-	if cfg.Performance.RateLimitCooldownSeconds < 1 || cfg.Performance.RateLimitCooldownSeconds > 300 {
-		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be between 1 and 300")
+	if cfg.Performance.RateLimitCooldownMaxSeconds == 0 {
+		cfg.Performance.RateLimitCooldownMaxSeconds = 3600
+	}
+	if cfg.Performance.RateLimitCooldownSeconds < 1 {
+		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be at least 1")
+	}
+	if cfg.Performance.RateLimitCooldownMaxSeconds < 1 {
+		return Config{}, errors.New("performance.rate_limit_cooldown_max_seconds must be at least 1")
+	}
+	if cfg.Performance.RateLimitCooldownMaxSeconds < cfg.Performance.RateLimitCooldownSeconds {
+		return Config{}, errors.New("performance.rate_limit_cooldown_max_seconds must be at least rate_limit_cooldown_seconds")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

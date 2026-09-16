@@ -36,14 +36,20 @@ func TestWebUIGlobalFormatRules(t *testing.T) {
 	}
 
 	// 3. Usage tables (by model & by upstream, range aggregate source)
+	// Incomplete legacy rows render reasoning/total as — via completeness flags.
 	for _, needle := range []string{
 		`cell(tr,fmtToken(r.input_tokens)); cell(tr,fmtToken(r.output_tokens));`,
-		`cell(tr,fmtToken(r.cached_tokens)); cell(tr,fmtToken(r.reasoning_tokens)); cell(tr,fmtToken(r.total_tokens));`,
+		`cell(tr,fmtToken(r.cached_tokens)); cell(tr,usageReasoningText(r)); cell(tr,usageTotalText(r));`,
+		`function usageReasoningText(r){ return (r.reasoning_complete===false)?"—":fmtToken(r.reasoning_tokens); }`,
+		`function usageTotalText(r){ return (r.total_complete===false)?"—":fmtToken(r.total_tokens); }`,
 		`td.textContent=fmtInt(r.calls);`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("usage table tokens must contain %q", needle)
 		}
+	}
+	if strings.Contains(html, `cell(tr,fmtToken(r.reasoning_tokens)); cell(tr,fmtToken(r.total_tokens));`) {
+		t.Fatal("usage tables must not render reasoning/total without completeness check")
 	}
 
 	// 4. Token trend hover title
@@ -99,9 +105,12 @@ func TestWebUIGlobalFormatRules(t *testing.T) {
 		t.Fatal("proxy stats avg duration must format as Number(d).toFixed(1)+\"ms\"")
 	}
 
-	// 4. Single proxy probe toast
-	if !strings.Contains(html, `res.duration_ms+"ms）"`) {
-		t.Fatal("proxy probe toast must format as res.duration_ms+\"ms）\"")
+	// 4. Single scoped availability toast uses node-result semantics (no transport trivia).
+	if !strings.Contains(html, `"检测 "+pool+"#"+p.index+": "`) {
+		t.Fatal("scoped single-check toast must use node-result semantics")
+	}
+	if strings.Contains(html, `res.duration_ms+"ms）"`) {
+		t.Fatal("single-check toast must not expose transport duration trivia")
 	}
 
 	// 5. Manual refresh status note and toast

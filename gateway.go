@@ -119,13 +119,20 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 	if pools[cfg.ProxyRouting.Zen] == nil || pools[cfg.ProxyRouting.Go] == nil || pools[cfg.ProxyRouting.Anonymous] == nil {
 		return nil, fmt.Errorf("proxy_routing must reference existing pools")
 	}
-	cooldown := time.Duration(cfg.Performance.FailureCooldownSeconds) * time.Second
-	rateCooldown := time.Duration(cfg.Performance.RateLimitCooldownSeconds) * time.Second
+	cooldown := secondsToDuration(cfg.Performance.FailureCooldownSeconds)
+	if cooldown <= 0 {
+		cooldown = 15 * time.Second
+	}
+	rateCooldown := secondsToDuration(cfg.Performance.RateLimitCooldownSeconds)
 	if rateCooldown <= 0 {
-		rateCooldown = cooldown
-		if rateCooldown <= 0 {
-			rateCooldown = 15 * time.Second
-		}
+		rateCooldown = defaultRateLimitBaseSeconds * time.Second
+	}
+	rateMax := secondsToDuration(cfg.Performance.RateLimitCooldownMaxSeconds)
+	if rateMax <= 0 {
+		rateMax = defaultRateLimitMaxSeconds * time.Second
+	}
+	if rateMax < rateCooldown {
+		rateMax = rateCooldown
 	}
 	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
@@ -133,7 +140,7 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		cfg:       cfg,
 		logger:    logger,
 		pools:     pools,
-		scheduler: newTargetScheduler(cooldown, rateCooldown),
+		scheduler: newTargetScheduler(cooldown, rateCooldown, rateMax),
 		zenCreds:  credentialsForKeys(TierZen, cfg.ZenKeys),
 		goCreds:   credentialsForKeys(TierGo, cfg.GoKeys),
 		catalog:   catalog,
@@ -2117,12 +2124,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 //     restores proxy transport health.
 //   - 401: global credential cooldown; the target is not cooled twice.
 //   - 429: tier-qualified proxy cooldown (Retry-After wins when larger,
-//     capped); the per-target, credential-401, credential429, and channel
-//     layers are untouched here. Credential429 is set only by the
-//     two-distinct-proxy evidence rule in pinned/unbound flows, never from a
-//     single 429. No same-target retry is implied; it still triggers only the
-//     neutral async proxy verification and never flips healthy directly.
-//   - 403/5xx: per-target cooldown (Retry-After wins when larger, capped).
+//     capped at the configured 429 max); the per-target, credential-401,
+//     credential429, and channel layers are untouched here. Credential429 is
+//     set only by the two-distinct-proxy evidence rule in pinned/unbound
+//     flows, never from a single 429. No same-target retry is implied; it
+//     still triggers only the neutral async proxy verification and never
+//     flips healthy directly.
+//   - 403/5xx: per-target cooldown (Retry-After wins when larger, capped at
+//     the generic 5 minutes).
 //     The channel layer is never written here; only comparative management
 //     probes write it.
 //   - Transport error (non-cancelled): neutral, no

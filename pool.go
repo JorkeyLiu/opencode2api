@@ -206,7 +206,7 @@ func isProxyFailure(err error) bool {
 
 func parseRetryAfter(value string) time.Duration {
 	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
-		return time.Duration(seconds) * time.Second
+		return secondsToDuration(seconds)
 	}
 	if when, err := http.ParseTime(value); err == nil {
 		return max(time.Until(when), 0)

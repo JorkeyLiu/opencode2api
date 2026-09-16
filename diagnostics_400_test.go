@@ -367,10 +367,15 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 	if strings.Contains(html, "毫秒") {
 		t.Fatal("stale duration unit 毫秒 must be removed")
 	}
-	// Cache labels: hit only, unknown stays a dash, never estimated.
-	for _, needle := range []string{"缓存命中", "不做估算", "上游已上报", "非最终尝试或上游未上报"} {
+	// Cache labels: hit only, unknown stays a dash with neutral wording.
+	for _, needle := range []string{"缓存命中", "非最终尝试显示"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("webui missing cache label %q", needle)
+		}
+	}
+	for _, stale := range []string{"上游已上报", "非最终尝试或上游未上报"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("repetitive usage caveat must stay removed: %q", stale)
 		}
 	}
 	// Dependency-free text-node rendering still holds.

@@ -371,13 +371,15 @@ type gatewayMigrationSummary struct {
 // scopes require proxy validity, and legacy auth overrides with proxy-bound
 // keys are dropped (new requests derive the proxy-independent session
 // statelessly). Only still-future cooldowns and still-fresh route overrides
-// migrate (remaining capped at 5 minutes for cooldowns, idle TTL for
-// sessions); new resources start at zero/stateless state and removed
-// identities are dropped. Session-affinity pins migrate without validity
-// filtering up to the pin cap as tombstone-like bindings: authenticated pins
-// validate proxy-independently (binding without proxy) while anonymous pins
-// remain full-target; removed/changed bindings still resolve to the pinned
-// path and fail locally with 502. Checking flags never migrate.
+// migrate (non-429 remaining capped at the generic 5 minutes, proxy429 and
+// credential429 remaining capped at the NEW configured 429 max, idle TTL
+// for sessions); new resources start at zero/stateless state and removed
+// identities are dropped. Session-affinity pins migrate
+// without validity filtering up to the pin cap as tombstone-like bindings:
+// authenticated pins validate proxy-independently (binding without proxy)
+// while anonymous pins remain full-target; removed/changed bindings still
+// resolve to the pinned path and fail locally with 502. Checking flags never
+// migrate.
 // Route-session overrides and pins are in-memory authority (not a
 // projection): they never persist across restarts and never enter logs,
 // metrics, history, or admin output. In-flight requests keep using the old
@@ -517,19 +519,23 @@ type ResourceSnapshot struct {
 	AvailabilityCheckedAt    *time.Time                  `json:"availability_checked_at,omitempty"`
 	AvailabilityTruncated    bool                        `json:"availability_truncated,omitempty"`
 	AvailabilityPartial      bool                        `json:"availability_partial,omitempty"`
+	Custom                   []bulkCustomAvailability    `json:"custom,omitempty"`
 	Metadata                 MetadataSnapshot            `json:"metadata"`
 }
 
 // KeyStatus is the per-credential availability row (凭证可用性). ID is the
-// key tail (never full secrets); Tier names the channel; ProxyPool is the
-// assigned pool identity. Status is available/unavailable/rate_limited;
+// key tail (never full secrets); Fingerprint is the stable redacted
+// credential identity (SHA-256 prefix of tier+key, never raw key material and
+// never tail-only) used by the per-row 检测 endpoint; Tier names the channel;
+// ProxyPool is the assigned pool identity. Status is available/unavailable/rate_limited;
 // Reason is the short machine reason (auth_failure, rate_limited,
 // no_healthy_proxies, all_proxies_cooling, success, untested, ...).
 // LastChecked is the admin bulk-check projection (never routing authority).
 type KeyStatus struct {
-	ID    string `json:"id"`
-	Tier  string `json:"tier"`
-	Index int    `json:"index"`
+	ID          string `json:"id"`
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Tier        string `json:"tier"`
+	Index       int    `json:"index"`
 	// Deprecated: the static key->proxy binding no longer exists.
 	// ProxyIndex is always zero and Proxy always empty; ProxyPool names the
 	// assigned named pool (config identity, not a binding).
@@ -613,6 +619,10 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			result.AvailabilityTruncated = bulkSnap.Truncated
 			result.AvailabilityPartial = bulkSnap.Partial
 		}
+		// Safe server projection of per-channel custom availability so an
+		// independent custom 检测 survives refresh/rerender without client
+		// state. Native batch never writes these rows.
+		result.Custom = append([]bulkCustomAvailability(nil), bulkSnap.Custom...)
 	}
 	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.zenCreds, gateway.cfg.ProxyRouting.Zen, credLastChecked)...)
 	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "go", gateway.goCreds, gateway.cfg.ProxyRouting.Go, credLastChecked)...)
@@ -776,7 +786,7 @@ func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, po
 	for _, cred := range creds {
 		failures, until := gateway.scheduler.credentialSnapshot(cred.id)
 		status := KeyStatus{
-			ID: cred.display, Tier: tier, Index: cred.index,
+			ID: cred.display, Fingerprint: credentialFingerprint(cred.tier, cred.key), Tier: tier, Index: cred.index,
 			ProxyPool: poolName, Failures: failures,
 			TotalTargets: total,
 		}
@@ -856,6 +866,14 @@ func cooldownRemainingSeconds(untilUnixNano int64, now time.Time) *int64 {
 func secretFingerprint(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:10]
+}
+
+// credentialFingerprint is the stable redacted per-credential identity used
+// by the per-row credential availability endpoint. It hashes tier+key so the
+// same raw key text on zen and go yields distinct identities, never exposes
+// raw key material, and is never tail-only (tails collide by design).
+func credentialFingerprint(tier Tier, key string) string {
+	return secretFingerprint(string(tier) + ":" + key)
 }
 
 // keyDisplayID is intentionally separate from secretFingerprint. The latter

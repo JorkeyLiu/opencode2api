@@ -753,7 +753,8 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		}
 	}
 	// Localization: key Chinese labels present for the new contract.
-	for _, needle := range []string{"运行时长", "活跃请求", "活跃流", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>状态</th>", "<th>耗时</th>", "匿名", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "今天", "本月", "历史记录", "活跃目标冷却", "代理可用性", "凭证可用性", "批量检测", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "最多显示 200 条", "WebUI 是否启用", "未知（", "上下文长度", "调试", "信息", "警告", "错误", "小时", "分钟", "秒"} {
+	// Topbar uses exact English Active/Streaming labels (metric IDs preserved).
+	for _, needle := range []string{"运行时长", "Active", "Streaming", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>状态</th>", "<th>耗时</th>", "匿名", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "今天", "本月", "历史记录", "活跃目标冷却", "代理可用性", "备用模型渠道可用性", "凭证可用性", "批量检测", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "最多显示 200 条", "WebUI 是否启用", "未知（", "上下文长度", "调试", "信息", "警告", "错误", "小时", "分钟", "秒"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing localized label %q", needle)
 		}
@@ -817,31 +818,42 @@ func TestHistoryWebUICompletedJoinStability(t *testing.T) {
 	if !strings.Contains(html, "if(req.attempts===undefined||attempt.attempt===undefined)return null") {
 		t.Fatal("final usage must require both counts known")
 	}
-	// Completed captions: realtime stability plus proxy-stats mixed grain.
-	for _, needle := range []string{"已完成请求的尝试记录，未完成的暂不显示", "已完成的上游响应未提供用量", "不做估算"} {
+	// Completed captions: realtime stability plus single usage explanation.
+	for _, needle := range []string{"已完成请求的尝试记录，未完成的暂不显示", "用量仅统计上游实际回报，不做估算，未知显示“—”。所选时间同时决定指标、趋势与历史记录。"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing completed-join copy %q", needle)
+		}
+	}
+	if got := strings.Count(html, "不做估算"); got != 1 {
+		t.Fatalf("usage explanation must appear exactly once, got %d", got)
+	}
+	for _, stale := range []string{"已完成的上游响应未提供用量", "请求级已上报用量", "上游已上报", "已上报才计数", "已返回用量的请求", "无已上报用量", "非最终尝试或上游未上报", "旧历史用量", "范围内共 "} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("repetitive usage caveat must stay removed: %q", stale)
 		}
 	}
 	if strings.Contains(html, "已完成请求的历史记录，未匹配到请求的不显示") {
 		t.Fatal("duplicate history-table copy must stay removed")
 	}
-	// Proxy stats mixed grain is explained once, concisely.
-	for _, needle := range []string{"代理统计", "上游尝试", "请求级已上报用量"} {
+	// Proxy stats mixed grain is explained once, concisely (neutral wording).
+	for _, needle := range []string{"代理统计", "上游尝试", "请求级用量"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing proxy-stats grain copy %q", needle)
 		}
 	}
-	// Precise operator label: request-count ratio, never token ratio; — means upstream gave nothing.
+	// Precise operator label: request-count ratio with neutral description.
 	if !strings.Contains(html, "上游用量返回率") {
 		t.Fatal("missing 上游用量返回率 label")
 	}
 	if strings.Contains(html, "用量上报率") {
 		t.Fatal("stale 用量上报率 label must be renamed")
 	}
-	for _, needle := range []string{"已返回用量的请求 / 请求数", "按请求数统计", "非 Token 占比", "— 表示上游未返回用量"} {
-		if !strings.Contains(html, needle) {
-			t.Fatalf("missing usage-return-rate description %q", needle)
+	if !strings.Contains(html, "按请求数统计") {
+		t.Fatal("missing usage-return-rate description 按请求数统计")
+	}
+	for _, stale := range []string{"非 Token 占比", "— 表示上游未返回用量"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("emphatic usage caveat must stay removed: %q", stale)
 		}
 	}
 	for _, stale := range []string{"projection", "coverage", "已上报/请求"} {

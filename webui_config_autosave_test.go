@@ -78,12 +78,63 @@ func TestWebUIConfigAutosaveBindings(t *testing.T) {
 			t.Fatalf("immediate binding must contain %q", needle)
 		}
 	}
-	// Text/number/URL: input debounces, change/blur flushes.
+	// Text/URL: input debounces, change/blur flushes. Numeric fields are
+	// commit-only (change/blur) so typing never issues a PUT.
 	if !strings.Contains(html, `on(id,"input",function(){ queueConfigSave(false)`) {
 		t.Fatal("text inputs must debounce via queueConfigSave(false)")
 	}
 	if !strings.Contains(html, `on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true)`) {
 		t.Fatal("text inputs must flush on blur")
+	}
+	bindIdx := strings.Index(html, "(function bindConfigAutosave(){")
+	if bindIdx < 0 {
+		t.Fatal("missing bindConfigAutosave")
+	}
+	bindEnd := strings.Index(html[bindIdx:], "function revealConfig()")
+	if bindEnd < 0 {
+		t.Fatal("missing revealConfig boundary")
+	}
+	bindBlock := html[bindIdx : bindIdx+bindEnd]
+	numericIDs := []string{"c-session", "c-attempts", "c-timeout", "c-refresh", "c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown", "c-ratelimit-cooldown", "c-ratelimit-cooldown-max", "c-ring", "c-hist-retention", "c-hist-max"}
+	textList := `["c-listen","c-web-listen","c-up-zen","c-up-go","c-hist-dir"]`
+	numericList := `["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ratelimit-cooldown-max","c-ring","c-hist-retention","c-hist-max"]`
+	if !strings.Contains(bindBlock, textList) {
+		t.Fatal("text/URL autosave list must stay explicit")
+	}
+	if !strings.Contains(bindBlock, numericList) {
+		t.Fatal("numeric commit-only list must include every type=number config input")
+	}
+	for _, id := range numericIDs {
+		if strings.Contains(bindBlock, textList+` `) && false {
+			t.Fatalf("unreachable %q", id)
+		}
+		if strings.Contains(textList, `"`+id+`"`) {
+			t.Fatalf("numeric field %q must not stay in the debounced text list", id)
+		}
+	}
+	// Text segment keeps input debounce + change/blur commit.
+	textIdx := strings.Index(bindBlock, textList)
+	textSeg := bindBlock[textIdx : textIdx+800]
+	if !strings.Contains(textSeg, `on(id,"input",function(){ queueConfigSave(false)`) {
+		t.Fatal("text/URL segment must debounce on input")
+	}
+	if !strings.Contains(textSeg, `on(id,"change",function(){ queueConfigSave(true)`) {
+		t.Fatal("text/URL segment must save on change")
+	}
+	// The numeric segment itself keeps change/blur commit with the no-double-save guard.
+	numIdx := strings.Index(bindBlock, numericList)
+	if numIdx < 0 {
+		t.Fatal("missing numeric list binding")
+	}
+	numSeg := bindBlock[numIdx : numIdx+800]
+	if !strings.Contains(numSeg, `on(id,"change",function(){ queueConfigSave(true)`) {
+		t.Fatal("numeric fields must save on change")
+	}
+	if !strings.Contains(numSeg, `on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true)`) {
+		t.Fatal("numeric fields must flush on blur without double-saving after change")
+	}
+	if strings.Contains(numSeg, `on(id,"input"`) {
+		t.Fatal("numeric segment must not bind input (per-keystroke PUT forbidden)")
 	}
 	// Advanced protocols JSON only saves when parseable.
 	for _, needle := range []string{

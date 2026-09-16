@@ -257,8 +257,9 @@ func TestProxy429BackoffCapEnvelopeNoRetry(t *testing.T) {
 	if !ok {
 		t.Fatalf("must cool")
 	}
-	if remaining := time.Until(time.Unix(0, until)); remaining < 100*time.Second || remaining > 5*time.Minute {
-		t.Fatalf("Retry-After not honored: %v", remaining)
+	// Default gateway uses 429 min 300s: backoff (~240-360s) wins over 120s.
+	if remaining := time.Until(time.Unix(0, until)); remaining < 200*time.Second || remaining > 400*time.Second {
+		t.Fatalf("Retry-After not honored within 429 max: %v", remaining)
 	}
 	gateway2 := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	pool2 := gateway2.pools["shared"]
@@ -267,8 +268,8 @@ func TestProxy429BackoffCapEnvelopeNoRetry(t *testing.T) {
 	resp2.Header.Set("Retry-After", "3600")
 	gateway2.applyAttemptOutcome(context.Background(), cand2, resp2, nil, time.Now().UnixNano())
 	until2, _, _ := gateway2.scheduler.proxy429CooldownStatus(TierZen, pool2.name, pool2.items[0].name)
-	if remaining := time.Until(time.Unix(0, until2)); remaining > 5*time.Minute {
-		t.Fatalf("cap exceeded: %v", remaining)
+	if remaining := time.Until(time.Unix(0, until2)); remaining < 3500*time.Second || remaining > 3600*time.Second {
+		t.Fatalf("429 Retry-After must clamp to 429 max (3600s), got %v", remaining)
 	}
 	// Local envelope preserves target protocol + Retry-After.
 	for _, proto := range []Protocol{ProtocolChat, ProtocolResponses, ProtocolAnthropic} {
@@ -426,16 +427,16 @@ func TestProxy429MigrationAndBounds(t *testing.T) {
 	if _, _, ok := newGateway.scheduler.proxy429CooldownStatus(TierZen, "shared", "http://127.0.0.1:8081"); ok {
 		t.Fatalf("removed/expired proxy429 must drop")
 	}
-	// Remaining capped at 5m.
+	// Remaining capped at the NEW configured 429 max (default 3600s).
 	old2 := newTargetScheduler(15 * time.Second)
 	old2.mu.Lock()
-	old2.proxy429State[proxy429Identity(TierZen, "shared", "direct")] = &proxy429Entry{failures: 1, cooldownUntil: time.Now().Add(time.Hour).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStartedNanos: time.Now().UnixNano(), lastFailureClass: AttemptClassRateLimited, lastStatus: 429}
+	old2.proxy429State[proxy429Identity(TierZen, "shared", "direct")] = &proxy429Entry{failures: 1, cooldownUntil: time.Now().Add(2 * time.Hour).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStartedNanos: time.Now().UnixNano(), lastFailureClass: AttemptClassRateLimited, lastStatus: 429}
 	old2.mu.Unlock()
 	next2 := newTargetScheduler(15 * time.Second)
 	next2.migrateFrom(old2)
 	_, until := next2.proxy429EntrySnapshot(TierZen, "shared", "direct")
-	if remaining := time.Until(time.Unix(0, until)); remaining <= 0 || remaining > 5*time.Minute {
-		t.Fatalf("migrated remaining=%v want (0,5m]", remaining)
+	if remaining := time.Until(time.Unix(0, until)); remaining <= 0 || remaining > defaultRateLimitMaxSeconds*time.Second {
+		t.Fatalf("migrated remaining=%v want (0,3600s]", remaining)
 	}
 	// Bounded cap with deterministic oldest-idle eviction.
 	bounded := newTargetScheduler(time.Second)

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"hash/fnv"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,9 +73,18 @@ const (
 	// this retention and out of cooldown the entry is pruned.
 	targetStaleRetention = targetBackoffCap
 
-	// targetBackoffCap caps every computed cooldown (credential, target, and
-	// proxy429).
+	// targetBackoffCap caps every non-429 computed cooldown (credential 401,
+	// target 403/5xx, channel 403/5xx). Proxy429 and credential429 use the
+	// configured 429 max (default 1h) instead; see rateLimitMax.
 	targetBackoffCap = 5 * time.Minute
+
+	// defaultRateLimitBaseSeconds is the 429 minimum/start/base when the
+	// config field is missing or zero. Explicit nonzero values are kept.
+	defaultRateLimitBaseSeconds = 300
+
+	// defaultRateLimitMaxSeconds is the 429 maximum clamp when the config
+	// field is missing or zero.
+	defaultRateLimitMaxSeconds = 3600
 
 	// maxProxy429States bounds the live proxy429State map (pool x proxy).
 	// Each pool-qualified proxy holds at most one entry, so the live size is
@@ -223,6 +233,7 @@ type targetScheduler struct {
 	mu                sync.Mutex
 	baseCooldown      time.Duration
 	rateLimitCooldown time.Duration
+	rateLimitMaxDur   time.Duration
 	credState         map[string]*credentialEntry
 	cred429State      map[string]*credential429Entry
 	targetState       map[string]*targetEntry
@@ -240,16 +251,25 @@ func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Durat
 		baseCooldown = 15 * time.Second
 	}
 	rateLimitCooldown := baseCooldown
-	if len(rateLimitBases) > 0 {
-		if rateLimitBases[0] > 0 {
-			rateLimitCooldown = rateLimitBases[0]
-		} else {
-			rateLimitCooldown = baseCooldown
-		}
+	if len(rateLimitBases) > 0 && rateLimitBases[0] > 0 {
+		rateLimitCooldown = rateLimitBases[0]
+	} else if len(rateLimitBases) == 0 {
+		// Single-arg legacy construction keeps both bases equal.
+		rateLimitCooldown = baseCooldown
+	} else if rateLimitCooldown <= 0 {
+		rateLimitCooldown = defaultRateLimitBaseSeconds * time.Second
+	}
+	rateLimitMax := defaultRateLimitMaxSeconds * time.Second
+	if len(rateLimitBases) > 1 && rateLimitBases[1] > 0 {
+		rateLimitMax = rateLimitBases[1]
+	}
+	if rateLimitMax < rateLimitCooldown {
+		rateLimitMax = rateLimitCooldown
 	}
 	return &targetScheduler{
 		baseCooldown:      baseCooldown,
 		rateLimitCooldown: rateLimitCooldown,
+		rateLimitMaxDur:   rateLimitMax,
 		credState:         make(map[string]*credentialEntry),
 		cred429State:      make(map[string]*credential429Entry),
 		targetState:       make(map[string]*targetEntry),
@@ -538,9 +558,54 @@ func (st *routeSessionStore) migrateRouteSessionsFrom(old *routeSessionStore, va
 	return migrated
 }
 
+// maxDurationValue is the saturation ceiling for duration arithmetic so
+// absurd config values never wrap negative through time.Duration overflow.
+const maxDurationValue = time.Duration(math.MaxInt64)
+
+// secondsToDuration converts whole seconds to a duration, saturating at
+// MaxInt64 instead of overflowing for absurd values.
+func secondsToDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	if int64(seconds) > int64(maxDurationValue)/int64(time.Second) {
+		return maxDurationValue
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// cooldownDeadline returns nowNanos+delay, saturating at MaxInt64 so absurd
+// configured maxima never wrap negative through int64 overflow.
+func cooldownDeadline(nowNanos int64, delay time.Duration) int64 {
+	if delay <= 0 {
+		return nowNanos
+	}
+	if int64(delay) > math.MaxInt64-nowNanos {
+		return math.MaxInt64
+	}
+	return nowNanos + int64(delay)
+}
+
+// saturatingShiftLeft returns base*2^shift, saturating at MaxInt64.
+func saturatingShiftLeft(base time.Duration, shift uint32) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	delay := base
+	for i := uint32(0); i < shift; i++ {
+		if delay > maxDurationValue/2 {
+			return maxDurationValue
+		}
+		delay *= 2
+	}
+	return delay
+}
+
 // deterministicJitter returns delay scaled by +/-20%, derived from
 // FNV-1a(identity + failure count) so tests are stable and concurrent
-// targets do not expire simultaneously. No global rand is used.
+// targets do not expire simultaneously. No global rand is used. The float
+// multiply is pre-clamped so huge delays saturate instead of overflowing
+// the float-to-int conversion.
 func deterministicJitter(delay time.Duration, identity string, failures uint32) time.Duration {
 	if delay <= 0 {
 		return 0
@@ -551,24 +616,44 @@ func deterministicJitter(delay time.Duration, identity string, failures uint32) 
 	_, _ = h.Write([]byte(strconv.FormatUint(uint64(failures), 10)))
 	frac := float64(h.Sum64()%4001) / 4000.0
 	factor := 0.8 + 0.4*frac
-	return time.Duration(float64(delay) * factor)
+	scaled := float64(delay) * factor
+	if scaled >= float64(maxDurationValue) {
+		return maxDurationValue
+	}
+	out := time.Duration(scaled)
+	if out < 0 {
+		return maxDurationValue
+	}
+	return out
 }
 
 // backoffDelay computes base*2^min(failures-1,3) with deterministic jitter,
 // taking the larger of the jittered backoff and retryAfter, capped at 5min.
+// It preserves the non-429 (credential 401 / target / channel) behavior.
 func (s *targetScheduler) backoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	return backoffDelayForBase(s.failureBase(), failures, identity, retryAfter)
 }
 
-// rateLimitBackoffDelay uses the rate-limit base (429 proxy/credential) with
-// the same exponential/jitter/Retry-After/cap conventions as backoffDelay.
+// rateLimitBackoffDelay uses the 429 minimum/start/base with the same
+// exponential/jitter/Retry-After conventions as backoffDelay, but clamps at
+// the configured 429 maximum (default 1h), not the generic 5-minute cap.
 func (s *targetScheduler) rateLimitBackoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
-	return backoffDelayForBase(s.rateLimitBase(), failures, identity, retryAfter)
+	return backoffDelayForBaseWithCap(s.rateLimitBase(), s.rateLimitMax(), failures, identity, retryAfter)
 }
 
 func backoffDelayForBase(base time.Duration, failures uint32, identity string, retryAfter time.Duration) time.Duration {
+	return backoffDelayForBaseWithCap(base, targetBackoffCap, failures, identity, retryAfter)
+}
+
+func backoffDelayForBaseWithCap(base, cap time.Duration, failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	if base <= 0 {
 		base = 15 * time.Second
+	}
+	if cap <= 0 {
+		cap = targetBackoffCap
+	}
+	if cap > maxDurationValue {
+		cap = maxDurationValue
 	}
 	if failures < 1 {
 		failures = 1
@@ -577,16 +662,22 @@ func backoffDelayForBase(base time.Duration, failures uint32, identity string, r
 	if shift > 3 {
 		shift = 3
 	}
-	delay := base * time.Duration(1<<shift)
-	if delay > targetBackoffCap {
-		delay = targetBackoffCap
+	delay := saturatingShiftLeft(base, shift)
+	if delay > cap {
+		delay = cap
 	}
 	delay = deterministicJitter(delay, identity, failures)
+	if delay > cap {
+		delay = cap
+	}
+	if retryAfter < 0 {
+		retryAfter = 0
+	}
 	if retryAfter > delay {
 		delay = retryAfter
 	}
-	if delay > targetBackoffCap {
-		delay = targetBackoffCap
+	if delay > cap {
+		delay = cap
 	}
 	if delay < 0 {
 		delay = 0
@@ -603,9 +694,19 @@ func (s *targetScheduler) failureBase() time.Duration {
 
 func (s *targetScheduler) rateLimitBase() time.Duration {
 	if s == nil || s.rateLimitCooldown <= 0 {
+		if s == nil {
+			return defaultRateLimitBaseSeconds * time.Second
+		}
 		return s.failureBase()
 	}
 	return s.rateLimitCooldown
+}
+
+func (s *targetScheduler) rateLimitMax() time.Duration {
+	if s == nil || s.rateLimitMaxDur <= 0 {
+		return defaultRateLimitMaxSeconds * time.Second
+	}
+	return s.rateLimitMaxDur
 }
 
 // credentialCoolUntil returns the credential cooldown deadline (nanos), or 0.
@@ -667,7 +768,7 @@ func (s *targetScheduler) noteCredentialAuthFailure(credID string) credentialCha
 	}
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, credID, 0)
-	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
 	entry.lastStatus = 401
 	return credentialChange{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
@@ -742,12 +843,12 @@ func (s *targetScheduler) noteTargetFailure(identity, failureClass string, statu
 	}
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, identity, retryAfter)
-	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
 	entry.lastFailureAt = nowNanos
 	entry.lastFailureClass = failureClass
 	entry.lastStatus = status
 	if retryAfter > 0 {
-		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+		entry.retryAfterUntil = cooldownDeadline(now.UnixNano(), retryAfter)
 	}
 	return targetChange{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
@@ -866,7 +967,7 @@ func (s *targetScheduler) noteCredential429Failure(credID, failureClass string, 
 	}
 	entry.failures++
 	delay := s.rateLimitDelayLocked(entry.failures, "cred429\x00"+credID, retryAfter)
-	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
 	entry.lastFailureAt = nowNanos
 	if startedNanos > entry.lastStartedNanos {
 		entry.lastStartedNanos = startedNanos
@@ -874,7 +975,7 @@ func (s *targetScheduler) noteCredential429Failure(credID, failureClass string, 
 	entry.lastFailureClass = failureClass
 	entry.lastStatus = status
 	if retryAfter > 0 {
-		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+		entry.retryAfterUntil = cooldownDeadline(now.UnixNano(), retryAfter)
 	}
 	return credentialChange{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
@@ -998,7 +1099,7 @@ func (s *targetScheduler) noteProxy429Failure(tier Tier, pool, proxyRaw, failure
 	}
 	entry.failures++
 	delay := s.rateLimitDelayLocked(entry.failures, identity, retryAfter)
-	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
 	entry.lastFailureAt = nowNanos
 	if startedNanos > entry.lastStartedNanos {
 		entry.lastStartedNanos = startedNanos
@@ -1006,7 +1107,7 @@ func (s *targetScheduler) noteProxy429Failure(tier Tier, pool, proxyRaw, failure
 	entry.lastFailureClass = failureClass
 	entry.lastStatus = status
 	if retryAfter > 0 {
-		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+		entry.retryAfterUntil = cooldownDeadline(now.UnixNano(), retryAfter)
 	}
 	return proxy429Change{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
@@ -1160,7 +1261,7 @@ func (s *targetScheduler) noteChannelFailure(tier Tier, pool, proxyRaw, failureC
 	}
 	entry.failures++
 	delay := s.backoffDelayLocked(entry.failures, "channel\x00"+identity, retryAfter)
-	entry.cooldownUntil = now.Add(delay).UnixNano()
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
 	entry.lastFailureAt = nowNanos
 	if startedNanos > entry.lastStartedNanos {
 		entry.lastStartedNanos = startedNanos
@@ -1168,7 +1269,7 @@ func (s *targetScheduler) noteChannelFailure(tier Tier, pool, proxyRaw, failureC
 	entry.lastFailureClass = failureClass
 	entry.lastStatus = status
 	if retryAfter > 0 {
-		entry.retryAfterUntil = now.Add(retryAfter).UnixNano()
+		entry.retryAfterUntil = cooldownDeadline(now.UnixNano(), retryAfter)
 	}
 	return channelChange{
 		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
@@ -1244,8 +1345,8 @@ func (s *targetScheduler) backoffDelayLocked(failures uint32, identity string, r
 }
 
 func (s *targetScheduler) rateLimitDelayLocked(failures uint32, identity string, retryAfter time.Duration) time.Duration {
-	// Caller holds s.mu; rateLimitCooldown is immutable after construction.
-	return backoffDelayForBase(s.rateLimitBase(), failures, identity, retryAfter)
+	// Caller holds s.mu; rate-limit base/max are immutable after construction.
+	return backoffDelayForBaseWithCap(s.rateLimitBase(), s.rateLimitMax(), failures, identity, retryAfter)
 }
 
 // hrwScore is a pure Rendezvous/HRW score over the full target identity plus
@@ -1765,13 +1866,15 @@ func splitNul5(s string) []string {
 }
 
 // migrateFrom copies still-future credential, credential429, target,
-// proxy429, and channel cooldowns from the old scheduler. Remaining time is
-// capped at 5 minutes. Expired cooldowns never migrate, including expired
-// failure memory (failures>0 out of cooldown): the new instance restarts
-// backoff from zero. New resources start at zero state and removed
-// identities are dropped. Proxy429 and channel migrate by (tier, pool,
-// proxy) identity only and preserve backoff/Retry-After remaining within
-// the cap; old pool-only identities (no tier separator count) are dropped.
+// proxy429, and channel cooldowns from the old scheduler. Non-429 remaining
+// (credential 401, target, channel) is capped at the generic 5 minutes;
+// proxy429 and credential429 remaining is capped at the NEW configured 429
+// max. Expired cooldowns never migrate, including expired failure memory
+// (failures>0 out of cooldown): the new instance restarts backoff from
+// zero. New resources start at zero state and removed identities are
+// dropped. Proxy429 and channel migrate by (tier, pool, proxy) identity
+// only and preserve backoff/Retry-After remaining within the cap; old
+// pool-only identities (no tier separator count) are dropped.
 // Credential429 migrates by tier+key (internal credential ID). Migrated
 // targets respect maxTargetStates and migrated proxy429/channel entries
 // respect maxProxy429States/maxChannelStates with the same deterministic
@@ -1842,7 +1945,7 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 			continue
 		}
 		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = now + int64(targetBackoffCap)
+			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
 		}
 		fresh := entry
 		s.credState[id] = &fresh
@@ -1860,7 +1963,7 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 			continue
 		}
 		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = now + int64(targetBackoffCap)
+			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
 		}
 		if len(s.targetState) >= maxTargetStates {
 			s.pruneStaleTargetsLocked(now)
@@ -1872,12 +1975,13 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		s.targetState[id] = &fresh
 		summary.Targets++
 	}
+	rateCap := s.rateLimitMax()
 	for id, entry := range cred429 {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = now + int64(targetBackoffCap)
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > rateCap {
+			entry.cooldownUntil = cooldownDeadline(now, rateCap)
 		}
 		if s.cred429State == nil {
 			s.cred429State = make(map[string]*credential429Entry)
@@ -1897,8 +2001,8 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = now + int64(targetBackoffCap)
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > rateCap {
+			entry.cooldownUntil = cooldownDeadline(now, rateCap)
 		}
 		if s.proxy429State == nil {
 			s.proxy429State = make(map[string]*proxy429Entry)
@@ -1921,7 +2025,7 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 			continue
 		}
 		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = now + int64(targetBackoffCap)
+			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
 		}
 		if s.channelState == nil {
 			s.channelState = make(map[string]*channelEntry)

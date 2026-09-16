@@ -144,7 +144,9 @@ func TestWebUIProxyUnhealthyDoubleDash(t *testing.T) {
 
 func TestWebUIProxySingleProbeButton(t *testing.T) {
 	html := proxyAvailHTML(t)
-	// Button structure: fixed-width ghost button with label + fixed spinner spans.
+	// Button structure: centered ghost button with label + spinner spans.
+	// Idle shows centered 检测; busy hides the label and shows only a centered
+	// spinner without reserving text/spinner space; completion restores 检测.
 	for _, needle := range []string{
 		`probeBtn.className="ghost probe-btn"`,
 		`probeLabel.className="probe-label"`,
@@ -153,6 +155,7 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 		`.probe-btn{min-width:`,
 		`.probe-btn .probe-spin{`,
 		`.probe-btn.is-busy .probe-spin{`,
+		`.probe-btn.is-busy .probe-label{display:none}`,
 		"@keyframes probe-spin",
 		"prefers-reduced-motion",
 		`btn.classList.add("is-busy")`,
@@ -160,19 +163,27 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 		`setAttribute("aria-busy","true")`,
 		`removeAttribute("aria-busy")`,
 		`setAttribute("aria-label","正在检测")`,
-		`setAttribute("aria-label","检测单节点传输")`,
+		`setAttribute("aria-label","检测节点可用性")`,
 		`btn.disabled=true`,
 		`btn.disabled=false`,
+		`justify-content:center`,
+		`display:none`,
+		`/api/availability/check-node`,
+		`function bulkNodeAvailable(`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("single probe button must contain %q", needle)
 		}
 	}
-	// Spinner reserves width when idle so the column never shifts.
-	if !strings.Contains(html, "visibility:hidden") || !strings.Contains(html, "visibility:visible") {
-		t.Fatal("spinner must reserve fixed width via visibility hidden/visible")
+	// Spinner must not reserve space when idle; busy shows only the spinner.
+	if strings.Contains(html, "visibility:hidden") || strings.Contains(html, "visibility:visible") {
+		t.Fatal("spinner must not reserve space via visibility hidden/visible")
 	}
-	// Visible copy stays 检测; no wide busy copy in the single-probe path.
+	if !strings.Contains(html, ".probe-btn .probe-spin{display:none") {
+		t.Fatal("idle spinner must use display:none without reserving space")
+	}
+	// Single-check path must use the scoped availability endpoint, never the
+	// transport-only probe contract (which stays preserved server-side).
 	probeIdx := strings.Index(html, "function probeProxy(p, btn)")
 	if probeIdx < 0 {
 		t.Fatal("missing probeProxy")
@@ -182,6 +193,9 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 		t.Fatal("missing bulkCheck boundary")
 	}
 	probeBlock := html[probeIdx : probeIdx+probeEnd]
+	if strings.Contains(probeBlock, "/api/proxies/probe") {
+		t.Fatal("availability table 检测 button must not use the transport-only probe endpoint")
+	}
 	if strings.Contains(probeBlock, "探测") {
 		t.Fatal("single probe path must not contain 探测 copy")
 	}
@@ -194,7 +208,7 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 	if strings.Contains(html, `probeBtn.textContent="探测"`) || strings.Contains(html, `probeBtn.textContent="检测"`) {
 		t.Fatal("probe button must use label/spinner spans, not direct textContent assignment")
 	}
-	// Batch action stays untouched.
+	// Batch action stays.
 	if !strings.Contains(html, "btn-bulk-check") || !strings.Contains(html, "批量检测") {
 		t.Fatal("batch 批量检测 action must stay")
 	}

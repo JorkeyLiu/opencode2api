@@ -60,6 +60,7 @@ type bulkNodeAvailability struct {
 type bulkCredentialAvailability struct {
 	Tier        string     `json:"tier"`
 	KeyTail     string     `json:"key_tail"`
+	Fingerprint string     `json:"fingerprint,omitempty"`
 	Pool        string     `json:"proxy_pool"`
 	Status      string     `json:"status"`
 	Reason      string     `json:"reason,omitempty"`
@@ -356,52 +357,26 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	// Apply deterministic state writes (comparative only) and transport
 	// health updates. All other outcomes remain display-only.
 	g.applyBulkWrites(ctx, results)
-	// Custom fallback channels: real minimal inference probes (per-channel
-	// chat or responses) on the same concurrency budget. Custom results never
-	// write scheduler or transport health and never record inference
-	// metrics/history.
-	customTargets := make([]bulkCustomTarget, 0, len(g.cfg.Fallback.Channels))
-	for _, ch := range g.cfg.Fallback.Channels {
-		if len(targets)+len(customTargets) >= bulkMaxTotalSends {
-			skipped++
-			truncated = true
-			break
-		}
-		customTargets = append(customTargets, bulkCustomTarget{Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model, APIKey: ch.APIKey, Protocol: fallbackChannelProtocol(ch)})
-	}
-	customResults := make([]bulkCustomResult, len(customTargets))
-	for i, ct := range customTargets {
-		if ctx.Err() != nil {
-			customResults[i] = bulkCustomResult{Target: ct, Cancelled: true}
-			continue
-		}
-		wg.Add(1)
-		go func(idx int, c bulkCustomTarget) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				customResults[idx] = bulkCustomResult{Target: c, Cancelled: true}
-				return
-			}
-			customResults[idx] = g.bulkCustomProbeOnce(ctx, c)
-		}(i, ct)
-	}
-	wg.Wait()
-	if ctx.Err() != nil {
-		partial = true
-	}
+	// Native proxy lanes only. Custom fallback channels are never probed
+	// here; per-channel custom checks use POST /api/availability/check-custom
+	// and the batch must not overwrite/clear stored custom snapshots.
 	// Build redacted per-node/per-credential projection.
-	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results, customResults, sortedNoModelList(noModel))
+	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results, []bulkCustomResult{}, sortedNoModelList(noModel))
+	resp.Custom = nil
 	// Atomically replace the admin-only latest-result snapshot (fixed
 	// bounded). It is a projection and never routing authority. Preserve
 	// useful partial node rows but visibly mark partial; never overwrite a
 	// newer complete snapshot with a fully cancelled zero-tested result.
+	// Stored per-channel custom rows are preserved verbatim.
+	existingSnap := g.bulkSnapshot.Load()
+	preservedCustom := []bulkCustomAvailability(nil)
+	if existingSnap != nil {
+		preservedCustom = append([]bulkCustomAvailability(nil), existingSnap.Custom...)
+	}
 	snap := &bulkAvailabilitySnapshot{
 		CheckedAt: checkedAt, TotalNodes: totalNodes, TestedNodes: tested,
 		SkippedNodes: skipped, Truncated: truncated, Partial: partial,
-		Custom: resp.Custom, NoModel: resp.NoModel,
+		Custom: preservedCustom, NoModel: resp.NoModel,
 	}
 	if len(resp.Nodes) > bulkMaxSnapshotNodes {
 		snap.Nodes = append([]bulkNodeAvailability(nil), resp.Nodes[:bulkMaxSnapshotNodes]...)
@@ -820,6 +795,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		tier     Tier
 		credID   string
 		disp     string
+		fp       string
 		pool     string
 		tested   int
 		success  int
@@ -882,7 +858,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			ck := credKeyFor(r.Target.Tier, r.Target.CredID, r.Target.PoolName)
 			ca, ok := creds[ck]
 			if !ok {
-				ca = &credAgg{tier: r.Target.Tier, credID: r.Target.CredID, disp: r.Target.CredDisp, pool: r.Target.PoolName}
+				ca = &credAgg{tier: r.Target.Tier, credID: r.Target.CredID, disp: r.Target.CredDisp, fp: credentialFingerprint(r.Target.Tier, r.Target.CredKey), pool: r.Target.PoolName}
 				creds[ck] = ca
 				credOrder = append(credOrder, ck)
 			}
@@ -933,7 +909,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			reason = ca.lastErr
 		}
 		credentials = append(credentials, bulkCredentialAvailability{
-			Tier: string(ca.tier), KeyTail: ca.disp, Pool: ca.pool,
+			Tier: string(ca.tier), KeyTail: ca.disp, Fingerprint: ca.fp, Pool: ca.pool,
 			Status: status, Reason: reason, TestedNodes: ca.tested, LastChecked: &checkedAt,
 			CredID: ca.credID,
 		})
@@ -970,7 +946,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 					}
 				}
 				if !found && len(credentials) < bulkMaxSnapshotCreds {
-					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierZen), KeyTail: cred.display, Pool: g.cfg.ProxyRouting.Zen, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
+					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierZen), KeyTail: cred.display, Fingerprint: credentialFingerprint(TierZen, cred.key), Pool: g.cfg.ProxyRouting.Zen, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
 				}
 			}
 		}
@@ -984,7 +960,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 					}
 				}
 				if !found && len(credentials) < bulkMaxSnapshotCreds {
-					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierGo), KeyTail: cred.display, Pool: g.cfg.ProxyRouting.Go, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
+					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierGo), KeyTail: cred.display, Fingerprint: credentialFingerprint(TierGo, cred.key), Pool: g.cfg.ProxyRouting.Go, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
 				}
 			}
 		}

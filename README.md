@@ -56,7 +56,7 @@ Field Manual WebUI 包含运行桌面、六步首次运行检查、接入手册�
 
 Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tier 分布。诊断页展示 models.dev 状态、模型原生协议与匿名判断来源、Key/代理状态、逐次上游尝试以及最近一次 Playground 追踪；实时日志通过 SSE 推送。所有动态管理数据都以 DOM 文本节点渲染。
 
-健康页为统一视图：全局就绪、`代理可用性`（传输连通性与 Zen / Go 通道合一，同一 URL 在不同池为独立成员，仅视觉分组不合并状态；Zen 与 Go 按通道分别展示，匿名 Zen 403/5xx 与限流并入 Zen 列与原因）、`凭证可用性`（按通道的密钥状态），以及`代理限流冷却`、`通道可用性冷却`、`活跃目标冷却`三张冷却表，不再有独立匿名目标表，外加`自定义 Fallback 可用性`（全部渠道真实最小推理，不写调度）。`代理可用性`页提供`批量检测`按钮，调用下述可用性接口；未被引用的暂存池不运行、不可检测。
+健康页为统一视图：全局就绪、`代理可用性`（传输连通性与 Zen / Go 通道合一，同一 URL 在不同池为独立成员，仅视觉分组不合并状态；Zen 与 Go 按通道分别展示，匿名 Zen 403/5xx 与限流并入 Zen 列与原因）、`备用模型渠道可用性`（全部自定义渠道真实最小推理，不写调度）、`凭证可用性`（按通道的密钥状态），以及`代理限流冷却`、`通道可用性冷却`、`活跃目标冷却`三张冷却表，不再有独立匿名目标表。`代理可用性`页提供`批量检测`按钮，调用下述可用性接口；未被引用的暂存池不运行、不可检测。顶栏指标为 `Active`（活跃请求）与 `Streaming`（活跃流）。
 
 自定义 session fallback（OpenAI-compatible chat/responses）：配置 `fallback: {"active":"name","channels":[{"name":"...","base_url":"https://...","api_key":"...","model":"...","protocol":"chat","reasoning_effort":""}]}`，命名唯一，active 可空、非空必须引用现有渠道，URL 仅 http/https；`protocol` 为 `chat`（Chat Completions，缺省）或 `responses`（Responses），缺省旧配置规范化为 `chat`，其他值严格拒绝；`reasoning_effort` 为 `""`（供应商默认，缺省）、`low`、`medium` 或 `high`，其他值严格拒绝，不进入接管绑定身份、不参与可用性探测。base 支持 host、host/v1 与所选协议一致的完整 endpoint；若 base 带有另一协议的完整 endpoint，按统一 API root 识别后依所选协议生成 endpoint，不产生重复坏路径（chat→`{root}/v1/chat/completions`，responses→`{root}/v1/responses`；模型发现对 host、/v1、/v1/chat/completions、/v1/responses 一律生成 `{root}/v1/models`）。仅当请求进入时已存在匿名 session+model pin 且在 pinned 匿名路径得 HTTP 429（含本地 proxy429 冷却 429）时触发；未绑定匿名 429 与认证 pin 429 不触发。无 active 时保持原 429；有 active 时当次经当时 active 渠道重试（客户端入口按渠道协议统一转换并改写为渠道模型与渠道思考强度覆盖：chat 设置 `reasoning_effort`，responses 合并/新建 `reasoning:{effort}` 并保留其他键，空值不注入，经对应 endpoint Bearer 发送，不依赖供应商会话亲和，每次带完整历史；响应/流按渠道协议转回客户端协议；自定义模型不进公开 `/v1/models`；不碰 Zen/Go 调度冷却），且无论成功与否先将会话固化到该完整渠道身份（name+规范化 base URL/authority+key 指纹/身份+配置模型+protocol），此后该会话仅走该固化渠道、不随 active 切换漂移，协议变更后旧会话本地 502；自定义错误原样返回不回退。接管键为 session，有界 4096 first-wins，容量满本地 502；热 Apply 无过滤迁移为 tombstone，删除/身份（含协议）变化后旧会话本地 502；进程期、无持久化/投影/过期，重启清空。WebUI 支持增删/改渠道（含协议选择：Chat Completions/Responses，每渠道思考强度：供应商默认/Low/Medium/High）、模型仅从下拉选择（无自由文本，已有模型预置，发现后保留或切换）并一键激活，激活经配置保存/应用持久化；模型发现失败保持 `discover_failed` code 并附加安全结构化 `reason`（dns_error/connect_refused/timeout/tls_error/transport_error/non_2xx/invalid_json/empty_list）、`endpoint`、`http_status`、`elapsed_ms`，不返回上游 body/key/Authorization 或原始错误全文。
 
@@ -69,7 +69,7 @@ Token 页面展示用量覆盖率、每分钟趋势、模型排行与 Zen/Go Tie
 | 字段 | 内容 |
 | --- | --- |
 | `version` | 当前程序版本。 |
-| `metrics` | 原有请求统计：进程启动时间、活跃请求/流、lifetime 与最近一小时成功率/延迟、端点/模型/Tier/状态码聚合，以及 60 个每分钟序列点。 |
+| `metrics` | 原有请求统计：进程启动时间、Active/Streaming（活跃请求/流）、lifetime 与最近一小时成功率/延迟、端点/模型/Tier/状态码聚合，以及 60 个每分钟序列点。 |
 | `usage` | Token 的 `lifetime` 与 `last_hour` 统计。包含 `requests`、`reported`、`coverage`、总 Token 和按模型/Tier 聚合；另有 additive `channels` 按通道聚合（自定义渠道为 `custom:<渠道名>`，旧 `custom` 合并行保留，`tiers.custom` 仍为总量）。 |
 | `upstream` | 上游请求级路由 `requests`、尝试级 `lifetime`、`last_hour` 与 `recent`。按 Tier、匿名/Key/自定义通道、Key 尾码聚合；自定义 Tier 保持 `custom`，通道为 `custom:<渠道名>`（`channels` 按此分裂，`tiers` 仍聚合）。 |
 | `resources` | 模型目录、Key 冷却、脱敏代理节点、匿名开关和 models.dev metadata 状态。 |
@@ -94,7 +94,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 | `GET` | `/api/history/proxy-stats?from=&to=&limit=` | 24h，limit 200 cap 500 |
 | `GET` | `/api/history/usage-aggregate?from=&to=&limit=` | 24h，limit 200 cap 500 |
 
-范围上限为 `retention_days`；`cursor` 为不透明 base64（稳定倒序分页）；禁用时返回 200 空 items 与 `active:false`；参数错 400。`usage-aggregate` 单遍扫描所选范围的 `requests-*.ndjson`，按模型与上游聚合（上游为 `tier`，`tier=custom` 时为完整渠道：旧 `custom` 保留合并行，新 `custom:<名>` 分行）：每项含 `calls`（范围内全部请求数）、`usage_calls`（已上报数）与仅已上报累计的 `input/output/cached/reasoning/total_tokens`，按 `total_tokens` 倒序、limit 截断并返回 `total_models/total_upstreams/truncated/gap/dropped/active/last_error/from/to`；旧历史用量行缺 `reasoning/total` 时计零且置 `legacy_incomplete:true`，不做估算，新请求已持久化真实上游上报的 `reasoning_tokens`/`total_tokens`（additive v1，旧行仍可读）。WebUI 使用统计页提供`今天|最近 24 小时|最近 7 天|本月`切换，按模型/按上游表均来自所选范围的 `usage-aggregate`（不再使用内存最近一小时），趋势/KPI/代理统计来源不变。
+范围上限为 `retention_days`；`cursor` 为不透明 base64（稳定倒序分页）；禁用时返回 200 空 items 与 `active:false`；参数错 400。`usage-aggregate` 单遍扫描所选范围的 `requests-*.ndjson`，按模型与上游聚合（上游为 `tier`，`tier=custom` 时为完整渠道：旧 `custom` 保留合并行，新 `custom:<名>` 分行）：每项含 `calls`（范围内全部请求数）、`usage_calls`（已上报数）与仅已上报累计的 `input/output/cached/reasoning/total_tokens`，另有行级 `total_complete`/`reasoning_complete`（任一已上报旧行缺 `usage_detail_complete` 时该行记 `false`，不从 input+output 合成总量；全完整行含合法零记 `true`，无已上报行亦记 `true`），按 `total_tokens` 倒序、limit 截断并返回 `total_models/total_upstreams/truncated/gap/dropped/active/last_error/from/to`；旧历史用量行缺 `reasoning/total` 时计零且置全局 `legacy_incomplete:true`，行级总量/推理展示为 `—` 而非数字 0 或部分和，不做估算，新请求已持久化真实上游上报的 `reasoning_tokens`/`total_tokens`（additive v1，旧行仍可读）。WebUI 使用统计页提供`今天|最近 24 小时|最近 7 天|本月`切换，按模型/按上游表均来自所选范围的 `usage-aggregate`（不再使用内存最近一小时），行级不完整总量/推理渲染为 `—`，趋势/KPI/代理统计来源不变。
 
 ### Playground 与诊断 API
 
@@ -255,7 +255,8 @@ cp config.example.json config.json
     "idle_conn_timeout_seconds": 120,
     "connect_timeout_seconds": 5,
     "failure_cooldown_seconds": 15,
-    "rate_limit_cooldown_seconds": 15
+    "rate_limit_cooldown_seconds": 300,
+    "rate_limit_cooldown_max_seconds": 3600
   },
   "logging": {
     "level": "info",
@@ -313,7 +314,7 @@ models.dev 使用固定 30 秒超时，每 24 小时刷新一次。标准地址�
 
 未绑定建立时每次请求按 credential×proxy×模型展开 target 候选并冻结顺序：匿名按会话对完整 target 做 HRW（Rendezvous）降序排列，保证同会话同模型同资源下顺序稳定；认证按“凭证组会话 HRW + 组内代理软亲和”排序，保证同凭证+池稳定首选同一代理、会话分散到不同凭证；无会话的后台路径使用原子 round-robin 起始偏移，不使用随机。分散与 fallback 只由该冻结顺序决定，同请求内不重排；同 target retry 永远不改变顺序，只在同一 target 上做临时性验证。同一会话+模型首次上游成功（含精确 400 同 target 重放成功）后即建立绑定：匿名绑定到含代理的完整 target，之后只用该 target；认证绑定到 tier/凭证/池/模型/协议/上游地址（代理为带代际 fencing 的当前选择），之后不再跨 Tier/跨凭证/跨池，也不再从匿名升级到认证；已建立认证可在同池同凭证同模型同协议同地址内移动：仅在传输失败（走完同 target transient retry 后、仍在发送预算内）或 HTTP 429 后、向客户端写任何字节之前尝试同池下一个健康代理，400/401/403/408/425/普通 4xx/5xx 从不移动，成功则只更新当前代理；target 侧的上游状态（prompt 缓存、Responses/reasoning 引用、路由状态）未必可跨 target 携带，因此网关取 fail-closed 防御兼容：绑定后其他失败按目标协议本地返回，而不是把已建立上下文换 target 重放。绑定为进程生命周期，不过期不淘汰，有界存储，容量满时新会话在发送前本地 502，已有绑定继续服务；进程重启清空全部绑定并重新建立。
 
-状态分层：单次前台传输错误为中性，不写 target/credential/限流冷却，也不会立即因 timeout/refused 将 proxy 标 unhealthy；它只触发现有异步中性 proxy 健康 verification，只有该独立 probe 明确得到连通性失败（timeout/refused 等）时才允许翻转 proxy healthy。HTTP 状态从不直接改变 proxy 健康；HTTP 401 按 tier+凭证全局冷却该 credential；HTTP 429 按（通道，代理池，代理原始身份）全局冷却该通道限定代理（跨模型/凭证/匿名/认证通道与客户端会话共享，匿名与认证 Zen 共享 Zen 通道，Go 独立；同 URL 不同池隔离），未绑定建立时直接过滤该代理的全部候选，匿名已绑定 pin 在冷却期间本地返回目标协议 429 + 剩余 Retry-After（不发送不 fallback），认证已绑定则在预算与候选允许时尝试同池下一代理；同一 tier+凭证在一次请求内两个不同代理先后 429 才额外冷却该凭证（取第二个 Retry-After，Zen/Go 即使 key 文本相同也隔离），单个代理 429 从不冷却凭证；403/5xx 只冷却命中的单个 (tier, credential, pool, proxy, model) target，同 credential 同 proxy 的其他模型不受影响，且仅在同 tier+凭证另有节点成功作比较时才写入（通道，池，代理）通道可用性冷却，无比较成功的单个 403/5xx 仅展示不写入通道层；408/425 为 transient 中性（可 retry/fallback，不冷却）；普通 4xx（含精确 400 与 404/422）中性，既不冷却也不清理已有状态（其中精确 400 另有同 target 单次会话重放语义，见上）；2xx 只清理本 target 与本 credential 的 401 状态，并仅当本次发送起始时间不早于最新失败时清理本通道代理的 429/通道状态与本凭证的 429 状态（已在途中早发的 2xx 不得清除更新的冷却，多个更新的失败保持权威）。Route Session override 是内存 Gateway authority 的一部分（首代无状态派生，仅 400 轮换后存储，有界、idle TTL、确定性淘汰；认证 scope 与代理无关因而移动不换会话值，匿名 scope 含代理；不持久化、不进投影/日志/metrics/history/admin），与会话+模型 target 绑定不同：后者是进程生命周期 durable 绑定，不过期不淘汰，有界 fail-closed。进程重启清空全部内存冷却/override/绑定。冷却按双基准指数退避（确定性 ±20% 抖动，总封顶 5 分钟）：非 429 用 `performance.failure_cooldown_seconds`，429 proxy/credential 用 `performance.rate_limit_cooldown_seconds`；429/403 的 `Retry-After` 取更大值同样封顶 5 分钟；429 仍只触发中性异步 proxy verification，从不直接改变 healthy。代理限流/通道表有界（与代理资源成比例，过期修剪 + 最老空闲确定性淘汰，全活跃时允许临时超出不断活跃冷却）。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态 key×healthy proxy 遍历，只读 healthy 代理顺序，不读写前台 credential/target/限流/通道/route-session 状态，也不改变 proxy healthy/checking；刷新 context deadline/cancel 只是刷新失败，失败保留旧快照。健康诊断另设“代理限流冷却”表（通道、池、脱敏节点、活跃/失败数/剩余/下次可用/分类/状态，有界截断）与“通道可用性冷却”表（同维，仅比较探测写入）；目标表仅描述按模型 403/5xx，不再解释 429。
+状态分层：单次前台传输错误为中性，不写 target/credential/限流冷却，也不会立即因 timeout/refused 将 proxy 标 unhealthy；它只触发现有异步中性 proxy 健康 verification，只有该独立 probe 明确得到连通性失败（timeout/refused 等）时才允许翻转 proxy healthy。HTTP 状态从不直接改变 proxy 健康；HTTP 401 按 tier+凭证全局冷却该 credential；HTTP 429 按（通道，代理池，代理原始身份）全局冷却该通道限定代理（跨模型/凭证/匿名/认证通道与客户端会话共享，匿名与认证 Zen 共享 Zen 通道，Go 独立；同 URL 不同池隔离），未绑定建立时直接过滤该代理的全部候选，匿名已绑定 pin 在冷却期间本地返回目标协议 429 + 剩余 Retry-After（不发送不 fallback），认证已绑定则在预算与候选允许时尝试同池下一代理；同一 tier+凭证在一次请求内两个不同代理先后 429 才额外冷却该凭证（取第二个 Retry-After，Zen/Go 即使 key 文本相同也隔离），单个代理 429 从不冷却凭证；403/5xx 只冷却命中的单个 (tier, credential, pool, proxy, model) target，同 credential 同 proxy 的其他模型不受影响，且仅在同 tier+凭证另有节点成功作比较时才写入（通道，池，代理）通道可用性冷却，无比较成功的单个 403/5xx 仅展示不写入通道层；408/425 为 transient 中性（可 retry/fallback，不冷却）；普通 4xx（含精确 400 与 404/422）中性，既不冷却也不清理已有状态（其中精确 400 另有同 target 单次会话重放语义，见上）；2xx 只清理本 target 与本 credential 的 401 状态，并仅当本次发送起始时间不早于最新失败时清理本通道代理的 429/通道状态与本凭证的 429 状态（已在途中早发的 2xx 不得清除更新的冷却，多个更新的失败保持权威）。Route Session override 是内存 Gateway authority 的一部分（首代无状态派生，仅 400 轮换后存储，有界、idle TTL、确定性淘汰；认证 scope 与代理无关因而移动不换会话值，匿名 scope 含代理；不持久化、不进投影/日志/metrics/history/admin），与会话+模型 target 绑定不同：后者是进程生命周期 durable 绑定，不过期不淘汰，有界 fail-closed。进程重启清空全部内存冷却/override/绑定。冷却按双基准指数退避（确定性 ±20% 抖动）：非 429 用 `performance.failure_cooldown_seconds`、总封顶 5 分钟（`Retry-After` 取更大值同样封顶 5 分钟）；429 proxy/credential 用 `performance.rate_limit_cooldown_seconds` 起算、`performance.rate_limit_cooldown_max_seconds` 封顶（默认 300/3600，`Retry-After` 取 `max(退避, Retry-After)` 后同样 clamp 到 429 最大值）；429 仍只触发中性异步 proxy verification，从不直接改变 healthy。代理限流/通道表有界（与代理资源成比例，过期修剪 + 最老空闲确定性淘汰，全活跃时允许临时超出不断活跃冷却）。下游请求取消不更新任何状态。模型/能力目录刷新使用独立的无状态 key×healthy proxy 遍历，只读 healthy 代理顺序，不读写前台 credential/target/限流/通道/route-session 状态，也不改变 proxy healthy/checking；刷新 context deadline/cancel 只是刷新失败，失败保留旧快照。健康诊断另设“代理限流冷却”表（通道、池、脱敏节点、活跃/失败数/剩余/下次可用/分类/状态，有界截断）与“通道可用性冷却”表（同维，仅比较探测写入）；目标表仅描述按模型 403/5xx，不再解释 429。
 
 共享单池示例（默认，行为与旧版单代理池一致）：
 
@@ -417,8 +418,9 @@ socks5://127.0.0.1:1080  # 备用代理
 | `performance.max_conns_per_host` | 每个主机的最大并发连接数。`0` 表示不设置上限。 |
 | `performance.idle_conn_timeout_seconds` | 空闲连接在连接池中保留的时间。 |
 | `performance.connect_timeout_seconds` | 与上游或代理建立 TCP 连接的超时时间。 |
-| `performance.failure_cooldown_seconds` | 非 429 冷却的基础时间。401 按此对 credential 全局指数退避，403/5xx 按此对单个 target 与通道可用性指数退避，均带确定性 ±20% 抖动、总封顶 5 分钟；403 的 `Retry-After` 取更大值同样封顶。 |
-| `performance.rate_limit_cooldown_seconds` | 429 冷却基准（秒）。429 proxy-level 与 credential429 指数退避的基础时间，默认 15，范围 1–300；旧配置缺失时默认 15。429 按此对池限定代理全局指数退避、同一 tier+凭证双代理 429 时对该凭证指数退避，均带确定性 ±20% 抖动、总封顶 5 分钟；429 的 `Retry-After` 取更大值同样封顶。 |
+| `performance.failure_cooldown_seconds` | 非 429 冷却的基础时间。401 按此对 credential 全局指数退避，403/5xx 按此对单个 target 与通道可用性指数退避，均带确定性 ±20% 抖动、总封顶 5 分钟；403 的 `Retry-After` 取更大值同样封顶 5 分钟。 |
+| `performance.rate_limit_cooldown_seconds` | 429 冷却最小值/起始/基准（秒），默认 300。429 proxy 与 credential429 连续打击按此起算指数退避（`base*2^min(n-1,3)`，确定性 ±20% 抖动）；缺失或显式 0 时兼容为 300，已有显式非零值保持不变；必须 ≥1。 |
+| `performance.rate_limit_cooldown_max_seconds` | 429 冷却最大值（秒），默认 3600。429 指数退避与 `Retry-After`（取 `max(退避, Retry-After)` 后）均 clamp 到此最大值，而非通用 5 分钟封顶；缺失或显式 0 时兼容为 3600；必须 ≥1 且 ≥最小值。非 429 冷却仍用通用 5 分钟封顶与 `failure_cooldown_seconds` 行为。时长换算与连续翻倍均为饱和安全，极端取值不会回绕为负。 |
 
 ### `logging`
 
@@ -444,9 +446,9 @@ WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy；运行�
 
 ### 配置保存与热重载
 
-WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后将旧 Gateway 状态按 identity 迁移到新实例：仍在未来的 credential/target/代理限流/通道/凭证限流冷却（credential 按 tier+key、target 按完整 identity、代理限流与通道按 tier+池+URL、凭证限流按 tier+key）与 proxy 传输健康（按池+URL）迁移，冷却剩余时间封顶 5 分钟；仍新鲜的 route-session override 仅当 target scope（不含 client 维度）仍有效时迁移，其中认证 scope 要求 proxy-free 且池仍为该通道所属池，新鲜度按 idle TTL 判断；会话+模型 pin 按 identity 无有效性过滤迁移至 cap 上限（含当前代理与代际，认证按绑定判有效、匿名按完整 target），呈 tombstone 绑定，被删除/变化的 target 仍命中原绑定并本地 502，不重建不 fallback；其余删除身份丢弃、新增从零开始，迁移日志仅聚合计数。再写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断，仍使用旧状态。
+WebUI 保存时先解析并验证完整候选配置、创建新的连接池和 Gateway，然后将旧 Gateway 状态按 identity 迁移到新实例：仍在未来的 credential/target/代理限流/通道/凭证限流冷却（credential 按 tier+key、target 按完整 identity、代理限流与通道按 tier+池+URL、凭证限流按 tier+key）与 proxy 传输健康（按池+URL）迁移，其中非 429（credential 401、target、通道）剩余封顶通用 5 分钟，proxy429 与 credential429 剩余按新配置的 429 最大值 clamp（不按通用 5 分钟）；仍新鲜的 route-session override 仅当 target scope（不含 client 维度）仍有效时迁移，其中认证 scope 要求 proxy-free 且池仍为该通道所属池，新鲜度按 idle TTL 判断；会话+模型 pin 按 identity 无有效性过滤迁移至 cap 上限（含当前代理与代际，认证按绑定判有效、匿名按完整 target），呈 tombstone 绑定，被删除/变化的 target 仍命中原绑定并本地 502，不重建不 fallback；其余删除身份丢弃、新增资源按新最小值/最大值从零开始，迁移日志仅聚合计数。再写入临时文件、保留 `config.json.bak` 并替换 `config.json`，最后原子切换新请求使用的运行实例。写入或初始化失败时旧实例继续工作；切换前已开始的请求不会中断，仍使用旧状态。
 
-keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用切换）、上游、重试、模型、性能（含 `failure_cooldown_seconds` 与 `rate_limit_cooldown_seconds`，新 scheduler 按新值、已有冷却仅保留剩余不重算）、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化为新格式（旧顶层 `proxies` / `proxyfile` 不保留），原有注释不会保留。
+keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用切换）、上游、重试、模型、性能（含 `failure_cooldown_seconds`、`rate_limit_cooldown_seconds` 与 `rate_limit_cooldown_max_seconds`，新 scheduler 按新最小值/最大值、新资源用新值、已有 429 冷却仅保留剩余并按新最大值 clamp 而不重算）、优先 tier 和日志级别会立即生效。`listen`、`webui.listen` 与 `webui.enabled` 会保存但需要重启进程。WebUI 也提供“从磁盘重载”，外部编辑后的配置仍会经过相同的验证与回滚流程。保存后的 JSON 会被规范化为新格式（旧顶层 `proxies` / `proxyfile` 不保留），原有注释不会保留。
 
 
 ## 会话 ID
