@@ -85,7 +85,8 @@ func TestStaleCleanupReportsIndependently(t *testing.T) {
 	if string(out) != string(raw) {
 		t.Fatalf("chat replay must preserve stale refs byte-identically")
 	}
-	// Responses with no stale refs: report both false, body behavior unchanged.
+	// Responses with no stale refs: report both false, but Responses
+	// cache/store defaults still apply.
 	raw2, _ := json.Marshal(map[string]any{"model": "m"})
 	out2, report2, err := applyRouteSessionToBodyWithReport(raw2, "rss_new", ProtocolResponses, true)
 	if err != nil {
@@ -94,8 +95,15 @@ func TestStaleCleanupReportsIndependently(t *testing.T) {
 	if report2.DroppedPreviousResponseID || report2.DroppedReasoningRefs {
 		t.Fatalf("no-stale report must be false/false: %+v", report2)
 	}
-	if string(out2) != string(raw2) {
-		t.Fatalf("no-stale body must stay byte-identical")
+	var decoded map[string]any
+	if err := json.Unmarshal(out2, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringAt(decoded, "prompt_cache_key"); got != routeWireSession("rss_new") {
+		t.Fatalf("responses must set prompt_cache_key to wire session, got %q", got)
+	}
+	if got, ok := decoded["store"]; !ok || got != false {
+		t.Fatalf("responses must default store:false, got %v", decoded["store"])
 	}
 	// Legacy wrapper preserves exact body behavior.
 	legacyOut, err := applyRouteSessionToBody(raw, "rss_new", ProtocolChat, true)

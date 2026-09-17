@@ -435,11 +435,14 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	} else {
 		req.Header.Set("Authorization", "Bearer "+tgt.CredKey)
 	}
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	// Official OpenCode wire identity for Zen/Go probes: deterministic
+	// canonical session/request/project, stateless and scheduler-neutral.
+	// No generic affinity headers; custom fallback probes stay separate.
+	req.Header.Set("User-Agent", opencodeWireUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-session", "bulk-probe")
-	req.Header.Set("x-session-affinity", "bulk-probe")
-	req.Header.Set("X-Session-Id", "bulk-probe")
+	req.Header.Set("x-opencode-session", bulkProbeWireSession())
+	req.Header.Set("x-opencode-request", bulkProbeWireRequest())
+	req.Header.Set("x-opencode-project", bulkProbeWireProject())
 	resp, err := tgt.Proxy.client.Do(req)
 	durationMS := max(time.Since(started).Milliseconds(), 0)
 	if err != nil {

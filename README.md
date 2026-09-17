@@ -453,14 +453,14 @@ keys、代理池（含 `proxy_pools` 与 `proxy_routing` 的新增/修改/引用
 
 ## 会话 ID
 
-代理会为上游添加 OpenCode 使用的 `User-Agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request` 和 `x-opencode-project` 请求头。
+代理会为上游添加 OpenCode 使用的 `User-Agent`（`opencode/1.18.31` 裸版本）、`x-opencode-client`、`x-opencode-session`、`x-opencode-request`、`x-opencode-project` 和可选的 `x-parent-session-id` 请求头（仅官方集合，不发送 `x-session-affinity` / `X-Session-Id`）。
 
-- 每个请求使用不同的 `x-opencode-request`，同一次请求的重试保持不变。
-- 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成客户端会话 ID。
+- 每个请求使用不同的 `x-opencode-request`（`msg_` 规范形状），同一次请求的重试保持不变。
+- 优先使用客户端提供的 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`、`x-session-id`、`conversation-id`、`conversation_id` 或 `metadata.session_id` 生成客户端会话 ID（入站解析不变）。
 - 没有显式会话标识时，使用第一条用户消息生成稳定客户端会话 ID，使同一段多轮对话保持一致；客户端会话是建立身份，从不原文出进程：未绑定时用于稳定排序并按冻结顺序 fallback，400 恢复不修改它、不重排已冻结候选；首次成功后同一会话+模型建立绑定，匿名绑定完整 target，认证绑定 tier/凭证/池/模型/协议/上游地址并允许同池内移动，之后不再跨 Tier/跨凭证/跨池回退。
 - 如果两个独立会话的第一条消息完全相同，建议由客户端发送不同的 `x-session-id`，以确保两个会话严格分离。
-- 上游实际发送的是按 route target scope 分离的 Route Session（上游 authority、tier、credential 内部身份、proxy pool、target protocol，不含 model、不存原始 credential；认证 scope 与代理无关，匿名 scope 另含 proxy 原始身份）：写入 `x-opencode-session`、`x-session-affinity`、`X-Session-Id`，并同步覆盖已存在的 body `conversation_id`、`metadata.session_id`（缺失不新增，类型不符明确报错）。首代稳定无状态派生，仅 400 轮换后保存有界内存 override；Apply 会按 target scope 有效性/新鲜度过滤迁移，重启丢失；override 不进日志/metrics/history/admin。会话+模型 target 绑定与此不同：它是 durable 建立绑定，Apply 无有效性过滤迁移为 tombstone 身份（被删除/变化的 target 仍保持绑定并本地 502，不重建），重启清空；新会话与已存在会话的 429 行为不同——前者在建立时过滤该代理全部候选，匿名已存在会话在冷却期间本地返回目标协议 429 + 剩余 Retry-After，认证已存在会话在预算与候选允许时可移向同池下一代理，否则同样本地失败。
-- 上游请求同时发送 `x-session-affinity`、`X-Session-Id` 和可选的 `x-parent-session-id`，以兼容 OpenCode 近期的会话关联要求。
+- 上游实际发送的是按 route target scope 分离的 Route Session（上游 authority、tier、credential 内部身份、proxy pool、target protocol，不含 model、不存原始 credential；认证 scope 与代理无关，匿名 scope 另含 proxy 原始身份）：内部仍为 target-bound 非原文的 `rss_*`（首代稳定无状态派生，仅 400 轮换后保存有界内存 override），线上编码为与之稳定对应的规范 OpenCode 形伪名 wire ID（`ses_` 规范形状、`msg_` 请求、`40hex` 项目、父会话亦为规范伪名），写入 `x-opencode-session` / `x-opencode-request` / `x-opencode-project` / 规范父会话，并同步覆盖已存在的 body `conversation_id`、`metadata.session_id` 为同一 wire 会话（缺失不新增，类型不符明确报错）；Responses 还会将 `prompt_cache_key` 置为同一 wire 会话、`store` 缺失时默认 `false`（显式值保留）。Apply 会按 target scope 有效性/新鲜度过滤迁移 route override，重启丢失；override 不进日志/metrics/history/admin。会话+模型 target 绑定与此不同：它是 durable 建立绑定，Apply 无有效性过滤迁移为 tombstone 身份（被删除/变化的 target 仍保持绑定并本地 502，不重建），重启清空；新会话与已存在会话的 429 行为不同——前者在建立时过滤该代理全部候选，匿名已存在会话在冷却期间本地返回目标协议 429 + 剩余 Retry-After，认证已存在会话在预算与候选允许时可移向同池下一代理，否则同样本地失败。
+- 可用性探测使用同样的官方集合与确定性规范会话/请求/项目值，无状态且不写 scheduler；自定义 fallback 通道不带供应商会话亲和语义。
 
 ## 致谢
 

@@ -632,12 +632,14 @@ type staleCleanup struct {
 
 // applyRouteSessionToBody builds one candidate-local body from the frozen
 // canonical tier body: it overwrites only already-present session fields
-// (top-level conversation_id, metadata.session_id) with the target-bound
-// route session and never invents schema-foreign fields. The canonical bytes
-// are never mutated; when nothing changes the canonical slice is returned
-// untouched. On replay for a Responses target it additionally drops
-// previous_response_id and reasoning input items. Malformed session fields
-// fail loudly instead of being silently dropped.
+// (top-level conversation_id, metadata.session_id) with the canonical
+// OpenCode-shaped wire encoding of the target-bound route session and never
+// invents schema-foreign fields except the Responses cache/store defaults
+// (prompt_cache_key set to the wire session, store defaulting to false). The
+// canonical bytes are never mutated; when nothing changes the canonical slice
+// is returned untouched. On replay for a Responses target it additionally
+// drops previous_response_id and reasoning input items. Malformed session
+// fields fail loudly instead of being silently dropped.
 func applyRouteSessionToBody(canonical []byte, routeSession string, protocol Protocol, stripStale bool) ([]byte, error) {
 	out, _, err := applyRouteSessionToBodyWithReport(canonical, routeSession, protocol, stripStale)
 	return out, err
@@ -653,14 +655,18 @@ func applyRouteSessionToBodyWithReport(canonical []byte, routeSession string, pr
 	if err := json.Unmarshal(canonical, &payload); err != nil {
 		return nil, report, fmt.Errorf("route session body rewrite: %w", err)
 	}
+	// Wire session is the canonical OpenCode-shaped encoding of the internal
+	// target-bound rss_* token; headers use the same mapping so body and
+	// header stay consistent without leaking internal or raw values.
+	wireSession := routeWireSession(routeSession)
 	changed := false
 	if _, ok := payload["conversation_id"]; ok {
 		raw := payload["conversation_id"]
 		if _, ok := raw.(string); !ok {
 			return nil, report, errors.New("conversation_id must be a string")
 		}
-		if payload["conversation_id"] != routeSession {
-			payload["conversation_id"] = routeSession
+		if payload["conversation_id"] != wireSession {
+			payload["conversation_id"] = wireSession
 			changed = true
 		}
 	}
@@ -671,8 +677,8 @@ func applyRouteSessionToBodyWithReport(canonical []byte, routeSession string, pr
 				if _, ok := md["session_id"].(string); !ok {
 					return nil, report, errors.New("metadata.session_id must be a string")
 				}
-				if md["session_id"] != routeSession {
-					md["session_id"] = routeSession
+				if md["session_id"] != wireSession {
+					md["session_id"] = wireSession
 					changed = true
 				}
 			}
@@ -680,6 +686,16 @@ func applyRouteSessionToBodyWithReport(canonical []byte, routeSession string, pr
 		// Non-object metadata cannot carry session_id: retain it untouched.
 		// Returning an error here would reject legitimate string metadata on
 		// same-protocol passthrough, and silently dropping it would lose data.
+	}
+	if protocol == ProtocolResponses {
+		if got, ok := payload["prompt_cache_key"]; !ok || got != wireSession {
+			payload["prompt_cache_key"] = wireSession
+			changed = true
+		}
+		if _, ok := payload["store"]; !ok {
+			payload["store"] = false
+			changed = true
+		}
 	}
 	if stripStale && protocol == ProtocolResponses {
 		droppedPrev, droppedReasoning := stripResponsesStaleRefs(payload)
@@ -2458,20 +2474,17 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("User-Agent", opencodeWireUserAgent())
 	req.Header.Set("x-opencode-client", "cli")
-	// Upstream route session: target-bound, never the raw client session.
-	// Request/project/parent correlation still comes from ids.
-	req.Header.Set("x-opencode-session", routeSession)
-	// OpenCode 1.18.x sends these correlation headers to preserve provider-side
-	// prompt/session affinity. Keep the legacy x-opencode-session header too so
-	// older Zen deployments continue to recognize the request.
-	req.Header.Set("x-session-affinity", routeSession)
-	req.Header.Set("X-Session-Id", routeSession)
-	req.Header.Set("x-opencode-request", ids.Request)
-	req.Header.Set("x-opencode-project", ids.Project)
-	if ids.ParentSession != "" {
-		req.Header.Set("x-parent-session-id", ids.ParentSession)
+	// Upstream route session: internal target-bound rss_* token encoded as a
+	// canonical OpenCode-shaped pseudonymous wire session, never raw client
+	// material. Official OpenCode-provider requests use only the official
+	// header set: no generic x-session-affinity / X-Session-Id.
+	req.Header.Set("x-opencode-session", routeWireSession(routeSession))
+	req.Header.Set("x-opencode-request", requestWireID(ids.Request))
+	req.Header.Set("x-opencode-project", projectWireID(ids.Project))
+	if parent := parentWireSession(ids.ParentSession); parent != "" {
+		req.Header.Set("x-parent-session-id", parent)
 	}
 	if protocol == ProtocolAnthropic {
 		req.Header.Set("x-api-key", key)

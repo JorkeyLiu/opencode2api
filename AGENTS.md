@@ -98,8 +98,13 @@
   and never leaves the process raw; upstream receives only the target-bound
   route session (upstream authority, tier, internal credential identity, proxy
   pool, raw proxy identity, target protocol; never the model, never raw
-  secrets) in the upstream session headers and in the already-present body
-  session fields. The authenticated route session excludes the proxy so a
+  secrets), encoded on the wire as canonical OpenCode-shaped pseudonymous IDs
+  (internal `rss_*` stays target-bound/non-raw; headers/body carry its stable
+  canonical mapping). OpenCode-provider requests use the official header set
+  only (bare `opencode/x.y.z` UA, `x-opencode-client`, `x-opencode-session` /
+  `request` / `project`, optional canonical parent; no generic affinity headers);
+  Responses `prompt_cache_key` / `store` / session body fields match the same
+  wire session. The authenticated route session excludes the proxy so a
   within-pool proxy move preserves the same upstream session value; the
   anonymous route session includes it. The first generation is a stable stateless derivation; only
   a 400 rotation stores a bounded in-memory override. Before a pin exists for

@@ -200,11 +200,25 @@ func TestAnonymous400ReplaysSameTarget(t *testing.T) {
 	if sessions[0] == "" || sessions[1] == "" || sessions[0] == sessions[1] {
 		t.Fatalf("two upstream sessions must differ: %q", sessions)
 	}
-	if !strings.HasPrefix(sessions[0], "rss_") || !strings.HasPrefix(sessions[1], "rss_") {
-		t.Fatalf("upstream sessions must be route sessions, got %q", sessions)
+	for _, s := range sessions {
+		if !isCanonicalWireSession(s) {
+			t.Fatalf("upstream wire session must be canonical ses_* shape, got %q", s)
+		}
+		if strings.HasPrefix(s, "rss_") {
+			t.Fatalf("wire session must not leak internal rss_* token, got %q", s)
+		}
+		if s == ids.Session {
+			t.Fatalf("upstream wire session must never equal the client session")
+		}
+		if strings.Contains(s, ids.Session) {
+			t.Fatalf("wire session must not embed raw client session")
+		}
 	}
-	if sessions[0] == ids.Session || sessions[1] == ids.Session {
-		t.Fatalf("upstream route session must never equal the client session")
+	// Internal route sessions stay rss_* and distinct from the client session;
+	// the wire headers above are their canonical encodings.
+	internalFirst := deriveFirstRouteSession(ids.Session, routeScopeForCandidate(gateway.cfg.Upstream.Zen, targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "a", ProxyRaw: "direct"}, ProtocolChat))
+	if !strings.HasPrefix(internalFirst, "rss_") || internalFirst == ids.Session {
+		t.Fatalf("internal route session must stay rss_* distinct from client, got %q", internalFirst)
 	}
 	for i, raw := range bodies {
 		payload := decodeBody(t, raw)
@@ -1110,11 +1124,21 @@ func TestBodyRewriteProtocols(t *testing.T) {
 			t.Fatalf("err=%v", err)
 		}
 		payload := decodeBody(t, out)
-		if got := stringAt(payload, "conversation_id"); got != "rss_new" {
-			t.Fatalf("conversation_id=%q", got)
+		want := routeWireSession("rss_new")
+		if !isCanonicalWireSession(want) {
+			t.Fatalf("wire helper must be canonical, got %q", want)
 		}
-		if got := stringAt(payload, "metadata", "session_id"); got != "rss_new" {
-			t.Fatalf("session_id=%q", got)
+		if got := stringAt(payload, "conversation_id"); got != want {
+			t.Fatalf("conversation_id=%q want wire %q", got, want)
+		}
+		if got := stringAt(payload, "metadata", "session_id"); got != want {
+			t.Fatalf("session_id=%q want wire %q", got, want)
+		}
+		if _, ok := payload["prompt_cache_key"]; ok {
+			t.Fatalf("chat must not add prompt_cache_key")
+		}
+		if _, ok := payload["store"]; ok {
+			t.Fatalf("chat must not add store")
 		}
 	})
 	t.Run("missing_fields_are_not_invented", func(t *testing.T) {
@@ -1170,6 +1194,13 @@ func TestBodyRewriteProtocols(t *testing.T) {
 				t.Fatalf("must strip reasoning items")
 			}
 		}
+		want := routeWireSession("rss_new")
+		if got := stringAt(payload, "prompt_cache_key"); got != want {
+			t.Fatalf("prompt_cache_key=%q want wire %q", got, want)
+		}
+		if got, ok := payload["store"]; !ok || got != false {
+			t.Fatalf("responses must default store:false, got %v", payload["store"])
+		}
 	})
 	t.Run("first_send_keeps_stale_refs", func(t *testing.T) {
 		raw := canonical(map[string]any{
@@ -1180,8 +1211,19 @@ func TestBodyRewriteProtocols(t *testing.T) {
 		if err != nil {
 			t.Fatalf("err=%v", err)
 		}
-		if string(out) != string(raw) {
-			t.Fatalf("first send without session fields must not strip refs")
+		payload := decodeBody(t, out)
+		if _, ok := payload["previous_response_id"]; !ok {
+			t.Fatalf("first send must keep previous_response_id")
+		}
+		if len(sliceAt(payload, "input")) != 1 {
+			t.Fatalf("first send must keep reasoning items")
+		}
+		want := routeWireSession("rss_new")
+		if got := stringAt(payload, "prompt_cache_key"); got != want {
+			t.Fatalf("prompt_cache_key=%q want wire %q", got, want)
+		}
+		if got, ok := payload["store"]; !ok || got != false {
+			t.Fatalf("responses must default store:false, got %v", payload["store"])
 		}
 	})
 }
