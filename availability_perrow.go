@@ -189,36 +189,7 @@ func (g *Gateway) runCredentialCheck(ctx context.Context, tier Tier, cred creden
 	// (proxyAffinityScore descending, proxy name tie-break) so the
 	// credential's preferred eligible proxy runs first. No pins,
 	// route-session overrides, or generation state participate.
-	nowNanos := time.Now().UnixNano()
-	eligible := []*proxyTransport{}
-	if pool := g.pools[poolName]; pool != nil {
-		active := false
-		for _, name := range g.cfg.UniqueActivePools() {
-			if name == poolName {
-				active = true
-				break
-			}
-		}
-		if active {
-			for _, proxy := range pool.items {
-				if proxy == nil || !proxy.healthy.Load() {
-					continue
-				}
-				if until, _, ok := g.scheduler.proxy429CooldownStatus(tier, poolName, proxy.name); ok && until > nowNanos {
-					continue
-				}
-				eligible = append(eligible, proxy)
-			}
-			sort.SliceStable(eligible, func(i, j int) bool {
-				si := proxyAffinityScore(cred.id, poolName, eligible[i].name)
-				sj := proxyAffinityScore(cred.id, poolName, eligible[j].name)
-				if si != sj {
-					return si > sj
-				}
-				return eligible[i].name < eligible[j].name
-			})
-		}
-	}
+	eligible := g.credentialProbeEligible(tier, cred.id, poolName)
 	if len(eligible) > bulkMaxNodesPerCredential {
 		eligible = eligible[:bulkMaxNodesPerCredential]
 	}
@@ -327,11 +298,53 @@ func (g *Gateway) mergeCredentialSnapshotRow(checkedAt time.Time, fresh bulkCred
 	g.bulkSnapshot.Store(snap)
 }
 
+// credentialProbeEligible returns the full ordered candidate set for one
+// credential's minimal Zen probes: active pool, transport-healthy, not under
+// tier-qualified (tier,pool,proxy) proxy429 cooldown, ordered by
+// authenticated credential soft-affinity (score descending, proxy name
+// tie-break). No pins, route-session overrides, or generation state
+// participate. Callers apply the per-credential send cap; proxy429-cooled
+// nodes are never sent to and never contribute evidence.
+func (g *Gateway) credentialProbeEligible(tier Tier, credID, poolName string) []*proxyTransport {
+	nowNanos := time.Now().UnixNano()
+	eligible := []*proxyTransport{}
+	if pool := g.pools[poolName]; pool != nil {
+		active := false
+		for _, name := range g.cfg.UniqueActivePools() {
+			if name == poolName {
+				active = true
+				break
+			}
+		}
+		if active {
+			for _, proxy := range pool.items {
+				if proxy == nil || !proxy.healthy.Load() {
+					continue
+				}
+				if until, _, ok := g.scheduler.proxy429CooldownStatus(tier, poolName, proxy.name); ok && until > nowNanos {
+					continue
+				}
+				eligible = append(eligible, proxy)
+			}
+			sort.SliceStable(eligible, func(i, j int) bool {
+				si := proxyAffinityScore(credID, poolName, eligible[i].name)
+				sj := proxyAffinityScore(credID, poolName, eligible[j].name)
+				if si != sj {
+					return si > sj
+				}
+				return eligible[i].name < eligible[j].name
+			})
+		}
+	}
+	return eligible
+}
+
 func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) customCheckResponse {
 	checkedAt := time.Now().UTC()
 	tgt := bulkCustomTarget{
 		ID: ch.ID, Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model,
 		APIKey: ch.APIKey, Protocol: fallbackChannelProtocol(ch),
+		Effort: fallbackChannelEffort(ch),
 	}
 	// Single send on the shared bulk budget (sem guards against concurrent
 	// batch/scoped/per-row checks only via bulkMu; the semaphore keeps the

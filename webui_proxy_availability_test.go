@@ -111,7 +111,7 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 func TestWebUIProxyActualStatusCells(t *testing.T) {
 	html := proxyAvailHTML(t)
 	// Header carries the canonical three columns.
-	for _, needle := range []string{"<th>传输</th>", "<th>匿名</th>", "<th>认证</th>"} {
+	for _, needle := range []string{`<th class="avail-c">传输</th>`, `<th class="avail-c">匿名</th>`, `<th class="avail-c">认证</th>`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("proxy table must contain canonical column %q", needle)
 		}
@@ -290,6 +290,153 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("dynamic text must use textContent %q", needle)
+		}
+	}
+}
+
+func TestWebUIAvailabilityTableAlignment(t *testing.T) {
+	html := proxyAvailHTML(t)
+	// Reusable scoped alignment classes, centered via the cell (pill stays inline-block).
+	for _, needle := range []string{
+		`table.table th.avail-c,table.table td.avail-c{text-align:center}`,
+		`table.table th.avail-l,table.table td.avail-l{text-align:left}`,
+		`table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowrap}`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("alignment CSS must contain %q", needle)
+		}
+	}
+	// Proxy header alignment: text left, sequence/status/action centered, timestamp left+nowrap.
+	for _, needle := range []string{
+		`<th class="avail-l">节点</th>`,
+		`<th class="avail-l">代理池</th>`,
+		`<th class="avail-c">序号</th>`,
+		`<th class="avail-l">路由通道</th>`,
+		`<th class="avail-c">传输</th>`,
+		`<th class="avail-c">匿名</th>`,
+		`<th class="avail-c">认证</th>`,
+		`<th class="avail-ts">上次检测</th>`,
+		`<th class="avail-c">操作</th>`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("proxy header must contain %q", needle)
+		}
+	}
+	// Custom header alignment mirrors the same reusable classes.
+	for _, needle := range []string{
+		`<th class="avail-l">渠道</th>`,
+		`<th class="avail-l">地址</th>`,
+		`<th class="avail-l">模型</th>`,
+		`<th class="avail-c">状态</th>`,
+		`<th class="avail-l">原因</th>`,
+		`<th class="avail-ts">上次检测</th>`,
+		`<th class="avail-c">操作</th>`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("custom header must contain %q", needle)
+		}
+	}
+	// Proxy cells: th/td class parity.
+	for _, needle := range []string{
+		`td.className="wrap avail-l"`,
+		`cell(tr,p.proxy_pool||p.pool||"—","avail-l")`,
+		`cell(tr,p.index,"avail-c")`,
+		`var op=document.createElement("td"); op.className="avail-c";`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("proxy cell must contain %q", needle)
+		}
+	}
+	if got := strings.Count(html, `td.className="avail-c"`); got < 3 {
+		t.Fatalf("proxy status/action cells must use avail-c at least 3 times, got %d", got)
+	}
+	// Custom cells: th/td class parity.
+	for _, needle := range []string{
+		`td.className="avail-l"`,
+		`td.className="wrap avail-l"`,
+		`var cop=document.createElement("td"); cop.className="avail-c";`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("custom cell must contain %q", needle)
+		}
+	}
+	proxyBlock := sliceFn(html, `var tp=$("tbody-proxies")`, `emptyRow(tp,9,`)
+	customBlock := sliceFn(html, `var tcb=$("tbody-custom")`, `emptyRow(tcb,7,`)
+	if proxyBlock == "" {
+		t.Fatal("missing proxy render block")
+	}
+	if customBlock == "" {
+		t.Fatal("missing custom render block")
+	}
+	// Centered sequence/status/action parity inside each render block.
+	for _, needle := range []string{`avail-c`, `avail-ts`} {
+		if !strings.Contains(proxyBlock, needle) {
+			t.Fatalf("proxy block must contain %q", needle)
+		}
+		if !strings.Contains(customBlock, needle) {
+			t.Fatalf("custom block must contain %q", needle)
+		}
+	}
+	// Left/nowrap timestamp parity with matching tooltip semantics in both tables.
+	for _, block := range []string{proxyBlock, customBlock} {
+		if !strings.Contains(block, `td.className="avail-ts"`) {
+			t.Fatal("timestamp cell must use avail-ts")
+		}
+		if !strings.Contains(block, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"`) &&
+			!strings.Contains(block, `td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"`) {
+			t.Fatal("timestamp cell must keep 上次检测/尚未批量检测 tooltip semantics")
+		}
+	}
+	if !strings.Contains(customBlock, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"`) {
+		t.Fatal("custom timestamp must carry title parity without changing timestamp semantics")
+	}
+	// Text columns stay left and keep wrapping for long values.
+	for _, needle := range []string{`td.className="wrap avail-l"`} {
+		if !strings.Contains(proxyBlock, needle) {
+			t.Fatalf("proxy text cell must contain %q", needle)
+		}
+		if !strings.Contains(customBlock, needle) {
+			t.Fatalf("custom text cell must contain %q", needle)
+		}
+	}
+	// Empty-row colspans unchanged.
+	for _, needle := range []string{`emptyRow(tp,9,"暂无代理")`, `emptyRow(tcb,7,"暂无自定义渠道")`} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("empty row must stay %q", needle)
+		}
+	}
+	// No margin/inline-offset hacks in these render blocks.
+	for _, hack := range []string{`margin`, `translate`, `.style.`, `paddingLeft`, `padding-left`, `textAlign`, `style="text-align`, `px`} {
+		if strings.Contains(proxyBlock, hack) {
+			t.Fatalf("proxy render block must not use offset hack %q", hack)
+		}
+		if strings.Contains(customBlock, hack) {
+			t.Fatalf("custom render block must not use offset hack %q", hack)
+		}
+	}
+	// Preserved layout/scrolling behavior and bulk action alignment.
+	for _, needle := range []string{
+		`table-wrap scroll-bound`,
+		`position:sticky`,
+		`min-width:760px`,
+		`btn-bulk-check`,
+		`批量检测`,
+		`justify-content:flex-end`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("preserved layout must contain %q", needle)
+		}
+	}
+	// Probe button dimensions/spinner/interaction unchanged.
+	for _, needle := range []string{
+		`.probe-btn{min-width:`,
+		`probeBtn.className="ghost probe-btn"`,
+		`cbtn.className="ghost probe-btn"`,
+		`btn.classList.add("is-busy")`,
+		`btn.classList.remove("is-busy")`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("probe button contract must contain %q", needle)
 		}
 	}
 }

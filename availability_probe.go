@@ -58,7 +58,12 @@ func (g *Gateway) bulkProbeModel(tier Tier, public bool) (string, Protocol, bool
 // probes only (custom suppliers keep their own wire semantics). Native Zen
 // anonymous/authenticated probes use bulkProbeCanonicalBody plus
 // newUpstreamRequest so they share the gateway preparation/header path.
-func bulkProbeRequestBody(model string, protocol Protocol) ([]byte, error) {
+// The configured channel reasoning effort is overlaid with the existing
+// fallback helper: supplier-default ("") strips target strength and
+// "inherit" preserves the converted strength, both no-ops on the minimal
+// body that carries no strength; explicit low/medium/high inject the same
+// target-protocol strength the normal fallback path sends.
+func bulkProbeRequestBody(model string, protocol Protocol, effort string) ([]byte, error) {
 	var payload map[string]any
 	switch protocol {
 	case ProtocolResponses:
@@ -68,6 +73,7 @@ func bulkProbeRequestBody(model string, protocol Protocol) ([]byte, error) {
 	default:
 		payload = map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1, "stream": false}
 	}
+	applyFallbackReasoningEffort(payload, effort, protocol)
 	return json.Marshal(payload)
 }
 
@@ -110,6 +116,10 @@ type bulkCustomTarget struct {
 	Model    string
 	APIKey   string
 	Protocol Protocol
+	// Effort is the configured channel reasoning effort ("" / inherit /
+	// low / medium / high), overlaid on the minimal probe body with the
+	// same helper the normal fallback path uses.
+	Effort string
 }
 
 type bulkCustomResult struct {
@@ -156,27 +166,25 @@ func bulkCustomOutcomeLabel(r bulkCustomResult) string {
 
 func (g *Gateway) bulkCustomProbeOnce(parent context.Context, tgt bulkCustomTarget) bulkCustomResult {
 	proto := fallbackChannelProtocol(FallbackChannelConfig{Protocol: tgt.Protocol})
-	endpoint := fallbackEndpointURL(tgt.BaseURL, proto)
 	started := time.Now()
 	startedNanos := started.UnixNano()
-	if endpoint == "" || strings.TrimSpace(tgt.APIKey) == "" || strings.TrimSpace(tgt.Model) == "" {
+	if strings.TrimSpace(tgt.APIKey) == "" || strings.TrimSpace(tgt.Model) == "" {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: 0, Cancelled: parent.Err() != nil}
 	}
-	body, err := bulkProbeRequestBody(strings.TrimSpace(tgt.Model), proto)
+	body, err := bulkProbeRequestBody(strings.TrimSpace(tgt.Model), proto, tgt.Effort)
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, Cancelled: parent.Err() != nil}
 	}
 	sendCtx, cancel := context.WithTimeout(parent, bulkPerSendTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(sendCtx, http.MethodPost, endpoint, bytes.NewReader(body))
+	// Shared custom request construction (endpoint, Content-Type,
+	// non-streaming Accept, User-Agent, x-opencode-client, Bearer auth).
+	// Probes carry no supplier session affinity and write no
+	// binding/scheduler/health/metrics/history state.
+	req, err := newCustomChannelRequest(sendCtx, tgt.BaseURL, proto, body, tgt.APIKey, false)
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: max(time.Since(started).Milliseconds(), 0), TransportErr: err, Cancelled: parent.Err() != nil}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(tgt.APIKey))
 	resp, err := g.fallbackCustomClient().Do(req)
 	durationMS := max(time.Since(started).Milliseconds(), 0)
 	if err != nil {
@@ -184,7 +192,9 @@ func (g *Gateway) bulkCustomProbeOnce(parent context.Context, tgt bulkCustomTarg
 	}
 	defer resp.Body.Close()
 	status := resp.StatusCode
-	if status/100 != 2 {
+	// Exactly HTTP 200 with a valid body is success; other HTTP statuses
+	// (including other 2xx) remain their real outcomes.
+	if status != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status}
 	}

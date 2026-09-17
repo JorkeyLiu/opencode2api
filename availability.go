@@ -358,8 +358,11 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	// health updates. All other outcomes remain display-only.
 	g.applyBulkWrites(ctx, results)
 	// Native proxy lanes only. Custom fallback channels are never probed
-	// here; per-channel custom checks use POST /api/availability/check-custom
-	// and the batch must not overwrite/clear stored custom snapshots.
+	// here; the credential table uses POST /api/availability/check-credentials
+	// and the custom table uses POST /api/availability/check-customs, while
+	// per-row checks use POST /api/availability/check-node,
+	// /api/availability/check-credential, and /api/availability/check-custom.
+	// The batch must not overwrite/clear stored custom snapshots.
 	// Build redacted per-node/per-credential projection.
 	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results, []bulkCustomResult{}, sortedNoModelList(noModel))
 	resp.Custom = nil

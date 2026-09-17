@@ -224,6 +224,10 @@ html,body{max-width:100%;overflow-x:hidden}
 .probe-btn.is-busy .probe-spin{display:inline-block;animation:probe-spin .8s linear infinite}
 @keyframes probe-spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.probe-btn.is-busy .probe-spin{animation:none;opacity:.7;border-top-color:currentColor}}
+/* availability-table alignment: semantic column alignment shared by proxy + custom tables */
+table.table th.avail-c,table.table td.avail-c{text-align:center}
+table.table th.avail-l,table.table td.avail-l{text-align:left}
+table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -336,19 +340,26 @@ html,body{max-width:100%;overflow-x:hidden}
         <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
           <button class="ghost" id="btn-bulk-check" type="button">批量检测</button>
         </div>
-        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>节点</th><th>代理池</th><th>序号</th><th>路由通道</th><th>传输</th><th>匿名</th><th>认证</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th class="avail-l">节点</th><th class="avail-l">代理池</th><th class="avail-c">序号</th><th class="avail-l">路由通道</th><th class="avail-c">传输</th><th class="avail-c">匿名</th><th class="avail-c">认证</th><th class="avail-ts">上次检测</th><th class="avail-c">操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
         <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px"><span class="note" id="proxies-note"></span><span class="note" id="bulk-state" style="text-align:right"></span></div>
       </div>
       <div class="section">
         <h2>备用模型渠道可用性</h2>
-        <div class="cap">已配置渠道列表与最近检测结果，可逐个检测。</div>
-        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>渠道</th><th>地址</th><th>模型</th><th>状态</th><th>原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-custom"></tbody></table></div>
-        <div class="note" id="custom-note"></div>
+        <div class="cap">已配置渠道列表与最近检测结果，可整体或逐个检测。</div>
+        <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
+          <button class="ghost" id="btn-bulk-check-customs" type="button">批量检测渠道</button>
+        </div>
+        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th class="avail-l">渠道</th><th class="avail-l">地址</th><th class="avail-l">模型</th><th class="avail-c">状态</th><th class="avail-l">原因</th><th class="avail-ts">上次检测</th><th class="avail-c">操作</th></tr></thead><tbody id="tbody-custom"></tbody></table></div>
+        <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px"><span class="note" id="custom-note"></span><span class="note" id="bulk-customs-state" style="text-align:right"></span></div>
       </div>
       <div class="section">
         <h2>凭证可用性</h2>
-        <div class="cap">各密钥的检测状态与所属池。完整密钥不在页面显示。</div>
+        <div class="cap">各密钥的检测状态与所属池，可整体或逐个检测。完整密钥不在页面显示。</div>
+        <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
+          <button class="ghost" id="btn-bulk-check-credentials" type="button">批量检测凭证</button>
+        </div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>密钥尾码</th><th>上游</th><th>代理池</th><th>状态</th><th>可用/全部</th><th>失败次数</th><th>原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px"><span class="note" id="bulk-credentials-state" style="text-align:right"></span></div>
       </div>
       <div class="section">
         <h2>代理限流冷却（429 全局）</h2>
@@ -556,6 +567,7 @@ var S = {
   logEvents:[], logPaused:false, logGap:"", logFail:0,
   es:null, timer:null,
   bulkCustom:[], bulkNoModel:[], customAvail:[],
+  availBusy:false,
   secretReveal:{seq:0,promise:null,data:null}
 };
 
@@ -1471,12 +1483,12 @@ function renderHealth(){
   var tp=$("tbody-proxies"); clear(tp);
   (r.proxies||[]).forEach(function(p){
     var tr=document.createElement("tr");
-    (function(){ var td=document.createElement("td"); var v=p.address||"—"; td.textContent=v; td.title="节点："+v; td.className="wrap"; tr.appendChild(td); })();
-    cell(tr,p.proxy_pool||p.pool||"—"); cell(tr,p.index);
-    (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由："+routingRefsLabel(p.routing); td.className="wrap"; tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用"; td.appendChild(h); tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var v=p.address||"—"; td.textContent=v; td.title="节点："+v; td.className="wrap avail-l"; tr.appendChild(td); })();
+    cell(tr,p.proxy_pool||p.pool||"—","avail-l"); cell(tr,p.index,"avail-c");
+    (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由："+routingRefsLabel(p.routing); td.className="wrap avail-l"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.className="avail-c"; var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用"; td.appendChild(h); tr.appendChild(td); })();
     (function(){
-      var td=document.createElement("td");
+      var td=document.createElement("td"); td.className="avail-c";
       if(!proxyAnonLaneOn(p)){ td.textContent="—"; td.title=proxyAnonDashTitle(p); tr.appendChild(td); return; }
       var lane=laneObsOf(p,"anonymous");
       var txt=obsDisplayText(lane.obs,lane.code);
@@ -1484,15 +1496,15 @@ function renderHealth(){
       s.title="匿名："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
     })();
     (function(){
-      var td=document.createElement("td");
+      var td=document.createElement("td"); td.className="avail-c";
       if(!proxyAuthLaneOn(p)){ td.textContent="—"; td.title=proxyAuthDashTitle(p); tr.appendChild(td); return; }
       var lane=laneObsOf(p,"authenticated");
       var txt=obsDisplayText(lane.obs,lane.code);
       var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
       s.title="认证："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
     })();
-    (function(){ var td=document.createElement("td"); td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
-    var op=document.createElement("td");
+    (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
+    var op=document.createElement("td"); op.className="avail-c";
     var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost probe-btn"; probeBtn.setAttribute("aria-label","检测节点可用性");
     var probeLabel=document.createElement("span"); probeLabel.className="probe-label"; probeLabel.textContent="检测"; probeBtn.appendChild(probeLabel);
     var probeSpin=document.createElement("span"); probeSpin.className="probe-spin"; probeSpin.setAttribute("aria-hidden","true"); probeBtn.appendChild(probeSpin);
@@ -1587,13 +1599,13 @@ function renderHealth(){
     var customs=mergeCustomRows((r.custom||[]),(S.customAvail||[]));
     customs.forEach(function(c){
       var tr=document.createElement("tr");
-      (function(){ var td=document.createElement("td"); var dn=String(c.name||c.id||"—"); td.textContent=dn; td.title="渠道："+dn; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.textContent=c.base_url||c.BaseURL||"—"; td.title="地址："+(c.base_url||c.BaseURL||"—"); td.className="wrap"; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap"; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); var v=customStatusLabel(c.status||"untested"); td.appendChild(el("span",v,"pill "+(v==="可用"?"ok":(v==="未检测"||v==="未定"?"neutral":(v==="限流"?"warn":"bad"))))); td.title="状态："+v; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); var rv=customReasonLabel(c.reason||"—"); td.textContent=rv; td.title="原因："+rv; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; tr.appendChild(td); })();
-      var cop=document.createElement("td");
+      (function(){ var td=document.createElement("td"); td.className="avail-l"; var dn=String(c.name||c.id||"—"); td.textContent=dn; td.title="渠道："+dn; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.textContent=c.base_url||c.BaseURL||"—"; td.title="地址："+(c.base_url||c.BaseURL||"—"); td.className="wrap avail-l"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap avail-l"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.className="avail-c"; var v=customStatusLabel(c.status||"untested"); td.appendChild(el("span",v,"pill "+(v==="可用"?"ok":(v==="未检测"||v==="未定"?"neutral":(v==="限流"?"warn":"bad"))))); td.title="状态："+v; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.className="avail-l"; var rv=customReasonLabel(c.reason||"—"); td.textContent=rv; td.title="原因："+rv; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
+      var cop=document.createElement("td"); cop.className="avail-c";
       var cbtn=document.createElement("button"); cbtn.type="button"; cbtn.className="ghost probe-btn"; cbtn.setAttribute("aria-label","检测自定义渠道可用性");
       var clabel=document.createElement("span"); clabel.className="probe-label"; clabel.textContent="检测"; cbtn.appendChild(clabel);
       var cspin=document.createElement("span"); cspin.className="probe-spin"; cspin.setAttribute("aria-hidden","true"); cbtn.appendChild(cspin);
@@ -1629,6 +1641,8 @@ function nodeResultText(node){
   return "匿名 "+laneText("anonymous")+"，认证 "+laneText("authenticated");
 }
 function probeProxy(p, btn){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
   var pool=p.proxy_pool||p.pool||"";
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
@@ -1638,8 +1652,8 @@ function probeProxy(p, btn){
     var node=nodes[0]||null;
     toast("检测 "+pool+"#"+p.index+": "+(node?nodeResultText(node):"无结果"));
     return refreshMonitor({force:true});
-  }).catch(function(err){ toast("检测失败："+err.message,true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} });
+  }).catch(function(err){ toast(availBusyMessage(err,"检测 "+pool+"#"+p.index),true); })
+  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} setAvailBusy(false); });
 }
 function customRowKey(r){ r=r||{}; return String(r.id||r.name||""); }
 function mergeCustomRows(server, cached){
@@ -1656,6 +1670,8 @@ function mergeCustomRowIntoCache(row){
   S.customAvail.push(row);
 }
 function probeCredential(k, btn){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
   var fp=k.fingerprint||k.Fingerprint||"";
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
@@ -1666,10 +1682,12 @@ function probeCredential(k, btn){
     var reason=customReasonLabel(String(cred.reason||""));
     toast("检测 "+(k.id||"")+"："+st+(reason&&reason!=="—"?("（"+reason+"）"):""));
     return refreshMonitor({force:true});
-  }).catch(function(err){ toast("检测失败："+err.message,true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} });
+  }).catch(function(err){ toast(availBusyMessage(err,"检测 "+(k.id||"")),true); })
+  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} setAvailBusy(false); });
 }
 function probeCustom(c, btn){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
   var cid=String(c.id||c.name||"");
   var name=String(c.name||cid||"");
   btn.disabled=true; btn.classList.add("is-busy");
@@ -1681,10 +1699,23 @@ function probeCustom(c, btn){
     var st=row?customStatusLabel(String(row.status||"untested")):"未知";
     toast("检测 "+name+"："+(st||"未知"));
     return refreshMonitor({force:true});
-  }).catch(function(err){ toast("检测失败："+err.message,true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测自定义渠道可用性");}catch(e){} });
+  }).catch(function(err){ toast(availBusyMessage(err,"检测 "+name),true); })
+  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测自定义渠道可用性");}catch(e){} setAvailBusy(false); });
+}
+function availBatchButtons(){ var out=[]; ["btn-bulk-check","btn-bulk-check-credentials","btn-bulk-check-customs"].forEach(function(id){ var b=$(id); if(b)out.push(b); }); return out; }
+function setAvailBusy(on){
+  try{ S.availBusy=!!on; }catch(e){}
+  availBatchButtons().forEach(function(b){ b.disabled=!!on; });
+  try{ var rows=document.querySelectorAll(".probe-btn"); for(var i=0;i<rows.length;i++){ rows[i].disabled=!!on; } }catch(e){}
+}
+function availBusyMessage(err, scope){
+  var m=String((err&&err.message)||"");
+  if(m.indexOf("already running")>=0||m.indexOf("bulk_busy")>=0||m.indexOf("409")>=0)return "另一检测正在进行，请稍候再试";
+  return scope+"失败："+(m||"未知错误");
 }
 function bulkCheck(){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
   var btn=$("btn-bulk-check"); var note=$("bulk-state");
   if(btn)btn.disabled=true;
   if(note)note.textContent="批量检测进行中…";
@@ -1698,10 +1729,45 @@ function bulkCheck(){
     if(note)note.textContent=msg;
     toast(msg);
     return refreshMonitor({force:true});
-  }).catch(function(err){ if(note)note.textContent="批量检测失败"; toast("批量检测失败："+err.message,true); })
-  .then(function(){ if(btn)btn.disabled=false; });
+  }).catch(function(err){ if(note)note.textContent="批量检测失败"; toast(availBusyMessage(err,"批量检测"),true); })
+  .then(function(){ if(btn)btn.disabled=false; setAvailBusy(false); });
 }
 (function(){ var b=$("btn-bulk-check"); if(b)b.addEventListener("click",bulkCheck); })();
+function bulkCheckCredentials(){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
+  var note=$("bulk-credentials-state");
+  if(note)note.textContent="批量检测凭证进行中…";
+  return api("/api/availability/check-credentials",{method:"POST",body:"{}"}).then(function(res){
+    var creds=res.credentials||[];
+    var msg="批量检测凭证完成：共检测 "+creds.length+" 个凭证";
+    if(res.truncated)msg+="（部分截断）";
+    if(res.partial)msg+="（部分结果）";
+    if((res.no_model||[]).length)msg+="（部分通道无可用模型）";
+    if(note)note.textContent=msg;
+    toast(msg);
+    return refreshMonitor({force:true});
+  }).catch(function(err){ if(note)note.textContent="批量检测凭证失败"; toast(availBusyMessage(err,"批量检测凭证"),true); })
+  .then(function(){ setAvailBusy(false); });
+}
+(function(){ var b=$("btn-bulk-check-credentials"); if(b)b.addEventListener("click",bulkCheckCredentials); })();
+function bulkCheckCustoms(){
+  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  setAvailBusy(true);
+  var note=$("bulk-customs-state");
+  if(note)note.textContent="批量检测渠道进行中…";
+  return api("/api/availability/check-customs",{method:"POST",body:"{}"}).then(function(res){
+    var customs=res.custom||[];
+    var msg="批量检测渠道完成：共检测 "+customs.length+" 个渠道";
+    if(res.truncated)msg+="（部分截断）";
+    if(res.partial)msg+="（部分结果）";
+    if(note)note.textContent=msg;
+    toast(msg);
+    return refreshMonitor({force:true});
+  }).catch(function(err){ if(note)note.textContent="批量检测渠道失败"; toast(availBusyMessage(err,"批量检测渠道"),true); })
+  .then(function(){ setAvailBusy(false); });
+}
+(function(){ var b=$("btn-bulk-check-customs"); if(b)b.addEventListener("click",bulkCheckCustoms); })();
 function manualRefresh(scope){
   var ids=["btn-refresh-catalog","btn-refresh-metadata","btn-refresh-all"];
   var buttons=ids.map(function(id){return $(id);});
@@ -2180,12 +2246,11 @@ function saveFallbackModal(){
   for(var i=0;i<chans.length;i++){ if(i!==st.index&&String(chans[i].id||"").trim()===chanID){ if(errEl)errEl.textContent="渠道 ID "+chanID+" 重复"; toast("渠道 ID "+chanID+" 重复",true); return; } }
   for(var j=0;j<chans.length;j++){ if(j!==st.index&&String(chans[j].name||"").trim()===name){ if(errEl)errEl.textContent="渠道名称 "+name+" 重复"; toast("渠道名称 "+name+" 重复",true); return; } }
   var backup={channels:chans.slice(),active:String(S.fbDraft.active||"")};
-  var pushed=false;
   var entry={id:chanID,name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
   if(isNew){
     entry.api_key={id:"",display:""};
     entry._newKey=nv;
-    chans.push(entry); pushed=true;
+    chans.push(entry);
   } else {
     var old=chans[st.index];
     var oldDisplay=String((old.api_key&&old.api_key.display)||"");
@@ -2206,27 +2271,7 @@ function saveFallbackModal(){
   }).catch(function(err){
     if(saveBtn)saveBtn.disabled=false;
     S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
-    if(!pushed&&st.index!==null&&st.index!==undefined){
-      try{
-        var cur=S.fbDraft.channels[st.index];
-        if(cur){
-          var re={id:chanID,name:name,base_url:base,api_key:{id:kid,display:String((cur.api_key&&cur.api_key.display)||"")},model:model,protocol:proto,reasoning_effort:effort};
-          if(nv&&nv!==String(st.origDisplay||"")&&nv!==String(st.originalSecret||""))re._newKey=nv;
-          S.fbDraft.channels[st.index]=re;
-        }
-      }catch(e){}
-    } else if(pushed){
-      try{
-        for(var k=S.fbDraft.channels.length-1;k>=0;k--){
-          if(String(S.fbDraft.channels[k].id||"")===chanID&&S.fbDraft.channels[k]._newKey===nv){ S.fbDraft.channels.splice(k,1); break; }
-        }
-      }catch(e){}
-      try{
-        var draftEntry={id:chanID,name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
-        if(nv)draftEntry._newKey=nv;
-        S.fbDraft.channels.push(draftEntry);
-      }catch(e){}
-    }
+    try{ renderFallbackList(); }catch(e){}
     if(errEl)errEl.textContent=(err&&err.message)||"保存失败";
   });
 }
@@ -2248,6 +2293,7 @@ function deleteFallbackModal(){
   }).catch(function(err){
     if(delBtn)delBtn.disabled=false;
     S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
+    try{ renderFallbackList(); }catch(e){}
     if(errEl)errEl.textContent=(err&&err.message)||"删除失败";
   });
 }
@@ -2799,10 +2845,16 @@ function reconcileAfterSuccess(sentUpdate, serverConfig){
   }catch(e){}
   try{
     var serverChans=((serverConfig&&serverConfig.fallback&&serverConfig.fallback.channels)||[]);
-    var byName={};
-    serverChans.forEach(function(c){ byName[String(c.name||"")]=c; });
+    var byId={};
+    var byNameLegacy={};
+    serverChans.forEach(function(c){
+      var sid=String(c.id||"").trim();
+      if(sid)byId[sid]=c;
+      else byNameLegacy[String(c.name||"")]=c;
+    });
     (S.fbDraft.channels||[]).forEach(function(c){
-      var sc=byName[String(c.name||"")];
+      var cid=String(c.id||"").trim();
+      var sc=cid?byId[cid]:byNameLegacy[String(c.name||"")];
       if(!sc)return;
       var skid=String((sc.api_key&&sc.api_key.id)||"");
       var sdisp=String((sc.api_key&&sc.api_key.display)||"");

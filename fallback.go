@@ -904,6 +904,35 @@ func fallbackObservabilityChannel(id string) string {
 	return string(TierCustom) + ":" + trimmed
 }
 
+// newCustomChannelRequest is the single shared constructor for custom-channel
+// HTTP sends: endpoint (unified API-root rule for the channel protocol),
+// Content-Type, parameterized Accept (streaming sends accept event streams,
+// probes accept JSON only), User-Agent, x-opencode-client, Bearer auth, and
+// the caller-supplied body carrying the channel model/protocol identity.
+// Probes stay sessionless/stateless: no supplier session affinity headers,
+// no binding, no scheduler/health/metrics/history writes (enforced by the
+// callers, which never touch those layers for custom sends).
+func newCustomChannelRequest(ctx context.Context, baseURL string, proto Protocol, body []byte, apiKey string, streaming bool) (*http.Request, error) {
+	endpoint := fallbackEndpointURL(baseURL, proto)
+	if endpoint == "" {
+		return nil, errors.New("fallback channel base_url must not be empty")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if streaming {
+		req.Header.Set("Accept", "application/json, text/event-stream")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
+	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	return req, nil
+}
+
 // fallbackCustomClient returns the Gateway custom-channel HTTP client,
 // defaulting to a direct client when unset (tests may override).
 func (g *Gateway) fallbackCustomClient() *http.Client {
@@ -938,15 +967,10 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	if endpoint == "" {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(chatBody))
+	req, err := newCustomChannelRequest(ctx, ch.BaseURL, channelProtocol, chatBody, ch.APIKey, true)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(ch.APIKey))
 	// No supplier session affinity headers; every request carries the full
 	// client-provided history in the chat body.
 	fakeProxy := &proxyTransport{name: normalizeFallbackBaseURL(ch.BaseURL), pool: "fallback"}

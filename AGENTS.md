@@ -248,9 +248,16 @@
   clears/sets proxy429); manual refresh shares the scheduled stateless path
   and its concurrency gate, so it never reads or writes proxy or foreground
   scheduler state.
-- Availability management: `POST /api/availability/check` sends real minimal
+- Availability management: `POST /api/availability/check` (proxy scope: all
+  nodes, anonymous and authenticated lanes) sends real minimal
   inference (`stream:false`, minimal messages, ~1 token max output) per lane,
-  never `GET /v1/models` as an availability verdict. Availability rows are
+  never `GET /v1/models` as an availability verdict. `POST
+  /api/availability/check-credentials` covers all configured authenticated
+  credentials only (no anonymous, no custom); `POST
+  /api/availability/check-customs` covers every configured custom channel
+  exactly once including inactive ones (no native nodes or credentials).
+  All three share the bulk rate limit and the single-flight gate (second
+  operation gets 409). Availability rows are
   latest real minimal-inference observations: the exact HTTP status is kept
   where present; only 200 is success; the authenticated probe is
   `unconfigured` and sends nothing without keys. UI/resources MUST NOT infer a
@@ -274,7 +281,9 @@
   their configured model plus channel protocol (chat → `/v1/chat/completions`,
   responses → `/v1/responses`, via the unified API-root rule);
   custom results never write Zen scheduler or transport health and never record
-  inference metrics/history. Model discovery may still use `GET {root}/v1/models`
+  inference metrics/history. The scoped customs batch probes the channels
+  under the same per-channel rule while the proxy batch never probes custom
+  channels. Model discovery may still use `GET {root}/v1/models`
   (host, `/v1`, either full inference endpoint all normalize to `/v1/models`)
   but MUST never be called an availability verdict; discovery failures keep code
   `discover_failed` with safe `reason` (`dns_error`/`connect_refused`/`timeout`/

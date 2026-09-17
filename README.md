@@ -128,7 +128,9 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 | 方法 | 路径 | 用途与限速 |
 | --- | --- | --- |
 | `POST` | `/api/proxies/probe` | 按具名 pool 与池内 index 探测单个 proxy 的传输健康；每客户端每分钟最多 10 次。 |
-| `POST` | `/api/availability/check` | 批量可用性检测（全部渠道真实最小推理）：原生按目录实际可服务模型与原生协议 POST `stream:false` 约 1 token，自定义渠道按其配置协议（Chat Completions/Responses）用配置模型测对应 endpoint；请求体必须为严格空对象 `{}`；每客户端每分钟最多 3 次，同时只允许一次运行（忙时 `409`）。 |
+| `POST` | `/api/availability/check` | 代理批量检测（原生节点匿名/认证通道真实最小推理）：原生按目录实际可服务模型与原生协议 POST `stream:false` 约 1 token；请求体必须为严格空对象 `{}`；每客户端每分钟最多 3 次，同时只允许一次运行（忙时 `409`）。 |
+| `POST` | `/api/availability/check-credentials` | 凭证批量检测（全部已配置认证凭证，不含匿名与自定义渠道）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
+| `POST` | `/api/availability/check-customs` | 渠道批量检测（全部已配置自定义渠道，含未启用渠道，不含原生节点与凭证）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
 | `POST` | `/api/fallback/discover` | 自定义渠道模型发现（GET `{root}/v1/models` 仅下拉，host//v1/完整推理 endpoint 统一归一）：支持未保存新 base_url+明文 key 与已保存 masked secret id；限流 10/分钟，限大小/超时，验证模型 id，`no-store` 不泄露 key；失败保持 `discover_failed` 并附加 `reason`/`endpoint`/`http_status`/`elapsed_ms` 安全分类。 |
 | `POST` | `/api/models/refresh` | 手动刷新模型目录（`catalog`）、models.dev metadata（`metadata`）或两者（`all`）；每客户端每分钟最多 3 次。 |
 
@@ -139,7 +141,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 {"scope": "all"}
 ```
 
- `scope` 只能是 `catalog`、`metadata` 或 `all`。探针只接受已被 anonymous/authenticated 引用的运行时池与合法池内 index，不接受 URL 或敏感值，因此无法被指向任意目标；未被引用的暂存池不可探测（`unknown_pool`）。探针是显式的管理健康动作：它可以改变该 proxy 的传输健康（`healthy`），但绝不读写 credential / target / 代理限流调度状态，也不清理或设置 429 冷却；WebUI 资源页每行 proxy 的“探测”按钮即调用此接口，目录/metadata 快照旁的“刷新目录 / 刷新 metadata / 全部刷新”按钮调用刷新接口。手动刷新复用定时刷新的无状态逻辑（失败保留旧快照），不触碰 proxy 健康/检查状态与前台 credential / target / 代理限流冷却；与定时刷新共享去重门，所需组件正忙时返回 HTTP `409` 而不叠加工作。批量检测对活跃节点发真实最小推理（目录驱动选模型：匿名选免费且 Zen 可服务，认证选 Zen 实际可服务；无模型时 `no_model`/`inconclusive`，不用 `/v1/models` 冒充成功；模型发现仍可用 GET 但绝不作为可用性判定）：匿名探测只影响匿名通道、从不影响认证与配置凭证；真实凭证 401 冷却该凭证；成功仅清理通道/限流（带陈旧发送保护），成功+429 写代理限流、成功+403/5xx 写通道可用性，无比较成功时 403/5xx 与单个 429 仅展示不写入，无比较成功的双 429 写凭证限流；传输不定性、408/425、普通 4xx、解析/空结果与超时/取消仅展示；单次与整批超时只用于诊断。全部自定义渠道在同一响应内按各自协议真实探测（配置模型+对应 endpoint 最小请求），结果不写 Zen 调度与传输健康、不记推理指标/历史。探针与刷新统一返回 HTTP `200` 并内嵌结果（`result` / `refreshed` 与快照摘要，不含全量模型列表）；参数错误返回相应 `4xx`。成功与失败分别以 `info` / `warn` 记录完成事件，错误文本经过脱敏。
+ `scope` 只能是 `catalog`、`metadata` 或 `all`。探针只接受已被 anonymous/authenticated 引用的运行时池与合法池内 index，不接受 URL 或敏感值，因此无法被指向任意目标；未被引用的暂存池不可探测（`unknown_pool`）。探针是显式的管理健康动作：它可以改变该 proxy 的传输健康（`healthy`），但绝不读写 credential / target / 代理限流调度状态，也不清理或设置 429 冷却；WebUI 资源页每行 proxy 的“探测”按钮即调用此接口，目录/metadata 快照旁的“刷新目录 / 刷新 metadata / 全部刷新”按钮调用刷新接口。手动刷新复用定时刷新的无状态逻辑（失败保留旧快照），不触碰 proxy 健康/检查状态与前台 credential / target / 代理限流冷却；与定时刷新共享去重门，所需组件正忙时返回 HTTP `409` 而不叠加工作。批量检测对活跃节点发真实最小推理（目录驱动选模型：匿名选免费且 Zen 可服务，认证选 Zen 实际可服务；无模型时 `no_model`/`inconclusive`，不用 `/v1/models` 冒充成功；模型发现仍可用 GET 但绝不作为可用性判定）：匿名探测只影响匿名通道、从不影响认证与配置凭证；真实凭证 401 冷却该凭证；成功仅清理通道/限流（带陈旧发送保护），成功+429 写代理限流、成功+403/5xx 写通道可用性，无比较成功时 403/5xx 与单个 429 仅展示不写入，无比较成功的双 429 写凭证限流；传输不定性、408/425、普通 4xx、解析/空结果与超时/取消仅展示；单次与整批超时只用于诊断。凭证批量检测覆盖全部已配置认证凭证（经其所属池节点发送，不含匿名通道；无密钥时不发送），渠道批量检测覆盖全部已配置自定义渠道（含未启用，按其配置协议与配置模型测对应 endpoint 最小请求，不含原生节点与凭证）；自定义渠道结果不写 Zen 调度与传输健康、不记推理指标/历史。探针与刷新统一返回 HTTP `200` 并内嵌结果（`result` / `refreshed` 与快照摘要，不含全量模型列表）；参数错误返回相应 `4xx`。成功与失败分别以 `info` / `warn` 记录完成事件，错误文本经过脱敏。
 
 ## 编译
 

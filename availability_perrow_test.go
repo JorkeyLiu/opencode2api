@@ -688,11 +688,12 @@ func TestPerRowWebUIContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(data)
-	// Credential + custom tables carry 操作 columns.
-	if !strings.Contains(html, "上次检测</th><th>操作</th>") {
+	// Credential + custom tables carry 操作 columns (proxy/custom use the
+	// shared centered alignment class; credential keeps the plain header).
+	if !strings.Contains(html, "上次检测</th>") || !strings.Contains(html, "操作</th>") {
 		t.Fatalf("credential/custom tables must carry 操作 column")
 	}
-	if got := strings.Count(html, "<th>操作</th>"); got < 3 {
+	if got := strings.Count(html, ">操作</th>"); got < 3 {
 		t.Fatalf("操作 columns=%d want >=3 (proxy+credential+custom)", got)
 	}
 	for _, needle := range []string{
@@ -713,18 +714,33 @@ func TestPerRowWebUIContracts(t *testing.T) {
 			t.Fatalf("webui per-row contract missing %q", needle)
 		}
 	}
-	// Batch completion must not mention custom.
+	// Proxy batch scope: the proxy bulkCheck calls only the proxy batch
+	// endpoint. Credential/custom batch operations live in their own scoped
+	// functions (bulkCheckCredentials/bulkCheckCustoms, covered by the scoped
+	// batch contract test), never as aliases inside the proxy block and never
+	// as per-row fan-out.
 	bulkIdx := strings.Index(html, "function bulkCheck()")
 	if bulkIdx < 0 {
 		t.Fatal("missing bulkCheck")
 	}
-	bulkEnd := strings.Index(html[bulkIdx:], "function manualRefresh(")
+	bulkEnd := strings.Index(html[bulkIdx:], "function bulkCheckCredentials()")
 	bulkBlock := html[bulkIdx:]
 	if bulkEnd >= 0 {
 		bulkBlock = bulkBlock[:bulkEnd]
 	}
-	if strings.Contains(bulkBlock, "custom") || strings.Contains(bulkBlock, "Custom") {
-		t.Fatalf("bulk completion must not mention custom")
+	if got := strings.Count(bulkBlock, "/api/availability/check\""); got != 1 {
+		t.Fatalf("proxy bulkCheck must call only its scoped endpoint, got %d", got)
+	}
+	for _, forbidden := range []string{
+		"/api/availability/check-node",
+		`/api/availability/check-credential"`,
+		"/api/availability/check-credentials",
+		`/api/availability/check-custom"`,
+		"/api/availability/check-customs",
+	} {
+		if strings.Contains(bulkBlock, forbidden) {
+			t.Fatalf("proxy bulkCheck must not contain %q", forbidden)
+		}
 	}
 	// Buttons reuse existing probe markup/styles; toasts use returned status.
 	for _, needle := range []string{
