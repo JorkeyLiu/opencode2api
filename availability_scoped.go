@@ -95,21 +95,19 @@ func (g *Gateway) runScopedCheck(ctx context.Context, poolName string, index int
 	}
 	proxy := pool.items[index]
 	raw := proxy.name
-	zenPoolName := g.cfg.ProxyRouting.Zen
+	authPoolName := g.authPoolName()
 	anonPoolName := g.cfg.ProxyRouting.Anonymous
-	goPoolName := g.cfg.ProxyRouting.Go
 	anonModel, anonProto, anonOK := g.bulkProbeModel(TierZen, true)
-	zenModel, zenProto, zenOK := g.bulkProbeModel(TierZen, false)
-	goModel, goProto, goOK := g.bulkProbeModel(TierGo, false)
+	authModel, authProto, authOK := g.bulkProbeModel(TierZen, false)
+	hasAuthKeys := len(g.credentials()) > 0
 	noModel := map[string]bool{}
 	if !anonOK {
 		noModel["anonymous"] = true
 	}
-	if !zenOK {
-		noModel["zen"] = true
-	}
-	if !goOK {
-		noModel["go"] = true
+	if !hasAuthKeys {
+		noModel["unconfigured"] = true
+	} else if !authOK {
+		noModel["authenticated"] = true
 	}
 	targets := make([]bulkSendTarget, 0, 8)
 	truncated := false
@@ -129,19 +127,14 @@ func (g *Gateway) runScopedCheck(ctx context.Context, poolName string, index int
 			ProbeModel: model, ProbeProtocol: proto,
 		})
 	}
-	// Public Zen applies only when this pool serves the Zen channel.
-	if poolName == zenPoolName || poolName == anonPoolName {
-		// Deduplicate when both routings point at the same pool: one public send.
+	// Anonymous applies when this pool serves the anonymous channel;
+	// authenticated applies when it serves the authenticated channel.
+	if poolName == anonPoolName {
 		addOne(TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, anonModel, anonProto, anonOK)
 	}
-	if poolName == zenPoolName {
-		for _, cred := range g.zenCreds {
-			addOne(TierZen, cred.key, cred.id, cred.display, false, zenModel, zenProto, zenOK)
-		}
-	}
-	if poolName == goPoolName {
-		for _, cred := range g.goCreds {
-			addOne(TierGo, cred.key, cred.id, cred.display, false, goModel, goProto, goOK)
+	if poolName == authPoolName && hasAuthKeys {
+		for _, cred := range g.credentials() {
+			addOne(TierZen, cred.key, cred.id, cred.display, false, authModel, authProto, authOK)
 		}
 	}
 	tested := len(targets)

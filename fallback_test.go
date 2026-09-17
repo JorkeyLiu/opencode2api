@@ -20,7 +20,7 @@ func fallbackTestGateway(t *testing.T, channels []FallbackChannelConfig, active 
 	t.Helper()
 	cfg := testGatewayConfig(
 		map[string][]string{"a": {"direct"}, "z": {"direct"}, "g": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
 	cfg.Fallback = FallbackConfig{Active: active, Channels: channels}
@@ -299,7 +299,7 @@ func TestFallbackAuthPinNoTrigger(t *testing.T) {
 		t.Fatal("z pool missing")
 	}
 	cred := credentialsForKeys(TierZen, []string{"zen-secret-12345"})[0]
-	gw.zenCreds = []credentialRef{cred}
+	gw.authCreds = []credentialRef{cred}
 	ses := "ses_auth_pin_429"
 	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
 	postStub(t, gw, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {
@@ -684,9 +684,8 @@ func TestFallbackDiscoverSecurity(t *testing.T) {
 
 func TestFallbackAvailabilityCustomAndNoModel(t *testing.T) {
 	manager := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-12345"}
-	cfg.GoKeys = []string{"go-key-12345"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-12345", "go-key-12345"}
 	cfg.Anonymous = true
 	var customHits atomic.Int32
 	customOK := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -763,7 +762,7 @@ func TestFallbackAvailabilityCustomAndNoModel(t *testing.T) {
 	_ = before
 	// No-model lane: fresh gateway with empty catalog must report no_model, not success.
 	manager2 := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg2 := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg2 := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfg2.ZenKeys = []string{"zen-key-12345"}
 	cfg2.Anonymous = true
 	norm2, _ := NormalizeConfig("config.json", cfg2)

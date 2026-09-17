@@ -14,8 +14,7 @@ import (
 func testBaseConfig() Config {
 	cfg := defaultConfig()
 	cfg.ServerKeys = []string{"local-key"}
-	cfg.ZenKeys = []string{"zen-key-12345"}
-	cfg.GoKeys = []string{"go-key-12345"}
+	cfg.Keys = []string{"zen-key-12345", "go-key-12345"}
 	return cfg
 }
 
@@ -34,7 +33,7 @@ func TestLegacyOnlyMigration(t *testing.T) {
 	if len(pool.Proxies) != 2 || pool.Proxies[0] != "http://127.0.0.1:8080" || pool.Proxies[1] != "direct" {
 		t.Fatalf("shared proxies=%v", pool.Proxies)
 	}
-	if got.ProxyRouting.Anonymous != "shared" || got.ProxyRouting.Zen != "shared" || got.ProxyRouting.Go != "shared" {
+	if got.ProxyRouting.Anonymous != "shared" || got.ProxyRouting.Authenticated != "shared" {
 		t.Fatalf("routing=%+v", got.ProxyRouting)
 	}
 	if len(got.Proxies) != 0 || got.ProxyFile != "" {
@@ -51,7 +50,7 @@ func TestNoFieldsMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ProxyRouting.Anonymous != "shared" || got.ProxyRouting.Zen != "shared" || got.ProxyRouting.Go != "shared" {
+	if got.ProxyRouting.Anonymous != "shared" || got.ProxyRouting.Authenticated != "shared" {
 		t.Fatalf("routing=%+v", got.ProxyRouting)
 	}
 	if eff := got.RuntimeProxiesFor("shared"); len(eff) != 1 || eff[0] != "direct" {
@@ -65,7 +64,7 @@ func TestNewOnlyValidation(t *testing.T) {
 		"a": {Proxies: []string{"direct"}},
 		"b": {Proxies: []string{"socks5://127.0.0.1:1080"}},
 	}
-	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "a", Zen: "a", Go: "b"}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "a", Authenticated: "b"}
 	cfg.proxyPoolsPresent = true
 	cfg.proxyRoutingPresent = true
 	got, err := NormalizeConfig("config.json", cfg)
@@ -82,7 +81,7 @@ func TestLegacyNewConflict(t *testing.T) {
 	cfg.Proxies = []string{"direct"}
 	cfg.legacyProxiesPresent = true
 	cfg.ProxyPools = map[string]ProxyPoolConfig{"shared": {Proxies: []string{"direct"}}}
-	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 	cfg.proxyPoolsPresent = true
 	if _, err := NormalizeConfig("config.json", cfg); err == nil || !strings.Contains(err.Error(), "legacy") {
 		t.Fatalf("want legacy conflict error, got %v", err)
@@ -91,7 +90,7 @@ func TestLegacyNewConflict(t *testing.T) {
 	cfg2 := testBaseConfig()
 	cfg2.Proxies = []string{"direct"}
 	cfg2.ProxyPools = map[string]ProxyPoolConfig{"shared": {Proxies: []string{"direct"}}}
-	cfg2.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+	cfg2.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 	if _, err := NormalizeConfig("config.json", cfg2); err == nil {
 		t.Fatalf("want conflict for struct literals too")
 	}
@@ -100,7 +99,7 @@ func TestLegacyNewConflict(t *testing.T) {
 func TestUnknownFieldRejected(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
-	content := `{"listen":"127.0.0.1:8080","server_keys":["k"],"zen_keys":["z"],"proxy_pools":{"shared":{"proxies":["direct"],"proxyfile":""}},"proxy_routing":{"anonymous":"shared","zen":"shared","go":"shared"},"typo_field":1}`
+	content := `{"listen":"127.0.0.1:8080","server_keys":["k"],"keys":["z"],"proxy_pools":{"shared":{"proxies":["direct"],"proxyfile":""}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"typo_field":1}`
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +111,7 @@ func TestUnknownFieldRejected(t *testing.T) {
 func TestPoolRefMissing(t *testing.T) {
 	cfg := testBaseConfig()
 	cfg.ProxyPools = map[string]ProxyPoolConfig{"a": {Proxies: []string{"direct"}}}
-	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "a", Zen: "missing", Go: "a"}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "a", Authenticated: "missing"}
 	cfg.proxyPoolsPresent = true
 	cfg.proxyRoutingPresent = true
 	if _, err := NormalizeConfig("config.json", cfg); err == nil || !strings.Contains(err.Error(), "unknown pool") {
@@ -124,7 +123,7 @@ func TestPoolNameValidation(t *testing.T) {
 	for _, bad := range []string{"", "direct", "DIRECT", "http://x", "bad name", "a/b", "a:b", "a@b", "::1", strings.Repeat("x", 65)} {
 		cfg := testBaseConfig()
 		cfg.ProxyPools = map[string]ProxyPoolConfig{bad: {Proxies: []string{"direct"}}}
-		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: bad, Zen: bad, Go: bad}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: bad, Authenticated: bad}
 		cfg.proxyPoolsPresent = true
 		cfg.proxyRoutingPresent = true
 		if _, err := NormalizeConfig("config.json", cfg); err == nil {
@@ -134,7 +133,7 @@ func TestPoolNameValidation(t *testing.T) {
 	for _, good := range []string{"shared", "pool-1", "a_b.c", "A9", "1.2.3.4"} {
 		cfg := testBaseConfig()
 		cfg.ProxyPools = map[string]ProxyPoolConfig{good: {Proxies: []string{"direct"}}}
-		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: good, Zen: good, Go: good}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: good, Authenticated: good}
 		cfg.proxyPoolsPresent = true
 		cfg.proxyRoutingPresent = true
 		if _, err := NormalizeConfig("config.json", cfg); err != nil {
@@ -146,7 +145,7 @@ func TestPoolNameValidation(t *testing.T) {
 func TestPoolURLValidation(t *testing.T) {
 	cfg := testBaseConfig()
 	cfg.ProxyPools = map[string]ProxyPoolConfig{"shared": {Proxies: []string{"ftp://127.0.0.1:21"}}}
-	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 	cfg.proxyPoolsPresent = true
 	cfg.proxyRoutingPresent = true
 	if _, err := NormalizeConfig("config.json", cfg); err == nil {
@@ -154,7 +153,7 @@ func TestPoolURLValidation(t *testing.T) {
 	}
 	cfg2 := testBaseConfig()
 	cfg2.ProxyPools = map[string]ProxyPoolConfig{"shared": {Proxies: []string{"http://"}}}
-	cfg2.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+	cfg2.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 	cfg2.proxyPoolsPresent = true
 	cfg2.proxyRoutingPresent = true
 	if _, err := NormalizeConfig("config.json", cfg2); err == nil {
@@ -171,7 +170,7 @@ func TestPoolDedupRelativeProxyfile(t *testing.T) {
 	}
 	cfg := testBaseConfig()
 	cfg.ProxyPools = map[string]ProxyPoolConfig{"shared": {Proxies: []string{"direct", "http://127.0.0.1:8080"}, ProxyFile: "p.txt"}}
-	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 	cfg.proxyPoolsPresent = true
 	cfg.proxyRoutingPresent = true
 	got, err := NormalizeConfig(configPath, cfg)
@@ -228,7 +227,7 @@ func TestSaveLoadOnlyNewFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.ProxyRouting.Zen != "shared" || reloaded.RuntimeProxiesFor("shared")[0] != "socks5://127.0.0.1:1080" {
+	if reloaded.ProxyRouting.Authenticated != "shared" || reloaded.RuntimeProxiesFor("shared")[0] != "socks5://127.0.0.1:1080" {
 		t.Fatalf("reloaded=%+v", reloaded)
 	}
 }
@@ -251,7 +250,7 @@ func testGatewayConfig(pools map[string][]string, routing ProxyRoutingConfig) Co
 }
 
 func TestSharedRefsSharePointer(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gateway, err := NewGateway(cfg, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
@@ -262,12 +261,16 @@ func TestSharedRefsSharePointer(t *testing.T) {
 	if len(gateway.pools) != 1 {
 		t.Fatalf("pools=%d want 1", len(gateway.pools))
 	}
-	// Credential x proxy candidates come from the shared pool for both tiers.
+	// Credential x proxy candidates come from the single authenticated lane.
 	now := time.Now().UnixNano()
-	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
-	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["shared"], "m", now)
-	if len(zen) != 2 || len(goCands) != 2 {
-		t.Fatalf("shared candidates zen=%d go=%d want 2/2", len(zen), len(goCands))
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
+	if len(zen) != 4 {
+		t.Fatalf("shared candidates auth=%d want 4 (2 keys x 2 proxies)", len(zen))
+	}
+	// Tier qualification stays isolated: a TierGo 429 never filters TierZen.
+	gateway.scheduler.noteProxy429Failure(TierGo, "shared", gateway.pools["shared"].items[0].name, AttemptClassRateLimited, 429, 0, now)
+	if got := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now); len(got) != 4 {
+		t.Fatalf("Go 429 must not filter Zen, got %d", len(got))
 	}
 	anon := gateway.scheduler.buildAnonymousCandidates(gateway.pools["shared"], "m", now)
 	if len(anon) != 2 {
@@ -280,44 +283,42 @@ func TestSharedRefsSharePointer(t *testing.T) {
 
 func TestSeparateRefsIsolated(t *testing.T) {
 	cfg := testGatewayConfig(
-		map[string][]string{"a": {"direct"}, "z": {"http://127.0.0.1:8080"}, "g": {"socks5://127.0.0.1:1080"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		map[string][]string{"a": {"direct"}, "z": {"http://127.0.0.1:8080"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	gateway, err := NewGateway(cfg, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gateway.pools["z"] == gateway.pools["g"] {
+	if gateway.pools["z"] == gateway.pools["a"] {
 		t.Fatalf("isolated pools must not share pointer")
 	}
-	if len(gateway.pools) != 3 {
-		t.Fatalf("pools=%d want 3", len(gateway.pools))
+	if len(gateway.pools) != 2 {
+		t.Fatalf("pools=%d want 2", len(gateway.pools))
 	}
-	if gateway.pools["z"].name != "z" || gateway.pools["g"].name != "g" {
-		t.Fatalf("pool names zen=%q go=%q", gateway.pools["z"].name, gateway.pools["g"].name)
+	if gateway.pools["z"].name != "z" || gateway.pools["a"].name != "a" {
+		t.Fatalf("pool names auth=%q anon=%q", gateway.pools["z"].name, gateway.pools["a"].name)
 	}
 	now := time.Now().UnixNano()
 	anon := gateway.scheduler.buildAnonymousCandidates(gateway.pools["a"], "m", now)
 	if len(anon) != 1 || anon[0].PoolName != "a" {
 		t.Fatalf("anon pool=%+v", anon)
 	}
-	// Pool isolation: zen candidates only use pool z, go only pool g.
-	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["z"], "m", now)
+	// Pool isolation: authenticated candidates only use pool z.
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["z"], "m", now)
 	for _, cand := range zen {
 		if cand.PoolName != "z" {
-			t.Fatalf("zen candidate leaked across pools: %+v", cand)
+			t.Fatalf("auth candidate leaked across pools: %+v", cand)
 		}
 	}
 }
 
 func TestTargetIsolationAcrossPools(t *testing.T) {
 	cfg := testGatewayConfig(
-		map[string][]string{"z": {"direct", "http://127.0.0.1:8081"}, "g": {"direct", "http://127.0.0.1:8082"}, "a": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		map[string][]string{"z": {"direct", "http://127.0.0.1:8081"}, "a": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
-	// Give each tier a key so candidates exist.
-	cfg.ZenKeys = []string{"zen-key-12345"}
-	cfg.GoKeys = []string{"go-key-12345"}
+	cfg.Keys = []string{"zen-key-12345"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -326,28 +327,31 @@ func TestTargetIsolationAcrossPools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Cooling a zen target must not remove the go candidate on its own pool.
+	// Cooling one target filters only that identity; other proxies stay.
 	zenPool := gateway.pools["z"]
 	zenProxy := zenPool.items[0]
-	identity := targetIdentity(TierZen, gateway.zenCreds[0].id, "z", zenProxy.name, "model-a")
+	identity := targetIdentity(TierZen, gateway.authCreds[0].id, "z", zenProxy.name, "model-a")
 	gateway.scheduler.noteTargetFailure(identity, AttemptClassUpstreamFailure, 500, 0)
 	now := time.Now().UnixNano()
-	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, zenPool, "model-a", now)
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, zenPool, "model-a", now)
 	for _, cand := range zen {
 		if cand.Identity == identity {
 			t.Fatalf("cooling target must be filtered: %s", identity)
 		}
 	}
-	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["g"], "model-a", now)
-	if len(goCands) != 2 {
-		t.Fatalf("go candidates must be unaffected, got %d", len(goCands))
+	if len(zen) != 1 {
+		t.Fatalf("other proxy must stay, got %d", len(zen))
+	}
+	// Tier qualification stays isolated across lanes.
+	gateway.scheduler.noteProxy429Failure(TierGo, "z", gateway.pools["z"].items[0].name, AttemptClassRateLimited, 429, 0, now)
+	if got := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["z"], "model-a", now); len(got) != 1 {
+		t.Fatalf("Go 429 must not filter Zen, got %d", len(got))
 	}
 }
 
 func TestSharedPoolTargetFanout(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-12345"}
-	cfg.GoKeys = []string{"go-key-12345"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-12345"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -356,17 +360,16 @@ func TestSharedPoolTargetFanout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// One key x two proxies per tier over the shared pool.
+	// One key x two proxies over the shared pool.
 	now := time.Now().UnixNano()
-	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
-	goCands := gateway.scheduler.buildAuthCandidates(TierGo, gateway.goCreds, gateway.pools["shared"], "m", now)
-	if len(zen) != 2 || len(goCands) != 2 {
-		t.Fatalf("shared fanout zen=%d go=%d want 2/2", len(zen), len(goCands))
+	zen := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
+	if len(zen) != 2 {
+		t.Fatalf("shared fanout auth=%d want 2", len(zen))
 	}
 }
 
 func TestHealthzUniquePoolCount(t *testing.T) {
-	sharedCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	sharedCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	shared, err := NewGateway(sharedCfg, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
@@ -381,8 +384,8 @@ func TestHealthzUniquePoolCount(t *testing.T) {
 		t.Fatalf("shared total=%d want 2", sharedHealth.Proxies.Total)
 	}
 	isoCfg := testGatewayConfig(
-		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8080"}, "g": {"socks5://127.0.0.1:1080"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8080"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	iso, err := NewGateway(isoCfg, nil, NewMonitor())
 	if err != nil {
@@ -394,18 +397,17 @@ func TestHealthzUniquePoolCount(t *testing.T) {
 	if err := json.Unmarshal(rec2.Body.Bytes(), &isoHealth); err != nil {
 		t.Fatal(err)
 	}
-	if isoHealth.Proxies.Total != 4 {
-		t.Fatalf("isolated total=%d want 4", isoHealth.Proxies.Total)
+	if isoHealth.Proxies.Total != 3 {
+		t.Fatalf("isolated total=%d want 3", isoHealth.Proxies.Total)
 	}
 }
 
 func TestResourcesPoolAttribution(t *testing.T) {
 	cfg := testGatewayConfig(
-		map[string][]string{"a": {"direct"}, "z": {"direct"}, "g": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		map[string][]string{"a": {"direct"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
-	cfg.ZenKeys = []string{"zen-key-12345"}
-	cfg.GoKeys = []string{"go-key-12345"}
+	cfg.Keys = []string{"zen-key-12345"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -417,26 +419,23 @@ func TestResourcesPoolAttribution(t *testing.T) {
 	}
 	manager.current.Store(&gatewayRuntime{config: normalized, gateway: gateway})
 	snap := manager.Resources()
-	if len(snap.Proxies) != 3 {
-		t.Fatalf("proxies=%d want 3", len(snap.Proxies))
+	if len(snap.Proxies) != 2 {
+		t.Fatalf("proxies=%d want 2", len(snap.Proxies))
 	}
 	byPool := map[string]ProxyStatus{}
 	for _, p := range snap.Proxies {
 		byPool[p.Pool] = p
 	}
-	// ZenKeys/GoKeys are pool-level routed config counts, not bindings:
-	// pool z carries the 1 zen key, pool g the 1 go key, pool a none.
-	if byPool["z"].ZenKeys != 1 || byPool["z"].GoKeys != 0 {
-		t.Fatalf("pool z routed counts wrong: %+v", byPool["z"])
+	// AuthKeys is the pool-level routed count, not a binding: pool z carries
+	// the key, pool a carries none (anonymous counted separately).
+	if byPool["z"].AuthKeys != 1 {
+		t.Fatalf("pool z routed count wrong: %+v", byPool["z"])
 	}
-	if byPool["g"].GoKeys != 1 || byPool["g"].ZenKeys != 0 {
-		t.Fatalf("pool g routed counts wrong: %+v", byPool["g"])
+	if byPool["a"].AuthKeys != 0 {
+		t.Fatalf("pool a routed count wrong: %+v", byPool["a"])
 	}
-	if byPool["a"].ZenKeys != 0 || byPool["a"].GoKeys != 0 {
-		t.Fatalf("pool a routed counts wrong: %+v", byPool["a"])
-	}
-	if byPool["z"].AvailableCredentials != 1 || byPool["g"].AvailableCredentials != 1 || byPool["a"].AvailableCredentials != 1 {
-		t.Fatalf("available credentials wrong: a=%+v z=%+v g=%+v", byPool["a"], byPool["z"], byPool["g"])
+	if byPool["z"].AvailableCredentials != 1 || byPool["a"].AvailableCredentials != 1 {
+		t.Fatalf("available credentials wrong: a=%+v z=%+v", byPool["a"], byPool["z"])
 	}
 	if !byPool["a"].Anonymous || byPool["z"].Anonymous {
 		t.Fatalf("anonymous attribution a=%v z=%v", byPool["a"].Anonymous, byPool["z"].Anonymous)
@@ -444,15 +443,17 @@ func TestResourcesPoolAttribution(t *testing.T) {
 	if len(byPool["a"].Routing) != 1 || byPool["a"].Routing[0] != "anonymous" {
 		t.Fatalf("routing a=%v", byPool["a"].Routing)
 	}
+	if len(byPool["z"].Routing) != 1 || byPool["z"].Routing[0] != "authenticated" {
+		t.Fatalf("routing z=%v", byPool["z"].Routing)
+	}
 	for _, key := range snap.Keys {
 		if key.ProxyPool == "" {
 			t.Fatalf("key missing pool: %+v", key)
 		}
 	}
-	// Unified 代理可用性 view replaces the independent anonymous summary:
-	// pool a carries the anonymous routing and its Zen channel is available.
-	if byPool["a"].Zen != "available" {
-		t.Fatalf("pool a zen availability=%q want available", byPool["a"].Zen)
+	// Observation-driven rows start untested before any probe.
+	if byPool["a"].AnonymousObservation != "untested" || byPool["z"].AuthenticatedObservation != "untested" {
+		t.Fatalf("fresh observations must be untested: a=%+v z=%+v", byPool["a"], byPool["z"])
 	}
 	if len(snap.ChannelCooldowns) != 0 {
 		t.Fatalf("fresh channel state must be empty: %+v", snap.ChannelCooldowns)
@@ -482,8 +483,8 @@ func TestAttemptPoolQualifiedAggregates(t *testing.T) {
 }
 
 func TestClientRejectedNeutral(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"k"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"k"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -554,12 +555,12 @@ func TestAdminPoolHelpers(t *testing.T) {
 	}
 	// New model decodes.
 	var good ConfigUpdate
-	dec2 := json.NewDecoder(strings.NewReader(`{"listen":"x","proxy_pools":{"shared":{"proxies":[],"proxyfile":""}},"proxy_routing":{"anonymous":"shared","zen":"shared","go":"shared"}}`))
+	dec2 := json.NewDecoder(strings.NewReader(`{"listen":"x","proxy_pools":{"shared":{"proxies":[],"proxyfile":""}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"}}`))
 	dec2.DisallowUnknownFields()
 	if err := dec2.Decode(&good); err != nil {
 		t.Fatalf("new model rejected: %v", err)
 	}
-	if good.ProxyRouting.Zen != "shared" {
+	if good.ProxyRouting.Authenticated != "shared" {
 		t.Fatalf("routing=%+v", good.ProxyRouting)
 	}
 }
@@ -623,14 +624,14 @@ func TestAdminMaskedPoolRenameRoundTrip(t *testing.T) {
 	cfg := testBaseConfig()
 	cfg.ProxyPools = resolved
 	cfg.ProxyRouting = remapProxyRoutingForRename(
-		ProxyRoutingConfig{Anonymous: "old", Zen: "old", Go: "other"}, "old", "new")
+		ProxyRoutingConfig{Anonymous: "old", Authenticated: "other"}, "old", "new")
 	cfg.proxyPoolsPresent = true
 	cfg.proxyRoutingPresent = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatalf("renamed config rejected: %v", err)
 	}
-	if normalized.ProxyRouting.Anonymous != "new" || normalized.ProxyRouting.Zen != "new" || normalized.ProxyRouting.Go != "other" {
+	if normalized.ProxyRouting.Anonymous != "new" || normalized.ProxyRouting.Authenticated != "other" {
 		t.Fatalf("routing=%+v", normalized.ProxyRouting)
 	}
 	if eff := normalized.RuntimeProxiesFor("new"); len(eff) != 2 || eff[0] != "direct" {
@@ -676,9 +677,9 @@ func TestResolvePoolPrefersSameNameOverAmbiguous(t *testing.T) {
 }
 
 func TestRemapProxyRoutingForRename(t *testing.T) {
-	routing := ProxyRoutingConfig{Anonymous: "old", Zen: "old", Go: "other"}
+	routing := ProxyRoutingConfig{Anonymous: "old", Authenticated: "other"}
 	mapped := remapProxyRoutingForRename(routing, "old", "new")
-	if mapped.Anonymous != "new" || mapped.Zen != "new" || mapped.Go != "other" {
+	if mapped.Anonymous != "new" || mapped.Authenticated != "other" {
 		t.Fatalf("mapped=%+v", mapped)
 	}
 	untouched := remapProxyRoutingForRename(routing, "missing", "new")

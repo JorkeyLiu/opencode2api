@@ -153,7 +153,7 @@ func TestMonitorResourceWindowExcludesOldAttempts(t *testing.T) {
 }
 
 func TestAnonymousTargetCooldownSnapshot(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8080"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfg.Anonymous = true
 	gateway, err := NewGateway(cfg, nil, NewMonitor())
 	if err != nil {
@@ -255,8 +255,8 @@ func TestObservabilityRedaction(t *testing.T) {
 }
 
 func TestKeyStatusCredentialAndCooldown(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"sk-live-1234567890"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"sk-live-1234567890"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestKeyStatusCredentialAndCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
+	statuses := keyStatusesForTier(gateway, "zen", gateway.authCreds, "shared", nil)
 	if len(statuses) != 1 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
@@ -288,17 +288,17 @@ func TestKeyStatusCredentialAndCooldown(t *testing.T) {
 	// Only 401 cools the credential; 500 cools the target, not the credential.
 	proxy := gateway.pools["shared"].items[0]
 	cand := targetCandidate{
-		Tier: TierZen, CredKey: "sk-live-1234567890", CredID: gateway.zenCreds[0].id,
+		Tier: TierZen, CredKey: "sk-live-1234567890", CredID: gateway.authCreds[0].id,
 		CredDisplay: "67890", PoolName: "shared", Proxy: proxy, ProxyRaw: proxy.name,
-		Model: "m", Identity: targetIdentity(TierZen, gateway.zenCreds[0].id, "shared", proxy.name, "m"),
+		Model: "m", Identity: targetIdentity(TierZen, gateway.authCreds[0].id, "shared", proxy.name, "m"),
 	}
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
+	statuses = keyStatusesForTier(gateway, "zen", gateway.authCreds, "shared", nil)
 	if statuses[0].CooldownUntil != nil {
 		t.Fatalf("5xx must not cool the credential: %+v", statuses[0])
 	}
 	gateway.applyAttemptOutcome(t.Context(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
+	statuses = keyStatusesForTier(gateway, "zen", gateway.authCreds, "shared", nil)
 	if statuses[0].CooldownUntil == nil || statuses[0].CooldownRemainingSeconds == nil {
 		t.Fatalf("401 must cool the credential: %+v", statuses[0])
 	}

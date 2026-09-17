@@ -46,13 +46,24 @@ const (
 	bulkRateLimit = 3
 )
 
+// bulkNodeAvailability is the per-proxy observation row. Anonymous and
+// Authenticated carry the latest real probe outcome for that lane (success
+// only on exact HTTP 200 with a valid body; 429 stays rate_limited; other
+// HTTP/transport outcomes stay real; no_model/unconfigured/transport etc. are
+// machine outcomes, never a generic available/unavailable verdict). The HTTP
+// status is present whenever an HTTP response exists.
 type bulkNodeAvailability struct {
-	Pool        string     `json:"proxy_pool"`
-	Index       int        `json:"index"`
-	ProxyNode   string     `json:"proxy_node"`
-	Transport   string     `json:"transport"`
-	Zen         string     `json:"zen"`
-	Go          string     `json:"go"`
+	Pool                    string `json:"proxy_pool"`
+	Index                   int    `json:"index"`
+	ProxyNode               string `json:"proxy_node"`
+	Transport               string `json:"transport"`
+	Anonymous               string `json:"anonymous"`
+	AnonymousHTTPStatus     int    `json:"anonymous_http_status,omitempty"`
+	Authenticated           string `json:"authenticated"`
+	AuthenticatedHTTPStatus int    `json:"authenticated_http_status,omitempty"`
+	// Deprecated aliases for test compilation; never serialized.
+	Zen         string     `json:"-"`
+	Go          string     `json:"-"`
 	Reason      string     `json:"reason,omitempty"`
 	LastChecked *time.Time `json:"last_checked,omitempty"`
 }
@@ -210,12 +221,11 @@ func (a *AdminServer) handleBulkCheck(w http.ResponseWriter, r *http.Request) {
 
 func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	checkedAt := time.Now().UTC()
-	// Snapshot live gateway/config at operation start.
-	zenPoolName := g.cfg.ProxyRouting.Zen
+	// Snapshot live gateway/config at operation start. Exactly two channels:
+	// anonymous and authenticated, both Zen upstream.
+	authPoolName := g.authPoolName()
 	anonPoolName := g.cfg.ProxyRouting.Anonymous
-	goPoolName := g.cfg.ProxyRouting.Go
-	zenCreds := append([]credentialRef(nil), g.zenCreds...)
-	goCreds := append([]credentialRef(nil), g.goCreds...)
+	authCreds := append([]credentialRef(nil), g.credentials()...)
 	// Enumerate active pool-qualified nodes including unhealthy ones.
 	type nodeRef struct {
 		poolName string
@@ -239,19 +249,20 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 		}
 	}
 	// Real-inference probe models per lane (directory-driven, never hardcoded).
-	// A lane without a servable model reports no_model/inconclusive and sends nothing.
+	// A lane without a servable model reports no_model and sends nothing.
+	// The authenticated lane without any configured key reports unconfigured
+	// and performs no inference send.
 	anonModel, anonProto, anonOK := g.bulkProbeModel(TierZen, true)
-	zenModel, zenProto, zenOK := g.bulkProbeModel(TierZen, false)
-	goModel, goProto, goOK := g.bulkProbeModel(TierGo, false)
+	authModel, authProto, authOK := g.bulkProbeModel(TierZen, false)
+	hasAuthKeys := len(authCreds) > 0
 	noModel := map[string]bool{}
 	if !anonOK {
 		noModel["anonymous"] = true
 	}
-	if !zenOK {
-		noModel["zen"] = true
-	}
-	if !goOK {
-		noModel["go"] = true
+	if !hasAuthKeys {
+		noModel["unconfigured"] = true
+	} else if !authOK {
+		noModel["authenticated"] = true
 	}
 	// Build send targets with bounded amplification.
 	targets := make([]bulkSendTarget, 0, bulkMaxTotalSends)
@@ -290,38 +301,16 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 		}
 		return added
 	}
-	// Zen public tests Zen-channel nodes (Zen pool + Anonymous pool, dedup
-	// pool-qualified). It applies only to the Zen channel, never Go.
-	zenPublicPools := []string{}
-	seenPool := map[string]bool{}
-	for _, p := range []string{zenPoolName, anonPoolName} {
-		if p == "" || seenPool[p] {
-			continue
+	// Anonymous tests the anonymous pool; authenticated tests the
+	// authenticated pool. Each key probes enough nodes to establish success,
+	// node-specific failure, or two-distinct-429 evidence. Caps keep
+	// amplification bounded; truncation is reported.
+	publicTested := addTargets(anonPoolName, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, bulkMaxPublicNodes, anonModel, anonProto, anonOK)
+	_ = publicTested
+	if hasAuthKeys {
+		for _, cred := range authCreds {
+			addTargets(authPoolName, TierZen, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, authModel, authProto, authOK)
 		}
-		seenPool[p] = true
-		zenPublicPools = append(zenPublicPools, p)
-	}
-	publicTested := 0
-	for _, p := range zenPublicPools {
-		// Public cap is shared across Zen-channel pools.
-		remaining := bulkMaxPublicNodes - publicTested
-		if remaining <= 0 {
-			if nodes, ok := poolNodes[p]; ok {
-				skipped += len(nodes)
-			}
-			truncated = true
-			continue
-		}
-		publicTested += addTargets(p, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, remaining, anonModel, anonProto, anonOK)
-	}
-	// Configured credentials: each key across enough nodes in its assigned
-	// pool to establish success, node-specific failure, or two-distinct-429
-	// evidence. Caps keep amplification bounded; truncation is reported.
-	for _, cred := range zenCreds {
-		addTargets(zenPoolName, TierZen, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, zenModel, zenProto, zenOK)
-	}
-	for _, cred := range goCreds {
-		addTargets(goPoolName, TierGo, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, goModel, goProto, goOK)
 	}
 	tested := len(targets)
 	// Bounded concurrency execution.
@@ -403,9 +392,6 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 
 func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulkSendResult {
 	base := g.cfg.Upstream.Zen
-	if tgt.Tier == TierGo {
-		base = g.cfg.Upstream.Go
-	}
 	protocol := tgt.ProbeProtocol
 	if protocol != ProtocolChat && protocol != ProtocolResponses && protocol != ProtocolAnthropic {
 		protocol = ProtocolChat
@@ -428,9 +414,7 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if tgt.Tier == TierGo && protocol == ProtocolAnthropic {
-		req.Header.Set("x-api-key", tgt.CredKey)
-	} else if protocol == ProtocolAnthropic {
+	if protocol == ProtocolAnthropic {
 		req.Header.Set("x-api-key", tgt.CredKey)
 	} else {
 		req.Header.Set("Authorization", "Bearer "+tgt.CredKey)
@@ -463,7 +447,9 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	defer resp.Body.Close()
 	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 	status := resp.StatusCode
-	if status/100 != 2 {
+	// Exactly HTTP 200 with a valid body is success; other HTTP statuses
+	// (including other 2xx) remain their real outcomes.
+	if status != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter}
 	}
@@ -754,22 +740,24 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			noModel = v
 		}
 	}
-	// Per pool-qualified node aggregation for the unified proxy view.
-	// Within one bulk run any observed HTTP response proves reachable for
-	// display and must never be overwritten by another credential's
-	// conclusive transport error: track sawHTTP per pool-qualified node and
-	// keep the highest-confidence outcome. Routing health writes remain
-	// separately governed in applyBulkWrites.
+	// Per pool-qualified node aggregation records the latest real probe
+	// observation per lane, never a generic available/unavailable verdict.
+	// Within one run any observed HTTP response proves reachable and must
+	// never be overwritten by another credential's conclusive transport
+	// error: track sawHTTP per node and keep the highest-confidence outcome.
+	// Routing health writes remain separately governed in applyBulkWrites.
 	type nodeAgg struct {
-		pool      string
-		index     int
-		raw       string
-		redacted  string
-		transport string
-		zen       string
-		goStatus  string
-		reason    string
-		sawHTTP   bool
+		pool              string
+		index             int
+		raw               string
+		redacted          string
+		transport         string
+		anonymous         string
+		anonymousHTTP     int
+		authenticated     string
+		authenticatedHTTP int
+		reason            string
+		sawHTTP           bool
 	}
 	aggOrder := []string{}
 	aggs := map[string]*nodeAgg{}
@@ -786,7 +774,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			}
 			k := keyFor(poolName, proxy.name)
 			if _, ok := aggs[k]; !ok {
-				aggs[k] = &nodeAgg{pool: poolName, index: proxy.index, raw: proxy.name, redacted: redactURL(proxy.name), transport: "untested", zen: "untested", goStatus: "untested"}
+				aggs[k] = &nodeAgg{pool: poolName, index: proxy.index, raw: proxy.name, redacted: redactURL(proxy.name), transport: "untested", anonymous: "untested", authenticated: "untested"}
 				aggOrder = append(aggOrder, k)
 			}
 		}
@@ -812,7 +800,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		nk := keyFor(r.Target.PoolName, r.Target.Raw)
 		na, ok := aggs[nk]
 		if !ok {
-			na = &nodeAgg{pool: r.Target.PoolName, index: r.Target.Index, raw: r.Target.Raw, redacted: redactURL(r.Target.Raw), transport: "untested", zen: "untested", goStatus: "untested"}
+			na = &nodeAgg{pool: r.Target.PoolName, index: r.Target.Index, raw: r.Target.Raw, redacted: redactURL(r.Target.Raw), transport: "untested", anonymous: "untested", authenticated: "untested"}
 			aggs[nk] = na
 			aggOrder = append(aggOrder, nk)
 		}
@@ -837,18 +825,25 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		} else if na.transport == "untested" {
 			na.transport = "inconclusive"
 		}
-		if r.Target.Tier == TierZen {
-			if na.zen == "untested" || label == "success" {
-				na.zen = label
-			} else if na.zen != "success" && (label == "rate_limited" || label == "upstream_failure" || label == "auth_failure") {
-				na.zen = label
+		setLane := func(current *string, currentHTTP *int) {
+			if *current == "untested" || label == "success" {
+				*current = label
+				if r.Status != 0 {
+					*currentHTTP = r.Status
+				}
+			} else if *current != "success" && (label == "rate_limited" || label == "upstream_failure" || label == "auth_failure") {
+				*current = label
+				if r.Status != 0 {
+					*currentHTTP = r.Status
+				}
+			} else if r.Status != 0 && *currentHTTP == 0 {
+				*currentHTTP = r.Status
 			}
-		} else if r.Target.Tier == TierGo {
-			if na.goStatus == "untested" || label == "success" {
-				na.goStatus = label
-			} else if na.goStatus != "success" && (label == "rate_limited" || label == "upstream_failure" || label == "auth_failure") {
-				na.goStatus = label
-			}
+		}
+		if r.Target.IsPublic {
+			setLane(&na.anonymous, &na.anonymousHTTP)
+		} else {
+			setLane(&na.authenticated, &na.authenticatedHTTP)
 		}
 		if r.TransportErr == nil && r.Status != 0 && na.reason == "" {
 			if label != "success" {
@@ -873,6 +868,27 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 			ca.lastErr = bulkOutcomeLabel(r)
 		}
 	}
+	// Overlay lane-level no_model/unconfigured onto untested per-node lanes so
+	// every row carries what the last check observed.
+	noSetOverlay := map[string]bool{}
+	for _, n := range noModel {
+		noSetOverlay[n] = true
+	}
+	anonPoolOverlay := g.cfg.ProxyRouting.Anonymous
+	authPoolOverlay := g.authPoolName()
+	for _, na := range aggs {
+		if na.pool == anonPoolOverlay && na.anonymous == "untested" && noSetOverlay["anonymous"] {
+			na.anonymous = "no_model"
+		}
+		if na.pool == authPoolOverlay && na.authenticated == "untested" {
+			if noSetOverlay["unconfigured"] {
+				na.authenticated = "unconfigured"
+			} else if noSetOverlay["authenticated"] {
+				na.authenticated = "no_model"
+			}
+		}
+		// Shared pool carries both lanes; the checks above already cover it.
+	}
 	sort.Strings(aggOrder)
 	sort.Strings(credOrder)
 	nodes := make([]bulkNodeAvailability, 0, len(aggOrder))
@@ -880,7 +896,9 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		na := aggs[k]
 		nodes = append(nodes, bulkNodeAvailability{
 			Pool: na.pool, Index: na.index, ProxyNode: na.redacted,
-			Transport: na.transport, Zen: na.zen, Go: na.goStatus, Reason: na.reason,
+			Transport: na.transport, Anonymous: na.anonymous, AnonymousHTTPStatus: na.anonymousHTTP,
+			Authenticated: na.authenticated, AuthenticatedHTTPStatus: na.authenticatedHTTP,
+			Zen: na.anonymous, Go: na.authenticated, Reason: na.reason,
 			LastChecked: &checkedAt,
 		})
 		if len(nodes) >= bulkMaxSnapshotNodes {
@@ -930,17 +948,15 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		})
 	}
 	// Lanes without a directory probe model surface explicit no_model rows
-	// so callers never mistake an untested lane for success.
+	// so callers never mistake an untested lane for success. The
+	// authenticated lane without keys is unconfigured, never probed.
 	if len(noModel) > 0 {
 		noSet := map[string]bool{}
 		for _, n := range noModel {
 			noSet[n] = true
 		}
-		// Synthesize per-credential inconclusive rows for tiers that sent nothing.
-		// The no_model list itself still carries the anonymous lane; no
-		// per-node synthesis is needed for it.
-		if noSet["zen"] {
-			for _, cred := range g.zenCreds {
+		if noSet["authenticated"] {
+			for _, cred := range g.credentials() {
 				found := false
 				for _, c := range credentials {
 					if c.Tier == string(TierZen) && c.CredID == cred.id {
@@ -949,21 +965,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 					}
 				}
 				if !found && len(credentials) < bulkMaxSnapshotCreds {
-					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierZen), KeyTail: cred.display, Fingerprint: credentialFingerprint(TierZen, cred.key), Pool: g.cfg.ProxyRouting.Zen, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
-				}
-			}
-		}
-		if noSet["go"] {
-			for _, cred := range g.goCreds {
-				found := false
-				for _, c := range credentials {
-					if c.Tier == string(TierGo) && c.CredID == cred.id {
-						found = true
-						break
-					}
-				}
-				if !found && len(credentials) < bulkMaxSnapshotCreds {
-					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierGo), KeyTail: cred.display, Fingerprint: credentialFingerprint(TierGo, cred.key), Pool: g.cfg.ProxyRouting.Go, Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
+					credentials = append(credentials, bulkCredentialAvailability{Tier: string(TierZen), KeyTail: cred.display, Fingerprint: credentialFingerprint(TierZen, cred.key), Pool: g.authPoolName(), Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt, CredID: cred.id})
 				}
 			}
 		}

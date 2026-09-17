@@ -243,7 +243,7 @@ func fallbackDiscoverAdmin(t *testing.T, savedBase, savedKey, secondBase, second
 		actualSavedBase = evilSrv.URL
 	}
 	manager := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{
 		{Name: "c1", BaseURL: actualSavedBase, APIKey: savedKey, Model: "m1"},
 		{Name: "c2", BaseURL: secondBase, APIKey: secondKey, Model: "m2"},

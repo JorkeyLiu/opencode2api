@@ -8,7 +8,7 @@ import (
 
 func TestMonitorCacheControlNoStore(t *testing.T) {
 	manager := &RuntimeManager{logger: nil, monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gateway, err := NewGateway(cfg, nil, manager.monitor)
 	if err != nil {
 		t.Fatal(err)

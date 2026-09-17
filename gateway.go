@@ -31,10 +31,13 @@ type Gateway struct {
 	logger    *slog.Logger
 	pools     map[string]*transportPool
 	scheduler *targetScheduler
-	zenCreds  []credentialRef
-	goCreds   []credentialRef
-	catalog   *modelCatalog
-	monitor   *Monitor
+	authCreds []credentialRef
+	// zenCreds mirrors authCreds for test compat; credentials() prefers
+	// authCreds and falls back to zenCreds so direct test assignments to
+	// either field remain effective.
+	zenCreds []credentialRef
+	catalog  *modelCatalog
+	monitor  *Monitor
 	// customClient serves custom OpenAI-compatible fallback channels directly
 	// (no proxy pool). Tests override it to point at local servers.
 	customClient *http.Client
@@ -66,7 +69,6 @@ type healthModels struct {
 	Total             int        `json:"total"`
 	Exposed           int        `json:"exposed"`
 	Zen               int        `json:"zen"`
-	Go                int        `json:"go"`
 	LastRefresh       *time.Time `json:"last_refresh,omitempty"`
 	StaleAfterSeconds int        `json:"stale_after_seconds"`
 	CacheSource       string     `json:"cache_source,omitempty"`
@@ -74,10 +76,9 @@ type healthModels struct {
 }
 
 type healthKeys struct {
-	Zen       int  `json:"zen"`
-	Go        int  `json:"go"`
-	Total     int  `json:"total"`
-	Anonymous bool `json:"anonymous"`
+	Authenticated int  `json:"authenticated"`
+	Total         int  `json:"total"`
+	Anonymous     bool `json:"anonymous"`
 }
 
 type healthProxies struct {
@@ -86,7 +87,8 @@ type healthProxies struct {
 	Unhealthy int `json:"unhealthy"`
 }
 
-// healthRouting is additive global route availability. It never reads
+// healthRouting is additive global route availability over exactly two
+// channels: anonymous and authenticated (both Zen upstream). It never reads
 // per-model target cooldowns: a single model's targets all cooling must not
 // degrade global readiness. Anonymous availability is config plus assigned
 // pool transport health only. Credential availability counts global 401
@@ -94,8 +96,8 @@ type healthProxies struct {
 // pool, so keys without a healthy proxy do not count as a channel.
 type healthRouting struct {
 	AnonymousAvailable      bool `json:"anonymous_available"`
+	AuthenticatedAvailable  int  `json:"authenticated_available"`
 	ZenCredentialsAvailable int  `json:"zen_credentials_available"`
-	GoCredentialsAvailable  int  `json:"go_credentials_available"`
 	CredentialsCooling      int  `json:"credentials_cooling"`
 	ChannelsAvailable       int  `json:"channels_available"`
 }
@@ -116,7 +118,11 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 	// Same routing reference shares one transportPool pointer; different
 	// references stay isolated. A referenced pool resolves to the same
 	// instance when two channels name the same pool.
-	if pools[cfg.ProxyRouting.Zen] == nil || pools[cfg.ProxyRouting.Go] == nil || pools[cfg.ProxyRouting.Anonymous] == nil {
+	authPool := cfg.ProxyRouting.Authenticated
+	if authPool == "" {
+		authPool = cfg.ProxyRouting.Zen
+	}
+	if pools[authPool] == nil || pools[cfg.ProxyRouting.Anonymous] == nil {
 		return nil, fmt.Errorf("proxy_routing must reference existing pools")
 	}
 	cooldown := secondsToDuration(cfg.Performance.FailureCooldownSeconds)
@@ -127,25 +133,43 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 	if rateCooldown <= 0 {
 		rateCooldown = defaultRateLimitBaseSeconds * time.Second
 	}
-	rateMax := secondsToDuration(cfg.Performance.RateLimitCooldownMaxSeconds)
-	if rateMax <= 0 {
-		rateMax = defaultRateLimitMaxSeconds * time.Second
-	}
-	if rateMax < rateCooldown {
-		rateMax = rateCooldown
-	}
-	catalog := newModelCatalog(cfg.Prefer, cfg.Models.Protocols)
+	catalog := newModelCatalog("", cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
+	authCreds := credentialsForKeys(TierZen, cfg.Keys)
 	return &Gateway{
 		cfg:       cfg,
 		logger:    logger,
 		pools:     pools,
-		scheduler: newTargetScheduler(cooldown, rateCooldown, rateMax),
-		zenCreds:  credentialsForKeys(TierZen, cfg.ZenKeys),
-		goCreds:   credentialsForKeys(TierGo, cfg.GoKeys),
+		scheduler: newTargetScheduler(cooldown, rateCooldown),
+		authCreds: authCreds,
+		zenCreds:  authCreds,
 		catalog:   catalog,
 		monitor:   monitor,
 	}, nil
+}
+
+// credentials returns the single authenticated lane, preferring authCreds and
+// falling back to the legacy zenCreds test alias.
+func (g *Gateway) credentials() []credentialRef {
+	if g == nil {
+		return nil
+	}
+	if len(g.authCreds) > 0 {
+		return g.authCreds
+	}
+	return g.zenCreds
+}
+
+// authPoolName returns the canonical authenticated pool, falling back to the
+// legacy zen routing value for in-memory compat.
+func (g *Gateway) authPoolName() string {
+	if g == nil {
+		return ""
+	}
+	if g.cfg.ProxyRouting.Authenticated != "" {
+		return g.cfg.ProxyRouting.Authenticated
+	}
+	return g.cfg.ProxyRouting.Zen
 }
 
 func (g *Gateway) uniquePools() []*transportPool {
@@ -222,7 +246,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		proxyTotal += total
 		proxyHealthy += healthy
 	}
-	zenKeys, goKeys := len(g.zenCreds), len(g.goCreds)
+	authKeys := len(g.credentials())
 	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
 
 	modelStatus := "ready"
@@ -242,7 +266,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			issues = append(issues, "model_catalog_stale")
 		}
 	}
-	if zenKeys+goKeys == 0 && !g.cfg.Anonymous {
+	if authKeys == 0 && !g.cfg.Anonymous {
 		issues = append(issues, "no_upstream_keys")
 	}
 	if proxyHealthy == 0 {
@@ -275,13 +299,12 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Total:             models.Total,
 			Exposed:           models.Exposed,
 			Zen:               models.Zen,
-			Go:                models.Go,
 			LastRefresh:       lastRefresh,
 			StaleAfterSeconds: int(staleAfter / time.Second),
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
-		Keys: healthKeys{Zen: zenKeys, Go: goKeys, Total: zenKeys + goKeys, Anonymous: g.cfg.Anonymous},
+		Keys: healthKeys{Authenticated: authKeys, Total: authKeys, Anonymous: g.cfg.Anonymous},
 		Proxies: healthProxies{
 			Total:     proxyTotal,
 			Healthy:   proxyHealthy,
@@ -292,47 +315,38 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// routingReadiness reports additive global route availability without changing
-// any existing healthz field. It reads only config, proxy transport health,
-// and global credential 401 cooldowns; per-model target cooldowns and global
-// proxy429 cooldowns are never consulted, so one model's backoff or one
-// proxy's rate-limit cooldown cannot trigger a global 503. An expired
-// cooldown counts as available immediately.
+// routingReadiness reports additive global route availability over the two
+// channels. It reads only config, proxy transport health, and global
+// credential 401 cooldowns; per-model target cooldowns and global proxy429
+// cooldowns are never consulted, so one model's backoff or one proxy's
+// rate-limit cooldown cannot trigger a global 503. An expired cooldown counts
+// as available immediately.
 func (g *Gateway) routingReadiness() healthRouting {
 	now := time.Now().UnixNano()
 	anonPool := g.pools[g.cfg.ProxyRouting.Anonymous]
 	anonymousAvailable := g.cfg.Anonymous && anonPool != nil && anonPool.hasHealthy()
-	zenAvailable := 0
-	for _, cred := range g.zenCreds {
+	creds := g.credentials()
+	authAvailable := 0
+	for _, cred := range creds {
 		if g.scheduler == nil || g.scheduler.credentialCoolUntil(cred.id) <= now {
-			zenAvailable++
+			authAvailable++
 		}
 	}
-	goAvailable := 0
-	for _, cred := range g.goCreds {
-		if g.scheduler == nil || g.scheduler.credentialCoolUntil(cred.id) <= now {
-			goAvailable++
-		}
-	}
-	cooling := (len(g.zenCreds) - zenAvailable) + (len(g.goCreds) - goAvailable)
+	cooling := len(creds) - authAvailable
 	channels := 0
 	if anonymousAvailable {
 		channels++
 	}
-	if len(g.zenCreds) > 0 && zenAvailable > 0 {
-		if pool := g.pools[g.cfg.ProxyRouting.Zen]; pool != nil && pool.hasHealthy() {
-			channels++
-		}
-	}
-	if len(g.goCreds) > 0 && goAvailable > 0 {
-		if pool := g.pools[g.cfg.ProxyRouting.Go]; pool != nil && pool.hasHealthy() {
+	authPoolName := g.authPoolName()
+	if len(creds) > 0 && authAvailable > 0 {
+		if pool := g.pools[authPoolName]; pool != nil && pool.hasHealthy() {
 			channels++
 		}
 	}
 	return healthRouting{
 		AnonymousAvailable:      anonymousAvailable,
-		ZenCredentialsAvailable: zenAvailable,
-		GoCredentialsAvailable:  goAvailable,
+		AuthenticatedAvailable:  authAvailable,
+		ZenCredentialsAvailable: authAvailable,
 		CredentialsCooling:      cooling,
 		ChannelsAvailable:       channels,
 	}
@@ -369,10 +383,10 @@ func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	models := g.catalog.List()
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		if g.cfg.Anonymous && len(g.cfg.ZenKeys) == 0 && len(g.cfg.GoKeys) == 0 && !g.catalog.anonymousDecision(model).Allowed {
+		if g.cfg.Anonymous && len(g.cfg.Keys) == 0 && !g.catalog.anonymousDecision(model).Allowed {
 			continue
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		route, err := g.catalog.Route(model, len(g.cfg.Keys) > 0, g.cfg.Anonymous)
 		if err != nil {
 			continue
 		}
@@ -435,7 +449,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, "the model uses an upstream protocol that opencode2api does not expose", "invalid_request_error", "model")
 			return
 		}
-		route, err := g.catalog.Route(model, len(g.cfg.ZenKeys) > 0, len(g.cfg.GoKeys) > 0, g.cfg.Anonymous)
+		route, err := g.catalog.Route(model, len(g.cfg.Keys) > 0, g.cfg.Anonymous)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "model")
 			return
@@ -546,7 +560,7 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 	tiers := make([]Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier Tier) {
-		if tier != TierZen && tier != TierGo || seen[tier] {
+		if tier != TierZen || seen[tier] {
 			return
 		}
 		seen[tier] = true
@@ -563,9 +577,6 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 	for _, tier := range tiers {
 		protocol := route.ProtocolFor(tier)
 		baseURL := g.cfg.Upstream.Zen
-		if tier == TierGo {
-			baseURL = g.cfg.Upstream.Go
-		}
 		upstreamPayload, err := prepareUpstreamRequest(from, protocol, input, baseURL)
 		if err != nil {
 			if tier != route.Tier {
@@ -1031,7 +1042,7 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 	}
 
 	keyTiers := route.KeyTiers
-	if !route.Anonymous && len(keyTiers) == 0 && (route.Tier == TierZen || route.Tier == TierGo) {
+	if !route.Anonymous && len(keyTiers) == 0 && route.Tier == TierZen {
 		keyTiers = []Tier{route.Tier}
 	}
 	for tierIdx, tier := range keyTiers {
@@ -1114,7 +1125,7 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 	effectiveRoute := route
 	effectiveRoute.Tier = pin.Tier
 	effectiveRoute.Protocol = pin.Protocol
-	if pin.Tier == TierZen || pin.Tier == TierGo {
+	if pin.Tier == TierZen {
 		effectiveRoute.Protocol = route.ProtocolFor(pin.Tier)
 		if pin.Protocol != effectiveRoute.Protocol {
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
@@ -1144,15 +1155,8 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		}
 	case pin.Tier == TierZen:
 		baseURL = g.cfg.Upstream.Zen
-		poolName = g.cfg.ProxyRouting.Zen
-		wantCreds = g.zenCreds
-		if pin.Pool != poolName || pin.Authority != normalizeRouteAuthority(baseURL) {
-			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
-		}
-	case pin.Tier == TierGo:
-		baseURL = g.cfg.Upstream.Go
-		poolName = g.cfg.ProxyRouting.Go
-		wantCreds = g.goCreds
+		poolName = g.authPoolName()
+		wantCreds = g.credentials()
 		if pin.Pool != poolName || pin.Authority != normalizeRouteAuthority(baseURL) {
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
@@ -1911,16 +1915,9 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int, extra ...upstreamExtra) (*http.Response, error, int, bool, bool) {
 	var lastResponse *http.Response
 	var lastErr error
-	var creds []credentialRef
-	poolName := g.cfg.ProxyRouting.Zen
+	creds := g.credentials()
+	poolName := g.authPoolName()
 	baseURL := g.cfg.Upstream.Zen
-	if route.Tier == TierGo {
-		creds = g.goCreds
-		poolName = g.cfg.ProxyRouting.Go
-		baseURL = g.cfg.Upstream.Go
-	} else {
-		creds = g.zenCreds
-	}
 	pool := g.pools[poolName]
 	if len(creds) == 0 {
 		return nil, fmt.Errorf("no %s nodes configured", route.Tier), 0, false, false
@@ -2672,19 +2669,18 @@ func (g *Gateway) refreshCatalogGated(ctx context.Context, source string) (ran b
 	return true, g.runCatalogRefresh(ctx, source)
 }
 
-// runCatalogRefresh performs one Zen/Go/capability refresh pass. It reuses
+// runCatalogRefresh performs one Zen/capability refresh pass. It reuses
 // the stateless foreground-safe traversal, keeps the previous snapshot on
 // failure, and emits a single catalog_refresh_completed event. Callers must
 // hold catalogRefreshMu.
 func (g *Gateway) runCatalogRefresh(ctx context.Context, source string) (refreshed bool) {
 	started := time.Now()
-	var zen, goModels []string
+	var zen []string
 	var capabilities protocolCapabilities
 	var capabilitiesErr error
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(2)
 	go func() { defer wg.Done(); zen = g.refreshZen(ctx) }()
-	go func() { defer wg.Done(); goModels = g.refreshTier(ctx, g.cfg.Upstream.Go, TierGo) }()
 	go func() {
 		defer wg.Done()
 		capabilityCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -2699,8 +2695,8 @@ func (g *Gateway) runCatalogRefresh(ctx context.Context, source string) (refresh
 	if capabilitiesErr != nil && g.logger != nil {
 		g.logger.Warn("OpenCode capability catalog refresh failed", "component", "models", "event", "capability_refresh_failed", "source", source, "error", capabilitiesErr)
 	}
-	if zen != nil || goModels != nil {
-		g.catalog.ReplaceWithCapabilities(zen, goModels, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
+	if zen != nil {
+		g.catalog.ReplaceWithCapabilities(zen, nil, capabilities.Protocols, capabilities.Unsupported, capabilities.Metadata)
 		if ctx.Err() == nil {
 			if err := g.catalog.SaveCache(); err != nil && g.logger != nil {
 				g.logger.Warn("model catalog cache write failed", "component", "models", "event", "catalog_cache_write_failed", "source", source, "error", err)
@@ -2787,16 +2783,12 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 // healthy/checking is never changed via syncProxyResult/verifyProxyAfterError.
 // Healthy proxies are observed read-only; success/failure only decides the
 // catalog snapshot in the caller, and a context deadline/cancel is only a
-// refresh failure, never a proxy signal.
+// refresh failure, never a proxy signal. Only the Zen lane exists; the tier
+// argument is retained for compat and ignored beyond pool selection.
 func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []string {
-	var keys []string
-	poolName := g.cfg.ProxyRouting.Zen
-	if tier == TierGo {
-		keys = g.cfg.GoKeys
-		poolName = g.cfg.ProxyRouting.Go
-	} else {
-		keys = g.cfg.ZenKeys
-	}
+	keys := g.cfg.Keys
+	poolName := g.authPoolName()
+	_ = tier
 	if len(keys) == 0 {
 		return nil
 	}

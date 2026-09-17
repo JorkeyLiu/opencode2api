@@ -13,8 +13,8 @@ import (
 func schedulerTestGateway(t *testing.T, keys, proxies []string) *Gateway {
 	t.Helper()
 	pools := map[string][]string{"shared": proxies}
-	cfg := testGatewayConfig(pools, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = keys
+	cfg := testGatewayConfig(pools, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = keys
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestHRWStableOrder(t *testing.T) {
 	now := time.Now().UnixNano()
 	build := func() []targetCandidate {
 		return gateway.scheduler.orderCandidates(
-			gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "model-x", now),
+			gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "model-x", now),
 			"ses_stable_123")
 	}
 	first := build()
@@ -68,7 +68,7 @@ func TestHRWMinimalDisruption(t *testing.T) {
 		[]string{"direct", "http://127.0.0.1:8081"})
 	now := time.Now().UnixNano()
 	oldOrder := old.scheduler.orderCandidates(
-		old.scheduler.buildAuthCandidates(TierZen, old.zenCreds, old.pools["shared"], "model-x", now),
+		old.scheduler.buildAuthCandidates(TierZen, old.authCreds, old.pools["shared"], "model-x", now),
 		"ses_disrupt_9")
 	oldIDs := make([]string, 0, len(oldOrder))
 	for _, cand := range oldOrder {
@@ -78,7 +78,7 @@ func TestHRWMinimalDisruption(t *testing.T) {
 		[]string{"zen-key-aaaaa", "zen-key-bbbbb", "zen-key-ccccc"},
 		[]string{"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"})
 	newOrder := full.scheduler.orderCandidates(
-		full.scheduler.buildAuthCandidates(TierZen, full.zenCreds, full.pools["shared"], "model-x", now),
+		full.scheduler.buildAuthCandidates(TierZen, full.authCreds, full.pools["shared"], "model-x", now),
 		"ses_disrupt_9")
 	// Project the new order onto the old identity set (same tier/cred/pool/
 	// proxy/model strings are identical across gateways by construction).
@@ -111,7 +111,7 @@ func TestHRWSessionDispersion(t *testing.T) {
 	orders := map[string][]string{}
 	for _, session := range []string{"ses_one", "ses_two", "ses_three", "ses_four"} {
 		cands := gateway.scheduler.orderCandidates(
-			gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "model-x", now),
+			gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "model-x", now),
 			session)
 		ids := make([]string, 0, len(cands))
 		for _, cand := range cands {
@@ -134,7 +134,7 @@ func TestNoSessionRoundRobin(t *testing.T) {
 		[]string{"zen-key-aaaaa", "zen-key-bbbbb"},
 		[]string{"direct", "http://127.0.0.1:8081"})
 	now := time.Now().UnixNano()
-	base := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "model-x", now)
+	base := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "model-x", now)
 	if len(base) != 4 {
 		t.Fatalf("candidates=%d want 4", len(base))
 	}
@@ -160,7 +160,7 @@ func TestCandidateFanoutKxP(t *testing.T) {
 		[]string{"zen-key-aaaaa", "zen-key-bbbbb"},
 		[]string{"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"})
 	now := time.Now().UnixNano()
-	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
 	if len(cands) != 6 {
 		t.Fatalf("candidates=%d want 6", len(cands))
 	}
@@ -174,8 +174,8 @@ func TestCandidateFanoutKxP(t *testing.T) {
 func TestTierBudgets(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082", "http://127.0.0.1:8083"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa", "zen-key-bbbbb"}
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa", "zen-key-bbbbb"}
 	cfg.Anonymous = true
 	cfg.Retry.MaxAttempts = 3
 	normalized, err := NormalizeConfig("config.json", cfg)
@@ -187,7 +187,7 @@ func TestTierBudgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UnixNano()
-	auth := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	auth := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
 	if len(auth) != 8 {
 		t.Fatalf("auth candidates=%d want 8", len(auth))
 	}
@@ -204,12 +204,12 @@ func TestTierBudgets(t *testing.T) {
 func TestAllCoolNoPenetration(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	now := time.Now().UnixNano()
-	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
 	if len(cands) != 1 {
 		t.Fatalf("candidates=%d", len(cands))
 	}
 	gateway.scheduler.noteTargetFailure(cands[0].Identity, AttemptClassUpstreamFailure, 500, 0)
-	again := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", time.Now().UnixNano())
+	again := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", time.Now().UnixNano())
 	if len(again) != 0 {
 		t.Fatalf("cooling target must be excluded, got %d", len(again))
 	}
@@ -220,7 +220,7 @@ func TestStateMatrix(t *testing.T) {
 	setup := func() (*Gateway, targetCandidate) {
 		gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct", "http://127.0.0.1:8081"})
 		pool := gateway.pools["shared"]
-		cred := gateway.zenCreds[0]
+		cred := gateway.authCreds[0]
 		proxy := pool.items[0]
 		return gateway, authCand(TierZen, cred, pool, proxy, "model-a")
 	}
@@ -392,7 +392,7 @@ func TestStateMatrix(t *testing.T) {
 func TestModelIsolation(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	proxy := pool.items[0]
 	a := authCand(TierZen, cred, pool, proxy, "model-a")
 	b := authCand(TierZen, cred, pool, proxy, "model-b")
@@ -404,11 +404,11 @@ func TestModelIsolation(t *testing.T) {
 		t.Fatalf("model B polluted by model A rejection")
 	}
 	now := time.Now().UnixNano()
-	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, pool, "model-b", now)
+	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, pool, "model-b", now)
 	if len(cands) != 1 {
 		t.Fatalf("model B must stay available, got %d", len(cands))
 	}
-	missing := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, pool, "model-a", now)
+	missing := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, pool, "model-a", now)
 	if len(missing) != 0 {
 		t.Fatalf("model A must stay cooled, got %d", len(missing))
 	}
@@ -418,15 +418,15 @@ func TestModelIsolation(t *testing.T) {
 func TestCredentialGlobalVsTargetLocal(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := gateway.pools["shared"]
-	credA := gateway.zenCreds[0]
-	credB := gateway.zenCreds[1]
+	credA := gateway.authCreds[0]
+	credB := gateway.authCreds[1]
 	a0 := authCand(TierZen, credA, pool, pool.items[0], "m")
 	a1 := authCand(TierZen, credA, pool, pool.items[1], "m")
 	b0 := authCand(TierZen, credB, pool, pool.items[0], "m")
 	// 401 on one combo cools the whole credential: both proxies gone for A.
 	gateway.applyAttemptOutcome(context.Background(), a0, responseWithStatus(401), nil, time.Now().UnixNano())
 	now := time.Now().UnixNano()
-	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, pool, "m", now)
+	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, pool, "m", now)
 	for _, cand := range cands {
 		if cand.CredID == credA.id {
 			t.Fatalf("credential A must be globally cooling: %s", cand.Identity)
@@ -438,12 +438,12 @@ func TestCredentialGlobalVsTargetLocal(t *testing.T) {
 	// Target failure is local to the single combination.
 	gateway2 := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool2 := gateway2.pools["shared"]
-	a0b := authCand(TierZen, gateway2.zenCreds[0], pool2, pool2.items[0], "m")
-	a1b := authCand(TierZen, gateway2.zenCreds[0], pool2, pool2.items[1], "m")
+	a0b := authCand(TierZen, gateway2.authCreds[0], pool2, pool2.items[0], "m")
+	a1b := authCand(TierZen, gateway2.authCreds[0], pool2, pool2.items[1], "m")
 	_ = a1
 	_ = b0
 	gateway2.applyAttemptOutcome(context.Background(), a0b, responseWithStatus(500), nil, time.Now().UnixNano())
-	cands2 := gateway2.scheduler.buildAuthCandidates(TierZen, gateway2.zenCreds, pool2, "m", time.Now().UnixNano())
+	cands2 := gateway2.scheduler.buildAuthCandidates(TierZen, gateway2.authCreds, pool2, "m", time.Now().UnixNano())
 	if len(cands2) != 3 {
 		t.Fatalf("only one combo must cool, got %d", len(cands2))
 	}
@@ -489,8 +489,8 @@ func TestDeterministicBackoff(t *testing.T) {
 	// is proxy-global and covered in proxy429 tests).
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct"})
 	pool := gateway.pools["shared"]
-	a := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m")
-	b := authCand(TierZen, gateway.zenCreds[1], pool, pool.items[0], "m")
+	a := authCand(TierZen, gateway.authCreds[0], pool, pool.items[0], "m")
+	b := authCand(TierZen, gateway.authCreds[1], pool, pool.items[0], "m")
 	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(500), nil, time.Now().UnixNano())
 	gateway.applyAttemptOutcome(context.Background(), b, responseWithStatus(403), nil, time.Now().UnixNano())
 	gateway.applyAttemptOutcome(context.Background(), a, responseWithStatus(200), nil, time.Now().UnixNano())
@@ -504,8 +504,8 @@ func TestDeterministicBackoff(t *testing.T) {
 
 // 5. Hot reload migrates credential/proxy/target state; deletions drop.
 func TestHotReloadMigration(t *testing.T) {
-	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	oldCfg.ZenKeys = []string{"zen-key-aaaaa", "zen-key-doomed"}
+	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	oldCfg.Keys = []string{"zen-key-aaaaa", "zen-key-doomed"}
 	oldCfg.Anonymous = true
 	oldNormalized, err := NormalizeConfig("config.json", oldCfg)
 	if err != nil {
@@ -516,7 +516,7 @@ func TestHotReloadMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := oldGateway.pools["shared"]
-	keepCred := oldGateway.zenCreds[0]
+	keepCred := oldGateway.authCreds[0]
 	// Seed: credential 401 on kept key, target 500 on kept combo, proxy down.
 	keepCand := authCand(TierZen, keepCred, pool, pool.items[0], "m")
 	oldGateway.applyAttemptOutcome(context.Background(), keepCand, responseWithStatus(401), nil, time.Now().UnixNano())
@@ -525,8 +525,8 @@ func TestHotReloadMigration(t *testing.T) {
 		AttemptClassUpstreamFailure, 500, 0)
 	oldGateway.pools["shared"].items[1].healthy.Store(false)
 
-	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	newCfg.ZenKeys = []string{"zen-key-aaaaa", "zen-key-fresh"}
+	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	newCfg.Keys = []string{"zen-key-aaaaa", "zen-key-fresh"}
 	newCfg.Anonymous = true
 	newNormalized, err := NormalizeConfig("config.json", newCfg)
 	if err != nil {
@@ -582,8 +582,8 @@ func TestMigrationCapsRemaining(t *testing.T) {
 // 5b. Saving config (Apply path helpers) preserves cooldowns.
 func TestApplyPreservesCooldowns(t *testing.T) {
 	manager := &RuntimeManager{logger: nil, monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -594,7 +594,7 @@ func TestApplyPreservesCooldowns(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "m")
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	manager.current.Store(&gatewayRuntime{config: normalized, gateway: gateway})
@@ -614,7 +614,7 @@ func TestApplyPreservesCooldowns(t *testing.T) {
 func TestRefreshStateless(t *testing.T) {
 	gateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct"})
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "some-model")
 	gateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(500), nil, time.Now().UnixNano())
 	targetUntil := gateway.scheduler.targetCoolUntil(cand.Identity)
@@ -684,10 +684,10 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 	gateway := schedulerTestGateway(t,
 		[]string{"zen-key-aaaaa"},
 		[]string{"direct", "http://127.0.0.1:8081"})
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	// Active 401 cooldown: zero available.
 	gateway.scheduler.noteCredentialAuthFailure(cred.id)
-	statuses := keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
+	statuses := keyStatusesForTier(gateway, "zen", gateway.authCreds, "shared", nil)
 	if len(statuses) != 1 || statuses[0].AvailableTargets != 0 {
 		t.Fatalf("cooling credential must report zero: %+v", statuses)
 	}
@@ -696,7 +696,7 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 	gateway.scheduler.mu.Lock()
 	gateway.scheduler.credState[cred.id].cooldownUntil = past
 	gateway.scheduler.mu.Unlock()
-	statuses = keyStatusesForTier(gateway, "zen", gateway.zenCreds, "shared", nil)
+	statuses = keyStatusesForTier(gateway, "zen", gateway.authCreds, "shared", nil)
 	if len(statuses) != 1 {
 		t.Fatalf("statuses=%d", len(statuses))
 	}
@@ -707,7 +707,7 @@ func TestKeyAvailableTargetsExpiredMemoryMatchesCandidates(t *testing.T) {
 		t.Fatalf("expired cooldown must not expose a deadline: %+v", statuses[0])
 	}
 	now := time.Now().UnixNano()
-	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds, gateway.pools["shared"], "m", now)
+	cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["shared"], "m", now)
 	if statuses[0].AvailableTargets != len(cands) || statuses[0].AvailableTargets != 2 {
 		t.Fatalf("available=%d candidates=%d want 2", statuses[0].AvailableTargets, len(cands))
 	}
@@ -722,7 +722,7 @@ func TestAnonymousSummaryIgnoresSharedPoolAuthCooldown(t *testing.T) {
 		[]string{"zen-key-aaaaa"},
 		[]string{"direct", "http://127.0.0.1:8081"})
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	authID := targetIdentity(TierZen, cred.id, "shared", pool.items[0].name, "m")
 	gateway.scheduler.noteTargetFailure(authID, AttemptClassUpstreamFailure, 500, 0)
 	if got := gateway.scheduler.targetCoolUntil(authID); got <= time.Now().UnixNano() {

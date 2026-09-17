@@ -58,7 +58,7 @@ func TestCredentialCheckAffinityFirstDespiteShuffledIndexes(t *testing.T) {
 	mk := func(order []string) *Gateway {
 		manager, _, _, _ := credentialAdmin(t,
 			map[string][]string{"shared": order},
-			ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+			ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 			[]string{"zen-key-affinity-1"}, nil)
 		return manager.current.Load().gateway
 	}
@@ -71,7 +71,7 @@ func TestCredentialCheckAffinityFirstDespiteShuffledIndexes(t *testing.T) {
 		seedBulkProbeCatalog(gw)
 		body := bulkChatSuccessBody("bulk-free-model")
 		hits := stubPoolHits(gw, body)
-		cred := gw.zenCreds[0]
+		cred := gw.authCreds[0]
 		names := make([]string, 0, len(gw.pools["shared"].items))
 		for _, p := range gw.pools["shared"].items {
 			names = append(names, p.name)
@@ -121,11 +121,11 @@ func TestCredentialCheckAffinityFirstDespiteShuffledIndexes(t *testing.T) {
 func TestCredentialCheckExclusionWinsOverAffinity(t *testing.T) {
 	manager, _, _, _ := credentialAdmin(t,
 		map[string][]string{"shared": {"http://127.0.0.1:8081", "http://127.0.0.1:8082", "http://127.0.0.1:8083"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-affinity-2"}, nil)
 	gw := manager.current.Load().gateway
 	seedBulkProbeCatalog(gw)
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	names := []string{}
 	for _, p := range gw.pools["shared"].items {
 		names = append(names, p.name)
@@ -164,12 +164,12 @@ func TestCredentialCheckExclusionWinsOverAffinity(t *testing.T) {
 func TestCredentialCheckNoPinOrSessionMutation(t *testing.T) {
 	manager, _, _, _ := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-affinity-3"}, nil)
 	gw := manager.current.Load().gateway
 	seedBulkProbeCatalog(gw)
 	stubPoolHits(gw, bulkChatSuccessBody("bulk-free-model"))
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	pinsBefore := gw.scheduler.pins.count()
 	sessBefore := gw.scheduler.routeSessions.count()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

@@ -31,10 +31,7 @@ func snapshotRefreshState(gateway *Gateway) refreshStateSnapshot {
 			snap.checking[key] = proxy.checking.Load()
 		}
 	}
-	for _, cred := range gateway.zenCreds {
-		snap.cred[cred.id] = gateway.scheduler.credentialCoolUntil(cred.id)
-	}
-	for _, cred := range gateway.goCreds {
+	for _, cred := range gateway.authCreds {
 		snap.cred[cred.id] = gateway.scheduler.credentialCoolUntil(cred.id)
 	}
 	entries, total := gateway.scheduler.snapshotTargets()
@@ -133,11 +130,11 @@ func modelsServer(status int, body string, delay time.Duration) *httptest.Server
 
 func seedRefreshForeground(t *testing.T, gateway *Gateway) targetCandidate {
 	t.Helper()
-	pool := gateway.pools[gateway.cfg.ProxyRouting.Zen]
+	pool := gateway.pools[gateway.authPoolName()]
 	if pool == nil {
-		t.Fatalf("zen pool missing")
+		t.Fatalf("auth pool missing")
 	}
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	proxy := pool.items[0]
 	cand := authCand(TierZen, cred, pool, proxy, "some-model")
 	// Seed both layers: a 403/5xx target cooldown and a 429 proxy429 cooldown.
@@ -300,7 +297,7 @@ func TestRefreshDoesNotCreateCredentialState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = gateway.refreshTier(ctx, server.URL, TierZen)
-	for _, cred := range gateway.zenCreds {
+	for _, cred := range gateway.authCreds {
 		if _, until := gateway.scheduler.credentialSnapshot(cred.id); until != 0 {
 			t.Fatalf("refresh must not create credential state")
 		}
@@ -309,7 +306,7 @@ func TestRefreshDoesNotCreateCredentialState(t *testing.T) {
 	// path (no immediate health flip), proving the refresh no-op did not
 	// disable the path; only the independent probe result may flip health.
 	pool := gateway.pools["shared"]
-	cand := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m")
+	cand := authCand(TierZen, gateway.authCreds[0], pool, pool.items[0], "m")
 	gateway.applyAttemptOutcome(context.Background(), cand, nil, syscall.ECONNREFUSED, time.Now().UnixNano())
 	if !pool.items[0].healthy.Load() {
 		t.Fatalf("single transport failure must not immediately mark proxy unhealthy")

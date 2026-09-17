@@ -69,7 +69,7 @@ func TestWebUIConfigAutosaveBindings(t *testing.T) {
 	html := readConfigWebUI(t)
 	// Select/checkbox change saves immediately.
 	for _, needle := range []string{
-		`"c-prefer","c-level"`,
+		`"c-level"`,
 		`"c-anonymous","c-hist-enabled"`,
 		`on(id,"change",function(){ queueConfigSave(true)`,
 		`refreshPoolBadges(); queueConfigSave(true)`,
@@ -95,9 +95,9 @@ func TestWebUIConfigAutosaveBindings(t *testing.T) {
 		t.Fatal("missing revealConfig boundary")
 	}
 	bindBlock := html[bindIdx : bindIdx+bindEnd]
-	numericIDs := []string{"c-session", "c-attempts", "c-timeout", "c-refresh", "c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown", "c-ratelimit-cooldown", "c-ratelimit-cooldown-max", "c-ring", "c-hist-retention", "c-hist-max"}
-	textList := `["c-listen","c-web-listen","c-up-zen","c-up-go","c-hist-dir"]`
-	numericList := `["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ratelimit-cooldown-max","c-ring","c-hist-retention","c-hist-max"]`
+	numericIDs := []string{"c-session", "c-attempts", "c-timeout", "c-refresh", "c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown", "c-ratelimit-cooldown", "c-ring", "c-hist-retention", "c-hist-max"}
+	textList := `["c-listen","c-web-listen","c-up-zen","c-hist-dir"]`
+	numericList := `["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-retention","c-hist-max"]`
 	if !strings.Contains(bindBlock, textList) {
 		t.Fatal("text/URL autosave list must stay explicit")
 	}
@@ -164,6 +164,25 @@ func TestWebUIConfigAutosaveBindings(t *testing.T) {
 	// Chips remove saves immediately.
 	if !strings.Contains(html, `chip.remove(); queueConfigSave(true)`) {
 		t.Fatal("chip remove must queue an immediate save")
+	}
+	// Canonical save payload uses keys + anonymous/authenticated routing + Zen upstream only.
+	for _, needle := range []string{
+		`keys:secretInputs("keys")`,
+		`proxy_routing:{anonymous:anon,authenticated:auth}`,
+		`upstream:{zen:$("c-up-zen").value}`,
+		`rate_limit_cooldown_seconds:num("c-ratelimit-cooldown")`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("canonical save payload must contain %q", needle)
+		}
+	}
+	for _, stale := range []string{`zen_keys:secretInputs`, `go_keys:secretInputs`, `proxy_routing:{anonymous:anon,zen:`, `$("c-prefer")`, `$("c-up-go")`, `rate_limit_cooldown_max_seconds`, `"c-ratelimit-cooldown-max"`, `"c-up-go"`, `"c-prefer"`} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("legacy save payload must stay removed: %q", stale)
+		}
+	}
+	if !strings.Contains(html, `if(!anon||!auth)`) {
+		t.Fatal("routing guard must require anonymous/authenticated")
 	}
 	// Pool textarea inside modal is draft-only until modal save.
 	if !strings.Contains(html, `add.setAttribute("data-role","new")`) && !strings.Contains(html, `setAttribute("data-role","new")`) {

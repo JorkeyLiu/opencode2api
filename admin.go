@@ -269,8 +269,7 @@ type ProxyPoolView struct {
 type ConfigView struct {
 	Listen       string                   `json:"listen"`
 	ServerKeys   []SecretView             `json:"server_keys"`
-	ZenKeys      []SecretView             `json:"zen_keys"`
-	GoKeys       []SecretView             `json:"go_keys"`
+	Keys         []SecretView             `json:"keys"`
 	Anonymous    bool                     `json:"anonymous"`
 	ProxyPools   map[string]ProxyPoolView `json:"proxy_pools"`
 	ProxyRouting ProxyRoutingConfig       `json:"proxy_routing"`
@@ -280,7 +279,6 @@ type ConfigView struct {
 	Models       ModelsConfig             `json:"models"`
 	Performance  PerformanceConfig        `json:"performance"`
 	Logging      LoggingConfig            `json:"logging"`
-	Prefer       Tier                     `json:"prefer"`
 	History      HistoryConfig            `json:"history"`
 	WebUI        WebUIView                `json:"webui"`
 	Effective    EffectiveView            `json:"effective"`
@@ -313,6 +311,7 @@ type ProxyPoolInput struct {
 type ConfigUpdate struct {
 	Listen       string                    `json:"listen"`
 	ServerKeys   []SecretInput             `json:"server_keys"`
+	Keys         []SecretInput             `json:"keys"`
 	ZenKeys      []SecretInput             `json:"zen_keys"`
 	GoKeys       []SecretInput             `json:"go_keys"`
 	Anonymous    bool                      `json:"anonymous"`
@@ -346,16 +345,22 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_server_keys", err.Error())
 		return
 	}
-	zenKeys, err := resolveSecrets(update.ZenKeys, current.ZenKeys)
+	newKeys, err := resolveSecrets(update.Keys, current.Keys)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_keys", err.Error())
+		return
+	}
+	legacyZen, err := resolveSecrets(update.ZenKeys, current.ZenKeys)
 	if err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_zen_keys", err.Error())
 		return
 	}
-	goKeys, err := resolveSecrets(update.GoKeys, current.GoKeys)
+	legacyGo, err := resolveSecrets(update.GoKeys, current.GoKeys)
 	if err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_go_keys", err.Error())
 		return
 	}
+	keys := mergeKeys(newKeys, legacyZen, legacyGo)
 	pools, err := resolveProxyPools(update.ProxyPools, current.ProxyPools)
 	if err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_proxies", err.Error())
@@ -367,8 +372,8 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	candidate := Config{
-		Listen: update.Listen, ServerKeys: serverKeys, ZenKeys: zenKeys, GoKeys: goKeys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting, Fallback: fallback,
-		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging, Prefer: update.Prefer,
+		Listen: update.Listen, ServerKeys: serverKeys, Keys: keys, Anonymous: update.Anonymous, ProxyPools: pools, ProxyRouting: update.ProxyRouting, Fallback: fallback,
+		Upstream: update.Upstream, Retry: update.Retry, Models: update.Models, Performance: update.Performance, Logging: update.Logging,
 		History: update.History,
 		WebUI:   WebUIConfig{Enabled: update.WebUI.Enabled, Listen: update.WebUI.Listen, Username: current.WebUI.Username, PasswordHash: current.WebUI.PasswordHash, SessionTTLMinutes: update.WebUI.SessionTTLMinutes},
 	}
@@ -409,7 +414,7 @@ func (a *AdminServer) handleReveal(w http.ResponseWriter, r *http.Request) {
 	for _, ch := range cfg.Fallback.Channels {
 		fallbackChannels = append(fallbackChannels, map[string]any{"name": ch.Name, "base_url": ch.BaseURL, "api_key": ch.APIKey, "model": ch.Model, "protocol": string(fallbackChannelProtocol(ch)), "reasoning_effort": fallbackChannelEffort(ch)})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "zen_keys": cfg.ZenKeys, "go_keys": cfg.GoKeys, "proxy_pools": pools, "fallback": map[string]any{"active": cfg.Fallback.Active, "channels": fallbackChannels}})
+	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "keys": cfg.Keys, "proxy_pools": pools, "fallback": map[string]any{"active": cfg.Fallback.Active, "channels": fallbackChannels}})
 }
 
 func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
@@ -700,10 +705,17 @@ func (a *AdminServer) configView() ConfigView {
 	for name, pool := range cfg.ProxyPools {
 		pools[name] = ProxyPoolView{Proxies: maskSecrets(pool.Proxies, true), ProxyFile: pool.ProxyFile}
 	}
+	// Canonical output: upstream Go and performance max are cleared by
+	// NormalizeConfig (omitempty drops them); proxy routing legacy zen/go are
+	// cleared as well.
+	routing := ProxyRoutingConfig{Anonymous: cfg.ProxyRouting.Anonymous, Authenticated: cfg.ProxyRouting.Authenticated}
+	upstream := UpstreamConfig{Zen: cfg.Upstream.Zen}
+	perf := cfg.Performance
+	perf.RateLimitCooldownMaxSeconds = 0
 	return ConfigView{
-		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), ZenKeys: maskSecrets(cfg.ZenKeys, false), GoKeys: maskSecrets(cfg.GoKeys, false), Anonymous: cfg.Anonymous,
-		ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Fallback: fallbackViewFromConfig(cfg), Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models,
-		Performance: cfg.Performance, Logging: cfg.Logging, Prefer: cfg.Prefer, History: cfg.History,
+		Listen: cfg.Listen, ServerKeys: maskSecrets(cfg.ServerKeys, false), Keys: maskSecrets(cfg.Keys, false), Anonymous: cfg.Anonymous,
+		ProxyPools: pools, ProxyRouting: routing, Fallback: fallbackViewFromConfig(cfg), Upstream: upstream, Retry: cfg.Retry, Models: cfg.Models,
+		Performance: perf, Logging: cfg.Logging, History: cfg.History,
 		WebUI:     WebUIView{Enabled: cfg.WebUI.Enabled, Listen: cfg.WebUI.Listen, Username: cfg.WebUI.Username, SessionTTLMinutes: cfg.WebUI.SessionTTLMinutes},
 		Effective: EffectiveView{Listen: effective.API, WebUIListen: effective.WebUI, WebUIEnabled: effective.WebUIEnabled},
 		Restart:   restart,

@@ -27,7 +27,10 @@ func TestWebUIConfigGroups(t *testing.T) {
 		"网络与性能",
 		"日志与历史",
 		"监听与管理",
-		"首选上游顺序",
+		"认证密钥",
+		"认证路由池",
+		"匿名路由池",
+		"429 冷却（秒）",
 		"停用备用渠道",
 		"config-item-grid",
 		"完整地址预览",
@@ -83,17 +86,17 @@ func TestWebUIConfigGroups(t *testing.T) {
 	}
 	// All long-lived config element IDs preserved (sticky/reveal removed, topbar reload + status remain).
 	for _, id := range []string{
-		"c-prefer", "c-listen", "c-web-listen", "c-session", "c-web-enabled",
+		"c-listen", "c-web-listen", "c-session", "c-web-enabled",
 		"c-anonymous", "server_keys-chips", "server_keys-new",
-		"zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new",
+		"keys-chips", "keys-new",
 		"pools-editor", "btn-pool-add", "pools-error",
-		"c-route-anon", "c-route-zen", "c-route-go",
+		"c-route-anon", "c-route-auth",
 		"fallback-editor", "btn-fallback-add", "btn-fallback-clear", "fallback-error",
 		"fallback-modal", "fallback-modal-body",
 		"fallback-modal-save", "fallback-modal-delete", "fallback-modal-cancel",
 		"pool-modal", "pool-modal-body",
 		"pool-modal-save", "pool-modal-delete", "pool-modal-cancel",
-		"c-up-zen", "c-up-go", "c-attempts", "c-timeout",
+		"c-up-zen", "c-attempts", "c-timeout",
 		"c-refresh", "c-protocols",
 		"c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown",
 		"c-level", "c-ring",
@@ -103,6 +106,18 @@ func TestWebUIConfigGroups(t *testing.T) {
 		if !strings.Contains(html, id) {
 			t.Fatalf("missing config id %q", id)
 		}
+	}
+	// Canonical config only: no Zen/Go split, no prefer, no Go upstream, single 429 field.
+	for _, stale := range []string{"c-prefer", "首选上游顺序", "zen_keys", "go_keys", "Zen 密钥", "Go 密钥", "c-route-zen", "c-route-go", "Zen 路由池", "Go 路由池", "c-up-go", "Go 地址", "c-ratelimit-cooldown-max", "429 冷却最大值", "429 冷却最小值", "Go 通道", "Go（失败回退"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("legacy config control must stay removed: %q", stale)
+		}
+	}
+	if !strings.Contains(html, `id="c-ratelimit-cooldown"`) {
+		t.Fatal("missing single 429 cooldown input")
+	}
+	if !strings.Contains(html, "keys") {
+		t.Fatal("missing canonical keys input")
 	}
 	// Global sensitive-value button/modal and bottom sticky bar are gone.
 	for _, stale := range []string{"config-sticky", "btn-reveal", "btn-reload", "查看敏感值", "二次验证"} {
@@ -432,8 +447,7 @@ func TestWebUIPoolListModal(t *testing.T) {
 		"仍被路由引用",
 		"mapRoutingOnRename(oldSel,oldName,name)",
 		"c-route-anon",
-		"c-route-zen",
-		"c-route-go",
+		"c-route-auth",
 		"poolInputs",
 		"poolInputNames",
 	} {
@@ -451,9 +465,9 @@ func TestWebUIPoolListModal(t *testing.T) {
 	}
 	// Routing guards: three routes required, delete blocked while referenced.
 	for _, needle := range []string{
-		"匿名 / Zen / Go 必须各选择一个代理池",
+		"匿名 / 认证必须各选择一个代理池",
 		"至少需要一个代理池",
-		"refs.a===cur||refs.z===cur||refs.g===cur",
+		"refs.a===cur||refs.auth===cur",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("pool routing guard must contain %q", needle)
@@ -775,11 +789,23 @@ func TestWebUICustomRealtimeDisplay(t *testing.T) {
 	if !strings.Contains(html, `return "自定义"`) || !strings.Contains(html, `custom:`) {
 		t.Fatal("channelLabel must map custom and custom:<name> to display text")
 	}
-	// Batch key chips UI stays untouched.
-	for _, needle := range []string{"server_keys-chips", "server_keys-new", "zen_keys-chips", "zen_keys-new", "go_keys-chips", "go_keys-new", "每行新增一个密钥", "移除"} {
+	// Batch key chips UI uses the canonical single authenticated keys input.
+	for _, needle := range []string{"server_keys-chips", "server_keys-new", "keys-chips", "keys-new", "每行新增一个密钥", "移除"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("batch key UI must stay intact: %q", needle)
 		}
+	}
+	for _, stale := range []string{"zen_keys-chips", "go_keys-chips", "zen_keys-new", "go_keys-new"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("split Zen/Go key UI must stay removed: %q", stale)
+		}
+	}
+	if !strings.Contains(html, "认证密钥") {
+		t.Fatal("keys input must be labeled for authenticated keys")
+	}
+	// API key field regression: the eye-row must be attached to its wrapper.
+	if !strings.Contains(html, "keyWrap.appendChild(keyRow)") {
+		t.Fatal("fallback keyRow must be attached via keyWrap.appendChild(keyRow)")
 	}
 }
 

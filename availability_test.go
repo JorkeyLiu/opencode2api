@@ -19,8 +19,9 @@ func bulkAdmin(t *testing.T, pools map[string][]string, routing ProxyRoutingConf
 	t.Helper()
 	manager := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
 	cfg := testGatewayConfig(pools, routing)
-	cfg.ZenKeys = zenKeys
-	cfg.GoKeys = goKeys
+	cfg.Keys = mergeKeys(zenKeys, goKeys)
+	cfg.ZenKeys = nil
+	cfg.GoKeys = nil
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -58,7 +59,7 @@ func bulkChatSuccessBody(model string) string {
 func TestBulkAuthCSRFOriginStrictNoStore(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	_ = manager
 	if rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", `{}`, "", "")); rec.Code != http.StatusUnauthorized {
@@ -88,7 +89,7 @@ func TestBulkAuthCSRFOriginStrictNoStore(t *testing.T) {
 func TestBulkRateLimitBusy(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		nil, nil)
 	// Point upstream at a fast local 500 so bulk completes quickly without external network.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -98,7 +99,6 @@ func TestBulkRateLimitBusy(t *testing.T) {
 	defer srv.Close()
 	runtime := manager.current.Load()
 	runtime.gateway.cfg.Upstream.Zen = srv.URL
-	runtime.gateway.cfg.Upstream.Go = srv.URL
 	var last *httptest.ResponseRecorder
 	for i := 0; i < 4; i++ {
 		last = serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", `{}`, token, csrf))
@@ -109,7 +109,7 @@ func TestBulkRateLimitBusy(t *testing.T) {
 	// Busy gate: hold the mutex then expect 409 (use a fresh admin to avoid rate limit).
 	_, admin2, token2, csrf2 := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		nil, nil)
 	rt2 := admin2.manager.current.Load()
 	rt2.gateway.bulkMu.Lock()
@@ -122,8 +122,8 @@ func TestBulkRateLimitBusy(t *testing.T) {
 func TestBulkSameRawURLIsolation(t *testing.T) {
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"a": {"direct"}, "b": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "a", Go: "b"},
-		[]string{"zen-key-12345"}, []string{"go-key-12345"})
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "b"},
+		[]string{"zen-key-12345"}, nil)
 	gw := manager.current.Load().gateway
 	// Same raw URL in different pools stays isolated.
 	gw.scheduler.noteChannelFailure(TierZen, "a", "direct", AttemptClassUpstreamFailure, 500, 0, time.Now().UnixNano())
@@ -137,25 +137,23 @@ func TestBulkSameRawURLIsolation(t *testing.T) {
 		t.Fatalf("go must stay isolated from zen")
 	}
 	snap := manager.Resources()
-	seen := map[string]string{}
-	for _, p := range snap.Proxies {
-		if p.Address == redactURL("direct") {
-			seen[p.Pool] = p.Zen
+	// Same raw URL in different pools appears as independent rows.
+	if len(snap.Proxies) != 2 {
+		t.Fatalf("expected two pool-qualified rows, got %d", len(snap.Proxies))
+	}
+	// Resource rows are observation-driven: scheduler channel state must not
+	// leak into observations; both rows stay untested without a probe.
+	for _, pr := range snap.Proxies {
+		if pr.AnonymousObservation != "untested" && pr.AuthenticatedObservation != "untested" {
+			t.Fatalf("fresh observations must stay untested despite channel cooldown: %+v", pr)
 		}
-	}
-	if seen["a"] == seen["b"] && seen["a"] == "available" {
-		t.Fatalf("pool a zen must differ after channel cooldown: %+v", seen)
-	}
-	// Visual grouping: same redacted node appears in both pools.
-	if len(snap.Proxies) < 2 {
-		t.Fatalf("expected two pool-qualified rows")
 	}
 }
 
 func TestBulkPublicNeverWritesGo(t *testing.T) {
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	gw := manager.current.Load().gateway
 	pool := gw.pools["shared"]
@@ -189,7 +187,7 @@ func TestBulkPublicNeverWritesGo(t *testing.T) {
 	if _, _, ok := gw2.scheduler.proxy429CooldownStatus(TierZen, "shared", pool2.items[1].name); ok {
 		t.Fatalf("public 429 without success must stay display-only")
 	}
-	for _, cred := range gw2.zenCreds {
+	for _, cred := range gw2.authCreds {
 		if _, _, ok := gw2.scheduler.credential429CooldownStatus(cred.id); ok {
 			t.Fatalf("public must never write configured credential429")
 		}
@@ -202,12 +200,12 @@ func TestBulkPublicNeverWritesGo(t *testing.T) {
 func TestBulkReal401Isolation(t *testing.T) {
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
-		[]string{"same-secret-12345"}, []string{"same-secret-12345"})
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
+		[]string{"same-secret-12345", "other-secret-67890"}, nil)
 	gw := manager.current.Load().gateway
 	pool := gw.pools["shared"]
 	now := time.Now().UnixNano()
-	zenCred := gw.zenCreds[0]
+	zenCred := gw.authCreds[0]
 	results := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: zenCred.key, CredID: zenCred.id, CredDisp: zenCred.display}, StartedNanos: now, Status: 401},
 	}
@@ -215,16 +213,21 @@ func TestBulkReal401Isolation(t *testing.T) {
 	if got := gw.scheduler.credentialCoolUntil(zenCred.id); got <= time.Now().UnixNano() {
 		t.Fatalf("zen 401 must cool matching tier+cred")
 	}
-	goCred := gw.goCreds[0]
-	if got := gw.scheduler.credentialCoolUntil(goCred.id); got > time.Now().UnixNano() {
-		t.Fatalf("same key text on go must stay isolated")
+	otherCred := gw.authCreds[1]
+	if got := gw.scheduler.credentialCoolUntil(otherCred.id); got > time.Now().UnixNano() {
+		t.Fatalf("other credential must stay isolated")
+	}
+	// Same key text on the legacy Go tier yields a distinct identity that the
+	// single authenticated lane never uses.
+	if credentialFingerprint(TierZen, zenCred.key) == credentialFingerprint(TierGo, zenCred.key) {
+		t.Fatalf("tier-qualified fingerprints must differ")
 	}
 }
 
 func TestBulk429ComparativeRules(t *testing.T) {
 	gw := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := gw.pools["shared"]
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	now := time.Now().UnixNano()
 	// One success + one 429 writes proxy429 only for failed node.
 	results := []bulkSendResult{
@@ -244,7 +247,7 @@ func TestBulk429ComparativeRules(t *testing.T) {
 	// Two distinct 429 without success writes credential429 with second Retry-After.
 	gw2 := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"})
 	pool2 := gw2.pools["shared"]
-	cred2 := gw2.zenCreds[0]
+	cred2 := gw2.authCreds[0]
 	now2 := time.Now().UnixNano()
 	r2 := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool2.items[0], Raw: pool2.items[0].name, Tier: TierZen, CredKey: cred2.key, CredID: cred2.id, CredDisp: cred2.display}, StartedNanos: now2, Status: 429, RetryAfter: time.Second},
@@ -274,7 +277,7 @@ func TestBulk429ComparativeRules(t *testing.T) {
 func TestBulkChannelComparativeRules(t *testing.T) {
 	gw := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := gw.pools["shared"]
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	now := time.Now().UnixNano()
 	results := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display}, StartedNanos: now, Status: 200, Success: true},
@@ -290,7 +293,7 @@ func TestBulkChannelComparativeRules(t *testing.T) {
 	// No comparative success means display only.
 	gw2 := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool2 := gw2.pools["shared"]
-	cred2 := gw2.zenCreds[0]
+	cred2 := gw2.authCreds[0]
 	r2 := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool2.items[0], Raw: pool2.items[0].name, Tier: TierZen, CredKey: cred2.key, CredID: cred2.id, CredDisp: cred2.display}, StartedNanos: now, Status: 503},
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool2.items[1], Raw: pool2.items[1].name, Tier: TierZen, CredKey: cred2.key, CredID: cred2.id, CredDisp: cred2.display}, StartedNanos: now + 1, Status: 403},
@@ -306,7 +309,7 @@ func TestBulkChannelComparativeRules(t *testing.T) {
 	}
 	gw.scheduler.noteChannelFailure(TierZen, "shared", pool.items[1].name, AttemptClassUpstreamFailure, 500, 0, now+3)
 	if _, _, ok := gw.scheduler.channelCooldownStatus(TierGo, "shared", pool.items[1].name); ok {
-		t.Fatalf("tier isolation broken")
+		t.Fatalf("legacy Go channel state must never be written by Zen traffic")
 	}
 	// Filtering in anonymous/auth candidate building.
 	anonPool := gw.pools["shared"]
@@ -314,7 +317,7 @@ func TestBulkChannelComparativeRules(t *testing.T) {
 		// Channel is on items[1]; anonymous should exclude it, leaving one.
 		t.Fatalf("anonymous must filter channel-cooling proxy: got %d", len(got))
 	}
-	authCands := gw.scheduler.buildAuthCandidates(TierZen, gw.zenCreds, anonPool, "m", time.Now().UnixNano())
+	authCands := gw.scheduler.buildAuthCandidates(TierZen, gw.authCreds, anonPool, "m", time.Now().UnixNano())
 	for _, c := range authCands {
 		if c.ProxyRaw == pool.items[1].name {
 			t.Fatalf("auth must filter channel-cooling proxy")
@@ -322,7 +325,7 @@ func TestBulkChannelComparativeRules(t *testing.T) {
 	}
 	// Pinned-anonymous fast-fails on channel without cross-proxy moves.
 	gw.bindSessionPin("ses-chan-1", "m1", TierZen, anonymousSchedulerCredentialID, "shared", pool.items[1].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
-	route, _ := gw.catalog.Route("m1", true, false, true)
+	route, _ := gw.catalog.Route("m1", true, true)
 	_ = route
 	// Directly verify fast-fail status via channel check (pinned path uses same check).
 	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "shared", pool.items[1].name); !ok {
@@ -339,7 +342,7 @@ func TestBulkChannelStaleAnd408Diagnostic(t *testing.T) {
 		t.Fatalf("stale channel success must not clear")
 	}
 	// 408/425/parse/empty are diagnostic only.
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	r := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display}, StartedNanos: newer + 1, Status: 408},
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display}, StartedNanos: newer + 2, ParseError: true, Status: 200},
@@ -355,7 +358,7 @@ func TestBulkChannelStaleAnd408Diagnostic(t *testing.T) {
 func TestBulkMigrationBoundsHealthNoPollution(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	_ = admin
 	_ = token
@@ -367,7 +370,7 @@ func TestBulkMigrationBoundsHealthNoPollution(t *testing.T) {
 	gw.scheduler.noteProxy429Failure(TierZen, "shared", pool.items[1].name, AttemptClassRateLimited, 429, 0, now)
 	beforeHealth := gw.routingReadiness()
 	// Healthz readiness unchanged by channel/proxy429/credential429.
-	gw.scheduler.noteCredential429Failure(gw.zenCreds[0].id, AttemptClassRateLimited, 429, 0, now)
+	gw.scheduler.noteCredential429Failure(gw.authCreds[0].id, AttemptClassRateLimited, 429, 0, now)
 	afterHealth := gw.routingReadiness()
 	if beforeHealth != afterHealth {
 		t.Fatalf("readiness must ignore channel/proxy429/credential429: %+v -> %+v", beforeHealth, afterHealth)
@@ -414,7 +417,7 @@ func TestBulkRedactionAndConcurrencyCap(t *testing.T) {
 	secretProxy := "http://user:hunter2@127.0.0.1:9"
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {secretProxy}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"sk-live-secret-abcdef-12345"}, []string{"go-live-secret-67890"})
 	// Fast local upstream that always succeeds.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -477,7 +480,7 @@ func TestBulkCancelPartialNoTransportWrite(t *testing.T) {
 func TestBulkPinnedMovementAndFastFail(t *testing.T) {
 	gw := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := gw.pools["shared"]
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	now := time.Now().UnixNano()
 	// Channel on items[1] must be skipped by pinned-auth eligible movement.
 	gw.scheduler.noteChannelFailure(TierZen, "shared", pool.items[1].name, AttemptClassUpstreamFailure, 500, 0, now)
@@ -553,8 +556,8 @@ func TestWebUIAvailabilityStatic(t *testing.T) {
 func TestBulkTransportProjectionMergeSawHTTP(t *testing.T) {
 	gw := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := gw.pools["shared"]
-	credA := gw.zenCreds[0]
-	credB := gw.zenCreds[1]
+	credA := gw.authCreds[0]
+	credB := gw.authCreds[1]
 	now := time.Now().UnixNano()
 	raw := pool.items[0].name
 	// Same pool-qualified node: HTTP success via one credential plus conclusive
@@ -607,23 +610,23 @@ func TestBulkTransportProjectionMergeSawHTTP(t *testing.T) {
 func TestBulkCredentialTailCollisionSeparate(t *testing.T) {
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"AAA-12345", "BBB-12345"}, nil)
 	gw := manager.current.Load().gateway
-	if len(gw.zenCreds) != 2 {
-		t.Fatalf("want 2 creds got %d", len(gw.zenCreds))
+	if len(gw.authCreds) != 2 {
+		t.Fatalf("want 2 creds got %d", len(gw.authCreds))
 	}
-	if gw.zenCreds[0].display != gw.zenCreds[1].display {
-		t.Fatalf("tails must collide for this test: %q vs %q", gw.zenCreds[0].display, gw.zenCreds[1].display)
+	if gw.authCreds[0].display != gw.authCreds[1].display {
+		t.Fatalf("tails must collide for this test: %q vs %q", gw.authCreds[0].display, gw.authCreds[1].display)
 	}
-	if gw.zenCreds[0].id == gw.zenCreds[1].id {
+	if gw.authCreds[0].id == gw.authCreds[1].id {
 		t.Fatalf("internal IDs must differ despite tail collision")
 	}
 	pool := gw.pools["shared"]
 	now := time.Now().UnixNano()
 	results := []bulkSendResult{
-		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.zenCreds[0].key, CredID: gw.zenCreds[0].id, CredDisp: gw.zenCreds[0].display}, StartedNanos: now, Status: 200, Success: true},
-		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.zenCreds[1].key, CredID: gw.zenCreds[1].id, CredDisp: gw.zenCreds[1].display}, StartedNanos: now + 1, Status: 401},
+		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.authCreds[0].key, CredID: gw.authCreds[0].id, CredDisp: gw.authCreds[0].display}, StartedNanos: now, Status: 200, Success: true},
+		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.authCreds[1].key, CredID: gw.authCreds[1].id, CredDisp: gw.authCreds[1].display}, StartedNanos: now + 1, Status: 401},
 	}
 	resp := gw.buildBulkResponse(time.Now().UTC(), 1, 2, 0, false, false, results)
 	if len(resp.Credentials) != 2 {
@@ -638,10 +641,10 @@ func TestBulkCredentialTailCollisionSeparate(t *testing.T) {
 		}
 	}
 	gw.applyBulkWrites(context.Background(), results)
-	if got := gw.scheduler.credentialCoolUntil(gw.zenCreds[1].id); got <= time.Now().UnixNano() {
+	if got := gw.scheduler.credentialCoolUntil(gw.authCreds[1].id); got <= time.Now().UnixNano() {
 		t.Fatalf("401 cred must cool")
 	}
-	if got := gw.scheduler.credentialCoolUntil(gw.zenCreds[0].id); got > time.Now().UnixNano() {
+	if got := gw.scheduler.credentialCoolUntil(gw.authCreds[0].id); got > time.Now().UnixNano() {
 		t.Fatalf("success cred must not cool despite same tail")
 	}
 }
@@ -669,7 +672,7 @@ func TestBulkStrictEmptyObject(t *testing.T) {
 		// rejected bodies consume the window.
 		_, admin, token, csrf := bulkAdmin(t,
 			map[string][]string{"shared": {"direct"}},
-			ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+			ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 			nil, nil)
 		// Point upstream at a fast local stub so OK cases complete without
 		// external network.
@@ -698,7 +701,7 @@ func TestBulkPartialSnapshotAndZeroTestedGuard(t *testing.T) {
 	now := time.Now().UTC()
 	// Complete run stores a complete snapshot.
 	complete := gw.buildBulkResponse(now, 2, 2, 0, false, false, []bulkSendResult{
-		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.zenCreds[0].key, CredID: gw.zenCreds[0].id, CredDisp: gw.zenCreds[0].display}, StartedNanos: time.Now().UnixNano(), Status: 200, Success: true},
+		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.authCreds[0].key, CredID: gw.authCreds[0].id, CredDisp: gw.authCreds[0].display}, StartedNanos: time.Now().UnixNano(), Status: 200, Success: true},
 	})
 	complete.Partial = false
 	snap := &bulkAvailabilitySnapshot{CheckedAt: now, TotalNodes: 2, TestedNodes: 2, Nodes: complete.Nodes, Credentials: complete.Credentials}
@@ -722,7 +725,7 @@ func TestBulkPartialSnapshotAndZeroTestedGuard(t *testing.T) {
 	}
 	// Partial run with useful rows preserves nodes and marks partial.
 	partialResp := gw.buildBulkResponse(time.Now().UTC(), 2, 1, 0, false, true, []bulkSendResult{
-		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.zenCreds[0].key, CredID: gw.zenCreds[0].id, CredDisp: gw.zenCreds[0].display}, StartedNanos: time.Now().UnixNano(), Status: 200, Success: true},
+		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: gw.authCreds[0].key, CredID: gw.authCreds[0].id, CredDisp: gw.authCreds[0].display}, StartedNanos: time.Now().UnixNano(), Status: 200, Success: true},
 	})
 	if !partialResp.Partial {
 		t.Fatalf("partial flag must survive response")
@@ -735,7 +738,7 @@ func TestBulkPartialSnapshotAndZeroTestedGuard(t *testing.T) {
 func TestBulkCred429SecondRetryAfterAndWatermark(t *testing.T) {
 	gw := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"})
 	pool := gw.pools["shared"]
-	cred := gw.zenCreds[0]
+	cred := gw.authCreds[0]
 	base := time.Now().UnixNano()
 	r := []bulkSendResult{
 		{Target: bulkSendTarget{PoolName: "shared", Proxy: pool.items[0], Raw: pool.items[0].name, Tier: TierZen, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display}, StartedNanos: base, Status: 429, RetryAfter: time.Second},
@@ -789,7 +792,7 @@ func TestBulkPinnedFilteringRealEntryPoints(t *testing.T) {
 	// entry point's own filter).
 	gw2 := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool2 := gw2.pools["shared"]
-	cred2 := gw2.zenCreds[0]
+	cred2 := gw2.authCreds[0]
 	gw2.scheduler.noteChannelFailure(TierZen, "shared", pool2.items[0].name, AttemptClassUpstreamFailure, 500, 0, now)
 	gw2.scheduler.noteChannelFailure(TierZen, "shared", pool2.items[1].name, AttemptClassUpstreamFailure, 500, 0, now)
 	gw2.bindSessionPin("ses-pinned-auth-real", "m1", TierZen, cred2.id, "shared", pool2.items[0].name, ProtocolChat, normalizeRouteAuthority(gw2.cfg.Upstream.Zen))
@@ -808,7 +811,7 @@ func TestBulkPinnedFilteringRealEntryPoints(t *testing.T) {
 	drainAndClose(resp2.Body)
 	// Unbound candidate builders must also filter the cooling proxy (real
 	// filtering entry points shared by establishment).
-	cands := gw2.scheduler.buildAuthCandidates(TierZen, gw2.zenCreds, pool2, "m1", time.Now().UnixNano())
+	cands := gw2.scheduler.buildAuthCandidates(TierZen, gw2.authCreds, pool2, "m1", time.Now().UnixNano())
 	for _, c := range cands {
 		if c.ProxyRaw == pool2.items[0].name || c.ProxyRaw == pool2.items[1].name {
 			t.Fatalf("auth candidates must filter channel-cooling proxies")
@@ -825,7 +828,7 @@ func TestBulkPinnedFilteringRealEntryPoints(t *testing.T) {
 func TestBulkFullHTTPRunLeavesMonitorHistoryUntouched(t *testing.T) {
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -874,7 +877,7 @@ func TestBulkLargePoolSendCapTruncation(t *testing.T) {
 	_ = proxies
 	manager, _, _, _ := bulkAdmin(t,
 		map[string][]string{"shared": distinct},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	gw := manager.current.Load().gateway
 	seedBulkProbeCatalog(gw)

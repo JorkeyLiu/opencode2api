@@ -50,23 +50,23 @@ type Tier string
 
 const (
 	TierZen Tier = "zen"
-	TierGo  Tier = "go"
+	// TierGo is a legacy compat value only. Old disk caches may still carry
+	// go entries; they are tolerated on load but never routable or exposed.
+	// All live routing uses TierZen for both anonymous and authenticated lanes.
+	TierGo Tier = "go"
 )
 
 type modelRoute struct {
 	ID       string
 	Tier     Tier
 	Protocol Protocol
-	// Protocols is the native protocol for each possible upstream tier. Zen
-	// and Go intentionally do not share one global protocol: OpenCode's
-	// catalog currently exposes, for example, MiniMax through Chat on Zen and
-	// Messages on Go. The request must therefore be re-encoded when a retry
-	// crosses tiers.
+	// Protocols carries the native protocol per tier for compat; only the Zen
+	// entry is live. Requests never cross tiers.
 	Protocols map[Tier]Protocol
 	Anonymous bool
-	// KeyTiers is the ordered authenticated fallback plan. Anonymous requests
-	// always start on Zen, then enter this list when the public credential does
-	// not succeed.
+	// KeyTiers is the authenticated lane plan. Only TierZen is ever present;
+	// anonymous requests start on Zen, then enter this lane when the public
+	// credential does not succeed.
 	KeyTiers []Tier
 }
 
@@ -77,7 +77,6 @@ type ModelRouteDiagnostic struct {
 	NativeProtocols      map[Tier]Protocol `json:"native_protocols,omitempty"`
 	ProtocolSource       string            `json:"protocol_source"`
 	AvailableZen         bool              `json:"available_zen"`
-	AvailableGo          bool              `json:"available_go"`
 	Tier                 Tier              `json:"tier,omitempty"`
 	Anonymous            bool              `json:"anonymous"`
 	KeyID                string            `json:"key_id,omitempty"`
@@ -109,7 +108,6 @@ type modelCatalog struct {
 
 type modelCatalogSnapshot struct {
 	Zen         int       `json:"zen"`
-	Go          int       `json:"go"`
 	Total       int       `json:"total"`
 	Exposed     int       `json:"exposed"`
 	UpdatedAt   time.Time `json:"updated_at,omitempty"`
@@ -260,7 +258,7 @@ func (c *modelCatalog) SaveCache() error {
 		SchemaVersion:   modelCatalogCacheSchemaVersion,
 		UpdatedAt:       c.updatedAt.UTC(),
 		Zen:             sortedSetKeys(c.zen),
-		Go:              sortedSetKeys(c.goModels),
+		Go:              []string{},
 		NativeProtocols: cloneTierProtocols(c.nativeProtocols),
 		Unsupported:     cloneTierBools(c.unsupported),
 		Metadata:        cloneModelMeta(c.modelMeta),
@@ -272,16 +270,15 @@ func (c *modelCatalog) SaveCache() error {
 	return saveModelCatalogCache(path, cache)
 }
 
-func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (modelRoute, error) {
+func (c *modelCatalog) Route(model string, hasKeys, hasAnonymous bool) (modelRoute, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	keyTiers := c.keyTierOrderLocked(model, hasZenKeys, hasGoKeys)
-	// OpenCode's public credential is a Zen-only lane. Every free model starts
-	// there, even if the current catalog only advertises it on Go: an upstream
-	// rejection will move the request into the authenticated fallback plan.
+	keyTiers := c.keyTierOrderLocked(model, hasKeys)
+	// The public credential is a Zen-only lane. Every free Zen-servable model
+	// starts there; legacy Go entries never make a model routable.
 	decision := c.anonymousDecision(model)
 	if hasAnonymous && decision.Allowed && (c.protocols[model] != "" || !c.unsupported[TierZen][model]) &&
-		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model] || c.goModels[model]) {
+		(len(c.zen) == 0 && len(c.goModels) == 0 || c.zen[model]) {
 		protocols := c.protocolsForLocked(model, keyTiers, true)
 		return modelRoute{ID: model, Tier: TierZen, Protocol: protocols[TierZen], Protocols: protocols, Anonymous: true, KeyTiers: keyTiers}, nil
 	}
@@ -289,7 +286,13 @@ func (c *modelCatalog) Route(model string, hasZenKeys, hasGoKeys, hasAnonymous b
 		protocols := c.protocolsForLocked(model, keyTiers, false)
 		return modelRoute{ID: model, Tier: keyTiers[0], Protocol: protocols[keyTiers[0]], Protocols: protocols, KeyTiers: keyTiers}, nil
 	}
-	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen or Go pools", model)
+	return modelRoute{}, fmt.Errorf("model %q is not available in the configured Zen pool", model)
+}
+
+// RouteLegacy is a compat wrapper for callers still passing dual-tier key
+// presence. Go presence is ignored; only the merged Zen presence matters.
+func (c *modelCatalog) RouteLegacy(model string, hasZenKeys, hasGoKeys, hasAnonymous bool) (modelRoute, error) {
+	return c.Route(model, hasZenKeys || hasGoKeys, hasAnonymous)
 }
 
 func (r modelRoute) ProtocolFor(tier Tier) Protocol {
@@ -323,33 +326,20 @@ func (c *modelCatalog) protocolForLocked(model string, tier Tier) Protocol {
 	return ProtocolChat
 }
 
-// keyTierOrderLocked builds an authenticated route in prefer order. A tier is
-// included only when it has a key and advertises the model. Before the first
-// successful catalog refresh, configured key pools remain usable so temporary
-// discovery failures do not take the gateway offline.
-func (c *modelCatalog) keyTierOrderLocked(model string, hasZenKeys, hasGoKeys bool) []Tier {
+// keyTierOrderLocked builds the single authenticated lane. The tier is
+// included only when a key is configured and the Zen catalog advertises the
+// model. Legacy Go entries never qualify. Before the first successful catalog
+// refresh, the configured key lane remains usable so temporary discovery
+// failures do not take the gateway offline.
+func (c *modelCatalog) keyTierOrderLocked(model string, hasKeys bool) []Tier {
+	if !hasKeys {
+		return nil
+	}
 	catalogPending := len(c.zen) == 0 && len(c.goModels) == 0
-	available := func(tier Tier) bool {
-		switch tier {
-		case TierZen:
-			return hasZenKeys && (catalogPending || c.zen[model]) && c.tierSupportedLocked(model, TierZen)
-		case TierGo:
-			return hasGoKeys && (catalogPending || c.goModels[model]) && c.tierSupportedLocked(model, TierGo)
-		default:
-			return false
-		}
+	if (catalogPending || c.zen[model]) && c.tierSupportedLocked(model, TierZen) {
+		return []Tier{TierZen}
 	}
-	order := []Tier{TierZen, TierGo}
-	if c.prefer == TierGo {
-		order[0], order[1] = order[1], order[0]
-	}
-	result := make([]Tier, 0, len(order))
-	for _, tier := range order {
-		if available(tier) {
-			result = append(result, tier)
-		}
-	}
-	return result
+	return nil
 }
 
 func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
@@ -359,38 +349,31 @@ func (c *modelCatalog) anonymousDecision(model string) AnonymousDecision {
 	return AnonymousDecision{Allowed: isFreeModel(model), Source: "name_fallback_metadata_pending"}
 }
 
-func (c *modelCatalog) Diagnostic(model string, requested Protocol, hasZenKeys, hasGoKeys, hasAnonymous bool) ModelRouteDiagnostic {
+func (c *modelCatalog) Diagnostic(model string, requested Protocol, hasKeys, hasAnonymous bool) ModelRouteDiagnostic {
 	c.mu.RLock()
 	configured, explicit := c.protocols[model]
-	zen, goModel := c.zen[model], c.goModels[model]
+	zen := c.zen[model]
 	nativeProtocols := map[Tier]Protocol{
 		TierZen: c.protocolForLocked(model, TierZen),
-		TierGo:  c.protocolForLocked(model, TierGo),
 	}
 	_, zenKnown := c.nativeProtocols[TierZen][model]
-	_, goKnown := c.nativeProtocols[TierGo][model]
 	c.mu.RUnlock()
 	source := "configured"
 	if !explicit {
 		source = "default"
-		if zenKnown || goKnown {
+		if zenKnown {
 			source = "upstream"
 		}
 	}
 	protocol := configured
 	if protocol == "" {
-		// Route() below selects the preferred available tier. This is only the
-		// fallback shown when no route can currently be built.
 		protocol = nativeProtocols[TierZen]
-		if c.prefer == TierGo {
-			protocol = nativeProtocols[TierGo]
-		}
 	}
 	diagnostic := ModelRouteDiagnostic{
 		Model: model, RequestedProtocol: requested, NativeProtocol: protocol, NativeProtocols: nativeProtocols, ProtocolSource: source,
-		AvailableZen: zen, AvailableGo: goModel, AnonymousEligibility: c.anonymousDecision(model),
+		AvailableZen: zen, AnonymousEligibility: c.anonymousDecision(model),
 	}
-	route, err := c.Route(model, hasZenKeys, hasGoKeys, hasAnonymous)
+	route, err := c.Route(model, hasKeys, hasAnonymous)
 	if err != nil {
 		diagnostic.RouteError = err.Error()
 		return diagnostic
@@ -409,18 +392,17 @@ func isFreeModel(model string) bool {
 func (c *modelCatalog) List() []string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	seen := make(map[string]bool, len(c.zen)+len(c.goModels))
+	// Only Zen entries are ever exposed; legacy Go entries are tolerated in
+	// storage but never listed.
+	models := make([]string, 0, len(c.zen))
 	for model := range c.zen {
-		seen[model] = true
-	}
-	for model := range c.goModels {
-		seen[model] = true
-	}
-	models := make([]string, 0, len(seen))
-	for model := range seen {
 		if c.supportedLocked(model) {
 			models = append(models, model)
 		}
+	}
+	if len(c.zen) == 0 && len(c.goModels) == 0 {
+		// Pending catalog: supportedLocked returns true for nothing to list.
+		return []string{}
 	}
 	sort.Strings(models)
 	return models
@@ -429,15 +411,8 @@ func (c *modelCatalog) List() []string {
 func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	seen := make(map[string]bool, len(c.zen)+len(c.goModels))
-	for model := range c.zen {
-		seen[model] = true
-	}
-	for model := range c.goModels {
-		seen[model] = true
-	}
 	exposed := 0
-	for model := range seen {
+	for model := range c.zen {
 		if c.supportedLocked(model) {
 			exposed++
 		}
@@ -447,7 +422,7 @@ func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 		stale = stale || time.Since(c.updatedAt) > max(2*c.refreshAfter, time.Minute)
 	}
 	return modelCatalogSnapshot{
-		Zen: len(c.zen), Go: len(c.goModels), Total: len(seen), Exposed: exposed,
+		Zen: len(c.zen), Total: len(c.zen), Exposed: exposed,
 		UpdatedAt: c.updatedAt, CacheSource: c.cacheSource, Stale: stale,
 	}
 }
@@ -475,10 +450,8 @@ func (c *modelCatalog) supportedLocked(model string) bool {
 	if len(c.zen) == 0 && len(c.goModels) == 0 {
 		return true
 	}
+	// Legacy Go entries never qualify.
 	if c.zen[model] && c.tierSupportedLocked(model, TierZen) {
-		return true
-	}
-	if c.goModels[model] && c.tierSupportedLocked(model, TierGo) {
 		return true
 	}
 	return false

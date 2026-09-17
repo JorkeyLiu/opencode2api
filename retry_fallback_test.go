@@ -16,9 +16,8 @@ func authTwoProxyGateway(t *testing.T, monitor *Monitor, maxAttempts int) *Gatew
 		map[string][]string{
 			"a": {"direct"},
 			"z": {"direct", "http://127.0.0.1:8081"},
-			"g": {"direct"},
 		},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = false
 	cfg.Retry.MaxAttempts = maxAttempts
@@ -365,31 +364,27 @@ func TestServerRetryAndNoRetryClasses(t *testing.T) {
 func TestAuthOrdinary4xxEndsTier(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authTwoProxyGateway(t, monitor, 5)
-	var z0calls, z1calls, goCalls atomic.Int32
+	var z0calls, z1calls atomic.Int32
 	postStub(t, gateway, "z", 0, &z0calls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(404, `{"error":"nope"}`), nil
 	})
 	postStub(t, gateway, "z", 1, &z1calls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(404, `{"error":"nope"}`), nil
 	})
-	postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
 	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
 	route := authOnlyRoute()
-	route.KeyTiers = []Tier{TierZen, TierGo}
+	route.KeyTiers = []Tier{TierZen}
 	resp, _, attempts, err := gateway.doUpstreamTiers(ctx, route, routeBodies(), emptySessionIDs(), 0)
-	if err != nil || resp == nil || resp.StatusCode != 200 {
-		t.Fatalf("err=%v", err)
+	if err != nil || resp == nil || resp.StatusCode != 404 {
+		t.Fatalf("err=%v resp=%v want 404 with no fallback", err, resp)
 	}
 	drainAndClose(resp.Body)
-	// Ordinary 404 ends the zen tier after its first candidate; it must not
-	// walk the second zen candidate, but must fall back to go.
-	if postCount(&z0calls)+postCount(&z1calls) != 1 || postCount(&goCalls) != 1 {
-		t.Fatalf("ordinary 4xx must end tier: zen %d/%d go %d", postCount(&z0calls), postCount(&z1calls), postCount(&goCalls))
+	// Ordinary 404 ends the single lane after its first candidate.
+	if postCount(&z0calls)+postCount(&z1calls) != 1 {
+		t.Fatalf("ordinary 4xx must end lane: zen %d/%d", postCount(&z0calls), postCount(&z1calls))
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d want 2", attempts)
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1", attempts)
 	}
 }
 
@@ -460,7 +455,7 @@ func TestAuth400RecoveryIgnoresBudget(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authTwoProxyGateway(t, monitor, 1)
 	cap := &capturedUpstream{}
-	var z0calls, z1calls, goCalls atomic.Int32
+	var z0calls, z1calls atomic.Int32
 	var calls atomic.Int32
 	postStub(t, gateway, "z", 0, &z0calls, cap, func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
@@ -471,9 +466,6 @@ func TestAuth400RecoveryIgnoresBudget(t *testing.T) {
 	postStub(t, gateway, "z", 1, &z1calls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
-	postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
 	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
 	route := authOnlyRoute()
 	route.KeyTiers = []Tier{TierZen}
@@ -482,8 +474,8 @@ func TestAuth400RecoveryIgnoresBudget(t *testing.T) {
 		t.Fatalf("err=%v resp=%v want replay 500 as final", err, resp)
 	}
 	drainAndClose(resp.Body)
-	if postCount(&z0calls) != 2 || postCount(&z1calls) != 0 || postCount(&goCalls) != 0 {
-		t.Fatalf("400 recovery must call A,A only: zen0=%d zen1=%d go=%d", postCount(&z0calls), postCount(&z1calls), postCount(&goCalls))
+	if postCount(&z0calls) != 2 || postCount(&z1calls) != 0 {
+		t.Fatalf("400 recovery must call A,A only: zen0=%d zen1=%d", postCount(&z0calls), postCount(&z1calls))
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts=%d want 2", attempts)

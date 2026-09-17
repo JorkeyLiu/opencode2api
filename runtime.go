@@ -184,6 +184,7 @@ func (m *RuntimeManager) RestartStatus() (effectiveListeners, []string) {
 
 func cloneConfig(cfg Config) Config {
 	cfg.ServerKeys = append([]string(nil), cfg.ServerKeys...)
+	cfg.Keys = append([]string(nil), cfg.Keys...)
 	cfg.ZenKeys = append([]string(nil), cfg.ZenKeys...)
 	cfg.GoKeys = append([]string(nil), cfg.GoKeys...)
 	cfg.Fallback.Active = strings.TrimSpace(cfg.Fallback.Active)
@@ -416,11 +417,8 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	summary.Targets = migrated.Targets
 	summary.Proxy429 = migrated.Proxy429
 	summary.Channel = migrated.Channel
-	validCreds := make(map[string]bool, len(newGateway.zenCreds)+len(newGateway.goCreds)+1)
-	for _, cred := range newGateway.zenCreds {
-		validCreds[cred.id] = true
-	}
-	for _, cred := range newGateway.goCreds {
+	validCreds := make(map[string]bool, len(newGateway.credentials())+1)
+	for _, cred := range newGateway.credentials() {
 		validCreds[cred.id] = true
 	}
 	if newGateway.cfg.Anonymous {
@@ -437,12 +435,10 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 		validPoolProxy[name] = set
 	}
 	validTierPool := map[string]map[string]bool{
-		string(TierZen): {newGateway.cfg.ProxyRouting.Zen: true, newGateway.cfg.ProxyRouting.Anonymous: true},
-		string(TierGo):  {newGateway.cfg.ProxyRouting.Go: true},
+		string(TierZen): {newGateway.authPoolName(): true, newGateway.cfg.ProxyRouting.Anonymous: true},
 	}
 	newGateway.scheduler.retainOnly(validCreds, validPoolProxy, validTierPool)
 	zenAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Zen)
-	goAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Go)
 	if oldGateway.scheduler.routeSessions != nil && newGateway.scheduler.routeSessions != nil {
 		validScope := func(scope routeSessionScope) bool {
 			if !validCreds[scope.CredID] {
@@ -481,12 +477,7 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 				if scope.Authority != zenAuthority {
 					return false
 				}
-				return scope.Pool == newGateway.cfg.ProxyRouting.Zen
-			case scope.Tier == TierGo:
-				if scope.Authority != goAuthority {
-					return false
-				}
-				return scope.Pool == newGateway.cfg.ProxyRouting.Go
+				return scope.Pool == newGateway.authPoolName()
 			default:
 				return false
 			}
@@ -557,37 +548,41 @@ type KeyStatus struct {
 	LastChecked *time.Time `json:"last_checked,omitempty"`
 }
 
-// ProxyStatus is one pool-qualified proxy row in the unified 代理可用性
-// view. The same raw URL in different pools appears as independent rows
-// (pool-qualified); the UI may visually group by redacted node but must
-// never merge state across pools. Zen/Go are channel-specific availability
-// labels for that tier+pool+proxy (available, rate_limited,
-// channel_unavailable, transport_unavailable, untested). CooldownReason is
-// the active Zen/Go cooldown reason (if any); LastChecked is the bulk-check
-// projection.
+// ProxyStatus is one pool-qualified proxy row. The same raw URL in different
+// pools appears as independent rows (pool-qualified). Anonymous and
+// Authenticated carry the latest real probe observations for that lane
+// (success only on exact HTTP 200; 429 stays rate_limited; other HTTP and
+// transport outcomes stay real; no_model/unconfigured/untested are machine
+// outcomes, never a generic available verdict). HTTP statuses are present
+// whenever an HTTP response exists. This view is observation-driven; scheduler
+// cooldown state lives in the dedicated cooling tables, never here.
 type ProxyStatus struct {
 	Index    int    `json:"index"`
 	Pool     string `json:"proxy_pool,omitempty"`
 	Address  string `json:"address"`
 	Healthy  bool   `json:"healthy"`
 	Checking bool   `json:"checking"`
-	// ZenKeys/GoKeys are pool-level routed config credential counts: the
-	// number of configured keys of that tier whose assigned pool is this
-	// pool. Every proxy row in the same pool shows the same pool-level
-	// count. They are NOT bindings; no key is bound to any single proxy.
-	ZenKeys   int      `json:"zen_keys"`
-	GoKeys    int      `json:"go_keys"`
+	// AuthKeys is the pool-level routed credential count for the single
+	// authenticated lane. It is NOT a binding.
+	AuthKeys int `json:"auth_keys"`
+	// Deprecated aliases kept for compilation; never serialized.
+	ZenKeys   int      `json:"-"`
+	GoKeys    int      `json:"-"`
 	Anonymous bool     `json:"anonymous"`
 	Routing   []string `json:"routing,omitempty"`
-	// AvailableCredentials is the pool-level routed config credential count:
-	// zen keys + go keys routed to this pool, plus one when the anonymous
-	// credential is routed here. Same value as ZenKeys+GoKeys(+1); kept for
-	// compatibility with consumers reading a single field.
-	AvailableCredentials int        `json:"available_credentials,omitempty"`
-	Zen                  string     `json:"zen,omitempty"`
-	Go                   string     `json:"go,omitempty"`
-	CooldownReason       string     `json:"cooldown_reason,omitempty"`
-	LastChecked          *time.Time `json:"last_checked,omitempty"`
+	// AvailableCredentials is the pool-level credential count: auth keys
+	// routed here, plus one when the anonymous credential is routed here.
+	AvailableCredentials     int    `json:"available_credentials,omitempty"`
+	AnonymousObservation     string `json:"anonymous_observation,omitempty"`
+	AnonymousHTTPStatus      int    `json:"anonymous_http_status,omitempty"`
+	AuthenticatedObservation string `json:"authenticated_observation,omitempty"`
+	AuthenticatedHTTPStatus  int    `json:"authenticated_http_status,omitempty"`
+	// Deprecated scheduler-derived aliases; never serialized.
+	Zen string `json:"-"`
+	Go  string `json:"-"`
+	// Deprecated scheduler-derived reason; always empty in the observation model.
+	CooldownReason string     `json:"-"`
+	LastChecked    *time.Time `json:"last_checked,omitempty"`
 }
 
 func (m *RuntimeManager) Resources() ResourceSnapshot {
@@ -619,86 +614,105 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			result.AvailabilityTruncated = bulkSnap.Truncated
 			result.AvailabilityPartial = bulkSnap.Partial
 		}
-		// Safe server projection of per-channel custom availability so an
-		// independent custom 检测 survives refresh/rerender without client
-		// state. Native batch never writes these rows.
-		result.Custom = append([]bulkCustomAvailability(nil), bulkSnap.Custom...)
 	}
-	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.zenCreds, gateway.cfg.ProxyRouting.Zen, credLastChecked)...)
-	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "go", gateway.goCreds, gateway.cfg.ProxyRouting.Go, credLastChecked)...)
+	// Configured fallback channels always appear: project every configured
+	// channel as untested, then overlay the latest stored custom observation.
+	// Restart/Apply may clear observations but never drops configured rows.
+	result.Custom = projectCustomResources(gateway.cfg, bulkSnap)
+	authPoolName := gateway.authPoolName()
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.credentials(), authPoolName, credLastChecked)...)
 	routingFor := func(poolName string) []string {
 		out := []string{}
 		if gateway.cfg.ProxyRouting.Anonymous == poolName {
 			out = append(out, "anonymous")
 		}
-		if gateway.cfg.ProxyRouting.Zen == poolName {
-			out = append(out, "zen")
-		}
-		if gateway.cfg.ProxyRouting.Go == poolName {
-			out = append(out, "go")
+		if authPoolName == poolName {
+			out = append(out, "authenticated")
 		}
 		return out
 	}
 	anonPool := gateway.pools[gateway.cfg.ProxyRouting.Anonymous]
 	credsForPool := func(poolName string) int {
 		count := 0
-		if gateway.cfg.ProxyRouting.Zen == poolName {
-			count += len(gateway.zenCreds)
-		}
-		if gateway.cfg.ProxyRouting.Go == poolName {
-			count += len(gateway.goCreds)
+		if authPoolName == poolName {
+			count += len(gateway.credentials())
 		}
 		if gateway.cfg.Anonymous && gateway.cfg.ProxyRouting.Anonymous == poolName {
 			count++
 		}
 		return count
 	}
-	// Bulk projection lookup for per-proxy last-checked (pool-qualified).
-	nodeLastChecked := map[string]*time.Time{}
+	// Observation snapshot lookup per pool-qualified proxy. The resource view
+	// is observation-driven, never inferred from scheduler cooldowns.
+	type nodeObs struct {
+		anon, anonHTTP, auth, authHTTP, reason string
+		anonCode, authCode                     int
+		checked                                *time.Time
+	}
+	nodeObsMap := map[string]*nodeObs{}
 	if bulkSnap != nil {
 		for _, n := range bulkSnap.Nodes {
-			nodeLastChecked[n.Pool+"\x00"+n.ProxyNode] = n.LastChecked
+			key := n.Pool + "\x00" + n.ProxyNode
+			// Keep the latest row per pool-qualified node; snapshot rows are
+			// already latest-merged, so first wins deterministically.
+			if _, ok := nodeObsMap[key]; ok {
+				continue
+			}
+			anon, anonCode := n.Anonymous, n.AnonymousHTTPStatus
+			if anon == "" {
+				anon = n.Zen
+			}
+			auth, authCode := n.Authenticated, n.AuthenticatedHTTPStatus
+			if auth == "" {
+				auth = n.Go
+			}
+			nodeObsMap[key] = &nodeObs{anon: anon, auth: auth, anonCode: anonCode, authCode: authCode, reason: n.Reason, checked: n.LastChecked}
 		}
 	}
-	now := time.Now()
 	for _, pool := range gateway.uniquePools() {
-		zenRouted, goRouted := 0, 0
-		if gateway.cfg.ProxyRouting.Zen == pool.name {
-			zenRouted = len(gateway.zenCreds)
-		}
-		if gateway.cfg.ProxyRouting.Go == pool.name {
-			goRouted = len(gateway.goCreds)
+		authRouted := 0
+		if authPoolName == pool.name {
+			authRouted = len(gateway.credentials())
 		}
 		for _, proxy := range pool.items {
 			healthy := proxy.healthy.Load()
-			zenLabel, zenReason := proxyChannelLabel(gateway, TierZen, pool.name, proxy.name, healthy, now)
-			goLabel, goReason := proxyChannelLabel(gateway, TierGo, pool.name, proxy.name, healthy, now)
-			reason := ""
-			if zenReason != "" {
-				reason = "zen:" + zenReason
-			}
-			if goReason != "" {
-				if reason != "" {
-					reason += ";"
+			redacted := redactURL(proxy.name)
+			obs := nodeObsMap[pool.name+"\x00"+redacted]
+			anonObs, authObs := "untested", "untested"
+			var anonHTTP, authHTTP int
+			var lastChecked *time.Time
+			var reason string
+			if obs != nil {
+				if obs.anon != "" {
+					anonObs = obs.anon
 				}
-				reason += "go:" + goReason
+				if obs.auth != "" {
+					authObs = obs.auth
+				}
+				anonHTTP, authHTTP = obs.anonCode, obs.authCode
+				reason = obs.reason
+				lastChecked = obs.checked
+				_ = reason
 			}
-			// Preserve anonymous Zen 403/5xx + proxy429 context inside the
-			// Zen reason column: channel/proxy429 already encode it, and the
-			// dedicated anonymous summary table is removed.
+			// Unprobed lanes stay untested; lanes that never apply to this
+			// pool stay untested as well. Authenticated without keys is
+			// unconfigured rather than untested.
+			if authObs == "untested" && pool.name == authPoolName && len(gateway.credentials()) == 0 {
+				authObs = "unconfigured"
+			}
 			status := ProxyStatus{
-				Index: proxy.index, Pool: pool.name, Address: redactURL(proxy.name),
+				Index: proxy.index, Pool: pool.name, Address: redacted,
 				Healthy: healthy, Checking: proxy.checking.Load(),
-				ZenKeys: zenRouted, GoKeys: goRouted,
+				AuthKeys: authRouted, ZenKeys: authRouted,
 				Anonymous: gateway.cfg.Anonymous && anonPool == pool,
 				Routing:   routingFor(pool.name), AvailableCredentials: credsForPool(pool.name),
-				Zen: zenLabel, Go: goLabel, CooldownReason: reason,
+				AnonymousObservation: anonObs, AnonymousHTTPStatus: anonHTTP,
+				AuthenticatedObservation: authObs, AuthenticatedHTTPStatus: authHTTP,
+				Zen: anonObs, Go: authObs,
 			}
-			if lc, ok := nodeLastChecked[pool.name+"\x00"+redactURL(proxy.name)]; ok {
-				status.LastChecked = lc
+			if lastChecked != nil {
+				status.LastChecked = lastChecked
 			} else if bulkSnap != nil && !bulkSnap.CheckedAt.IsZero() {
-				// Fall back to the run timestamp so every row shows a
-				// last-checked projection after at least one bulk run.
 				value := bulkSnap.CheckedAt.UTC()
 				status.LastChecked = &value
 			}
@@ -720,10 +734,9 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	return result
 }
 
-// proxyChannelLabel resolves one tier's operator-facing availability for a
-// pool-qualified proxy: transport first, then proxy429, then channel.
-// It returns the compact label plus the active cooldown reason (if any).
-// Zen and Go are evaluated independently so the same node can differ by tier.
+// proxyChannelLabel is a deprecated scheduler-derived helper kept for test
+// compilation. Resource status is observation-driven; new code must read the
+// bulkSnapshot observation instead.
 func proxyChannelLabel(gateway *Gateway, tier Tier, pool, raw string, healthy bool, now time.Time) (string, string) {
 	if !healthy {
 		return "transport_unavailable", "transport_unavailable"
@@ -737,6 +750,32 @@ func proxyChannelLabel(gateway *Gateway, tier Tier, pool, raw string, healthy bo
 	return "available", ""
 }
 
+// projectCustomResources projects every configured fallback channel as a row.
+// Configured channels always appear, even before any probe (as untested);
+// the latest stored custom observation overlays the matching row.
+func projectCustomResources(cfg Config, snap *bulkAvailabilitySnapshot) []bulkCustomAvailability {
+	stored := map[string]bulkCustomAvailability{}
+	if snap != nil {
+		for _, c := range snap.Custom {
+			if _, ok := stored[c.Name]; !ok {
+				stored[c.Name] = c
+			}
+		}
+	}
+	out := make([]bulkCustomAvailability, 0, len(cfg.Fallback.Channels))
+	for _, ch := range cfg.Fallback.Channels {
+		if row, ok := stored[ch.Name]; ok {
+			out = append(out, row)
+			continue
+		}
+		out = append(out, bulkCustomAvailability{
+			Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
+			Status: "untested", Reason: "untested",
+		})
+	}
+	return out
+}
+
 func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot) {
 	runtime := m.current.Load()
 	if runtime == nil {
@@ -746,7 +785,7 @@ func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot
 	models := gateway.catalog.List()
 	result := make([]ModelRouteDiagnostic, 0, len(models))
 	for _, model := range models {
-		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
+		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.Keys) > 0, gateway.cfg.Anonymous))
 	}
 	metadata := MetadataSnapshot{}
 	if gateway.catalog.metadata != nil {
@@ -761,7 +800,7 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 		return ModelRouteDiagnostic{Model: model, RequestedProtocol: requested, RouteError: "gateway runtime is unavailable"}
 	}
 	gateway := runtime.gateway
-	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous)
+	return gateway.catalog.Diagnostic(model, requested, len(gateway.cfg.Keys) > 0, gateway.cfg.Anonymous)
 }
 
 // keyStatusesForTier snapshots credential-level state for one tier without

@@ -44,10 +44,10 @@ func credentialFingerprintFor(t *testing.T, manager *RuntimeManager, tier Tier, 
 func TestCredentialCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
-	fp := credentialFingerprintFor(t, manager, TierZen, rt.gateway.zenCreds[0].key)
+	fp := credentialFingerprintFor(t, manager, TierZen, rt.gateway.authCreds[0].key)
 	_ = fp
 	if rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, "", "")); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauth code=%d want 401", rec.Code)
@@ -77,7 +77,7 @@ func TestCredentialCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 	} {
 		_, admin2, token2, csrf2 := credentialAdmin(t,
 			map[string][]string{"shared": {"direct"}},
-			ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+			ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 			[]string{"zen-key-12345"}, nil)
 		rec := serveAdmin(admin2, operabilityRequest(http.MethodPost, "/api/availability/check-credential", tc.body, token2, csrf2))
 		if rec.Code != http.StatusBadRequest {
@@ -94,12 +94,12 @@ func TestCredentialCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 		t.Fatalf("unknown fp must carry unknown_credential, got %s", rec.Body.String())
 	}
 	// Tail-only must not resolve.
-	tail := rt.gateway.zenCreds[0].display
+	tail := rt.gateway.authCreds[0].display
 	if rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+tail+`"}`, token, csrf)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("tail code=%d want 400", rec.Code)
 	}
 	// Raw key must not resolve and must never be echoed.
-	raw := rt.gateway.zenCreds[0].key
+	raw := rt.gateway.authCreds[0].key
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+raw+`"}`, token, csrf))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("raw key code=%d want 400", rec.Code)
@@ -115,7 +115,7 @@ func TestCredentialCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 func TestCustomCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		nil, nil)
 	rt := manager.current.Load()
 	rt.gateway.cfg.Fallback = FallbackConfig{Active: "", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: "https://api.example.com", APIKey: "secret-custom-11111", Model: "cm"}}}
@@ -143,7 +143,7 @@ func TestCustomCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 	} {
 		_, admin2, token2, csrf2 := credentialAdmin(t,
 			map[string][]string{"shared": {"direct"}},
-			ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+			ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 			nil, nil)
 		rt2 := admin2.manager.current.Load()
 		rt2.gateway.cfg.Fallback = FallbackConfig{Active: "", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: "https://api.example.com", APIKey: "secret-custom-11111", Model: "cm"}}}
@@ -165,7 +165,7 @@ func TestCustomCheckAuthCSRFOriginStrictNoStore(t *testing.T) {
 func TestPerRowRateLimitBusy(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -176,7 +176,7 @@ func TestPerRowRateLimitBusy(t *testing.T) {
 	rt.gateway.cfg.Upstream.Zen = srv.URL
 	rt.gateway.cfg.Upstream.Go = srv.URL
 	seedBulkProbeCatalog(rt.gateway)
-	fp := credentialFingerprint(TierZen, rt.gateway.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, rt.gateway.authCreds[0].key)
 	var last *httptest.ResponseRecorder
 	for i := 0; i < 4; i++ {
 		last = serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
@@ -187,12 +187,12 @@ func TestPerRowRateLimitBusy(t *testing.T) {
 	// Busy gate shares bulkMu.
 	_, admin2, token2, csrf2 := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt2 := admin2.manager.current.Load()
 	rt2.gateway.bulkMu.Lock()
 	defer rt2.gateway.bulkMu.Unlock()
-	fp2 := credentialFingerprint(TierZen, rt2.gateway.zenCreds[0].key)
+	fp2 := credentialFingerprint(TierZen, rt2.gateway.authCreds[0].key)
 	if rec := serveAdmin(admin2, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp2+`"}`, token2, csrf2)); rec.Code != http.StatusConflict {
 		t.Fatalf("busy credential code=%d want 409", rec.Code)
 	}
@@ -205,7 +205,7 @@ func TestPerRowRateLimitBusy(t *testing.T) {
 func TestCredentialEligibilityFiltering(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -218,7 +218,7 @@ func TestCredentialEligibilityFiltering(t *testing.T) {
 	gw.scheduler.noteProxy429Failure(TierZen, "shared", pool.items[0].name, AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
 	// Mark proxy1 healthy (default) and keep proxy0 healthy (cooling is
 	// scheduler state, not transport health).
-	fp := credentialFingerprint(TierZen, gw.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, gw.authCreds[0].key)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("credential code=%d body=%s", rec.Code, rec.Body.String())
@@ -236,7 +236,7 @@ func TestCredentialEligibilityFiltering(t *testing.T) {
 	if resp.Credential.Status != "available" {
 		t.Fatalf("credential status=%q want available", resp.Credential.Status)
 	}
-	if strings.Contains(rec.Body.String(), gw.zenCreds[0].key) {
+	if strings.Contains(rec.Body.String(), gw.authCreds[0].key) {
 		t.Fatalf("raw key leaked")
 	}
 	// Transport-unhealthy exclusion.
@@ -246,7 +246,7 @@ func TestCredentialEligibilityFiltering(t *testing.T) {
 	// Fresh admin to avoid rate limit.
 	_, admin2, token2, csrf2 := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt2 := admin2.manager.current.Load()
 	gw2 := rt2.gateway
@@ -257,7 +257,7 @@ func TestCredentialEligibilityFiltering(t *testing.T) {
 	pool2.items[1].client.Transport = &stubTransport{hits: &h1, status: 200, body: bulkChatSuccessBody("bulk-free-model")}
 	pool2.items[0].healthy.Store(false)
 	pool2.items[1].healthy.Store(true)
-	fp2 := credentialFingerprint(TierZen, gw2.zenCreds[0].key)
+	fp2 := credentialFingerprint(TierZen, gw2.authCreds[0].key)
 	rec2 := serveAdmin(admin2, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp2+`"}`, token2, csrf2))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("unhealthy-filter code=%d body=%s", rec2.Code, rec2.Body.String())
@@ -273,7 +273,7 @@ func TestCredentialEligibilityFiltering(t *testing.T) {
 func TestCredentialZeroEligibleNoMutation(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -293,14 +293,14 @@ func TestCredentialZeroEligibleNoMutation(t *testing.T) {
 			{Pool: "shared", Index: 1, ProxyNode: redactURL(pool.items[1].name), Transport: "healthy", Zen: "success", LastChecked: &nodeChecked},
 		},
 		Credentials: []bulkCredentialAvailability{
-			{Tier: "zen", KeyTail: gw.zenCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.zenCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &credChecked, CredID: gw.zenCreds[0].id},
+			{Tier: "zen", KeyTail: gw.authCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.authCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &credChecked, CredID: gw.authCreds[0].id},
 		},
 		Custom: []bulkCustomAvailability{{Name: "c1", BaseURL: "https://api.example.com", Model: "cm", Status: "available", Reason: "success", LastChecked: &credChecked}},
 	}
 	gw.bulkSnapshot.Store(snap)
 	proxyBefore, _, _ := gw.scheduler.proxy429CooldownStatus(TierZen, "shared", pool.items[0].name)
 	_ = proxyBefore
-	fp := credentialFingerprint(TierZen, gw.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, gw.authCreds[0].key)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("zero eligible code=%d want 503 body=%s", rec.Code, rec.Body.String())
@@ -321,7 +321,7 @@ func TestCredentialZeroEligibleNoMutation(t *testing.T) {
 	if after.Credentials[0].LastChecked == nil || !after.Credentials[0].LastChecked.Equal(credChecked) {
 		t.Fatalf("credential time must not move")
 	}
-	if _, _, ok := gw.scheduler.credential429CooldownStatus(gw.zenCreds[0].id); ok {
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(gw.authCreds[0].id); ok {
 		t.Fatalf("credential429 must not be written on zero-eligible error")
 	}
 }
@@ -330,7 +330,7 @@ func TestCredentialOneVsTwo429Semantics(t *testing.T) {
 	// One eligible proxy with fresh 429: display-only for credential429.
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -341,7 +341,7 @@ func TestCredentialOneVsTwo429Semantics(t *testing.T) {
 	pool.items[1].client.Transport = &stubTransport{hits: &h1, status: 429, body: `{"error":{"message":"slow"}}`}
 	// Exclude proxy1 via proxy429 so only proxy0 is eligible (single 429).
 	gw.scheduler.noteProxy429Failure(TierZen, "shared", pool.items[1].name, AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
-	fp := credentialFingerprint(TierZen, gw.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, gw.authCreds[0].key)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("single-429 code=%d body=%s", rec.Code, rec.Body.String())
@@ -353,13 +353,13 @@ func TestCredentialOneVsTwo429Semantics(t *testing.T) {
 	if resp.Credential.Status != "rate_limited" {
 		t.Fatalf("single-429 credential status=%q want rate_limited", resp.Credential.Status)
 	}
-	if _, _, ok := gw.scheduler.credential429CooldownStatus(gw.zenCreds[0].id); ok {
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(gw.authCreds[0].id); ok {
 		t.Fatalf("single newly observed 429 must stay display-only for credential429")
 	}
 	// Two eligible proxies both 429: credential429 must be written.
 	manager2, admin2, token2, csrf2 := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt2 := manager2.current.Load()
 	gw2 := rt2.gateway
@@ -368,12 +368,12 @@ func TestCredentialOneVsTwo429Semantics(t *testing.T) {
 	var g0, g1 atomic.Int32
 	pool2.items[0].client.Transport = &stubTransport{hits: &g0, status: 429, body: `{"error":{"message":"slow"}}`}
 	pool2.items[1].client.Transport = &stubTransport{hits: &g1, status: 429, body: `{"error":{"message":"slow"}}`}
-	fp2 := credentialFingerprint(TierZen, gw2.zenCreds[0].key)
+	fp2 := credentialFingerprint(TierZen, gw2.authCreds[0].key)
 	rec2 := serveAdmin(admin2, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp2+`"}`, token2, csrf2))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("two-429 code=%d body=%s", rec2.Code, rec2.Body.String())
 	}
-	if _, status, ok := gw2.scheduler.credential429CooldownStatus(gw2.zenCreds[0].id); !ok || status != 429 {
+	if _, status, ok := gw2.scheduler.credential429CooldownStatus(gw2.authCreds[0].id); !ok || status != 429 {
 		t.Fatalf("two distinct 429s must write credential429")
 	}
 }
@@ -381,7 +381,7 @@ func TestCredentialOneVsTwo429Semantics(t *testing.T) {
 func TestCredentialNoModelSemantics(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -389,7 +389,7 @@ func TestCredentialNoModelSemantics(t *testing.T) {
 	pool := gw.pools["shared"]
 	var hits atomic.Int32
 	pool.items[0].client.Transport = &stubTransport{hits: &hits, status: 200, body: bulkChatSuccessBody("bulk-free-model")}
-	fp := credentialFingerprint(TierZen, gw.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, gw.authCreds[0].key)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("no-model code=%d body=%s", rec.Code, rec.Body.String())
@@ -407,7 +407,7 @@ func TestCredentialNoModelSemantics(t *testing.T) {
 	if hits.Load() != 0 {
 		t.Fatalf("no-model must send nothing, hits=%d", hits.Load())
 	}
-	if strings.Contains(rec.Body.String(), gw.zenCreds[0].key) {
+	if strings.Contains(rec.Body.String(), gw.authCreds[0].key) {
 		t.Fatalf("raw key leaked")
 	}
 	// Snapshot merge updates only that credential row/time.
@@ -419,13 +419,13 @@ func TestCredentialNoModelSemantics(t *testing.T) {
 	// no_available_proxy error applies only when a send would be required.
 	_, admin3, token3, csrf3 := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt3 := admin3.manager.current.Load()
 	gw3 := rt3.gateway
 	// No catalog seeding here either; mark the only proxy unhealthy.
 	gw3.pools["shared"].items[0].healthy.Store(false)
-	fp3 := credentialFingerprint(TierZen, gw3.zenCreds[0].key)
+	fp3 := credentialFingerprint(TierZen, gw3.authCreds[0].key)
 	rec3 := serveAdmin(admin3, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp3+`"}`, token3, csrf3))
 	if rec3.Code != http.StatusOK {
 		t.Fatalf("no-model zero-eligible code=%d want 200 body=%s", rec3.Code, rec3.Body.String())
@@ -442,7 +442,7 @@ func TestCredentialNoModelSemantics(t *testing.T) {
 func TestCredentialSnapshotMergePreserves(t *testing.T) {
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"AAA-12345", "BBB-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -463,13 +463,13 @@ func TestCredentialSnapshotMergePreserves(t *testing.T) {
 			{Pool: "shared", Index: 1, ProxyNode: redactURL(pool.items[1].name), Transport: "healthy", Zen: "success", LastChecked: &nodeChecked},
 		},
 		Credentials: []bulkCredentialAvailability{
-			{Tier: "zen", KeyTail: gw.zenCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.zenCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.zenCreds[0].id},
-			{Tier: "zen", KeyTail: gw.zenCreds[1].display, Fingerprint: credentialFingerprint(TierZen, gw.zenCreds[1].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.zenCreds[1].id},
+			{Tier: "zen", KeyTail: gw.authCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.authCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.authCreds[0].id},
+			{Tier: "zen", KeyTail: gw.authCreds[1].display, Fingerprint: credentialFingerprint(TierZen, gw.authCreds[1].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.authCreds[1].id},
 		},
 		Custom: []bulkCustomAvailability{{Name: "c1", BaseURL: "https://api.example.com", Model: "cm", Status: "available", Reason: "success", LastChecked: &otherChecked}},
 	}
 	gw.bulkSnapshot.Store(snap)
-	fp := credentialFingerprint(TierZen, gw.zenCreds[0].key)
+	fp := credentialFingerprint(TierZen, gw.authCreds[0].key)
 	rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("merge code=%d body=%s", rec.Code, rec.Body.String())
@@ -488,7 +488,7 @@ func TestCredentialSnapshotMergePreserves(t *testing.T) {
 	}
 	kept := false
 	for _, c := range after.Credentials {
-		if c.CredID == gw.zenCreds[1].id {
+		if c.CredID == gw.authCreds[1].id {
 			if c.LastChecked == nil || !c.LastChecked.Equal(otherChecked) {
 				t.Fatalf("unrelated credential must not move")
 			}
@@ -506,7 +506,7 @@ func TestCredentialSnapshotMergePreserves(t *testing.T) {
 	if resp.Credential.CredID != "" && resp.Credential.Fingerprint != fp {
 		t.Fatalf("response fingerprint mismatch: %+v", resp.Credential)
 	}
-	if len(resp.Credential.KeyTail) == 0 || strings.Contains(rec.Body.String(), gw.zenCreds[0].key) {
+	if len(resp.Credential.KeyTail) == 0 || strings.Contains(rec.Body.String(), gw.authCreds[0].key) {
 		t.Fatalf("redaction broken")
 	}
 }
@@ -519,7 +519,7 @@ func TestCustomCheckNoSchedulerMerge(t *testing.T) {
 	defer customSrv.Close()
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	rt := manager.current.Load()
 	gw := rt.gateway
@@ -536,7 +536,7 @@ func TestCustomCheckNoSchedulerMerge(t *testing.T) {
 		CheckedAt: checked, TotalNodes: 1, TestedNodes: 1,
 		Nodes: []bulkNodeAvailability{{Pool: "shared", Index: 0, ProxyNode: redactURL(pool.items[0].name), Transport: "healthy", Zen: "success", LastChecked: &otherChecked}},
 		Credentials: []bulkCredentialAvailability{
-			{Tier: "zen", KeyTail: gw.zenCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.zenCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.zenCreds[0].id},
+			{Tier: "zen", KeyTail: gw.authCreds[0].display, Fingerprint: credentialFingerprint(TierZen, gw.authCreds[0].key), Pool: "shared", Status: "available", Reason: "success", LastChecked: &otherChecked, CredID: gw.authCreds[0].id},
 		},
 		Custom: []bulkCustomAvailability{{Name: "c2", BaseURL: "https://other.example", Model: "cm", Status: "unavailable", Reason: "auth_failure", LastChecked: &otherChecked}},
 	}
@@ -566,7 +566,7 @@ func TestCustomCheckNoSchedulerMerge(t *testing.T) {
 	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "shared", pool.items[0].name); ok {
 		t.Fatalf("custom must not write channel")
 	}
-	if got := gw.scheduler.credentialCoolUntil(gw.zenCreds[0].id); got > time.Now().UnixNano() {
+	if got := gw.scheduler.credentialCoolUntil(gw.authCreds[0].id); got > time.Now().UnixNano() {
 		t.Fatalf("custom must not write credential401")
 	}
 	if !pool.items[0].healthy.Load() {
@@ -613,13 +613,13 @@ func TestCustomCheckNoSchedulerMerge(t *testing.T) {
 	// Monitor keys carry fingerprint (never raw).
 	foundFP := false
 	for _, k := range res.Keys {
-		if k.Fingerprint == credentialFingerprint(TierZen, gw.zenCreds[0].key) {
+		if k.Fingerprint == credentialFingerprint(TierZen, gw.authCreds[0].key) {
 			foundFP = true
-			if strings.Contains(k.Fingerprint, gw.zenCreds[0].key) {
+			if strings.Contains(k.Fingerprint, gw.authCreds[0].key) {
 				t.Fatalf("fingerprint leaks raw")
 			}
 		}
-		if strings.Contains(k.ID, gw.zenCreds[0].key) {
+		if strings.Contains(k.ID, gw.authCreds[0].key) {
 			t.Fatalf("key id leaks raw")
 		}
 	}
@@ -638,7 +638,7 @@ func TestBatchExcludesCustomPreservesStored(t *testing.T) {
 	_ = customHits
 	manager, admin, token, csrf := credentialAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)

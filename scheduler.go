@@ -82,9 +82,14 @@ const (
 	// config field is missing or zero. Explicit nonzero values are kept.
 	defaultRateLimitBaseSeconds = 300
 
-	// defaultRateLimitMaxSeconds is the 429 maximum clamp when the config
-	// field is missing or zero.
+	// defaultRateLimitMaxSeconds is the fixed 429 maximum clamp. The 429
+	// maximum is not a configurable field; the single configurable 429 value
+	// is the base (300..3600) and the backoff always clamps at 3600.
 	defaultRateLimitMaxSeconds = 3600
+
+	// rateLimitMaxFixedSeconds is the fixed numeric/backoff maximum for 429
+	// cooldowns. It is not configurable.
+	rateLimitMaxFixedSeconds = 3600
 
 	// maxProxy429States bounds the live proxy429State map (pool x proxy).
 	// Each pool-qualified proxy holds at most one entry, so the live size is
@@ -259,10 +264,9 @@ func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Durat
 	} else if rateLimitCooldown <= 0 {
 		rateLimitCooldown = defaultRateLimitBaseSeconds * time.Second
 	}
-	rateLimitMax := defaultRateLimitMaxSeconds * time.Second
-	if len(rateLimitBases) > 1 && rateLimitBases[1] > 0 {
-		rateLimitMax = rateLimitBases[1]
-	}
+	// The 429 maximum is fixed at 3600s; any legacy max argument is accepted
+	// for compatibility but ignored.
+	rateLimitMax := rateLimitMaxFixedSeconds * time.Second
 	if rateLimitMax < rateLimitCooldown {
 		rateLimitMax = rateLimitCooldown
 	}
@@ -703,10 +707,7 @@ func (s *targetScheduler) rateLimitBase() time.Duration {
 }
 
 func (s *targetScheduler) rateLimitMax() time.Duration {
-	if s == nil || s.rateLimitMaxDur <= 0 {
-		return defaultRateLimitMaxSeconds * time.Second
-	}
-	return s.rateLimitMaxDur
+	return rateLimitMaxFixedSeconds * time.Second
 }
 
 // credentialCoolUntil returns the credential cooldown deadline (nanos), or 0.

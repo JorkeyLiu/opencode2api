@@ -137,14 +137,15 @@ func NewSecretRedactor() *SecretRedactor {
 }
 
 func (r *SecretRedactor) Replace(cfg Config) {
-	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
+	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.Keys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
 	values = append(values, cfg.ServerKeys...)
+	values = append(values, cfg.Keys...)
 	values = append(values, cfg.ZenKeys...)
 	values = append(values, cfg.GoKeys...)
 	if cfg.WebUI.Password != "" {
 		values = append(values, cfg.WebUI.Password)
 	}
-	for _, value := range []string{cfg.Upstream.Zen, cfg.Upstream.Go} {
+	for _, value := range []string{cfg.Upstream.Zen} {
 		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
 			values = append(values, value, parsed.User.Username())
 			if password, ok := parsed.User.Password(); ok {

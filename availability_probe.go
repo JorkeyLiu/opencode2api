@@ -13,10 +13,13 @@ import (
 
 // bulkProbeModel selects a real directory model for availability probing.
 // It never hardcodes model IDs: the first sorted catalog model satisfying the
-// tier lane is used. Anonymous requires a free Zen-servable model;
-// authenticated Zen/Go require a model actually served by that tier.
+// lane is used. Anonymous requires a free Zen-servable model; authenticated
+// requires a Zen-served model. The legacy Go tier never yields a model.
 func (g *Gateway) bulkProbeModel(tier Tier, public bool) (string, Protocol, bool) {
 	if g == nil || g.catalog == nil {
+		return "", "", false
+	}
+	if tier == TierGo {
 		return "", "", false
 	}
 	for _, model := range g.catalog.List() {
@@ -24,50 +27,29 @@ func (g *Gateway) bulkProbeModel(tier Tier, public bool) (string, Protocol, bool
 			if !g.catalog.anonymousDecision(model).Allowed {
 				continue
 			}
-			route, err := g.catalog.Route(model, false, false, true)
+			route, err := g.catalog.Route(model, false, true)
 			if err != nil || !route.Anonymous || route.Tier != TierZen {
 				continue
 			}
 			return model, route.ProtocolFor(TierZen), true
 		}
-		if tier == TierZen {
-			route, err := g.catalog.Route(model, true, false, false)
-			if err != nil {
-				continue
-			}
-			serves := route.Tier == TierZen
-			if !serves {
-				for _, t := range route.KeyTiers {
-					if t == TierZen {
-						serves = true
-						break
-					}
+		route, err := g.catalog.Route(model, true, false)
+		if err != nil {
+			continue
+		}
+		serves := route.Tier == TierZen
+		if !serves {
+			for _, t := range route.KeyTiers {
+				if t == TierZen {
+					serves = true
+					break
 				}
 			}
-			if !serves {
-				continue
-			}
-			return model, route.ProtocolFor(TierZen), true
 		}
-		if tier == TierGo {
-			route, err := g.catalog.Route(model, false, true, false)
-			if err != nil {
-				continue
-			}
-			serves := route.Tier == TierGo
-			if !serves {
-				for _, t := range route.KeyTiers {
-					if t == TierGo {
-						serves = true
-						break
-					}
-				}
-			}
-			if !serves {
-				continue
-			}
-			return model, route.ProtocolFor(TierGo), true
+		if !serves {
+			continue
 		}
+		return model, route.ProtocolFor(TierZen), true
 	}
 	return "", "", false
 }

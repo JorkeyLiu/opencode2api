@@ -63,8 +63,8 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 	redactor := NewSecretRedactor()
 	logger := newStructuredLogger(&buf, level, hub, redactor)
 
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"sk-live-secret-abcdef-12345"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"sk-live-secret-abcdef-12345"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +75,7 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := gateway.pools["shared"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "event-model")
 	fullKey := "sk-live-secret-abcdef-12345"
 
@@ -145,7 +145,7 @@ func TestGatewaySchedulerEventLogging(t *testing.T) {
 func TestMigrationSummaryCounts(t *testing.T) {
 	oldGateway := schedulerTestGateway(t, []string{"zen-key-aaaaa"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool := oldGateway.pools["shared"]
-	cred := oldGateway.zenCreds[0]
+	cred := oldGateway.authCreds[0]
 	cand := authCand(TierZen, cred, pool, pool.items[0], "m")
 	oldGateway.applyAttemptOutcome(context.Background(), cand, responseWithStatus(401), nil, time.Now().UnixNano())
 	oldGateway.scheduler.noteTargetFailure(
@@ -165,7 +165,7 @@ func TestMigrationSummaryCounts(t *testing.T) {
 func operabilityAdmin(t *testing.T, proxies []string) (*RuntimeManager, *AdminServer, string, string) {
 	t.Helper()
 	manager := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": proxies}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": proxies}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gateway, err := NewGateway(cfg, nil, manager.monitor)
 	if err != nil {
 		t.Fatal(err)
@@ -277,7 +277,7 @@ func TestProxyProbeSuccessFlipsHealthWithoutSchedulerPollution(t *testing.T) {
 	proxy := gateway.pools["shared"].items[0]
 	proxy.healthy.Store(false)
 	// Seed foreground scheduler state that the probe must not touch.
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	pool := gateway.pools["shared"]
 	cand := authCand(TierZen, cred, pool, proxy, "probe-model")
 	gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)

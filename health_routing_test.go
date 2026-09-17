@@ -50,9 +50,8 @@ func requireIssue(t *testing.T, health healthResponse, issue string, want bool) 
 
 func singleZenGateway(t *testing.T, anonymous bool) *Gateway {
 	t.Helper()
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.GoKeys = []string{}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = anonymous
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -69,7 +68,7 @@ func singleZenGateway(t *testing.T, anonymous bool) *Gateway {
 func TestHealthRoutingAllCredentialsCoolingBlocks(t *testing.T) {
 	gateway := singleZenGateway(t, false)
 	// Single zen credential actively cooling, anonymous off.
-	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], gateway.pools["shared"], gateway.pools["shared"].items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
+	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.authCreds[0], gateway.pools["shared"], gateway.pools["shared"].items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
 	code, health := decodeHealth(t, gateway)
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d want 503", code)
@@ -95,7 +94,7 @@ func TestHealthRoutingAllCredentialsCoolingBlocks(t *testing.T) {
 
 func TestHealthRoutingExpiredCooldownImmediatelyAvailable(t *testing.T) {
 	gateway := singleZenGateway(t, false)
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	gateway.scheduler.noteCredentialAuthFailure(cred.id)
 	// Expire the cooldown but keep failure memory.
 	gateway.scheduler.mu.Lock()
@@ -112,9 +111,8 @@ func TestHealthRoutingExpiredCooldownImmediatelyAvailable(t *testing.T) {
 }
 
 func TestHealthRoutingAnonymousHealthyReady(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.GoKeys = []string{}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -127,7 +125,7 @@ func TestHealthRoutingAnonymousHealthyReady(t *testing.T) {
 	seedHealthyCatalog(t, gateway)
 	// Cool the only key; anonymous healthy pool must still provide a channel.
 	pool := gateway.pools["shared"]
-	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
+	gateway.applyAttemptOutcome(t.Context(), authCand(TierZen, gateway.authCreds[0], pool, pool.items[0], "m1"), responseWithStatus(401), nil, time.Now().UnixNano())
 	code, health := decodeHealth(t, gateway)
 	if code != http.StatusOK || !health.Ready {
 		t.Fatalf("anonymous healthy must stay ready: code=%d ready=%v issues=%v routing=%+v", code, health.Ready, health.Issues, health.Routing)
@@ -140,10 +138,9 @@ func TestHealthRoutingAnonymousHealthyReady(t *testing.T) {
 func TestHealthRoutingAnonymousPoolUnhealthyButKeyTierHealthy(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"a": {"direct"}, "z": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "z"},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.GoKeys = []string{}
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -187,7 +184,7 @@ func TestHealthRoutingKeysWithoutHealthyProxyNotAChannel(t *testing.T) {
 func TestHealthRoutingModelTargetCoolingDoesNotBlock(t *testing.T) {
 	gateway := singleZenGateway(t, false)
 	pool := gateway.pools["shared"]
-	cand := authCand(TierZen, gateway.zenCreds[0], pool, pool.items[0], "m1")
+	cand := authCand(TierZen, gateway.authCreds[0], pool, pool.items[0], "m1")
 	gateway.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, 500, 0)
 	code, health := decodeHealth(t, gateway)
 	if code != http.StatusOK || !health.Ready {
@@ -200,9 +197,8 @@ func TestHealthRoutingModelTargetCoolingDoesNotBlock(t *testing.T) {
 }
 
 func TestHealthRoutingSharedPoolCountsEachChannel(t *testing.T) {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.GoKeys = []string{"go-key-bbbbb"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa", "go-key-bbbbb"}
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -214,21 +210,20 @@ func TestHealthRoutingSharedPoolCountsEachChannel(t *testing.T) {
 	}
 	seedHealthyCatalog(t, gateway)
 	_, health := decodeHealth(t, gateway)
-	if health.Routing.ChannelsAvailable != 3 {
-		t.Fatalf("shared pool must serve 3 channels, got %+v", health.Routing)
+	if health.Routing.ChannelsAvailable != 2 {
+		t.Fatalf("shared pool must serve 2 channels, got %+v", health.Routing)
 	}
-	if health.Routing.ZenCredentialsAvailable != 1 || health.Routing.GoCredentialsAvailable != 1 {
+	if health.Routing.ZenCredentialsAvailable != 2 || health.Routing.AuthenticatedAvailable != 2 {
 		t.Fatalf("routing=%+v", health.Routing)
 	}
 }
 
 func TestHealthRoutingIsolatedPoolsAndAnonymousOff(t *testing.T) {
 	cfg := testGatewayConfig(
-		map[string][]string{"a": {"direct"}, "z": {"direct"}, "g": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		map[string][]string{"a": {"direct"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
-	cfg.GoKeys = []string{}
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = false
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -243,8 +238,8 @@ func TestHealthRoutingIsolatedPoolsAndAnonymousOff(t *testing.T) {
 	if health.Routing.AnonymousAvailable {
 		t.Fatalf("anonymous=false must report unavailable")
 	}
-	if health.Routing.GoCredentialsAvailable != 0 || health.Routing.ChannelsAvailable != 1 {
-		t.Fatalf("routing=%+v want go=0 channels=1", health.Routing)
+	if health.Routing.AuthenticatedAvailable != 1 || health.Routing.ChannelsAvailable != 1 {
+		t.Fatalf("routing=%+v want auth=1 channels=1", health.Routing)
 	}
 }
 

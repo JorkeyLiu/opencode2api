@@ -403,7 +403,7 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 		t.Fatal("stale 14-column empty rows must be removed")
 	}
 	// Localization: protocol/tier/failure/hint/log/routing/cache mappings present, proper casing kept.
-	for _, needle := range []string{"protoLabel", "tierLabel", "failureLabel", "hintLabel", "Chat Completions", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "传输失败", "认证失败", "限流", "上游失败", "客户端拒绝", "调试", "信息", "警告", "错误", "最近一小时", "进程累计", "上游", "代理", "密钥", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "Token"} {
+	for _, needle := range []string{"protoLabel", "tierLabel", "failureLabel", "hintLabel", "Chat Completions", "上下文长度", "陈旧响应引用", "会话被拒绝", "无效请求", "传输失败", "认证失败", "限流", "上游失败", "客户端拒绝", "调试", "信息", "警告", "错误", "最近一小时", "进程累计", "上游", "代理", "密钥", "凭证", "目标", "元数据", "尝试", "回退", "Token"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing localized mapping/label %q", needle)
 		}

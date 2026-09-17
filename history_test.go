@@ -20,7 +20,7 @@ import (
 func testHistoryConfig(path string) Config {
 	cfg := defaultConfig()
 	cfg.ServerKeys = []string{"local-key-12345"}
-	cfg.ZenKeys = []string{"zen-key-12345"}
+	cfg.Keys = []string{"zen-key-12345"}
 	return cfg
 }
 
@@ -268,7 +268,7 @@ func TestHistoryRedaction(t *testing.T) {
 
 func historyAuthedAdmin(t *testing.T, store *HistoryStore, mon *Monitor) (*AdminServer, string, string) {
 	t.Helper()
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	mgr := &RuntimeManager{configPath: filepath.Join(t.TempDir(), "config.json"), logger: nil, monitor: mon, hub: NewLogHub(100), redactor: NewSecretRedactor(), level: new(slog.LevelVar)}
 	mgr.level.Set(slog.LevelInfo)
 	gw, err := NewGateway(cfg, nil, mon)
@@ -754,7 +754,7 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 	}
 	// Localization: key Chinese labels present for the new contract.
 	// Topbar uses exact English Active/Streaming labels (metric IDs preserved).
-	for _, needle := range []string{"运行时长", "Active", "Streaming", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>状态</th>", "<th>耗时</th>", "匿名", "凭证", "目标", "元数据", "尝试", "回退", "失败回退", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "今天", "本月", "历史记录", "活跃目标冷却", "代理可用性", "备用模型渠道可用性", "凭证可用性", "批量检测", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "最多显示 200 条", "WebUI 是否启用", "未知（", "上下文长度", "调试", "信息", "警告", "错误", "小时", "分钟", "秒"} {
+	for _, needle := range []string{"运行时长", "Active", "Streaming", "<th>上游</th>", "<th>代理</th>", "<th>密钥</th>", "<th>状态</th>", "<th>耗时</th>", "匿名", "凭证", "目标", "元数据", "尝试", "回退", "最近一小时", "进程累计", "最近 24 小时", "最近 7 天", "今天", "本月", "历史记录", "活跃目标冷却", "代理可用性", "备用模型渠道可用性", "凭证可用性", "批量检测", "目录 / 元数据快照", "管理会话有效期", "服务端密钥", "具名代理池", "匿名路由池", "代理文件", "运行中", "暂存：不运行", "最多显示 200 条", "WebUI 是否启用", "未知（", "上下文长度", "调试", "信息", "警告", "错误", "小时", "分钟", "秒"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing localized label %q", needle)
 		}
@@ -766,7 +766,7 @@ func TestHistoryWebUISyntaxDOM(t *testing.T) {
 		}
 	}
 	// Localization: required proper-case technical terms preserved.
-	for _, needle := range []string{"Request ID", "HTTP", "API", "WebUI", "CSRF", "Responses", "Anthropic", "Zen", "Go", "JSON", "URL", "IP", "SOCKS5", "Token", "Chat Completions", "protoLabel"} {
+	for _, needle := range []string{"Request ID", "HTTP", "API", "WebUI", "CSRF", "Responses", "Anthropic", "Zen", "JSON", "URL", "IP", "SOCKS5", "Token", "Chat Completions", "protoLabel"} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing proper-case term %q", needle)
 		}

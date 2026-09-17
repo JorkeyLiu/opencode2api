@@ -71,14 +71,14 @@ func TestGatewayCloseIdleSharedDedup(t *testing.T) {
 }
 
 func testGatewayConfigForClose() Config {
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	return cfg
 }
 
 func TestGatewayApplyClosesOldIdle(t *testing.T) {
 	// Frequent Apply must not panic and must close old idle pools exactly
 	// once per Apply via uniquePools (race detector covers concurrency).
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gw, err := NewGateway(cfg, nil, NewMonitor())
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +103,7 @@ func TestRuntimeFrequentApplyNoPanic(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte("{}"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	base := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	base := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	normalized, err := NormalizeConfig(cfgPath, base)
 	if err != nil {
 		t.Fatal(err)

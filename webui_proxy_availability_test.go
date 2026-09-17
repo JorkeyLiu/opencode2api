@@ -30,82 +30,75 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 	html := proxyAvailHTML(t)
 	for _, fn := range []string{
 		"function proxyRoutingHas(p,name)",
+		"function proxyAnonLaneOn(p)",
+		"function proxyAuthLaneOn(p)",
+		"function proxyAnonDashTitle(p)",
+		"function proxyAuthDashTitle(p)",
+		"function obsLabel(v)",
+		"function laneObsOf(p,lane)",
+		"function obsTone(obs,code)",
+		"function obsDisplayText(obs,code)",
+	} {
+		if !strings.Contains(html, fn) {
+			t.Fatalf("missing projection helper %q", fn)
+		}
+	}
+	// Canonical lanes: anonymous + authenticated routing only.
+	for _, needle := range []string{
+		`proxyRoutingHas(p,"anonymous")`,
+		`proxyRoutingHas(p,"authenticated")`,
+		"anonymous_observation",
+		"authenticated_observation",
+		"anonymous_http_status",
+		"authenticated_http_status",
+		"auth_keys",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("canonical lane must contain %q", needle)
+		}
+	}
+	// Old Zen/Go split must be gone from lane logic.
+	for _, stale := range []string{
 		"function proxyZenLaneOn(p)",
 		"function proxyGoLaneOn(p)",
 		"function proxyZenDisplay(p)",
 		"function proxyGoDisplay(p)",
 		"function proxyZenDashTitle(p)",
 		"function proxyGoDashTitle(p)",
-	} {
-		if !strings.Contains(html, fn) {
-			t.Fatalf("missing projection helper %q", fn)
-		}
-	}
-	// Zen lane: routed by anonymous or zen, then anonymous flag or zen_keys>0.
-	// Must use structure fields, never the Chinese routing display helper.
-	zenIdx := strings.Index(html, "function proxyZenLaneOn(p)")
-	if zenIdx < 0 {
-		t.Fatal("missing proxyZenLaneOn")
-	}
-	zenEnd := strings.Index(html[zenIdx:], "function proxyGoLaneOn(p)")
-	if zenEnd < 0 {
-		t.Fatal("missing proxyGoLaneOn boundary")
-	}
-	zenBlock := html[zenIdx : zenIdx+zenEnd]
-	for _, needle := range []string{
-		`proxyRoutingHas(p,"anonymous")`,
-		`proxyRoutingHas(p,"zen")`,
-		"p.anonymous",
+		"function channelStatusLabel(",
+		"function bulkNodeAvailable(",
 		"zen_keys",
-		"zk>0",
-		"anonActive||zk>0",
-	} {
-		if !strings.Contains(zenBlock, needle) {
-			t.Fatalf("zen lane must contain %q", needle)
-		}
-	}
-	if strings.Contains(zenBlock, "routingRefsLabel") || strings.Contains(zenBlock, "routingRefLabel") {
-		t.Fatal("zen lane must not depend on Chinese routing display helpers")
-	}
-	// Go lane: only go routing + go_keys>0; anonymous must never count as Go.
-	goIdx := strings.Index(html, "function proxyGoLaneOn(p)")
-	if goIdx < 0 {
-		t.Fatal("missing proxyGoLaneOn")
-	}
-	goEnd := strings.Index(html[goIdx:], "function proxyZenDashTitle(p)")
-	if goEnd < 0 {
-		t.Fatal("missing proxyZenDashTitle boundary")
-	}
-	goBlock := html[goIdx : goIdx+goEnd]
-	for _, needle := range []string{
 		"go_keys",
+		`proxyRoutingHas(p,"zen")`,
 		`proxyRoutingHas(p,"go")`,
-		"gk>0",
 	} {
-		if !strings.Contains(goBlock, needle) {
-			t.Fatalf("go lane must contain %q", needle)
+		if strings.Contains(html, stale) {
+			t.Fatalf("legacy lane helper must stay removed: %q", stale)
 		}
 	}
-	if strings.Contains(goBlock, "p.anonymous") || strings.Contains(goBlock, "p.Anonymous") {
-		t.Fatal("go lane must never count anonymous as Go config")
-	}
-	if strings.Contains(goBlock, "routingRefsLabel") || strings.Contains(goBlock, "routingRefLabel") {
-		t.Fatal("go lane must not depend on Chinese routing display helpers")
-	}
-	// Display projections: unhealthy short-circuits to dash before any pill.
+	// Actual-status mapping: HTTP code drives display and color.
 	for _, needle := range []string{
-		"function proxyZenDisplay(p)",
-		"function proxyGoDisplay(p)",
-		"p.healthy===false",
-		`return "—"`,
+		`if(code===200)return "ok"`,
+		`if(code===429)return "warn"`,
+		`if(code)return String(code)`,
 	} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("display projection must contain %q", needle)
+			t.Fatalf("actual-status mapping must contain %q", needle)
 		}
 	}
-	// Dash titles distinguish transport / unrouted-pool / unconfigured-channel.
+	// Localized observation labels, never raw backend enums in cells.
 	for _, needle := range []string{
-		"传输不可用",
+		`if(v==="unconfigured")return "未配置"`,
+		`if(v==="no_model")return "无可用模型"`,
+		`if(v==="untested")return "未检测"`,
+		`if(v==="inconclusive")return "未定"`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("observation label must contain %q", needle)
+		}
+	}
+	// Dash titles distinguish unrouted-pool / unconfigured-channel.
+	for _, needle := range []string{
 		"该池未用于该通道",
 		"未配置该通道",
 	} {
@@ -115,30 +108,103 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 	}
 }
 
-func TestWebUIProxyUnhealthyDoubleDash(t *testing.T) {
+func TestWebUIProxyActualStatusCells(t *testing.T) {
 	html := proxyAvailHTML(t)
-	// Render path: both Zen and Go cells check healthy===false first and emit plain dash.
-	if got := strings.Count(html, "p.healthy===false||!proxyZenLaneOn(p)"); got < 1 {
-		t.Fatalf("zen cell must gate on p.healthy===false||!proxyZenLaneOn(p)")
-	}
-	if got := strings.Count(html, "p.healthy===false||!proxyGoLaneOn(p)"); got < 1 {
-		t.Fatalf("go cell must gate on p.healthy===false||!proxyGoLaneOn(p)")
-	}
-	for _, needle := range []string{
-		"td.title=proxyZenDashTitle(p)",
-		"td.title=proxyGoDashTitle(p)",
-	} {
+	// Header carries the canonical three columns.
+	for _, needle := range []string{"<th>传输</th>", "<th>匿名</th>", "<th>认证</th>"} {
 		if !strings.Contains(html, needle) {
-			t.Fatalf("dash cell must carry title %q", needle)
+			t.Fatalf("proxy table must contain canonical column %q", needle)
 		}
 	}
-	// Cooldown reason column is preserved.
-	if !strings.Contains(html, "p.cooldown_reason") {
-		t.Fatal("cooldown reason column must be preserved")
+	for _, stale := range []string{"<th>Zen 通道</th>", "<th>Go 通道</th>", "Go 通道", "Zen 通道", "冷却原因", "p.cooldown_reason"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("legacy proxy column must stay removed: %q", stale)
+		}
 	}
-	// Transport column still shows the pill; Zen/Go unhealthy must not render a transport pill.
+	// Cells gate on the canonical lane, not on transport health.
+	if got := strings.Count(html, "!proxyAnonLaneOn(p)"); got < 1 {
+		t.Fatal("anonymous cell must gate on !proxyAnonLaneOn(p)")
+	}
+	if got := strings.Count(html, "!proxyAuthLaneOn(p)"); got < 1 {
+		t.Fatal("authenticated cell must gate on !proxyAuthLaneOn(p)")
+	}
+	for _, needle := range []string{
+		"td.title=proxyAnonDashTitle(p)",
+		"td.title=proxyAuthDashTitle(p)",
+		"laneObsOf(p,\"anonymous\")",
+		"laneObsOf(p,\"authenticated\")",
+		"obsTone(lane.obs,lane.code)",
+		"obsDisplayText(lane.obs,lane.code)",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("actual-status cell must contain %q", needle)
+		}
+	}
+	// Transport column still shows the pill.
 	if !strings.Contains(html, `p.healthy?"正常":"不可用"`) {
 		t.Fatal("transport column must keep 正常/不可用 pill")
+	}
+	// Auth no-key state is visibly 未配置, never a misleading usable state.
+	if !strings.Contains(html, "未配置") {
+		t.Fatal("auth no-key state must visibly say 未配置")
+	}
+	if !strings.Contains(html, "未配置：暂无认证密钥") {
+		t.Fatal("empty credential table must say 未配置：暂无认证密钥")
+	}
+	// Cooldown diagnostics stay as separate tables with simplified captions.
+	for _, needle := range []string{"tbody-ratelimit", "tbody-channel", "tbody-targets", "限流中的代理", "通道冷却中的节点", "冷却中的目标"} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("cooldown diagnostic must contain %q", needle)
+		}
+	}
+}
+
+func TestWebUICustomAvailabilityProjection(t *testing.T) {
+	html := proxyAvailHTML(t)
+	// Configured rows always exist before probing; observations overlay.
+	for _, needle := range []string{
+		"function mergeCustomRows(server, cached)",
+		"function customStatusLabel(v)",
+		"function customReasonLabel(v)",
+		"keyWrap.appendChild(keyRow)",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("custom projection must contain %q", needle)
+		}
+	}
+	// Localized status mapping, never raw backend enum strings in cells.
+	for _, needle := range []string{
+		`customStatusLabel(c.status||"untested")`,
+		`customReasonLabel(c.reason||"—")`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("custom cell must map through localized labels: %q", needle)
+		}
+	}
+	customIdx := strings.Index(html, "tbody-custom")
+	if customIdx < 0 {
+		t.Fatal("missing tbody-custom")
+	}
+	customBlock := html[customIdx : customIdx+3000]
+	if strings.Contains(customBlock, `el("span",v,"pill`) && strings.Contains(customBlock, `td.title="状态："+v`) {
+		t.Fatal("custom status cell must not print raw backend enum strings")
+	}
+	// Toasts report localized status, never raw enums or generic available counts.
+	for _, needle := range []string{
+		`customStatusLabel(String(row.status||"untested"))`,
+		`credStatusLabel(String(cred.status||"untested"))`,
+		"nodeResultText(node)",
+		"批量检测完成：共检测 ",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("detection toast must report actual observation %q", needle)
+		}
+	}
+	if strings.Contains(html, "bulkNodeAvailable") {
+		t.Fatal("generic available counting must stay removed from detection toasts")
+	}
+	if strings.Contains(html, "可用 \"+avail") || strings.Contains(html, `可用 "+avail`) {
+		t.Fatal("bulk toast must not count generic available")
 	}
 }
 
@@ -169,7 +235,7 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 		`justify-content:center`,
 		`display:none`,
 		`/api/availability/check-node`,
-		`function bulkNodeAvailable(`,
+		`function nodeResultText(`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("single probe button must contain %q", needle)

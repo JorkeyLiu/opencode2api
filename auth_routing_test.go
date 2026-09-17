@@ -20,7 +20,7 @@ func authThreeProxyGateway(t *testing.T, monitor *Monitor) *Gateway {
 			"z": {"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"},
 			"g": {"direct", "http://127.0.0.1:8083"},
 		},
-		ProxyRoutingConfig{Anonymous: "a", Zen: "z", Go: "g"},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
 	cfg.Retry.MaxAttempts = 5
@@ -36,7 +36,7 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authTwoProxyGateway(t, monitor, 5)
 	pool := gateway.pools["z"]
-	cred := gateway.zenCreds[0]
+	cred := gateway.authCreds[0]
 	pref := preferredProxyRaw(cred.id, pool.name, pool.items)
 	if pref == "" {
 		t.Fatalf("empty preferred")
@@ -44,7 +44,7 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	for _, ses := range []string{"ses_aff_1", "ses_aff_2", "ses_other"} {
 		for _, model := range []string{"m", "model-x", "model-y"} {
 			now := time.Now().UnixNano()
-			cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.zenCreds[:1], pool, model, now)
+			cands := gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds[:1], pool, model, now)
 			ordered := gateway.scheduler.orderCandidates(cands, ses)
 			if len(ordered) == 0 {
 				t.Fatalf("no candidates")
@@ -57,8 +57,8 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	// Different credentials disperse: aaaaa vs bbbbb have different preferred.
 	gateway2 := schedulerTestGateway(t, []string{"zen-key-aaaaa", "zen-key-bbbbb"}, []string{"direct", "http://127.0.0.1:8081"})
 	pool2 := gateway2.pools["shared"]
-	p0 := preferredProxyRaw(gateway2.zenCreds[0].id, pool2.name, pool2.items)
-	p1 := preferredProxyRaw(gateway2.zenCreds[1].id, pool2.name, pool2.items)
+	p0 := preferredProxyRaw(gateway2.authCreds[0].id, pool2.name, pool2.items)
+	p1 := preferredProxyRaw(gateway2.authCreds[1].id, pool2.name, pool2.items)
 	if p0 == "" || p1 == "" {
 		t.Fatalf("empty preferred")
 	}
@@ -66,8 +66,8 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 		t.Fatalf("expected dispersion for test keys, both prefer %s", p0)
 	}
 	// Same key different pools independent: z prefers 8081, other prefers direct.
-	cfg := testGatewayConfig(map[string][]string{"z": {"direct", "http://127.0.0.1:8081"}, "other": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "z", Zen: "z", Go: "other"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
+	cfg := testGatewayConfig(map[string][]string{"z": {"direct", "http://127.0.0.1:8081"}, "other": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "other", Authenticated: "z"})
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Anonymous = true
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
@@ -77,7 +77,7 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cid := gw.zenCreds[0].id
+	cid := gw.authCreds[0].id
 	pz := preferredProxyRaw(cid, "z", gw.pools["z"].items)
 	po := preferredProxyRaw(cid, "other", gw.pools["other"].items)
 	if pz == "" || po == "" {
@@ -91,18 +91,18 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	_ = po
 	// Minimal disruption: adding a proxy preserves relative order of old ones.
 	now := time.Now().UnixNano()
-	oldCands := gw.scheduler.buildAuthCandidates(TierZen, gw.zenCreds, gw.pools["z"], "m", now)
+	oldCands := gw.scheduler.buildAuthCandidates(TierZen, gw.authCreds, gw.pools["z"], "m", now)
 	oldOrdered := gw.scheduler.orderCandidates(oldCands, "ses_aff_1")
 	oldIDs := []string{}
 	for _, c := range oldOrdered {
 		oldIDs = append(oldIDs, c.Identity)
 	}
 	// New pool with extra proxy.
-	cfg2 := testGatewayConfig(map[string][]string{"z": {"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"}, "other": {"direct"}}, ProxyRoutingConfig{Anonymous: "z", Zen: "z", Go: "other"})
-	cfg2.ZenKeys = []string{"zen-key-aaaaa"}
+	cfg2 := testGatewayConfig(map[string][]string{"z": {"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082"}, "other": {"direct"}}, ProxyRoutingConfig{Anonymous: "other", Authenticated: "z"})
+	cfg2.Keys = []string{"zen-key-aaaaa"}
 	n2, _ := NormalizeConfig("config.json", cfg2)
 	gw2, _ := NewGateway(n2, nil, NewMonitor())
-	newCands := gw2.scheduler.buildAuthCandidates(TierZen, gw2.zenCreds, gw2.pools["z"], "m", now)
+	newCands := gw2.scheduler.buildAuthCandidates(TierZen, gw2.authCreds, gw2.pools["z"], "m", now)
 	newOrdered := gw2.scheduler.orderCandidates(newCands, "ses_aff_1")
 	allowed := map[string]bool{}
 	for _, id := range oldIDs {
@@ -314,7 +314,7 @@ func TestAuthEstablishedMoveMatrix(t *testing.T) {
 				}
 			}
 			otherIdx := 1 - curIdx
-			var curCalls, otherCalls, goCalls atomic.Int32
+			var curCalls, otherCalls atomic.Int32
 			if tc.transport {
 				postStub(t, gateway, "z", curIdx, &curCalls, nil, func(*http.Request) (*http.Response, error) {
 					return nil, errors.New("dial timeout")
@@ -334,9 +334,6 @@ func TestAuthEstablishedMoveMatrix(t *testing.T) {
 			postStub(t, gateway, "z", otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
 				return responseWithBody(200, `{"ok":true}`), nil
 			})
-			postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
-				return responseWithBody(200, `{"ok":true}`), nil
-			})
 			r2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r2"), 0)
 			if err != nil {
 				t.Fatalf("err=%v", err)
@@ -350,9 +347,6 @@ func TestAuthEstablishedMoveMatrix(t *testing.T) {
 			}
 			if postCount(&otherCalls) != tc.wantOtherCalls {
 				t.Fatalf("other calls=%d want %d", postCount(&otherCalls), tc.wantOtherCalls)
-			}
-			if postCount(&goCalls) != 0 {
-				t.Fatalf("must never cross tier: go=%d", postCount(&goCalls))
 			}
 			pin2, _ := gateway.scheduler.pinGet(ses, "m")
 			moved := pin2.ProxyRaw != pin.ProxyRaw
@@ -484,19 +478,20 @@ func TestAuthCredential429Evidence(t *testing.T) {
 			t.Fatalf("proto %s envelope broken", proto)
 		}
 	}
-	// Zen/Go isolation even for identical key text.
+	// Credential IDs stay tier-qualified: same key text on Zen vs legacy Go
+	// yields distinct identities, and the legacy Go identity never affects the
+	// single authenticated lane.
 	gatewayIso := authThreeProxyGateway(t, NewMonitor())
 	sameKey := "same-key-text-zzzzz"
-	gatewayIso.zenCreds = credentialsForKeys(TierZen, []string{sameKey})
-	gatewayIso.goCreds = credentialsForKeys(TierGo, []string{sameKey})
-	zenID := gatewayIso.zenCreds[0].id
-	goID := gatewayIso.goCreds[0].id
+	gatewayIso.authCreds = credentialsForKeys(TierZen, []string{sameKey})
+	zenID := gatewayIso.authCreds[0].id
+	goID := credentialIDForKey(TierGo, sameKey)
 	if zenID == goID {
 		t.Fatalf("cred IDs must isolate tiers")
 	}
 	gatewayIso.scheduler.noteCredential429Failure(zenID, AttemptClassRateLimited, 429, 5*time.Second, time.Now().UnixNano())
 	if _, _, ok := gatewayIso.scheduler.credential429CooldownStatus(goID); ok {
-		t.Fatalf("Go must stay isolated from Zen credential limit")
+		t.Fatalf("legacy Go identity must stay isolated from Zen credential limit")
 	}
 	// Stale success protection.
 	s := newTargetScheduler(15 * time.Second)
@@ -510,7 +505,7 @@ func TestAuthCredential429Evidence(t *testing.T) {
 	}
 	// Success clearing via gateway: newer-started 2xx clears.
 	gw2 := authTwoProxyGateway(t, NewMonitor(), 5)
-	cred := gw2.zenCreds[0]
+	cred := gw2.authCreds[0]
 	started := time.Now().UnixNano()
 	gw2.scheduler.noteCredential429Failure(cred.id, AttemptClassRateLimited, 429, time.Second, started)
 	pool := gw2.pools["z"]
@@ -542,7 +537,7 @@ func TestAuthCredential429Evidence(t *testing.T) {
 	})
 	ru, _, _, _ := gwU.doUpstreamTiers(pinTestCtx(), routeU, routeBodies(), pinIDs("ses_unbound_429_1", "ru1"), 0)
 	drainResp(ru)
-	credU := gwU.zenCreds[0].id
+	credU := gwU.authCreds[0].id
 	if _, _, ok := gwU.scheduler.credential429CooldownStatus(credU); !ok {
 		t.Fatalf("unbound two-proxy same-cred 429 must set credential cooldown")
 	}
@@ -590,9 +585,8 @@ func TestAuthPinMoveFencing(t *testing.T) {
 
 // Reload migration, tombstone, cap, tier qualification, readiness.
 func TestAuthMigrationTombstoneCapReadiness(t *testing.T) {
-	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	oldCfg.ZenKeys = []string{"zen-key-aaaaa"}
-	oldCfg.GoKeys = []string{"go-key-bbbbb"}
+	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	oldCfg.Keys = []string{"zen-key-aaaaa", "go-key-bbbbb"}
 	oldCfg.Anonymous = true
 	oldNormalized, err := NormalizeConfig("config.json", oldCfg)
 	if err != nil {
@@ -603,7 +597,7 @@ func TestAuthMigrationTombstoneCapReadiness(t *testing.T) {
 		t.Fatal(err)
 	}
 	zenAuth := normalizeRouteAuthority(oldNormalized.Upstream.Zen)
-	zenCred := oldGateway.zenCreds[0].id
+	zenCred := oldGateway.authCreds[0].id
 	// Auth pin proxy-independent; anon pin full target.
 	oldGateway.scheduler.pinBind("ses_auth_keep", "m", sessionPin{Tier: TierZen, CredID: zenCred, Pool: "shared", ProxyRaw: "direct", Model: "m", Protocol: ProtocolChat, Authority: zenAuth})
 	oldGateway.scheduler.pinBind("ses_anon_keep", "m", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Model: "m", Protocol: ProtocolChat, Authority: zenAuth})
@@ -615,9 +609,8 @@ func TestAuthMigrationTombstoneCapReadiness(t *testing.T) {
 	oldGateway.scheduler.proxy429State["shared\x00direct"] = &proxy429Entry{failures: 1, cooldownUntil: time.Now().Add(time.Minute).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStartedNanos: time.Now().UnixNano(), lastStatus: 429}
 	oldGateway.scheduler.mu.Unlock()
 
-	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	newCfg.ZenKeys = []string{"zen-key-aaaaa"}
-	newCfg.GoKeys = []string{"go-key-bbbbb"}
+	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	newCfg.Keys = []string{"zen-key-aaaaa", "go-key-bbbbb"}
 	newCfg.Anonymous = true
 	newNormalized, err := NormalizeConfig("config.json", newCfg)
 	if err != nil {

@@ -12,7 +12,7 @@ import (
 func TestScopedAuthCSRFOriginStrictNoStore(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	_ = manager
 	if rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-node", `{"pool":"shared","index":0}`, "", "")); rec.Code != http.StatusUnauthorized {
@@ -57,7 +57,7 @@ func TestScopedStrictValidation(t *testing.T) {
 	for _, tc := range cases {
 		_, admin, token, csrf := bulkAdmin(t,
 			map[string][]string{"shared": {"direct"}},
-			ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+			ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 			nil, nil)
 		rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-node", tc.body, token, csrf))
 		if rec.Code != tc.want {
@@ -72,7 +72,7 @@ func TestScopedStrictValidation(t *testing.T) {
 func TestScopedRateLimitBusy(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		nil, nil)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -92,7 +92,7 @@ func TestScopedRateLimitBusy(t *testing.T) {
 	}
 	_, admin2, token2, csrf2 := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		nil, nil)
 	rt2 := admin2.manager.current.Load()
 	rt2.gateway.bulkMu.Lock()
@@ -105,7 +105,7 @@ func TestScopedRateLimitBusy(t *testing.T) {
 func TestScopedSameSchemaMergePreservesUnrelated(t *testing.T) {
 	manager, admin, token, csrf := bulkAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
@@ -148,7 +148,7 @@ func TestScopedSameSchemaMergePreservesUnrelated(t *testing.T) {
 	// Scoped check for node 0 only. Use a fresh admin to avoid bulk rate limit.
 	_, admin2, token2, csrf2 := bulkAdmin(t,
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
-		ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
 		[]string{"zen-key-12345"}, []string{"go-key-12345"})
 	// Point the second gateway at the same stub and copy the snapshot so the
 	// merge-preservation assertion is meaningful.
@@ -263,8 +263,21 @@ func TestScopedWebUIContracts(t *testing.T) {
 		}
 		_ = stale
 	}
-	if !strings.Contains(html, "批量检测完成：共检测 ") || !strings.Contains(html, "可用 ") || !strings.Contains(html, "不可用 ") {
-		t.Fatal("bulk completion must read 批量检测完成：共检测 X 个节点，可用 Y 个，不可用 Z 个")
+	if !strings.Contains(html, "批量检测完成：共检测 ") {
+		t.Fatal("bulk completion must read 批量检测完成：共检测 X 个节点")
+	}
+	{
+		blkIdx := strings.Index(html, "function bulkCheck()")
+		if blkIdx >= 0 {
+			blkEnd := strings.Index(html[blkIdx:], "function manualRefresh(")
+			blk := html[blkIdx:]
+			if blkEnd >= 0 {
+				blk = blk[:blkEnd]
+			}
+			if strings.Contains(blk, "bulkNodeAvailable") || strings.Contains(blk, "+avail") {
+				t.Fatal("bulk completion must report actual observations, not generic available counts")
+			}
+		}
 	}
 	// In-progress concise, no protocol trivia.
 	bulkIdx := strings.Index(html, "function bulkCheck()")
@@ -284,23 +297,15 @@ func TestScopedWebUIContracts(t *testing.T) {
 			t.Fatalf("bulk in-progress must not expose trivia %q", trivia)
 		}
 	}
-	// Node availability derives from native lanes only.
-	if !strings.Contains(html, "function bulkNodeAvailable(") {
-		t.Fatal("missing bulkNodeAvailable helper")
+	// Node results report actual observations per lane, never generic available counts.
+	if !strings.Contains(html, "function nodeResultText(") {
+		t.Fatal("missing nodeResultText helper")
 	}
 	if strings.Contains(html, "function bulkNodeAvailable(") {
-		start := strings.Index(html, "function bulkNodeAvailable(")
-		end := strings.Index(html[start:], "function probeProxy(")
-		block := html[start:]
-		if end >= 0 {
-			block = block[:end]
-		}
-		if !strings.Contains(block, `"available"`) || !strings.Contains(block, `"success"`) {
-			t.Fatal("node availability must treat available/success lanes")
-		}
-		if strings.Contains(block, "custom") || strings.Contains(block, "no_model") {
-			t.Fatal("node availability must not include custom channels or no_model text")
-		}
+		t.Fatal("generic bulkNodeAvailable helper must stay removed")
+	}
+	if !strings.Contains(html, "laneObsOf(p,") && !strings.Contains(html, "node.anonymous") {
+		t.Fatal("node results must read actual anonymous/authenticated observations")
 	}
 	// Batch control upper-right with normal spacing; progress hint below table right-aligned.
 	if !strings.Contains(html, `justify-content:flex-end`) {

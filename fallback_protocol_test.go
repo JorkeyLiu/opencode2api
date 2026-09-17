@@ -376,7 +376,7 @@ func TestFallbackDiscoverAdminShape(t *testing.T) {
 	}))
 	defer bad.Close()
 	manager := &RuntimeManager{monitor: NewMonitor(), hub: NewLogHub(100), redactor: NewSecretRedactor()}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfg.Fallback = FallbackConfig{Active: "", Channels: []FallbackChannelConfig{}}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {

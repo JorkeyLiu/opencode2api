@@ -78,21 +78,17 @@ func (a *AdminServer) handleCredentialCheck(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	gateway := runtime.gateway
-	// Resolve exactly one configured credential server-side.
+	// Resolve exactly one configured credential server-side. Only the single
+	// authenticated (Zen) lane exists; legacy Go fingerprints never resolve.
 	type resolvedCred struct {
 		tier Tier
 		cred credentialRef
 		pool string
 	}
 	var matches []resolvedCred
-	for _, cred := range gateway.zenCreds {
+	for _, cred := range gateway.credentials() {
 		if credentialFingerprint(TierZen, cred.key) == fp {
-			matches = append(matches, resolvedCred{tier: TierZen, cred: cred, pool: gateway.cfg.ProxyRouting.Zen})
-		}
-	}
-	for _, cred := range gateway.goCreds {
-		if credentialFingerprint(TierGo, cred.key) == fp {
-			matches = append(matches, resolvedCred{tier: TierGo, cred: cred, pool: gateway.cfg.ProxyRouting.Go})
+			matches = append(matches, resolvedCred{tier: TierZen, cred: cred, pool: gateway.authPoolName()})
 		}
 	}
 	if len(matches) != 1 {
@@ -160,14 +156,19 @@ func (a *AdminServer) handleCustomCheck(w http.ResponseWriter, r *http.Request) 
 
 func (g *Gateway) runCredentialCheck(ctx context.Context, tier Tier, cred credentialRef, poolName string) (credentialCheckResponse, int, string, string) {
 	checkedAt := time.Now().UTC()
+	if tier == TierGo {
+		freshGo := bulkCredentialAvailability{
+			Tier: string(tier), KeyTail: cred.display,
+			Fingerprint: credentialFingerprint(tier, cred.key), Pool: poolName,
+			Status: "inconclusive", Reason: "no_model", LastChecked: &checkedAt,
+			CredID: cred.id,
+		}
+		return credentialCheckResponse{CheckedAt: checkedAt, Credential: freshGo, TestedNodes: 0, NoModel: []string{"go"}}, http.StatusOK, "", ""
+	}
 	model, proto, ok := g.bulkProbeModel(tier, false)
 	noModelList := []string(nil)
 	if !ok {
-		lane := "zen"
-		if tier == TierGo {
-			lane = "go"
-		}
-		noModelList = []string{lane}
+		noModelList = []string{"authenticated"}
 		fresh := bulkCredentialAvailability{
 			Tier: string(tier), KeyTail: cred.display,
 			Fingerprint: credentialFingerprint(tier, cred.key), Pool: poolName,

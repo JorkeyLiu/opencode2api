@@ -229,7 +229,7 @@ html,body{max-width:100%;overflow-x:hidden}
 <section id="view-login" class="login">
   <form id="login-form" class="login-card">
     <h1>opencode2api · 运维控制台</h1>
-    <p>本地控制面。无外部依赖，动态内容经 DOM 安全渲染。</p>
+    <p>本地控制面。无外部依赖。</p>
     <div class="field"><label for="login-user">账号</label><input id="login-user" autocomplete="username" required></div>
     <div class="field"><label for="login-pass">密码</label><input id="login-pass" type="password" autocomplete="current-password" required></div>
     <div id="login-error" class="error"></div>
@@ -331,39 +331,39 @@ html,body{max-width:100%;overflow-x:hidden}
       </div>
       <div class="section">
         <h2>代理可用性</h2>
-        <div class="cap">传输连通性与 Zen / Go 通道可用性合一视图。同一原始 URL 在不同池为独立池限定成员，仅视觉分组，不合并状态。Zen 与 Go 为通道维度，同一节点可因通道不同而状态不同；匿名 Zen 403/5xx 与限流信息并入 Zen 列与原因。节点名不代表出口 IP。未被引用的暂存池不运行、不可检测。</div>
+        <div class="cap">各代理节点的连通性与匿名、认证通道实测结果。节点名为配置名称，不代表出口 IP，可逐个检测。</div>
         <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
           <button class="ghost" id="btn-bulk-check" type="button">批量检测</button>
         </div>
-        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>节点（视觉分组）</th><th>代理池（成员）</th><th>序号</th><th>路由通道</th><th>传输</th><th>Zen 通道</th><th>Go 通道</th><th>冷却原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>节点</th><th>代理池</th><th>序号</th><th>路由通道</th><th>传输</th><th>匿名</th><th>认证</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
         <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px"><span class="note" id="proxies-note"></span><span class="note" id="bulk-state" style="text-align:right"></span></div>
       </div>
       <div class="section">
         <h2>备用模型渠道可用性</h2>
-        <div class="cap">全部自定义渠道真实最小推理探测（chat，stream:false，约 1 token）。不写入 Zen/Go 调度与传输健康。模型发现仍可用 GET /v1/models，但绝不作为可用性判定；无目录探测模型时报告 no_model/inconclusive。</div>
+        <div class="cap">已配置渠道列表与最近检测结果，可逐个检测。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>渠道</th><th>地址</th><th>模型</th><th>状态</th><th>原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-custom"></tbody></table></div>
         <div class="note" id="custom-note"></div>
       </div>
       <div class="section">
         <h2>凭证可用性</h2>
-        <div class="cap">按通道统计的密钥可用性：上游、所属池、状态、可用/全部目标、原因与上次检测。完整密钥不在页面显示，查看仍走敏感值接口。</div>
+        <div class="cap">各密钥的检测状态与所属池。完整密钥不在页面显示。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>密钥尾码</th><th>上游</th><th>代理池</th><th>状态</th><th>可用/全部</th><th>失败次数</th><th>原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
       </div>
       <div class="section">
         <h2>代理限流冷却（429 全局）</h2>
-        <div class="cap">按通道与池限定的 429 冷却：同一池内同 URL 按通道隔离，Zen 匿名与认证共享 Zen 通道，Go 独立。限流期间该通道暂不使用该代理。</div>
+        <div class="cap">限流中的代理与剩余时间。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>通道名</th><th>代理池</th><th>节点</th><th>活跃</th><th>失败次数</th><th>剩余</th><th>下次可用</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-ratelimit"></tbody></table></div>
         <div class="note" id="ratelimit-note"></div>
       </div>
       <div class="section">
-        <h2>通道可用性冷却（403/5xx 比较探测）</h2>
-        <div class="cap">按通道与池限定的 403/5xx 通道冷却：仅比较探测写入（同凭证一节点成功而另一节点 403/5xx），无比较成功时仅展示不写入；与传输、限流、凭证冷却及按模型目标冷却相互独立。</div>
+        <h2>通道可用性冷却</h2>
+        <div class="cap">通道冷却中的节点与剩余时间。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>通道名</th><th>代理池</th><th>节点</th><th>活跃</th><th>失败次数</th><th>剩余</th><th>下次可用</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-channel"></tbody></table></div>
         <div class="note" id="channel-note"></div>
       </div>
       <div class="section">
-        <h2>活跃目标冷却（403/5xx 按模型）</h2>
-        <div class="cap">仅含 403/5xx 触发的按（凭证×池×代理×模型）目标冷却，最多显示 512 条；429 见代理限流冷却，通道级 403/5xx 见通道可用性冷却。</div>
+        <h2>活跃目标冷却</h2>
+        <div class="cap">403/5xx 冷却中的目标与剩余时间，最多显示 512 条。</div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>上游</th><th>凭证</th><th>代理池</th><th>代理</th><th>模型</th><th>失败次数</th><th>剩余</th><th>失败分类</th><th>状态</th></tr></thead><tbody id="tbody-targets"></tbody></table></div>
         <div class="note" id="targets-note"></div>
       </div>
@@ -402,13 +402,11 @@ html,body{max-width:100%;overflow-x:hidden}
       <form id="config-form" autocomplete="off">
         <div class="section config-card">
           <h2>接入与鉴权</h2>
-          <div class="cap">决定请求优先走哪个上游，以及匿名试用与各类密钥是否可用。</div>
+          <div class="cap">匿名试用开关与认证密钥管理。</div>
           <div class="form-grid">
-            <div class="field"><label>首选上游顺序</label><select id="c-prefer"><option value="go">Go（失败回退 Zen）</option><option value="zen">Zen（失败回退 Go）</option></select></div>
-            <div class="field check-field"><label>匿名通道</label><div class="check-row"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用 Zen 匿名通道（仅免费模型先试）</span></label></div></div>
+            <div class="field check-field"><label>匿名通道</label><div class="check-row"><label class="check-label"><input id="c-anonymous" type="checkbox"><span>启用匿名通道（仅免费模型先试）</span></label></div></div>
             <div class="field full"><label>服务端密钥（掩码标签，点击显示明文；移除后保存生效）</label><div id="server_keys-chips" class="chips"></div><textarea id="server_keys-new" placeholder="每行新增一个密钥"></textarea></div>
-            <div class="field"><label>Zen 密钥（掩码标签，点击显示明文）</label><div id="zen_keys-chips" class="chips"></div><textarea id="zen_keys-new" placeholder="每行新增一个密钥"></textarea></div>
-            <div class="field"><label>Go 密钥（掩码标签，点击显示明文）</label><div id="go_keys-chips" class="chips"></div><textarea id="go_keys-new" placeholder="每行新增一个密钥"></textarea></div>
+            <div class="field full"><label>认证密钥（掩码标签，点击显示明文）</label><div id="keys-chips" class="chips"></div><textarea id="keys-new" placeholder="每行新增一个密钥"></textarea></div>
           </div>
         </div>
         <div class="section config-card">
@@ -416,8 +414,7 @@ html,body{max-width:100%;overflow-x:hidden}
           <div class="cap">具名代理池，被路由选中的池为运行中，其余为暂存。</div>
           <div class="form-grid">
             <div class="field"><label>匿名路由池</label><select id="c-route-anon"></select></div>
-            <div class="field"><label>Zen 路由池</label><select id="c-route-zen"></select></div>
-            <div class="field"><label>Go 路由池</label><select id="c-route-go"></select></div>
+            <div class="field"><label>认证路由池</label><select id="c-route-auth"></select></div>
             <div class="field full"><label>具名代理池</label><div id="pools-editor" class="pool-list"></div><div class="actions"><button class="ghost" id="btn-pool-add" type="button">新增代理池</button></div><div class="note" id="pools-error"></div></div>
           </div>
         </div>
@@ -433,7 +430,6 @@ html,body{max-width:100%;overflow-x:hidden}
           <div class="cap">上游服务地址与单密钥重试预算、请求超时。修改后立即生效。</div>
           <div class="form-grid">
             <div class="field"><label>Zen 地址（URL）</label><input id="c-up-zen"></div>
-            <div class="field"><label>Go 地址（URL）</label><input id="c-up-go"></div>
             <div class="field"><label>每个密钥上游最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
             <div class="field"><label>请求超时（秒）</label><input id="c-timeout" type="number" min="1"></div>
           </div>
@@ -456,8 +452,7 @@ html,body{max-width:100%;overflow-x:hidden}
             <div class="field"><label>空闲超时（秒）</label><input id="c-idle-timeout" type="number"></div>
             <div class="field"><label>连接超时（秒）</label><input id="c-connect" type="number"></div>
             <div class="field"><label>失败冷却（秒）</label><input id="c-cooldown" type="number"></div>
-            <div class="field"><label>429 冷却最小值（秒）</label><input id="c-ratelimit-cooldown" type="number" min="1"></div>
-            <div class="field"><label>429 冷却最大值（秒）</label><input id="c-ratelimit-cooldown-max" type="number" min="1"></div>
+            <div class="field"><label>429 冷却（秒）</label><input id="c-ratelimit-cooldown" type="number" min="300" max="3600"></div>
           </div>
         </div>
         <div class="section config-card">
@@ -517,8 +512,8 @@ function fmtMs(v){ if(v===undefined||v===null)return "—"; return Number(v)+"ms
 function fmtSec(v){ if(v===undefined||v===null)return "—"; return Number(v)+"秒"; }
 function fmtBytes(v){ v=Number(v||0); if(v<1024)return v+" B"; if(v<1024*1024)return (v/1024).toFixed(1)+" KB"; return (v/1024/1024).toFixed(1)+" MB"; }
 function protoLabel(p){ p=String(p||"").toLowerCase(); if(p==="chat")return "Chat Completions"; if(p==="responses")return "Responses"; if(p==="anthropic")return "Anthropic"; if(!p||p==="—")return "—"; return "未知"; }
-function tierLabel(t){ t=String(t||"").toLowerCase(); if(t==="zen")return "Zen"; if(t==="go")return "Go"; if(t==="custom")return "自定义"; if(!t||t==="—")return "—"; return "未知"; }
-function channelLabel(c){ var s=String(c||""); var l=s.toLowerCase(); if(l==="anonymous")return "匿名"; if(l==="zen")return "Zen"; if(l==="go")return "Go"; if(l==="custom"||l.slice(0,7)==="custom:")return "自定义"; if(!s||s==="—")return "—"; return "未知"; }
+function tierLabel(t){ t=String(t||"").toLowerCase(); if(t==="zen")return "Zen"; if(t==="custom")return "自定义"; if(!t||t==="—")return "—"; return "未知"; }
+function channelLabel(c){ var s=String(c||""); var l=s.toLowerCase(); if(l==="anonymous")return "匿名"; if(l==="authenticated")return "认证"; if(l==="zen")return "Zen"; if(l==="custom"||l.slice(0,7)==="custom:")return "自定义"; if(!s||s==="—")return "—"; return "未知"; }
 function customChannelOf(a){ var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return k.slice(7); var ch=String((a&&(a.channel||a.Channel))||""); if(ch.slice(0,7)==="custom:")return ch.slice(7); var chl=ch.toLowerCase(); if(chl.slice(0,7)==="custom:")return ch.slice(7); return ""; }
 function isCustomRow(a){ var t=String((a&&(a.tier||a.Tier))||"").toLowerCase(); if(t==="custom")return true; var ch=String((a&&(a.channel||a.Channel))||""); var chl=ch.toLowerCase(); if(chl==="custom"||chl.slice(0,7)==="custom:")return true; var k=String((a&&(a.key_id||a.KeyID))||""); if(k.slice(0,7)==="custom:")return true; return false; }
 function keyLabel(a){ if(a&&(a.anonymous||a.Anonymous))return "匿名"; var k=(a&&(a.key_id||a.KeyID))||""; return k||"—"; }
@@ -1221,70 +1216,112 @@ function proxyRoutingHas(p,name){
   for(var i=0;i<r.length;i++){ if(String(r[i]||"").toLowerCase()===name)return true; }
   return false;
 }
-function proxyZenLaneOn(p){
+function proxyAnonLaneOn(p){
   p=p||{};
-  var anonRouted=proxyRoutingHas(p,"anonymous");
-  var zenRouted=proxyRoutingHas(p,"zen");
-  var anonActive=!!(p.anonymous||p.Anonymous);
-  var zk=Number((p.zen_keys!==undefined?p.zen_keys:(p.ZenKeys!==undefined?p.ZenKeys:0))||0);
-  var hasR=p.routing!==undefined?p.routing:p.Routing;
-  if(Object.prototype.toString.call(hasR)==="[object Array]"){
-    if(!anonRouted&&!zenRouted)return false;
-    return anonActive||zk>0;
-  }
-  return anonActive||zk>0;
+  return proxyRoutingHas(p,"anonymous");
 }
-function proxyGoLaneOn(p){
+function proxyAuthLaneOn(p){
   p=p||{};
-  var gk=Number((p.go_keys!==undefined?p.go_keys:(p.GoKeys!==undefined?p.GoKeys:0))||0);
-  if(!(gk>0))return false;
-  var hasR=p.routing!==undefined?p.routing:p.Routing;
-  if(Object.prototype.toString.call(hasR)==="[object Array]"){
-    return proxyRoutingHas(p,"go");
-  }
-  return gk>0;
+  return proxyRoutingHas(p,"authenticated");
 }
-function proxyZenDashTitle(p){
+function authKeysOf(p){
+  p=p||{};
+  var v=(p.auth_keys!==undefined?p.auth_keys:(p.AuthKeys!==undefined?p.AuthKeys:0));
+  return Number(v||0);
+}
+function proxyAnonDashTitle(p){
   p=p||{};
   if(p.healthy===false)return "传输不可用";
-  if(!proxyRoutingHas(p,"anonymous")&&!proxyRoutingHas(p,"zen"))return "该池未用于该通道";
+  if(!proxyRoutingHas(p,"anonymous"))return "该池未用于该通道";
   return "未配置该通道";
 }
-function proxyGoDashTitle(p){
+function proxyAuthDashTitle(p){
   p=p||{};
   if(p.healthy===false)return "传输不可用";
-  if(!proxyRoutingHas(p,"go"))return "该池未用于该通道";
+  if(!proxyRoutingHas(p,"authenticated"))return "该池未用于该通道";
   return "未配置该通道";
 }
-function proxyZenDisplay(p){
-  p=p||{};
-  if(p.healthy===false)return "—";
-  if(!proxyZenLaneOn(p))return "—";
-  return channelStatusLabel(p.zen!==undefined?p.zen:(p.Zen!==undefined?p.Zen:"untested"));
+function obsLabel(v){
+  v=String(v||"");
+  if(v==="success")return "成功";
+  if(v==="rate_limited")return "限流";
+  if(v==="auth_failure")return "认证失败";
+  if(v==="upstream_failure")return "上游失败";
+  if(v==="transport_failure")return "传输失败";
+  if(v==="parse_error")return "解析失败";
+  if(v==="client_rejected")return "请求被拒";
+  if(v==="other_response")return "其他响应";
+  if(v==="transient_client")return "临时重试";
+  if(v==="cancelled")return "已取消";
+  if(v==="healthy")return "正常";
+  if(v==="unhealthy")return "不可用";
+  if(v==="available")return "可用";
+  if(v==="unavailable")return "不可用";
+  if(v==="untested")return "未检测";
+  if(v==="unconfigured")return "未配置";
+  if(v==="no_model")return "无可用模型";
+  if(v==="inconclusive")return "未定";
+  if(!v||v==="—")return "—";
+  return "未知";
 }
-function proxyGoDisplay(p){
+function laneObsOf(p,lane){
   p=p||{};
-  if(p.healthy===false)return "—";
-  if(!proxyGoLaneOn(p))return "—";
-  return channelStatusLabel(p.go!==undefined?p.go:(p.Go!==undefined?p.Go:"untested"));
+  if(lane==="anonymous"){
+    var o=p.anonymous_observation!==undefined?p.anonymous_observation:(p.anonymous!==undefined&&typeof p.anonymous==="string"?p.anonymous:(p.Anonymous!==undefined&&typeof p.Anonymous==="string"?p.Anonymous:""));
+    if(o===undefined||o===null||o==="")o=(p.zen!==undefined?p.zen:(p.Zen!==undefined?p.Zen:"untested"));
+    var c=(p.anonymous_http_status!==undefined?p.anonymous_http_status:(p.AnonymousHTTPStatus!==undefined?p.AnonymousHTTPStatus:(p.anonymousHttpStatus||0)));
+    return {obs:String(o||"untested"),code:Number(c||0)||0};
+  }
+  var o2=p.authenticated_observation!==undefined?p.authenticated_observation:(p.authenticated!==undefined&&typeof p.authenticated==="string"?p.authenticated:(p.Authenticated!==undefined&&typeof p.Authenticated==="string"?p.Authenticated:""));
+  if(o2===undefined||o2===null||o2==="")o2=(p.authenticated_obs||"untested");
+  if((o2===undefined||o2===null||o2==="")||o2==="untested"){
+    var fb=p.authenticated!==undefined?p.authenticated:(p.Authenticated!==undefined?p.Authenticated:"");
+    if(fb)o2=fb;
+  }
+  if(o2===undefined||o2===null||o2==="")o2="untested";
+  var c2=(p.authenticated_http_status!==undefined?p.authenticated_http_status:(p.AuthenticatedHTTPStatus!==undefined?p.AuthenticatedHTTPStatus:(p.authenticatedHttpStatus||0)));
+  return {obs:String(o2||"untested"),code:Number(c2||0)||0};
 }
-function channelStatusLabel(v){
+function obsTone(obs,code){
+  if(code) { if(code===200)return "ok"; if(code===429)return "warn"; return "bad"; }
+  obs=String(obs||"");
+  if(obs==="success"||obs==="healthy"||obs==="available")return "ok";
+  if(obs==="rate_limited")return "warn";
+  if(obs==="untested"||obs==="unconfigured"||obs==="no_model"||obs==="inconclusive"||obs===""||obs==="—")return "neutral";
+  return "bad";
+}
+function obsDisplayText(obs,code){
+  if(code)return String(code);
+  return obsLabel(obs);
+}
+function customStatusLabel(v){
   v=String(v||"");
   if(v==="available")return "可用";
   if(v==="rate_limited")return "限流";
-  if(v==="channel_unavailable")return "通道不可用";
-  if(v==="transport_unavailable")return "传输不可用";
+  if(v==="unavailable")return "不可用";
+  if(v==="inconclusive")return "未定";
   if(v==="untested")return "未检测";
   if(!v||v==="—")return "—";
-  return v;
+  return obsLabel(v);
+}
+function customReasonLabel(v){
+  v=String(v||"");
+  if(!v||v==="—")return "—";
+  if(v==="untested")return "未检测";
+  if(v==="unconfigured")return "未配置";
+  if(v==="no_model")return "无可用模型";
+  if(v==="inconclusive"||v==="cancelled"||v==="parse_error")return obsLabel(v);
+  return failureLabel(v)!=="未知"?failureLabel(v):obsLabel(v);
 }
 function credStatusLabel(v){
   v=String(v||"");
   if(v==="available")return "可用";
   if(v==="unavailable")return "不可用";
   if(v==="rate_limited")return "限流";
+  if(v==="inconclusive")return "未定";
+  if(v==="untested")return "未检测";
   if(!v||v==="—")return "—";
-  return v;
+  return obsLabel(v);
 }
 function renderHealth(){
   var r=S.resources||{proxies:[],keys:[]};
@@ -1309,25 +1346,26 @@ function renderHealth(){
   var tp=$("tbody-proxies"); clear(tp);
   (r.proxies||[]).forEach(function(p){
     var tr=document.createElement("tr");
-    (function(){ var td=document.createElement("td"); var v=p.address||"—"; td.textContent=v; td.title="节点（视觉分组，池限定成员独立）："+v+"；同 URL 跨池不合并状态"; td.className="wrap"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var v=p.address||"—"; td.textContent=v; td.title="节点："+v; td.className="wrap"; tr.appendChild(td); })();
     cell(tr,p.proxy_pool||p.pool||"—"); cell(tr,p.index);
-    (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由引用（该池被哪些通道使用）："+routingRefsLabel(p.routing); td.className="wrap"; tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用（连通性）"; td.appendChild(h); tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由："+routingRefsLabel(p.routing); td.className="wrap"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用"; td.appendChild(h); tr.appendChild(td); })();
     (function(){
       var td=document.createElement("td");
-      if(p.healthy===false||!proxyZenLaneOn(p)){ td.textContent="—"; td.title=proxyZenDashTitle(p); tr.appendChild(td); return; }
-      var v=p.zen!==undefined?p.zen:(p.Zen!==undefined?p.Zen:"untested");
-      var s=el("span",channelStatusLabel(v),"pill "+(v==="available"?"ok":(v==="untested"?"neutral":"warn")));
-      s.title="Zen 通道（含匿名与认证 Zen）："+channelStatusLabel(v); td.appendChild(s); tr.appendChild(td);
+      if(!proxyAnonLaneOn(p)){ td.textContent="—"; td.title=proxyAnonDashTitle(p); tr.appendChild(td); return; }
+      var lane=laneObsOf(p,"anonymous");
+      var txt=obsDisplayText(lane.obs,lane.code);
+      var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
+      s.title="匿名："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
     })();
     (function(){
       var td=document.createElement("td");
-      if(p.healthy===false||!proxyGoLaneOn(p)){ td.textContent="—"; td.title=proxyGoDashTitle(p); tr.appendChild(td); return; }
-      var v=p.go!==undefined?p.go:(p.Go!==undefined?p.Go:"untested");
-      var s=el("span",channelStatusLabel(v),"pill "+(v==="available"?"ok":(v==="untested"?"neutral":"warn")));
-      s.title="Go 通道："+channelStatusLabel(v)+"；同一节点可因通道不同而状态不同"; td.appendChild(s); tr.appendChild(td);
+      if(!proxyAuthLaneOn(p)){ td.textContent="—"; td.title=proxyAuthDashTitle(p); tr.appendChild(td); return; }
+      var lane=laneObsOf(p,"authenticated");
+      var txt=obsDisplayText(lane.obs,lane.code);
+      var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
+      s.title="认证："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
     })();
-    (function(){ var td=document.createElement("td"); var v=p.cooldown_reason||"—"; td.textContent=v; td.title="活跃冷却原因："+v; td.className="wrap"; tr.appendChild(td); })();
     (function(){ var td=document.createElement("td"); td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
     var op=document.createElement("td");
     var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost probe-btn"; probeBtn.setAttribute("aria-label","检测节点可用性");
@@ -1339,16 +1377,16 @@ function renderHealth(){
     op.appendChild(probeBtn); tr.appendChild(op);
     tp.appendChild(tr);
   });
-  if(!(r.proxies||[]).length)emptyRow(tp,10,"暂无代理");
-  (function(){ var n=$("proxies-note"); if(n){ clear(n); var total=(r.proxies||[]).length; n.appendChild(document.createTextNode("共 "+total+" 个池限定代理（同 URL 跨池独立计）。Zen/Go 为通道维度。")); } })();
+  if(!(r.proxies||[]).length)emptyRow(tp,9,"暂无代理");
+  (function(){ var n=$("proxies-note"); if(n){ clear(n); var total=(r.proxies||[]).length; n.appendChild(document.createTextNode("共 "+total+" 个代理。")); } })();
   var tk=$("tbody-keys"); clear(tk);
   (r.keys||[]).forEach(function(k){
     var tr=document.createElement("tr");
     cell(tr,k.id,"wrap"); (function(){ var td=document.createElement("td"); td.textContent=tierLabel(k.tier); td.title="上游："+tierLabel(k.tier); tr.appendChild(td); })(); cell(tr,k.proxy_pool||"—");
     (function(){ var td=document.createElement("td"); var v=k.status||"available"; var s=el("span",credStatusLabel(v),"pill "+(v==="available"?"ok":(v==="rate_limited"?"warn":"bad"))); s.title="凭证状态："+credStatusLabel(v); td.appendChild(s); tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); var a=(k.available_targets===undefined?"—":k.available_targets); var t=(k.total_targets===undefined?"—":k.total_targets); td.textContent=a+" / "+t; td.title="可用目标 / 全部目标（传输与 401 维度）"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var a=(k.available_targets===undefined?"—":k.available_targets); var t=(k.total_targets===undefined?"—":k.total_targets); td.textContent=a+" / "+t; td.title="可用目标 / 全部目标"; tr.appendChild(td); })();
     cell(tr,k.failures===undefined?"—":k.failures);
-    (function(){ var td=document.createElement("td"); var v=k.reason||"—"; td.textContent=v; td.title="原因："+v; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var v=customReasonLabel(k.reason||"—"); td.textContent=v; td.title="原因："+v; tr.appendChild(td); })();
     (function(){ var td=document.createElement("td"); td.textContent=k.last_checked?fmtDateTime(k.last_checked):"—"; td.title=k.last_checked?("上次检测："+fmtDateTime(k.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
     var kop=document.createElement("td");
     var kbtn=document.createElement("button"); kbtn.type="button"; kbtn.className="ghost probe-btn"; kbtn.setAttribute("aria-label","检测凭证可用性");
@@ -1360,7 +1398,7 @@ function renderHealth(){
     kop.appendChild(kbtn); tr.appendChild(kop);
     tk.appendChild(tr);
   });
-  if(!(r.keys||[]).length)emptyRow(tk,9,"暂无密钥");
+  if(!(r.keys||[]).length)emptyRow(tk,9,"未配置：暂无认证密钥");
   var tt=$("tbody-targets"); clear(tt);
   (r.targets||[]).forEach(function(t){
     var tr=document.createElement("tr");
@@ -1386,7 +1424,7 @@ function renderHealth(){
       var tr=document.createElement("tr");
       (function(){ var td=document.createElement("td"); td.textContent=tierLabel(l.tier); td.title="通道："+tierLabel(l.tier); tr.appendChild(td); })();
       cell(tr,l.proxy_pool||"—"); cell(tr,l.proxy_node||"—","wrap");
-      (function(){ var td=document.createElement("td"); var act=!!l.active; td.appendChild(el("span",act?"限流中":"已恢复","pill "+(act?"warn":"ok"))); td.title=act?"该代理正处通道 429 冷却":"无活跃冷却（仅失败记忆）"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var act=!!l.active; td.appendChild(el("span",act?"限流中":"已恢复","pill "+(act?"warn":"ok"))); td.title=act?"限流中":"已恢复"; tr.appendChild(td); })();
       cell(tr,l.failures===undefined?"—":l.failures);
       (function(){ var td=document.createElement("td"); var rs=(l.remaining_seconds===undefined||l.remaining_seconds===null)?"—":l.remaining_seconds+"秒"; td.appendChild(el("span",rs,"pill "+(rs==="—"?"neutral":"warn"))); td.title=(rs==="—")?"无冷却":"冷却剩余 "+rs; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=l.next_available_at?fmtDateTime(l.next_available_at):"—"; td.title=l.next_available_at?("下次可用："+fmtDateTime(l.next_available_at)):"暂无冷却"; tr.appendChild(td); })();
@@ -1406,7 +1444,7 @@ function renderHealth(){
       var tr=document.createElement("tr");
       (function(){ var td=document.createElement("td"); td.textContent=tierLabel(l.tier); td.title="通道："+tierLabel(l.tier); tr.appendChild(td); })();
       cell(tr,l.proxy_pool||"—"); cell(tr,l.proxy_node||"—","wrap");
-      (function(){ var td=document.createElement("td"); var act=!!l.active; td.appendChild(el("span",act?"不可用":"已恢复","pill "+(act?"warn":"ok"))); td.title=act?"该通道正处 403/5xx 通道冷却":"无活跃冷却（仅失败记忆）"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var act=!!l.active; td.appendChild(el("span",act?"不可用":"已恢复","pill "+(act?"warn":"ok"))); td.title=act?"不可用":"已恢复"; tr.appendChild(td); })();
       cell(tr,l.failures===undefined?"—":l.failures);
       (function(){ var td=document.createElement("td"); var rs=(l.remaining_seconds===undefined||l.remaining_seconds===null)?"—":l.remaining_seconds+"秒"; td.appendChild(el("span",rs,"pill "+(rs==="—"?"neutral":"warn"))); td.title=(rs==="—")?"无冷却":"冷却剩余 "+rs; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=l.next_available_at?fmtDateTime(l.next_available_at):"—"; td.title=l.next_available_at?("下次可用："+fmtDateTime(l.next_available_at)):"暂无冷却"; tr.appendChild(td); })();
@@ -1427,8 +1465,8 @@ function renderHealth(){
       (function(){ var td=document.createElement("td"); td.textContent=c.name||"—"; td.title="渠道："+(c.name||"—"); tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.base_url||c.BaseURL||"—"; td.title="地址："+(c.base_url||c.BaseURL||"—"); td.className="wrap"; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap"; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); var v=c.status||"inconclusive"; td.appendChild(el("span",v,"pill "+(v==="available"?"ok":(v==="inconclusive"?"neutral":"warn")))); td.title="状态："+v; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.textContent=c.reason||"—"; td.title="原因："+(c.reason||"—"); tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var v=customStatusLabel(c.status||"untested"); td.appendChild(el("span",v,"pill "+(v==="可用"?"ok":(v==="未检测"||v==="未定"?"neutral":(v==="限流"?"warn":"bad"))))); td.title="状态："+v; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var rv=customReasonLabel(c.reason||"—"); td.textContent=rv; td.title="原因："+rv; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; tr.appendChild(td); })();
       var cop=document.createElement("td");
       var cbtn=document.createElement("button"); cbtn.type="button"; cbtn.className="ghost probe-btn"; cbtn.setAttribute("aria-label","检测自定义渠道可用性");
@@ -1442,10 +1480,10 @@ function renderHealth(){
     });
     if(!customs.length)emptyRow(tcb,7,"暂无自定义渠道");
   }
-  var cnote=$("custom-note"); if(cnote){ clear(cnote); var cl=mergeCustomRows((r.custom||[]),(S.customAvail||[])).length; cnote.appendChild(document.createTextNode("共 "+cl+" 个自定义渠道（真实探测，不写调度）。")); }
+  var cnote=$("custom-note"); if(cnote){ clear(cnote); var cl=mergeCustomRows((r.custom||[]),(S.customAvail||[])).length; cnote.appendChild(document.createTextNode("共 "+cl+" 个自定义渠道。")); }
   var fc=$("facts-catalog"); clear(fc);
   var cat=(r.models||{});
-  fact(fc,"目录（Zen / Go / 可暴露）", (cat.zen||0)+" / "+(cat.go||0)+" / "+(cat.exposed||0));
+  fact(fc,"目录（已收录 / 可暴露）", (cat.zen||0)+" / "+(cat.exposed||0));
   fact(fc,"目录更新", fmtDateTime(cat.updated_at)+(cat.cache_source?(" · "+cacheSourceLabel(cat.cache_source)):""), cat.stale?(cat.stale?"warn":"ok"):"ok");
   if(cat.stale)fact(fc,"目录状态","已过期","warn");
   var md=r.metadata||S.metadata||{};
@@ -1454,11 +1492,16 @@ function renderHealth(){
   fact(fc,"元数据更新", fmtDateTime(md.updated_at), md.stale?"warn":"ok");
   fact(fc,"元数据错误", md.last_error||"无", md.last_error?"bad":"ok");
 }
-function bulkNodeAvailable(n){
-  n=n||{};
-  var z=String(n.zen!==undefined?n.zen:(n.Zen!==undefined?n.Zen:""));
-  var g=String(n.go!==undefined?n.go:(n.Go!==undefined?n.Go:""));
-  return z==="available"||z==="success"||g==="available"||g==="success";
+function nodeResultText(node){
+  node=node||{};
+  function laneText(lane){
+    var obs="",code=0;
+    if(lane==="anonymous"){ obs=String(node.anonymous!==undefined?node.anonymous:(node.Anonymous!==undefined?node.Anonymous:(node.anonymous_observation||"untested"))); code=Number(node.anonymous_http_status||node.AnonymousHTTPStatus||0)||0; }
+    else { obs=String(node.authenticated!==undefined?node.authenticated:(node.Authenticated!==undefined?node.Authenticated:(node.authenticated_observation||"untested"))); code=Number(node.authenticated_http_status||node.AuthenticatedHTTPStatus||0)||0; }
+    if(code)return String(code);
+    return obsLabel(obs||"untested");
+  }
+  return "匿名 "+laneText("anonymous")+"，认证 "+laneText("authenticated");
 }
 function probeProxy(p, btn){
   var pool=p.proxy_pool||p.pool||"";
@@ -1468,8 +1511,7 @@ function probeProxy(p, btn){
   api("/api/availability/check-node",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
     var nodes=res.nodes||[];
     var node=nodes[0]||null;
-    var ok=node?bulkNodeAvailable(node):false;
-    toast("检测 "+pool+"#"+p.index+": "+(ok?"可用":"不可用"));
+    toast("检测 "+pool+"#"+p.index+": "+(node?nodeResultText(node):"无结果"));
     refreshMonitor();
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} });
@@ -1494,8 +1536,9 @@ function probeCredential(k, btn){
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
   api("/api/availability/check-credential",{method:"POST",body:JSON.stringify({fingerprint:fp})}).then(function(res){
     var cred=res.credential||{};
-    var st=String(cred.status||"");
-    toast("检测 "+(k.id||"")+"："+(st||"未知"));
+    var st=credStatusLabel(String(cred.status||"untested"));
+    var reason=customReasonLabel(String(cred.reason||""));
+    toast("检测 "+(k.id||"")+"："+st+(reason&&reason!=="—"?("（"+reason+"）"):""));
     refreshMonitor();
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} });
@@ -1508,7 +1551,7 @@ function probeCustom(c, btn){
   api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({name:name})}).then(function(res){
     var row=res.custom||null;
     if(row)mergeCustomRowIntoCache(row);
-    var st=row?String(row.status||""):"";
+    var st=row?customStatusLabel(String(row.status||"untested")):"未知";
     toast("检测 "+name+"："+(st||"未知"));
     refreshMonitor();
   }).catch(function(err){ toast("检测失败："+err.message,true); })
@@ -1522,9 +1565,9 @@ function bulkCheck(){
     S.bulkNoModel=res.no_model||[];
     var nodes=res.nodes||[];
     var total=nodes.length;
-    var avail=0;
-    for(var i=0;i<nodes.length;i++){ if(bulkNodeAvailable(nodes[i]))avail++; }
-    var msg="批量检测完成：共检测 "+total+" 个节点，可用 "+avail+" 个，不可用 "+(total-avail)+" 个";
+    var msg="批量检测完成：共检测 "+total+" 个节点";
+    if(res.partial)msg+="（部分结果）";
+    if((res.no_model||[]).length)msg+="（部分通道无可用模型）";
     if(note)note.textContent=msg;
     toast(msg);
     refreshMonitor();
@@ -1559,7 +1602,7 @@ function loadConfig(){
     try{clearSecretRevealCache();}catch(e){}
     S.config=cfg; fillConfig(cfg); renderTopbar();
     try{
-      ["server_keys","zen_keys","go_keys"].forEach(function(n){ var t=$(n+"-new"); if(t)t.value=""; });
+      ["server_keys","keys"].forEach(function(n){ var t=$(n+"-new"); if(t)t.value=""; });
       if(S.cfgSave){ try{clearTimeout(S.cfgSave.debounce);}catch(e){} S.cfgSave.debounce=null; S.cfgSave.dirty=false; }
       setSaveStatus("","");
     }catch(e){}
@@ -1569,15 +1612,13 @@ function fillConfig(v){
   try{clearSecretRevealCache();}catch(e){}
   v=v||{};
   var wv=(v&&v.webui)||{};
-  $("c-prefer").value=v.prefer||"go";
   $("c-listen").value=v.listen||"";
   $("c-web-listen").value=wv.listen||"";
   $("c-session").value=wv.session_ttl_minutes||"";
   /* hidden-enabled-preserved: hidden control mirrors backend, submit preserves backend value */
   var we=$("c-web-enabled"); if(we)we.checked=!!wv.enabled;
   $("c-anonymous").checked=!!v.anonymous;
-  $("c-up-zen").value=v.upstream.zen||"";
-  $("c-up-go").value=v.upstream.go||"";
+  $("c-up-zen").value=(v.upstream&&v.upstream.zen)||"";
   $("c-attempts").value=v.retry.max_attempts||"";
   $("c-timeout").value=v.retry.timeout_seconds||"";
   $("c-refresh").value=v.models.refresh_seconds||"";
@@ -1588,8 +1629,7 @@ function fillConfig(v){
   $("c-idle-timeout").value=v.performance.idle_conn_timeout_seconds||"";
   $("c-connect").value=v.performance.connect_timeout_seconds||"";
   $("c-cooldown").value=v.performance.failure_cooldown_seconds||"";
-  $("c-ratelimit-cooldown").value=v.performance.rate_limit_cooldown_seconds||"";
-  $("c-ratelimit-cooldown-max").value=v.performance.rate_limit_cooldown_max_seconds||"";
+  $("c-ratelimit-cooldown").value=(v.performance&&v.performance.rate_limit_cooldown_seconds)||300;
   $("c-level").value=v.logging.level||"info";
   $("c-ring").value=v.logging.ring_size||"";
   var hh=(v&&v.history)||{};
@@ -1597,7 +1637,7 @@ function fillConfig(v){
   $("c-hist-dir").value=hh.directory||"";
   $("c-hist-retention").value=hh.retention_days||7;
   $("c-hist-max").value=hh.max_bytes_mb||128;
-  ["server_keys","zen_keys","go_keys"].forEach(renderChips);
+  ["server_keys","keys"].forEach(renderChips);
   renderPoolsEditor(v);
   renderFallbackEditor(v);
 }
@@ -1844,7 +1884,7 @@ function openFallbackModal(idx){
     }).catch(function(err){ toast((err&&err.message)||"查看失败",true); })
     .then(function(){ keyToggle.disabled=false; });
   });
-  var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=savedId; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyHidden);
+  var keyHidden=document.createElement("input"); keyHidden.type="hidden"; keyHidden.value=savedId; keyHidden.setAttribute("data-role","fb-key-id"); keyWrap.appendChild(keyRow); keyWrap.appendChild(keyHidden);
   grid.appendChild(keyWrap);
   var modelWrap=document.createElement("div"); modelWrap.className="field span-6";
   var modelLabel=document.createElement("label"); modelLabel.textContent="模型"; modelWrap.appendChild(modelLabel);
@@ -2070,8 +2110,8 @@ function poolNamesFromEditor(){
   return [];
 }
 function currentRoutingRefs(){
-  var a=$("c-route-anon")?$("c-route-anon").value:"", z=$("c-route-zen")?$("c-route-zen").value:"", g=$("c-route-go")?$("c-route-go").value:"";
-  return {a:a,z:z,g:g};
+  var a=$("c-route-anon")?$("c-route-anon").value:"", auth=$("c-route-auth")?$("c-route-auth").value:"";
+  return {a:a,auth:auth};
 }
 function refreshPoolBadges(){
   var refs=currentRoutingRefs();
@@ -2079,14 +2119,14 @@ function refreshPoolBadges(){
   for(var i=0;i<rows.length;i++){
     var name=rows[i].getAttribute("data-pool");
     var badge=rows[i].querySelector('[data-role="pool-badge"]');
-    var active=(name===refs.a||name===refs.z||name===refs.g);
+    var active=(name===refs.a||name===refs.auth);
     var text=active?"运行中":"暂存";
     if(badge){ clear(badge); badge.appendChild(document.createTextNode(text)); badge.className="pill "+(active?"ok":"neutral"); }
   }
   var st=S.poolModal||{};
   if(st.fields&&st.fields.statusPanel){
     var cur=String((st.fields.nameInput&&st.fields.nameInput.value||"").trim()||st.origName||"");
-    var on=(cur===refs.a||cur===refs.z||cur===refs.g);
+    var on=(cur===refs.a||cur===refs.auth);
     clear(st.fields.statusPanel); st.fields.statusPanel.appendChild(document.createTextNode(on?"运行中":"暂存"));
   }
 }
@@ -2104,8 +2144,7 @@ function renderPoolsEditor(v){
   renderPoolsList();
   syncRoutingSelects();
   if(routing.anonymous)$("c-route-anon").value=routing.anonymous;
-  if(routing.zen)$("c-route-zen").value=routing.zen;
-  if(routing.go)$("c-route-go").value=routing.go;
+  if(routing.authenticated)$("c-route-auth").value=routing.authenticated;
   refreshPoolBadges();
 }
 function renderPoolsList(){
@@ -2122,8 +2161,8 @@ function poolListRow(p, idx){
   var refs=currentRoutingRefs();
   var name=String(p.name||"");
   var row=document.createElement("div"); row.className="pool-row"; row.setAttribute("data-pool",name);
-  var active=(name===refs.a||name===refs.z||name===refs.g);
-  var badge=document.createElement("span"); badge.className="pill "+(active?"ok":"neutral"); badge.setAttribute("data-role","pool-badge"); badge.title=active?"运行中":"暂存：不运行、不可探测、不计容量"; badge.appendChild(document.createTextNode(active?"运行中":"暂存")); row.appendChild(badge);
+  var active=(name===refs.a||name===refs.auth);
+  var badge=document.createElement("span"); badge.className="pill "+(active?"ok":"neutral"); badge.setAttribute("data-role","pool-badge"); badge.title=active?"运行中":"暂存：不运行"; badge.appendChild(document.createTextNode(active?"运行中":"暂存")); row.appendChild(badge);
   var meta=document.createElement("div"); meta.className="meta";
   var nm=document.createElement("div"); nm.className="name"; nm.textContent=name||"(未命名)"; meta.appendChild(nm);
   var sub=document.createElement("div"); sub.className="sub";
@@ -2139,17 +2178,16 @@ function poolListRow(p, idx){
 }
 function syncRoutingSelects(){
   var names=poolNamesFromEditor();
-  [["c-route-anon"],["c-route-zen"],["c-route-go"]].forEach(function(pair){
+  [["c-route-anon"],["c-route-auth"]].forEach(function(pair){
     var sel=$(pair[0]), cur=sel.value; clear(sel);
     names.forEach(function(n){ var o=document.createElement("option"); o.value=n; o.textContent=n; sel.appendChild(o); });
     if(cur&&names.indexOf(cur)>=0)sel.value=cur;
   });
 }
 function mapRoutingOnRename(sel, oldName, newName){
-  var out={a:sel.a, z:sel.z, g:sel.g};
+  var out={a:sel.a, auth:sel.auth};
   if(out.a===oldName)out.a=newName;
-  if(out.z===oldName)out.z=newName;
-  if(out.g===oldName)out.g=newName;
+  if(out.auth===oldName)out.auth=newName;
   return out;
 }
 function mapFallbackActiveOnRename(active, oldName, newName){
@@ -2214,14 +2252,14 @@ function openPoolModal(idx){
   grid.appendChild(fileWrap);
   var stateWrap=document.createElement("div"); stateWrap.className="field span-6";
   var stateLabel=document.createElement("label"); stateLabel.textContent="运行状态"; stateWrap.appendChild(stateLabel);
-  var statePanel=document.createElement("div"); statePanel.className="status-panel"; statePanel.setAttribute("data-role","pool-status"); statePanel.title="暂存：不运行、不可探测、不计容量"; statePanel.textContent="暂存"; stateWrap.appendChild(statePanel);
+  var statePanel=document.createElement("div"); statePanel.className="status-panel"; statePanel.setAttribute("data-role","pool-status"); statePanel.title="暂存：不运行"; statePanel.textContent="暂存"; stateWrap.appendChild(statePanel);
   grid.appendChild(stateWrap);
   S.poolModal.fields={nameInput:nameInput,fileInput:fileInput,newInput:add,statusPanel:statePanel};
   S.poolModal.draft={proxies:draftProxies,added:draftAdded};
   function syncStatus(){
     var refs=currentRoutingRefs();
     var cur=String((nameInput.value||"").trim()||draftName||"");
-    var on=(cur===refs.a||cur===refs.z||cur===refs.g);
+    var on=(cur===refs.a||cur===refs.auth);
     clear(statePanel); statePanel.appendChild(document.createTextNode(on?"运行中":"暂存"));
   }
   nameInput.addEventListener("input",syncStatus);
@@ -2245,7 +2283,7 @@ function savePoolModal(){
   if(!S.poolDraft)S.poolDraft={pools:[]};
   var pools=S.poolDraft.pools||[];
   for(var i=0;i<pools.length;i++){ if(i!==st.index&&String(pools[i].name||"")===name){ if(errEl)errEl.textContent="代理池名 "+name+" 已存在"; toast("代理池名 "+name+" 已存在",true); return; } }
-  var backup={pools:pools.slice(),routeA:$("c-route-anon")?$("c-route-anon").value:"",routeZ:$("c-route-zen")?$("c-route-zen").value:"",routeG:$("c-route-go")?$("c-route-go").value:""};
+  var backup={pools:pools.slice(),routeA:$("c-route-anon")?$("c-route-anon").value:"",routeAuth:$("c-route-auth")?$("c-route-auth").value:""};
   var rawNew=String((f.newInput&&f.newInput.value||""));
   var lines=rawNew.split(/\r?\n/).map(function(s){return s.trim();}).filter(Boolean).map(function(s){return {value:s};});
   var mergedAdded=(d.added||[]).concat(lines);
@@ -2256,19 +2294,17 @@ function savePoolModal(){
   } else {
     pools[st.index]={name:name,proxies:(d.proxies||[]),proxyfile:fileVal,added:mergedAdded};
     var oldName=String(st.origName||"");
-    var oldSel={a:$("c-route-anon").value,z:$("c-route-zen").value,g:$("c-route-go").value};
+    var oldSel={a:$("c-route-anon").value,auth:$("c-route-auth").value};
     var mapped=mapRoutingOnRename(oldSel,oldName,name);
     syncRoutingSelects();
     if(mapped.a)$("c-route-anon").value=mapped.a;
-    if(mapped.z)$("c-route-zen").value=mapped.z;
-    if(mapped.g)$("c-route-go").value=mapped.g;
+    if(mapped.auth)$("c-route-auth").value=mapped.auth;
   }
   syncRoutingSelects();
   (function(){
     var refs=currentRoutingRefs();
     if(refs.a&&poolNamesFromEditor().indexOf(refs.a)<0)$("c-route-anon").value=poolNamesFromEditor()[0]||"";
-    if(refs.z&&poolNamesFromEditor().indexOf(refs.z)<0)$("c-route-zen").value=poolNamesFromEditor()[0]||"";
-    if(refs.g&&poolNamesFromEditor().indexOf(refs.g)<0)$("c-route-go").value=poolNamesFromEditor()[0]||"";
+    if(refs.auth&&poolNamesFromEditor().indexOf(refs.auth)<0)$("c-route-auth").value=poolNamesFromEditor()[0]||"";
   })();
   var saveBtn=$("pool-modal-save"); if(saveBtn)saveBtn.disabled=true;
   saveConfigAndWait().then(function(){
@@ -2279,8 +2315,7 @@ function savePoolModal(){
     if(saveBtn)saveBtn.disabled=false;
     S.poolDraft.pools=backup.pools;
     try{ if($("c-route-anon"))$("c-route-anon").value=backup.routeA; }catch(e){}
-    try{ if($("c-route-zen"))$("c-route-zen").value=backup.routeZ; }catch(e){}
-    try{ if($("c-route-go"))$("c-route-go").value=backup.routeG; }catch(e){}
+    try{ if($("c-route-auth"))$("c-route-auth").value=backup.routeAuth; }catch(e){}
     renderPoolsList(); refreshPoolBadges();
     if(errEl)errEl.textContent=(err&&err.message)||"保存失败";
   });
@@ -2292,7 +2327,7 @@ function deletePoolModal(){
   var errEl=$("pool-modal-error"); if(errEl)errEl.textContent="";
   var cur=String(S.poolDraft.pools[st.index].name||"");
   var refs=currentRoutingRefs();
-  if(refs.a===cur||refs.z===cur||refs.g===cur){
+  if(refs.a===cur||refs.auth===cur){
     if(errEl)errEl.textContent="代理池 "+cur+" 仍被路由引用，请先切换路由再删除。";
     toast("代理池 "+cur+" 仍被路由引用，请先切换路由再删除。",true);
     return;
@@ -2349,7 +2384,7 @@ function fallbackInputs(){
   }
   return out;
 }
-["c-route-anon","c-route-zen","c-route-go"].forEach(function(id){
+["c-route-anon","c-route-auth"].forEach(function(id){
   var sel=$(id); if(sel)sel.addEventListener("change",function(){ refreshPoolBadges(); queueConfigSave(true); });
 });
 function poolInputs(){
@@ -2379,8 +2414,8 @@ function collectConfigUpdate(){
   var dup=duplicatePoolName(rawNames);
   if(dup||rawNames.length!==names.length){ try{$("pools-error").textContent="代理池名 "+(dup||"?")+" 重复，请先去重再保存。";}catch(e){} return {ok:false,error:"代理池名 "+(dup||"?")+" 重复，禁止保存（重命名后名称必须唯一）"}; }
   try{ if($("pools-error"))$("pools-error").textContent=""; }catch(e){}
-  var anon=$("c-route-anon").value, zen=$("c-route-zen").value, go=$("c-route-go").value;
-  if(!anon||!zen||!go){ return {ok:false,error:"匿名 / Zen / Go 必须各选择一个代理池"}; }
+  var anon=$("c-route-anon").value, auth=$("c-route-auth").value;
+  if(!anon||!auth){ return {ok:false,error:"匿名 / 认证必须各选择一个代理池"}; }
   var preservedEnabled=(S.config&&S.config.webui)?!!S.config.webui.enabled:true;
   var cfgWebui=((S.config&&S.config.webui)||{});
   var fbChannels=fallbackInputs();
@@ -2393,14 +2428,13 @@ function collectConfigUpdate(){
   try{ if($("fallback-error"))$("fallback-error").textContent=""; }catch(e){}
   var update={
     listen:$("c-listen").value, server_keys:secretInputs("server_keys"),
-    zen_keys:secretInputs("zen_keys"), go_keys:secretInputs("go_keys"),
-    anonymous:$("c-anonymous").checked, proxy_pools:pools, proxy_routing:{anonymous:anon,zen:zen,go:go},
+    keys:secretInputs("keys"),
+    anonymous:$("c-anonymous").checked, proxy_pools:pools, proxy_routing:{anonymous:anon,authenticated:auth},
     fallback:{active:fbActive,channels:fbChannels},
-    prefer:$("c-prefer").value,
-    upstream:{zen:$("c-up-zen").value,go:$("c-up-go").value},
+    upstream:{zen:$("c-up-zen").value},
     retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout")},
     models:{refresh_seconds:num("c-refresh"),protocols:protocols},
-    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown"),rate_limit_cooldown_max_seconds:num("c-ratelimit-cooldown-max")},
+    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown")},
     logging:{level:$("c-level").value,ring_size:num("c-ring")},
     history:{enabled:$("c-hist-enabled").checked,directory:$("c-hist-dir").value.trim(),retention_days:num("c-hist-retention"),max_bytes_mb:num("c-hist-max")},
     webui:{enabled:preservedEnabled,listen:$("c-web-listen").value,username:cfgWebui.username||"",session_ttl_minutes:num("c-session")}
@@ -2522,7 +2556,7 @@ function handleConfigSaveSuccess(sentUpdate,res){
     else toast("配置已更新，需重启");
   }
   if(!hadDirtyDuring){
-    ["server_keys","zen_keys","go_keys"].forEach(function(n){ try{$(n+"-new").value="";}catch(e){} });
+    ["server_keys","keys"].forEach(function(n){ try{$(n+"-new").value="";}catch(e){} });
     fillConfig(S.config); renderTopbar();
     setSaveStatus("已保存","");
     okToast();
@@ -2538,7 +2572,7 @@ function reconcileAfterSuccess(sentUpdate, serverConfig){
   try{ S.config=serverConfig; }catch(e){}
   try{resetSecretChipLabels();}catch(e){}
   try{clearSecretRevealCache();}catch(e){}
-  ["server_keys","zen_keys","go_keys"].forEach(function(n){
+  ["server_keys","keys"].forEach(function(n){
     try{
       var sentList=(sentUpdate&&sentUpdate[n])||[];
       var sentKept={};
@@ -2611,16 +2645,16 @@ $("config-form").addEventListener("submit",function(e){
 });
 (function bindConfigAutosave(){
   function on(id, ev, fn){ try{ var n=$(id); if(n)n.addEventListener(ev,fn); }catch(e){} }
-  ["c-prefer","c-level"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
+  ["c-level"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
   ["c-anonymous","c-hist-enabled"].forEach(function(id){ on(id,"change",function(){ queueConfigSave(true).catch(function(){}); }); });
   // Text/URL fields keep debounced input autosave; numeric fields save only
   // on committed edits (change/blur) so typing never issues a PUT.
-  ["c-listen","c-web-listen","c-up-zen","c-up-go","c-hist-dir"].forEach(function(id){
+  ["c-listen","c-web-listen","c-up-zen","c-hist-dir"].forEach(function(id){
     on(id,"input",function(){ queueConfigSave(false).catch(function(){}); });
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
-  ["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ratelimit-cooldown-max","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
+  ["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
@@ -2639,7 +2673,7 @@ $("config-form").addEventListener("submit",function(e){
     try{ JSON.parse(raw); }catch(e){ toast("模型协议手动指定 JSON 无效："+e.message,true); return; }
     if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){});
   });
-  ["server_keys","zen_keys","go_keys"].forEach(function(n){
+  ["server_keys","keys"].forEach(function(n){
     on(n+"-new","change",function(){ queueConfigSave(true).catch(function(){}); });
     on(n+"-new","blur",function(){ queueConfigSave(true).catch(function(){}); });
   });

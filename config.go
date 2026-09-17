@@ -15,7 +15,7 @@ import (
 )
 
 var allowedConfigKeys = map[string]bool{
-	"listen": true, "server_keys": true, "zen_keys": true, "go_keys": true,
+	"listen": true, "server_keys": true, "keys": true, "zen_keys": true, "go_keys": true,
 	"anonymous": true, "proxies": true, "proxyfile": true,
 	"proxy_pools": true, "proxy_routing": true,
 	"upstream": true, "retry": true, "models": true, "performance": true,
@@ -30,16 +30,19 @@ type ProxyPoolConfig struct {
 }
 
 type ProxyRoutingConfig struct {
-	Anonymous string `json:"anonymous"`
-	Zen       string `json:"zen"`
-	Go        string `json:"go"`
+	Anonymous     string `json:"anonymous"`
+	Authenticated string `json:"authenticated"`
+	// Legacy compat inputs only: accepted on load, never emitted.
+	Zen string `json:"zen,omitempty"`
+	Go  string `json:"go,omitempty"`
 }
 
 type Config struct {
 	Listen       string                     `json:"listen"`
 	ServerKeys   []string                   `json:"server_keys"`
-	ZenKeys      []string                   `json:"zen_keys"`
-	GoKeys       []string                   `json:"go_keys"`
+	Keys         []string                   `json:"keys"`
+	ZenKeys      []string                   `json:"zen_keys,omitempty"`
+	GoKeys       []string                   `json:"go_keys,omitempty"`
 	Anonymous    bool                       `json:"anonymous"`
 	ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
 	ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
@@ -50,7 +53,7 @@ type Config struct {
 	Performance  PerformanceConfig          `json:"performance"`
 	Logging      LoggingConfig              `json:"logging"`
 	WebUI        WebUIConfig                `json:"webui"`
-	Prefer       Tier                       `json:"prefer"`
+	Prefer       Tier                       `json:"prefer,omitempty"`
 	History      HistoryConfig              `json:"history"`
 	Proxies      []string                   `json:"proxies,omitempty"`
 	ProxyFile    string                     `json:"proxyfile,omitempty"`
@@ -64,7 +67,8 @@ type Config struct {
 
 type UpstreamConfig struct {
 	Zen string `json:"zen"`
-	Go  string `json:"go"`
+	// Legacy compat input only: accepted on load, ignored at runtime, never emitted.
+	Go string `json:"go,omitempty"`
 }
 
 type RetryConfig struct {
@@ -92,14 +96,16 @@ type WebUIConfig struct {
 }
 
 type PerformanceConfig struct {
-	MaxIdleConns                int `json:"max_idle_conns"`
-	MaxIdleConnsPerHost         int `json:"max_idle_conns_per_host"`
-	MaxConnsPerHost             int `json:"max_conns_per_host"`
-	IdleConnTimeoutSeconds      int `json:"idle_conn_timeout_seconds"`
-	ConnectTimeoutSeconds       int `json:"connect_timeout_seconds"`
-	FailureCooldownSeconds      int `json:"failure_cooldown_seconds"`
-	RateLimitCooldownSeconds    int `json:"rate_limit_cooldown_seconds"`
-	RateLimitCooldownMaxSeconds int `json:"rate_limit_cooldown_max_seconds"`
+	MaxIdleConns             int `json:"max_idle_conns"`
+	MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
+	MaxConnsPerHost          int `json:"max_conns_per_host"`
+	IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
+	ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
+	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
+	RateLimitCooldownSeconds int `json:"rate_limit_cooldown_seconds"`
+	// Legacy compat input only: accepted on load, ignored at runtime, never emitted.
+	// The 429 maximum is the fixed 3600s backoff cap.
+	RateLimitCooldownMaxSeconds int `json:"rate_limit_cooldown_max_seconds,omitempty"`
 }
 
 // HistoryConfig is a bounded, redacted, embedded projection of recent
@@ -114,13 +120,12 @@ type HistoryConfig struct {
 func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
-		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen", Go: "https://opencode.ai/zen/go"},
+		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen"},
 		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300, RateLimitCooldownMaxSeconds: 3600},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
-		Prefer:      TierGo,
 		History:     HistoryConfig{Enabled: true, Directory: "", RetentionDays: 7, MaxBytesMB: 128},
 	}
 }
@@ -146,25 +151,42 @@ func LoadConfig(path string) (Config, error) {
 	return NormalizeConfig(path, cfg)
 }
 
-// MarshalJSON emits only the formal new proxy model. Legacy top-level
-// proxies/proxyfile are load-time inputs and never persist.
+// MarshalJSON emits only the canonical shape: keys, anonymous+authenticated
+// routing, Zen upstream only, and the single 429 base. Legacy inputs
+// (zen_keys/go_keys, prefer, proxy_routing.zen/go, upstream.go,
+// performance.rate_limit_cooldown_max_seconds, top-level proxies/proxyfile)
+// are load-time compat and never persist.
 func (cfg Config) MarshalJSON() ([]byte, error) {
+	type diskRouting struct {
+		Anonymous     string `json:"anonymous"`
+		Authenticated string `json:"authenticated"`
+	}
+	type diskUpstream struct {
+		Zen string `json:"zen"`
+	}
+	type diskPerformance struct {
+		MaxIdleConns             int `json:"max_idle_conns"`
+		MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
+		MaxConnsPerHost          int `json:"max_conns_per_host"`
+		IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
+		ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
+		FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
+		RateLimitCooldownSeconds int `json:"rate_limit_cooldown_seconds"`
+	}
 	type diskConfig struct {
 		Listen       string                     `json:"listen"`
 		ServerKeys   []string                   `json:"server_keys"`
-		ZenKeys      []string                   `json:"zen_keys"`
-		GoKeys       []string                   `json:"go_keys"`
+		Keys         []string                   `json:"keys"`
 		Anonymous    bool                       `json:"anonymous"`
 		ProxyPools   map[string]ProxyPoolConfig `json:"proxy_pools"`
-		ProxyRouting ProxyRoutingConfig         `json:"proxy_routing"`
+		ProxyRouting diskRouting                `json:"proxy_routing"`
 		Fallback     FallbackConfig             `json:"fallback"`
-		Upstream     UpstreamConfig             `json:"upstream"`
+		Upstream     diskUpstream               `json:"upstream"`
 		Retry        RetryConfig                `json:"retry"`
 		Models       ModelsConfig               `json:"models"`
-		Performance  PerformanceConfig          `json:"performance"`
+		Performance  diskPerformance            `json:"performance"`
 		Logging      LoggingConfig              `json:"logging"`
 		WebUI        WebUIConfig                `json:"webui"`
-		Prefer       Tier                       `json:"prefer"`
 		History      HistoryConfig              `json:"history"`
 	}
 	pools := cfg.ProxyPools
@@ -175,11 +197,24 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 	if fb.Channels == nil {
 		fb.Channels = []FallbackChannelConfig{}
 	}
+	keys := cfg.Keys
+	if keys == nil {
+		keys = []string{}
+	}
 	return json.Marshal(diskConfig{
-		Listen: cfg.Listen, ServerKeys: cfg.ServerKeys, ZenKeys: cfg.ZenKeys, GoKeys: cfg.GoKeys,
-		Anonymous: cfg.Anonymous, ProxyPools: pools, ProxyRouting: cfg.ProxyRouting, Fallback: fb,
-		Upstream: cfg.Upstream, Retry: cfg.Retry, Models: cfg.Models, Performance: cfg.Performance,
-		Logging: cfg.Logging, WebUI: cfg.WebUI, Prefer: cfg.Prefer, History: cfg.History,
+		Listen: cfg.Listen, ServerKeys: cfg.ServerKeys, Keys: keys,
+		Anonymous: cfg.Anonymous, ProxyPools: pools,
+		ProxyRouting: diskRouting{Anonymous: cfg.ProxyRouting.Anonymous, Authenticated: cfg.ProxyRouting.Authenticated},
+		Fallback:     fb,
+		Upstream:     diskUpstream{Zen: cfg.Upstream.Zen},
+		Retry:        cfg.Retry, Models: cfg.Models,
+		Performance: diskPerformance{
+			MaxIdleConns: cfg.Performance.MaxIdleConns, MaxIdleConnsPerHost: cfg.Performance.MaxIdleConnsPerHost,
+			MaxConnsPerHost: cfg.Performance.MaxConnsPerHost, IdleConnTimeoutSeconds: cfg.Performance.IdleConnTimeoutSeconds,
+			ConnectTimeoutSeconds: cfg.Performance.ConnectTimeoutSeconds, FailureCooldownSeconds: cfg.Performance.FailureCooldownSeconds,
+			RateLimitCooldownSeconds: cfg.Performance.RateLimitCooldownSeconds,
+		},
+		Logging: cfg.Logging, WebUI: cfg.WebUI, History: cfg.History,
 	})
 }
 
@@ -221,6 +256,9 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if err := decodeStrict("server_keys", &cfg.ServerKeys); err != nil {
+		return err
+	}
+	if err := decodeStrict("keys", &cfg.Keys); err != nil {
 		return err
 	}
 	if err := decodeStrict("zen_keys", &cfg.ZenKeys); err != nil {
@@ -281,13 +319,23 @@ func hasKey(raw map[string]json.RawMessage, key string) bool {
 
 // NormalizeConfig resolves external inputs and validates a Config supplied by
 // either the JSON file or the authenticated management API.
+// Canonical keys live in Keys; zen_keys/go_keys merge in as one-time compat.
+// Canonical routing is anonymous+authenticated; proxy_routing.zen (then go)
+// maps to authenticated as compat. Upstream uses zen only; upstream.go and
+// prefer are accepted but ignored.
 func NormalizeConfig(path string, cfg Config) (Config, error) {
 	trimList(&cfg.ServerKeys)
+	trimList(&cfg.Keys)
 	trimList(&cfg.ZenKeys)
 	trimList(&cfg.GoKeys)
+	cfg.Keys = mergeKeys(cfg.Keys, cfg.ZenKeys, cfg.GoKeys)
+	cfg.ZenKeys = nil
+	cfg.GoKeys = nil
+	// Prefer is a legacy compat input: accepted, ignored at runtime, never emitted.
+	cfg.Prefer = ""
 	legacyExplicit := cfg.legacyProxiesPresent || cfg.legacyProxyFilePresent || len(cfg.Proxies) > 0 || strings.TrimSpace(cfg.ProxyFile) != ""
 	newExplicit := cfg.proxyPoolsPresent || cfg.proxyRoutingPresent || len(cfg.ProxyPools) > 0 ||
-		strings.TrimSpace(cfg.ProxyRouting.Anonymous) != "" || strings.TrimSpace(cfg.ProxyRouting.Zen) != "" || strings.TrimSpace(cfg.ProxyRouting.Go) != ""
+		strings.TrimSpace(cfg.ProxyRouting.Anonymous) != "" || strings.TrimSpace(cfg.ProxyRouting.Authenticated) != "" || strings.TrimSpace(cfg.ProxyRouting.Zen) != "" || strings.TrimSpace(cfg.ProxyRouting.Go) != ""
 	if legacyExplicit && newExplicit {
 		return Config{}, errors.New("proxies/proxyfile (legacy) cannot be combined with proxy_pools/proxy_routing; remove the legacy fields to use named pools")
 	}
@@ -303,7 +351,7 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 			cfg.ProxyPools = map[string]ProxyPoolConfig{}
 		}
 		cfg.ProxyPools["shared"] = ProxyPoolConfig{Proxies: append([]string(nil), cfg.Proxies...), ProxyFile: cfg.ProxyFile, effective: effective}
-		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 		cfg.Proxies = nil
 		cfg.ProxyFile = ""
 		cfg.legacyProxiesPresent = false
@@ -314,7 +362,7 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		cfg.ProxyPools = map[string]ProxyPoolConfig{
 			"shared": {Proxies: []string{"direct"}, ProxyFile: "", effective: []string{"direct"}},
 		}
-		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"}
+		cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"}
 		cfg.Proxies = nil
 		cfg.ProxyFile = ""
 		cfg.proxyPoolsPresent = true
@@ -325,29 +373,38 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		cfg.ProxyFile = ""
 		cfg.legacyProxiesPresent = false
 		cfg.legacyProxyFilePresent = false
+		// Map authenticated pool from legacy zen when present, else legacy go.
+		if strings.TrimSpace(cfg.ProxyRouting.Authenticated) == "" {
+			if strings.TrimSpace(cfg.ProxyRouting.Zen) != "" {
+				cfg.ProxyRouting.Authenticated = strings.TrimSpace(cfg.ProxyRouting.Zen)
+			} else if strings.TrimSpace(cfg.ProxyRouting.Go) != "" {
+				cfg.ProxyRouting.Authenticated = strings.TrimSpace(cfg.ProxyRouting.Go)
+			}
+		}
+		cfg.ProxyRouting.Zen = ""
+		cfg.ProxyRouting.Go = ""
 	}
 	if err := normalizeNamedPools(path, &cfg); err != nil {
 		return Config{}, err
-	}
-	if cfg.Prefer != TierZen && cfg.Prefer != TierGo {
-		return Config{}, errors.New("prefer must be \"zen\" or \"go\"")
 	}
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
 	}
 	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
 	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
-	for name, raw := range map[string]string{"upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
-		u, err := url.Parse(strings.TrimSpace(raw))
+	{
+		u, err := url.Parse(strings.TrimSpace(cfg.Upstream.Zen))
 		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
-			return Config{}, fmt.Errorf("%s must be an http or https URL", name)
+			return Config{}, fmt.Errorf("upstream.zen must be an http or https URL")
 		}
 	}
+	// Legacy upstream.go is ignored for runtime.
+	cfg.Upstream.Go = ""
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
 	}
-	if !cfg.Anonymous && len(cfg.ZenKeys) == 0 && len(cfg.GoKeys) == 0 {
-		return Config{}, errors.New("zen_keys or go_keys must contain at least one upstream key unless anonymous is enabled")
+	if !cfg.Anonymous && len(cfg.Keys) == 0 {
+		return Config{}, errors.New("keys must contain at least one upstream key unless anonymous is enabled")
 	}
 	if cfg.Retry.MaxAttempts < 1 {
 		return Config{}, errors.New("retry.max_attempts must be at least 1")
@@ -364,17 +421,11 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Performance.RateLimitCooldownSeconds == 0 {
 		cfg.Performance.RateLimitCooldownSeconds = 300
 	}
-	if cfg.Performance.RateLimitCooldownMaxSeconds == 0 {
-		cfg.Performance.RateLimitCooldownMaxSeconds = 3600
-	}
-	if cfg.Performance.RateLimitCooldownSeconds < 1 {
-		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be at least 1")
-	}
-	if cfg.Performance.RateLimitCooldownMaxSeconds < 1 {
-		return Config{}, errors.New("performance.rate_limit_cooldown_max_seconds must be at least 1")
-	}
-	if cfg.Performance.RateLimitCooldownMaxSeconds < cfg.Performance.RateLimitCooldownSeconds {
-		return Config{}, errors.New("performance.rate_limit_cooldown_max_seconds must be at least rate_limit_cooldown_seconds")
+	// Legacy max is accepted as compat input but ignored; the 429 maximum is
+	// the fixed 3600s backoff cap.
+	cfg.Performance.RateLimitCooldownMaxSeconds = 0
+	if cfg.Performance.RateLimitCooldownSeconds < 300 || cfg.Performance.RateLimitCooldownSeconds > 3600 {
+		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be between 300 and 3600")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
@@ -434,15 +485,28 @@ func normalizeNamedPools(path string, cfg *Config) error {
 	}
 	routing := &cfg.ProxyRouting
 	routing.Anonymous = strings.TrimSpace(routing.Anonymous)
+	routing.Authenticated = strings.TrimSpace(routing.Authenticated)
 	routing.Zen = strings.TrimSpace(routing.Zen)
 	routing.Go = strings.TrimSpace(routing.Go)
-	if routing.Anonymous == "" || routing.Zen == "" || routing.Go == "" {
-		return errors.New("proxy_routing.anonymous, proxy_routing.zen and proxy_routing.go must each reference an existing pool")
+	// Legacy zen/go were already mapped to authenticated before this call for
+	// the default path; tolerate stray legacy values by mapping them here as
+	// well so old in-memory configs still normalize.
+	if routing.Authenticated == "" {
+		if routing.Zen != "" {
+			routing.Authenticated = routing.Zen
+		} else if routing.Go != "" {
+			routing.Authenticated = routing.Go
+		}
+	}
+	routing.Zen = ""
+	routing.Go = ""
+	if routing.Anonymous == "" || routing.Authenticated == "" {
+		return errors.New("proxy_routing.anonymous and proxy_routing.authenticated must each reference an existing pool")
 	}
 	for _, ref := range []struct {
 		field string
 		name  string
-	}{{field: "proxy_routing.anonymous", name: routing.Anonymous}, {field: "proxy_routing.zen", name: routing.Zen}, {field: "proxy_routing.go", name: routing.Go}} {
+	}{{field: "proxy_routing.anonymous", name: routing.Anonymous}, {field: "proxy_routing.authenticated", name: routing.Authenticated}} {
 		if _, ok := cfg.ProxyPools[ref.name]; !ok {
 			return fmt.Errorf("%s references unknown pool %q", ref.field, ref.name)
 		}
@@ -495,6 +559,9 @@ func remapProxyRoutingForRename(routing ProxyRoutingConfig, oldName, newName str
 	if routing.Anonymous == oldName {
 		routing.Anonymous = newName
 	}
+	if routing.Authenticated == oldName {
+		routing.Authenticated = newName
+	}
 	if routing.Zen == oldName {
 		routing.Zen = newName
 	}
@@ -544,19 +611,22 @@ func (cfg Config) RuntimeProxiesFor(pool string) []string {
 // RuntimeProxies preserves the legacy single-pool accessor for shared-pool
 // callers that have not migrated yet. New code should use RuntimeProxiesFor.
 func (cfg Config) RuntimeProxies() []string {
+	if name := cfg.ProxyRouting.Authenticated; name != "" {
+		return cfg.RuntimeProxiesFor(name)
+	}
 	if name := cfg.ProxyRouting.Zen; name != "" {
 		return cfg.RuntimeProxiesFor(name)
 	}
 	return cfg.RuntimeProxiesFor("shared")
 }
 
-// ReferencedPools returns routing references in anonymous/zen/go order.
+// ReferencedPools returns routing references in anonymous/authenticated order.
 func (cfg Config) ReferencedPools() []string {
-	return []string{cfg.ProxyRouting.Anonymous, cfg.ProxyRouting.Zen, cfg.ProxyRouting.Go}
+	return []string{cfg.ProxyRouting.Anonymous, cfg.ProxyRouting.Authenticated}
 }
 
 // UniqueActivePools returns deduplicated referenced pool names in first-use
-// order (anonymous, zen, go), skipping empty references.
+// order (anonymous, authenticated), skipping empty references.
 func (cfg Config) UniqueActivePools() []string {
 	seen := map[string]bool{}
 	out := []string{}
@@ -822,6 +892,23 @@ func trimList(items *[]string) {
 		}
 	}
 	*items = out
+}
+
+// mergeKeys dedupes the canonical keys with legacy zen/go inputs, preserving
+// first-seen order (keys, then zen_keys, then go_keys).
+func mergeKeys(groups ...[]string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, group := range groups {
+		for _, key := range group {
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			out = append(out, key)
+		}
+	}
+	return out
 }
 
 // ResolveHistoryDir maps the history.directory field to an absolute path.

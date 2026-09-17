@@ -33,7 +33,7 @@ func drainResp(resp *http.Response) {
 func TestPinUnboundFallbackThenPins(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
-	var a0, a1, zen, goCalls atomic.Int32
+	var a0, a1, zen atomic.Int32
 	postStub(t, gateway, "a", 0, &a0, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(404, `{"error":"nope"}`), nil
 	})
@@ -41,9 +41,6 @@ func TestPinUnboundFallbackThenPins(t *testing.T) {
 		return responseWithBody(404, `{"error":"nope"}`), nil
 	})
 	postStub(t, gateway, "z", 0, &zen, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
-	postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	ids := pinIDs("ses_pin_fallback_1", "req-pin-1")
@@ -55,8 +52,8 @@ func TestPinUnboundFallbackThenPins(t *testing.T) {
 	if postCount(&a0)+postCount(&a1) != 1 {
 		t.Fatalf("anon must stop after first ordinary rejection: %d/%d", postCount(&a0), postCount(&a1))
 	}
-	if postCount(&zen) != 1 || postCount(&goCalls) != 0 {
-		t.Fatalf("must fallback to zen only: zen=%d go=%d", postCount(&zen), postCount(&goCalls))
+	if postCount(&zen) != 1 {
+		t.Fatalf("must fallback to auth only: zen=%d", postCount(&zen))
 	}
 	pin, ok := gateway.scheduler.pinGet(ids.Session, "m")
 	if !ok {
@@ -127,7 +124,7 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 	})
 	ids := pinIDs("ses_pin_anon429_1", "req-pin-1")
 	route := anonAuthRoute()
-	route.KeyTiers = []Tier{TierZen, TierGo}
+	route.KeyTiers = []Tier{TierZen}
 	resp, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -155,7 +152,7 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 	if otherIdx < 0 || otherIdx > 1 {
 		t.Fatalf("unexpected pool size")
 	}
-	var pinnedCalls, otherCalls, zenCalls, goCalls atomic.Int32
+	var pinnedCalls, otherCalls, zenCalls atomic.Int32
 	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
 		r := responseWithBody(429, `{"error":"throttled"}`)
 		r.Header.Set("Retry-After", "7")
@@ -165,9 +162,6 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	postStub(t, gateway, "z", 0, &zenCalls, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
-	postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	ids2 := pinIDs(ids.Session, "req-pin-2")
@@ -185,8 +179,8 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 	if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 0 {
 		t.Fatalf("no cross-proxy fallback: pinned=%d other=%d", postCount(&pinnedCalls), postCount(&otherCalls))
 	}
-	if postCount(&zenCalls) != 0 || postCount(&goCalls) != 0 {
-		t.Fatalf("no anon->paid fallback: zen=%d go=%d", postCount(&zenCalls), postCount(&goCalls))
+	if postCount(&zenCalls) != 0 {
+		t.Fatalf("no anon->paid fallback: zen=%d", postCount(&zenCalls))
 	}
 }
 
@@ -244,9 +238,6 @@ func TestPinnedCooldownFastFail(t *testing.T) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	postStub(t, gateway, "z", 0, &zc, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
-	postStub(t, gateway, "g", 0, &gc, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	ids3 := pinIDs(ids.Session, "req-pin-3")
@@ -458,19 +449,16 @@ func TestAuthPinNoCrossTierFallback(t *testing.T) {
 	})
 	ids := pinIDs("ses_pin_auth_1", "req-pin-1")
 	route := authOnlyRoute()
-	route.KeyTiers = []Tier{TierZen, TierGo}
+	route.KeyTiers = []Tier{TierZen}
 	resp, _, _, _ := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids, 0)
 	drainResp(resp)
 	pin, ok := gateway.scheduler.pinGet(ids.Session, "m")
 	if !ok || pin.Tier != TierZen {
 		t.Fatalf("must pin zen, got %+v ok=%v", pin, ok)
 	}
-	var zenCalls, goCalls atomic.Int32
+	var zenCalls atomic.Int32
 	postStub(t, gateway, "z", 0, &zenCalls, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(404, `{"error":"nope"}`), nil
-	})
-	postStub(t, gateway, "g", 0, &goCalls, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	ids2 := pinIDs(ids.Session, "req-pin-2")
 	resp2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
@@ -478,8 +466,8 @@ func TestAuthPinNoCrossTierFallback(t *testing.T) {
 		t.Fatalf("err=%v resp=%v want pinned 404", err, resp2)
 	}
 	drainResp(resp2)
-	if postCount(&zenCalls) != 1 || postCount(&goCalls) != 0 {
-		t.Fatalf("no cross-tier fallback: zen=%d go=%d", postCount(&zenCalls), postCount(&goCalls))
+	if postCount(&zenCalls) != 1 {
+		t.Fatalf("no cross-tier fallback: zen=%d", postCount(&zenCalls))
 	}
 }
 
@@ -510,8 +498,8 @@ func TestPinSeparateModels(t *testing.T) {
 	routeA.ID = "model-a"
 	routeB := anonAuthRoute()
 	routeB.ID = "model-b"
-	bodiesA := map[Tier][]byte{TierZen: []byte(`{"model":"model-a"}`), TierGo: []byte(`{"model":"model-a"}`)}
-	bodiesB := map[Tier][]byte{TierZen: []byte(`{"model":"model-b"}`), TierGo: []byte(`{"model":"model-b"}`)}
+	bodiesA := map[Tier][]byte{TierZen: []byte(`{"model":"model-a"}`)}
+	bodiesB := map[Tier][]byte{TierZen: []byte(`{"model":"model-b"}`)}
 	ses := "ses_pin_models_1"
 	r1, _, _, _ := gateway.doUpstreamTiers(pinTestCtx(), routeA, bodiesA, pinIDs(ses, "r1"), 0)
 	drainResp(r1)
@@ -1020,9 +1008,6 @@ func TestPinCapFailClosedBeforeSend(t *testing.T) {
 	postStub(t, gateway, "z", 0, &zc, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
-	postStub(t, gateway, "g", 0, &gc, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
 	newResp, _, attempts, err := gateway.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs("ses_pin_cap_new_1", "req-new-1"), 0)
 	if err != nil {
 		t.Fatalf("cap fail-closed must return response, err=%v", err)
@@ -1223,8 +1208,8 @@ func TestPinFailedOwnerReleasesReservation(t *testing.T) {
 // later requests resolve to the pinned path and fail 502 with no sends and
 // no fallback. Valid targets continue normally.
 func TestPinMigrationTombstone502(t *testing.T) {
-	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	oldCfg.ZenKeys = []string{"zen-key-aaaaa"}
+	oldCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	oldCfg.Keys = []string{"zen-key-aaaaa"}
 	oldCfg.Anonymous = true
 	oldNormalized, err := NormalizeConfig("config.json", oldCfg)
 	if err != nil {
@@ -1235,14 +1220,14 @@ func TestPinMigrationTombstone502(t *testing.T) {
 		t.Fatal(err)
 	}
 	zenAuth := normalizeRouteAuthority(oldNormalized.Upstream.Zen)
-	keepCred := oldGateway.zenCreds[0].id
+	keepCred := oldGateway.authCreds[0].id
 	keepPin := sessionPin{Tier: TierZen, CredID: keepCred, Pool: "shared", ProxyRaw: "direct", Model: "m", Protocol: ProtocolChat, Authority: zenAuth}
 	removedPin := sessionPin{Tier: TierZen, CredID: credentialIDForKey(TierZen, "zen-key-doomed"), Pool: "shared", ProxyRaw: "direct", Model: "m", Protocol: ProtocolChat, Authority: zenAuth}
 	oldGateway.scheduler.pinBind("ses_mig_keep", "m", keepPin)
 	oldGateway.scheduler.pinBind("ses_mig_gone", "m", removedPin)
 
-	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	newCfg.ZenKeys = []string{"zen-key-aaaaa"}
+	newCfg := testGatewayConfig(map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	newCfg.Keys = []string{"zen-key-aaaaa"}
 	newCfg.Anonymous = true
 	newNormalized, err := NormalizeConfig("config.json", newCfg)
 	if err != nil {
@@ -1306,8 +1291,8 @@ func TestPinMigrationTombstone502(t *testing.T) {
 	// Changed-pool tombstone: pool identity changed, pin still migrates then 502s.
 	oldGateway2, _ := NewGateway(oldNormalized, nil, NewMonitor())
 	oldGateway2.scheduler.pinBind("ses_pool", "m", keepPin)
-	newCfg2 := testGatewayConfig(map[string][]string{"other": {"direct"}}, ProxyRoutingConfig{Anonymous: "other", Zen: "other", Go: "other"})
-	newCfg2.ZenKeys = []string{"zen-key-aaaaa"}
+	newCfg2 := testGatewayConfig(map[string][]string{"other": {"direct"}}, ProxyRoutingConfig{Anonymous: "other", Authenticated: "other"})
+	newCfg2.Keys = []string{"zen-key-aaaaa"}
 	newCfg2.Anonymous = true
 	newNormalized2, _ := NormalizeConfig("config.json", newCfg2)
 	newGateway2, _ := NewGateway(newNormalized2, nil, NewMonitor())
@@ -1338,8 +1323,8 @@ func TestPinRestartStartsEmpty(t *testing.T) {
 	if newTargetScheduler(15*time.Second).pins.count() != 0 {
 		t.Fatalf("fresh scheduler pins must start empty")
 	}
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
-	cfg.ZenKeys = []string{"zen-key-aaaaa"}
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfg.Keys = []string{"zen-key-aaaaa"}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -1401,7 +1386,7 @@ func TestPinUnresolvableUnhealthy502(t *testing.T) {
 func TestPinIsolation(t *testing.T) {
 	gateway := singleZenGateway(t, false)
 	// Pin a session to the only target.
-	gateway.scheduler.pinBind("ses_iso", "m1", sessionPin{Tier: TierZen, CredID: gateway.zenCreds[0].id, Pool: "shared", ProxyRaw: "direct", Model: "m1", Protocol: ProtocolChat, Authority: normalizeRouteAuthority(gateway.cfg.Upstream.Zen)})
+	gateway.scheduler.pinBind("ses_iso", "m1", sessionPin{Tier: TierZen, CredID: gateway.authCreds[0].id, Pool: "shared", ProxyRaw: "direct", Model: "m1", Protocol: ProtocolChat, Authority: normalizeRouteAuthority(gateway.cfg.Upstream.Zen)})
 	codeBefore, healthBefore := decodeHealth(t, gateway)
 	// A bound session must not change global readiness.
 	code, health := decodeHealth(t, gateway)

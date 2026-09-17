@@ -315,7 +315,7 @@ func TestBulkProbeOfficialIdentity(t *testing.T) {
 		t.Fatalf("probe identity must be deterministic")
 	}
 	// Live header check via bulkProbeOnce.
-	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Zen: "shared", Go: "shared"})
+	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gw, err := NewGateway(cfg, discardGatewayLogger(), NewMonitor())
 	if err != nil {
 		t.Fatal(err)
