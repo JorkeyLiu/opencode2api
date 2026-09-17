@@ -28,10 +28,11 @@ import (
 //     observed 429 writes proxy429 only (display-only for credential state);
 //     two distinct eligible 429s write credential429 (existing invariant).
 //     Snapshot merge updates only that credential row/time.
-//   - Custom: exactly one configured channel by unique name, all config
-//     resolved server-side. One real minimal inference with the existing
-//     custom probe/classification; never writes scheduler/health/metrics/
-//     history. Snapshot merge updates only that custom row by name.
+//   - Custom: exactly one configured channel by stable ID (legacy display
+//     names still resolve), all config resolved server-side. One real minimal
+//     inference with the existing custom probe/classification; never writes
+//     scheduler/health/metrics/history. Snapshot merge updates only that
+//     custom row by ID.
 
 type credentialCheckRequest struct {
 	Fingerprint string `json:"fingerprint"`
@@ -46,6 +47,7 @@ type credentialCheckResponse struct {
 }
 
 type customCheckRequest struct {
+	ID   string `json:"id"`
 	Name string `json:"name"`
 }
 
@@ -124,9 +126,13 @@ func (a *AdminServer) handleCustomCheck(w http.ResponseWriter, r *http.Request) 
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	name := strings.TrimSpace(input.Name)
-	if name == "" {
-		writeAdminError(w, http.StatusBadRequest, "invalid_request", "name is required")
+	// Stable ID is primary; legacy display name still resolves.
+	ref := strings.TrimSpace(input.ID)
+	if ref == "" {
+		ref = strings.TrimSpace(input.Name)
+	}
+	if ref == "" {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", "id is required")
 		return
 	}
 	runtime := a.manager.current.Load()
@@ -135,7 +141,7 @@ func (a *AdminServer) handleCustomCheck(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	gateway := runtime.gateway
-	ch, ok := fallbackChannelByName(gateway.cfg, name)
+	ch, ok := fallbackChannelLookup(gateway.cfg, ref)
 	if !ok {
 		writeAdminError(w, http.StatusBadRequest, "unknown_channel", "fallback channel does not exist")
 		return
@@ -324,7 +330,7 @@ func (g *Gateway) mergeCredentialSnapshotRow(checkedAt time.Time, fresh bulkCred
 func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) customCheckResponse {
 	checkedAt := time.Now().UTC()
 	tgt := bulkCustomTarget{
-		Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model,
+		ID: ch.ID, Name: ch.Name, BaseURL: ch.BaseURL, Model: ch.Model,
 		APIKey: ch.APIKey, Protocol: fallbackChannelProtocol(ch),
 	}
 	// Single send on the shared bulk budget (sem guards against concurrent
@@ -344,7 +350,7 @@ func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) 
 	label := bulkCustomOutcomeLabel(result)
 	status, reason := bulkCustomStatusFor(label)
 	fresh := bulkCustomAvailability{
-		Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
+		ID: ch.ID, Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
 		Status: status, Reason: reason, LastChecked: &checkedAt,
 	}
 	g.mergeCustomSnapshotRow(checkedAt, fresh)
@@ -372,7 +378,7 @@ func (g *Gateway) mergeCustomSnapshotRow(checkedAt time.Time, fresh bulkCustomAv
 	}
 	replaced := false
 	for i, old := range snap.Custom {
-		if old.Name == fresh.Name {
+		if customAvailabilityKey(old) == customAvailabilityKey(fresh) && customAvailabilityKey(fresh) != "" {
 			snap.Custom[i] = fresh
 			replaced = true
 			break

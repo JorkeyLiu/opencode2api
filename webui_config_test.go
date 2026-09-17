@@ -203,15 +203,31 @@ func TestWebUIFallbackProtocolKeyPreview(t *testing.T) {
 	if strings.Contains(html, "fb-use-model") || strings.Contains(html, "选用") {
 		t.Fatal("redundant apply-model button must be removed; select change submits directly")
 	}
-	// Effort select carries the four options with Low/Medium/High display.
-	for _, needle := range []string{`"low"`, `"medium"`, `"high"`, `"Low"`, `"Medium"`, `"High"`} {
+	// Effort select carries supplier-default + inherit + Low/Medium/High.
+	for _, needle := range []string{`"low"`, `"medium"`, `"high"`, `"inherit"`, `"Low"`, `"Medium"`, `"High"`, `继承自请求`, `供应商默认`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("effort selector must contain %q", needle)
 		}
 	}
-	// Key entry defaults to password with masked value, never placeholder-masked.
-	if !strings.Contains(html, `keyInput.type="password"`) {
-		t.Fatal("fallback key input must default to password")
+	// Key entry is a non-password text input with visual concealment
+	// (never a password submission), masked value in the input value.
+	if strings.Contains(html, `keyInput.type="password"`) {
+		t.Fatal("fallback key input must not be a password input")
+	}
+	if strings.Contains(html, `keyInput.autocomplete="new-password"`) || strings.Contains(html, `autocomplete", "new-password"`) {
+		t.Fatal("fallback key input must not use new-password; autocomplete off suppresses save")
+	}
+	if !strings.Contains(html, `keyInput.setAttribute("autocomplete","off")`) {
+		t.Fatal("fallback key input must carry autocomplete off")
+	}
+	if !strings.Contains(html, `key-row input.masked`) || !strings.Contains(html, `-webkit-text-security`) {
+		t.Fatal("fallback key concealment must use a masked text class (-webkit-text-security)")
+	}
+	if !strings.Contains(html, `keyInput.classList.add("masked")`) {
+		t.Fatal("fallback key input must start concealed via the masked class")
+	}
+	if strings.Contains(html, `keyInput.setAttribute("name"`) {
+		t.Fatal("fallback key input must not carry a credential-like name")
 	}
 	if !strings.Contains(html, `keyInput.value=pendingNew||savedDisplay`) {
 		t.Fatal("editing channel must default input value to masked display, not placeholder")
@@ -238,25 +254,40 @@ func TestWebUIFallbackEyeReauthMasked(t *testing.T) {
 		`keyToggle.className="icon-btn"`,
 		`aria-label","显示密钥"`,
 		`aria-label","隐藏密钥"`,
-		`setEye(false)`,
+		`function setMasked(masked)`,
+		`keyInput.classList.add("masked")`,
+		`keyInput.classList.remove("masked")`,
 		`st.revealed`,
 		`st.originalSecret`,
 		`origDisplay`,
 		`origId`,
 		`revealConfig()`,
 		`body:"{}"`,
-		`String(chans[i].name||"")===String(st.origName`,
+		`String(chans[i].id||"")===String(st.chanID`,
 		`fallbackSecretById(candidates,savedSecretId)`,
 		`keyInput.value=pendingNew||savedDisplay`,
 		`keyInput.value=savedDisplay`,
 		`st.originalSecret=""`,
 		`delete entry._newKey`,
 		`entry._newKey=nv`,
-		`S.fbModal={index:null,origName:"",origDisplay`,
+		`S.fbModal={index:null,chanID:""`,
 		`X-CSRF-Token`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing eye/reveal contract %q", needle)
+		}
+	}
+	// Concealment toggles the masked class; the input is never a password field.
+	if strings.Contains(html, `keyInput.type="password"`) {
+		t.Fatal("eye toggle must not switch to a password input; it toggles the masked class")
+	}
+	for _, stale := range []string{
+		`keyInput.type=(keyInput.type==="password"`,
+		`keyInput.autocomplete="new-password"`,
+		`autocomplete", "new-password"`,
+	} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("password-submission behavior must stay removed: %q", stale)
 		}
 	}
 	// Logged-in session reveals directly: no second password prompt, no password payload.
@@ -383,25 +414,30 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 			t.Fatalf("missing fallback rename mapping %q", needle)
 		}
 	}
-	// Compact list + modal is the only editor: rename maps active, delete clears it.
-	// Enabled state is expressed only by list highlight (.active) and pill (已启用/未启用).
+	// Stable identity: new channels get a generated ID; rows key by ID and
+	// show the display name via textContent; a display-name rename preserves
+	// the active ID binding.
 	for _, needle := range []string{
 		"function renderFallbackList()",
 		"function fallbackListRow(ch, idx)",
 		"function openFallbackModal(idx)",
 		"function saveFallbackModal()",
 		"function deleteFallbackModal()",
-		"function setFallbackActive(name)",
+		"function setFallbackActive(id)",
+		"function fallbackGenerateChannelID()",
+		"function fallbackChannelIDs()",
+		"function fallbackDisplayNameForID(id)",
 		"S.fbDraft",
-		"mapFallbackActiveOnRename(String(S.fbDraft.active",
 		"fb-row",
-		`row.className="fb-row"+(String(S.fbDraft.active`,
 		`"已启用"`,
 		`"未启用"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("fallback list/modal must contain %q", needle)
 		}
+	}
+	if !strings.Contains(html, `row.setAttribute("data-id",cid)`) {
+		t.Fatal("fallback rows must key by stable channel ID")
 	}
 	for _, stale := range []string{"fallback-active-note", "当前启用：", "当前未启用备用渠道"} {
 		if strings.Contains(html, stale) {
@@ -414,9 +450,9 @@ func TestWebUIFallbackActiveRenameMapping(t *testing.T) {
 			t.Fatalf("expanded fallback card must stay removed: %q", stale)
 		}
 	}
-	// Delete-active clears the selection.
-	if !strings.Contains(html, `if(String(S.fbDraft.active||"")===name)S.fbDraft.active=""`) {
-		t.Fatal("fallback delete must clear active when the enabled channel is removed")
+	// Delete-active clears the selection by stable ID.
+	if !strings.Contains(html, `if(delID&&String(S.fbDraft.active||"")===delID)S.fbDraft.active=""`) {
+		t.Fatal("fallback delete must clear active by stable ID when the enabled channel is removed")
 	}
 }
 
@@ -715,11 +751,17 @@ func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
 	if !strings.Contains(html, `<form id="config-form" autocomplete="off">`) {
 		t.Fatal("config-form must carry autocomplete=off to suppress credential capture")
 	}
-	if !strings.Contains(html, `keyInput.autocomplete="new-password"`) {
-		t.Fatal("fallback key input must use autocomplete new-password, not off")
+	// The fallback API-key editor is not a login credential: it must be a
+	// non-password text input with visual concealment and autocomplete off,
+	// so Chrome does not classify a save as a password submission.
+	if !strings.Contains(html, `keyInput.setAttribute("autocomplete","off")`) {
+		t.Fatal("fallback key input must use autocomplete off (non-password text input)")
 	}
-	if strings.Contains(html, `keyInput.autocomplete="off"`) {
-		t.Fatal("fallback key input must not use autocomplete off; new-password suppresses save")
+	if strings.Contains(html, `keyInput.autocomplete="new-password"`) {
+		t.Fatal("fallback key input must not use new-password; off + text type avoids password-save prompts")
+	}
+	if strings.Contains(html, `keyInput.type="password"`) {
+		t.Fatal("fallback key input must stay a text input with masked class, never a password input")
 	}
 	for _, needle := range []string{
 		`nameInput.setAttribute("autocomplete","off")`,
@@ -730,6 +772,11 @@ func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
 		`baseInput.setAttribute("autocapitalize","off")`,
 		`baseInput.setAttribute("autocorrect","off")`,
 		`baseInput.setAttribute("spellcheck","false")`,
+		`keyInput.setAttribute("autocapitalize","off")`,
+		`keyInput.setAttribute("autocorrect","off")`,
+		`keyInput.setAttribute("spellcheck","false")`,
+		`-webkit-text-security`,
+		`key-row input.masked`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("missing fallback non-credential hygiene %q", needle)
@@ -738,10 +785,11 @@ func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
 	for _, bad := range []string{
 		`nameInput.setAttribute("name"`,
 		`baseInput.setAttribute("name"`,
+		`keyInput.setAttribute("name"`,
 		`setAttribute("username"`,
 	} {
 		if strings.Contains(html, bad) {
-			t.Fatalf("fallback name/base must not carry credential-ish attribute %q", bad)
+			t.Fatalf("fallback name/base/key must not carry credential-ish attribute %q", bad)
 		}
 	}
 	if strings.Contains(html, "fb-name\"].autocomplete=\"username\"") || strings.Contains(html, "fb-base\"].autocomplete=\"username\"") {
@@ -751,7 +799,7 @@ func TestWebUIFallbackAutocompleteHygiene(t *testing.T) {
 	for _, needle := range []string{
 		`autocomplete="username"`,
 		`autocomplete="current-password"`,
-		`keyInput.type="password"`,
+		`keyInput.type="text"`,
 		`data-role","fb-key-toggle"`,
 		`data-role","fb-key-id"`,
 		`fallbackInputs`,
@@ -862,7 +910,7 @@ func TestWebUILoginClearsPlaintextModals(t *testing.T) {
 	}
 	// Helper fallback path resets fbModal state even when closeFallbackModal
 	// is unavailable at init time.
-	if !strings.Contains(helper, `S.fbModal={index:null,origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}`) {
+	if !strings.Contains(helper, `S.fbModal={index:null,chanID:"",origID:"",origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}`) {
 		t.Fatal("helper fallback path must reset S.fbModal plaintext state")
 	}
 	// closeFallbackModal itself wipes the live DOM key value before dropping

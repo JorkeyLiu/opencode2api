@@ -280,14 +280,19 @@
   `discover_failed` with safe `reason` (`dns_error`/`connect_refused`/`timeout`/
   `tls_error`/`transport_error`/`non_2xx`/`invalid_json`/`empty_list`),
   `endpoint`, `http_status`, `elapsed_ms`, never body/key/Authorization/raw error.
-- Custom session fallback: strict `fallback` config (`active` + unique-name
-  `channels` with `name`/`base_url` http-https/`api_key`/`model`/`protocol`
+- Custom session fallback: strict `fallback` config (`active` + unique-ID
+  `channels` with stable `id` (strict 1-64 `[A-Za-z0-9_.-]`, unique machine
+  identity)/free-form display `name` (unique display text, spaces allowed)/
+  `base_url` http-https/`api_key`/`model`/`protocol`
   (`chat`=Chat Completions default, `responses`=Responses; empty normalizes to
   `chat`, other values strictly rejected) plus optional per-channel
-  `reasoning_effort` (`""`=supplier default, `low`/`medium`/`high`; empty
+  `reasoning_effort` (`""`=supplier default (strip target strength),
+  `"inherit"`=preserve converted strength, `low`/`medium`/`high`; empty
   normalizes to `""`, other values strictly rejected; never in the binding
   identity, never migrates as identity, never probed); active empty or referencing an
-  existing channel) persists via config authority/RuntimeManager.Apply
+  existing channel ID (legacy display-name active normalizes to the ID);
+  legacy name-only channels derive their ID deterministically; new WebUI
+  channels receive a generated stable ID (never the display name)) persists via config authority/RuntimeManager.Apply
   with masked GET, authenticated-session reveal (POST-only non-GET behind admin
   session auth + CSRF + Origin, no-store response, and full-chain
   redaction without plaintext logging). Only a request
@@ -299,19 +304,27 @@
   for chat, `{root}/v1/responses` for responses via the unified API-root rule,
   Bearer key, client entry converted to the channel protocol via the strict bridge
   with model rewritten to the channel model plus the channel reasoning_effort
+  control (`inherit` preserves converted strength, `""` strips target strength
+  (chat removes top-level strength fields, responses removes the target
+  reasoning control; history/content untouched), explicit low/medium/high
   override (chat sets `reasoning_effort`, responses merges/creates
-  `reasoning:{effort}`, empty never injects), response/stream transcoded back;
+  `reasoning:{effort}`)), response/stream transcoded back;
   never listed in public `/v1/models`; no supplier session affinity; never touches
   Zen scheduler layers)
-  and the session binds first to that full channel identity (name + normalized base
-  URL/authority + key fingerprint/identity + configured model + protocol) so later
+  and the session binds first to that full channel identity (stable `id` +
+  normalized base URL/authority + key fingerprint/identity + configured model +
+  protocol; display `name` is snapshot-only and a rename preserves the binding) so later
   requests for the session serve exclusively there without drifting on active
   switches. Custom errors return as-is with no fallback to native or other custom
   channels. Takeover state is session-keyed (not session+model), process-lifetime,
   unpersisted, unprojected, unexpired, bounded 4096, first-wins, capacity-502
   without claiming unrecorded takeover; hot Apply migrates without validity
   filtering as tombstones and a deleted/identity-mismatched (including protocol
-  change) channel fails locally with 502. Restart clears.
+  change) channel fails locally with 502. Restart clears. Per-channel
+  observability keys use the stable ID (`custom:<id>`); operator copy shows the
+  display name. The fallback API-key editor is a non-password text input with
+  visual concealment and `autocomplete="off"` (never a password submission);
+  the real admin login keeps `username`/`current-password` semantics.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
   per-model target cooldowns, proxy429 cooldowns, channel cooldowns, and credential429

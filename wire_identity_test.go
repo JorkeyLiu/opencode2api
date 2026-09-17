@@ -35,14 +35,14 @@ func TestWireShapesExact(t *testing.T) {
 	if got := parentWireSession(""); got != "" {
 		t.Fatalf("empty parent must stay empty, got %q", got)
 	}
-	if !isCanonicalWireSession(bulkProbeWireSession()) {
-		t.Fatalf("probe session shape invalid: %q", bulkProbeWireSession())
+	if !isCanonicalWireSession(routeWireSession(deriveFirstRouteSession(bulkProbeIDs().Session, routeSessionScope{Authority: "https://zen.example", Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Protocol: ProtocolChat}))) {
+		t.Fatalf("probe session shape invalid")
 	}
-	if !isCanonicalWireRequest(bulkProbeWireRequest()) {
-		t.Fatalf("probe request shape invalid: %q", bulkProbeWireRequest())
+	if !isCanonicalWireRequest(requestWireID(bulkProbeIDs().Request)) {
+		t.Fatalf("probe request shape invalid: %q", requestWireID(bulkProbeIDs().Request))
 	}
-	if !isCanonicalWireProject(bulkProbeWireProject()) {
-		t.Fatalf("probe project shape invalid: %q", bulkProbeWireProject())
+	if !isCanonicalWireProject(projectWireID(bulkProbeIDs().Project)) {
+		t.Fatalf("probe project shape invalid: %q", projectWireID(bulkProbeIDs().Project))
 	}
 	// Negative shapes.
 	for _, bad := range []string{"", "ses_short", "msg_short", "bulk-probe", "rss_abc", "ses_UPPERCASE00000000000000", strings.Repeat("g", 40)} {
@@ -304,24 +304,25 @@ func TestReplayWireRotatesAndStaysFinal(t *testing.T) {
 }
 
 func TestBulkProbeOfficialIdentity(t *testing.T) {
-	if !isCanonicalWireSession(bulkProbeWireSession()) || bulkProbeWireSession() == "bulk-probe" {
-		t.Fatalf("probe session must be canonical, got %q", bulkProbeWireSession())
+	// Probe internal identity is deterministic and scheduler-neutral; wire
+	// values derive only through the shared gateway mappers.
+	idsA, idsB := bulkProbeIDs(), bulkProbeIDs()
+	if idsA != idsB {
+		t.Fatalf("probe identity must be deterministic: %+v vs %+v", idsA, idsB)
 	}
-	if !isCanonicalWireRequest(bulkProbeWireRequest()) || !isCanonicalWireProject(bulkProbeWireProject()) {
+	if !isCanonicalWireRequest(requestWireID(idsA.Request)) || !isCanonicalWireProject(projectWireID(idsA.Project)) {
 		t.Fatalf("probe request/project must be canonical")
 	}
-	// Deterministic and stateless.
-	if bulkProbeWireSession() != bulkProbeWireSession() || bulkProbeWireRequest() != bulkProbeWireRequest() {
-		t.Fatalf("probe identity must be deterministic")
-	}
-	// Live header check via bulkProbeOnce.
+	// Live header check via bulkProbeOnce: must equal the shared
+	// newUpstreamRequest construction for the same inputs.
 	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	gw, err := NewGateway(cfg, discardGatewayLogger(), NewMonitor())
 	if err != nil {
 		t.Fatal(err)
 	}
 	seedBulkProbeCatalog(gw)
-	var gotSes, gotReq, gotPrj, gotAffinity, gotSid, gotUA string
+	var gotSes, gotReq, gotPrj, gotAffinity, gotSid, gotUA, gotAccept, gotClient string
+	var gotBody []byte
 	pool := gw.pools["shared"]
 	pool.items[0].client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		gotSes = r.Header.Get("x-opencode-session")
@@ -330,6 +331,9 @@ func TestBulkProbeOfficialIdentity(t *testing.T) {
 		gotAffinity = r.Header.Get("x-session-affinity")
 		gotSid = r.Header.Get("X-Session-Id")
 		gotUA = r.Header.Get("User-Agent")
+		gotAccept = r.Header.Get("Accept")
+		gotClient = r.Header.Get("x-opencode-client")
+		gotBody, _ = io.ReadAll(r.Body)
 		return responseWithBody(200, bulkChatSuccessBody("bulk-free-model")), nil
 	})}
 	pinsBefore := gw.scheduler.pins.count()
@@ -339,14 +343,32 @@ func TestBulkProbeOfficialIdentity(t *testing.T) {
 	if !res.Success {
 		t.Fatalf("probe must succeed: %+v", res)
 	}
-	if !isCanonicalWireSession(gotSes) || gotSes != bulkProbeWireSession() {
-		t.Fatalf("probe session header=%q", gotSes)
+	ids := bulkProbeIDs()
+	scope := bulkProbeScope(gw.cfg.Upstream.Zen, tgt, ProtocolChat)
+	routeSession := deriveFirstRouteSession(ids.Session, scope)
+	if want := routeWireSession(routeSession); !isCanonicalWireSession(gotSes) || gotSes != want {
+		t.Fatalf("probe session header=%q want %q", gotSes, want)
 	}
-	if !isCanonicalWireRequest(gotReq) || gotReq != bulkProbeWireRequest() {
-		t.Fatalf("probe request header=%q", gotReq)
+	if want := requestWireID(ids.Request); !isCanonicalWireRequest(gotReq) || gotReq != want {
+		t.Fatalf("probe request header=%q want %q", gotReq, want)
 	}
-	if !isCanonicalWireProject(gotPrj) || gotPrj != bulkProbeWireProject() {
-		t.Fatalf("probe project header=%q", gotPrj)
+	if want := projectWireID(ids.Project); !isCanonicalWireProject(gotPrj) || gotPrj != want {
+		t.Fatalf("probe project header=%q want %q", gotPrj, want)
+	}
+	// Shared construction parity: identical inputs through newUpstreamRequest
+	// must yield identical headers.
+	wantReq, err := newUpstreamRequest(context.Background(), gw.cfg.Upstream.Zen, ProtocolChat, gotBody, ids, tgt.CredKey, routeSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wantReq.Header.Get("x-opencode-session") != gotSes || wantReq.Header.Get("x-opencode-request") != gotReq || wantReq.Header.Get("x-opencode-project") != gotPrj {
+		t.Fatalf("probe headers must match shared newUpstreamRequest")
+	}
+	if wantReq.Header.Get("User-Agent") != gotUA || wantReq.Header.Get("Accept") != gotAccept || wantReq.Header.Get("x-opencode-client") != gotClient {
+		t.Fatalf("probe UA/Accept/client must match shared construction")
+	}
+	if wantReq.Header.Get("Authorization") != "Bearer "+tgt.CredKey {
+		t.Fatalf("probe auth must match shared construction")
 	}
 	if gotAffinity != "" || gotSid != "" {
 		t.Fatalf("probe must omit generic affinity: %q %q", gotAffinity, gotSid)

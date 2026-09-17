@@ -13,10 +13,15 @@
     "anonymous": "shared",
     "authenticated": "shared"
   },
-  // fallback channels: protocol "chat" (Chat Completions, default) or "responses" (Responses).
-  // reasoning_effort "" (supplier default), "low", "medium" or "high" per channel.
+  // fallback channels: id is the stable machine identity (strict 1-64
+  // [A-Za-z0-9_.-], unique); name is free-form display text (spaces allowed).
+  // Legacy name-only channels derive id deterministically; legacy active
+  // values referencing a name normalize to the id.
+  // protocol "chat" (Chat Completions, default) or "responses" (Responses).
+  // reasoning_effort "" (supplier default: strip target strength), "inherit"
+  // (preserve converted strength), "low", "medium" or "high" per channel.
   // base supports host, host/v1, or the matching full endpoint; e.g.
-  // {"name":"c1","base_url":"https://...","api_key":"...","model":"...","protocol":"chat","reasoning_effort":""}.
+  // {"id":"c1","name":"c1","base_url":"https://...","api_key":"...","model":"...","protocol":"chat","reasoning_effort":""}.
   "fallback": {
     "active": "",
     "channels": []

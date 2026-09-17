@@ -361,7 +361,9 @@ func TestDiagnosticsWebUIStatic(t *testing.T) {
 		t.Fatal("stale no-hash copy must be removed")
 	}
 	// Shared row: compact status code with title detail; duration uses `ms` without space.
-	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", "上游：", "目标协议：", "代理池/节点：", "密钥尾码："} {
+	// Realtime 代理 column is display-only node/dash: native "代理节点：",
+	// custom "自定义渠道不使用代理池节点" (never pool/node internals).
+	for _, needle := range []string{"pillForFailureClass(fc)", "failureLabel(fc)", "失败分类：", "HTTP 状态 ", "上游：", "目标协议：", "代理节点：", "自定义渠道不使用代理池节点", "密钥尾码："} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("shared row must keep compact status with title detail, missing %q", needle)
 		}

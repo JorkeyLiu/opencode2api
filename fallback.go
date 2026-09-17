@@ -27,12 +27,19 @@ import (
 const TierCustom Tier = "custom"
 
 // FallbackChannelConfig is one operator-defined OpenAI-compatible channel.
+// ID is the stable machine identity (persisted, unique, strict syntax) used
+// by active selection, takeover binding, secret resolution, discovery/check,
+// and availability keys. Name is free-form operator display text and never
+// participates in identity matching: a name-only edit preserves bindings.
 // Protocol selects the upstream inference endpoint: "chat" (Chat Completions)
 // or "responses" (Responses). Empty/legacy configs normalize to "chat".
-// ReasoningEffort is an optional per-channel thinking-strength override:
-// "" (supplier default), "low", "medium", or "high". Anything else is
-// strictly rejected. It never participates in the takeover binding identity.
+// ReasoningEffort is an optional per-channel thinking-strength control:
+// "" (supplier default: strip target strength after conversion),
+// "inherit" (preserve the converted request strength), "low", "medium", or
+// "high". Anything else is strictly rejected. It never participates in the
+// takeover binding identity.
 type FallbackChannelConfig struct {
+	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	BaseURL         string   `json:"base_url"`
 	APIKey          string   `json:"api_key"`
@@ -166,11 +173,81 @@ func fallbackModelsURL(baseURL string) string {
 	return root + "/v1/models"
 }
 
-func validateFallbackChannelName(name string) error {
-	if err := validatePoolName(strings.TrimSpace(name)); err != nil {
-		return fmt.Errorf("invalid fallback channel name %q: %w", name, err)
+func validateFallbackChannelID(id string) error {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return errors.New("fallback channel id must not be empty")
+	}
+	if len(trimmed) > 64 {
+		return fmt.Errorf("invalid fallback channel id %q: must be 1-64 characters", id)
+	}
+	for _, r := range trimmed {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid fallback channel id %q: use letters, digits, '_', '-' or '.'", id)
 	}
 	return nil
+}
+
+// validateFallbackDisplayName permits trimmed free-form UTF-8 display text
+// (spaces such as "OpenCode Go" are allowed). Only empty values,
+// unreasonable length, or control characters are rejected.
+func validateFallbackDisplayName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("fallback channel display name must not be empty")
+	}
+	if len([]rune(trimmed)) > 128 {
+		return fmt.Errorf("invalid fallback channel display name %q: must be 1-128 characters", name)
+	}
+	for _, r := range trimmed {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid fallback channel display name %q: must not contain control characters", name)
+		}
+	}
+	return nil
+}
+
+// fallbackDeriveChannelID deterministically derives a stable ID for legacy
+// name-only configs. Names that already satisfy the ID syntax are preserved
+// as-is (legacy valid names keep their identity); anything else is slugified
+// (lowercased, invalid runs become "-"). Empty slugs fall back to a stable
+// hash so derivation never yields an empty ID. Collisions are reported by the
+// caller as duplicate IDs rather than silently renamed.
+func fallbackDeriveChannelID(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	if err := validateFallbackChannelID(trimmed); err == nil {
+		return trimmed
+	}
+	lower := strings.ToLower(trimmed)
+	var b strings.Builder
+	prevDash := false
+	for _, r := range lower {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+			prevDash = r == '-'
+			continue
+		}
+		if !prevDash && b.Len() > 0 {
+			b.WriteRune('-')
+			prevDash = true
+		}
+	}
+	slug := strings.Trim(b.String(), "-.")
+	if slug == "" {
+		slug = "channel-" + fallbackKeyHash(trimmed)[:8]
+	}
+	if len(slug) > 64 {
+		slug = strings.Trim(slug[:64], "-.")
+	}
+	if slug == "" {
+		slug = "channel"
+	}
+	return slug
 }
 
 func validateFallbackBaseURL(raw string) error {
@@ -191,25 +268,26 @@ func validateFallbackBaseURL(raw string) error {
 }
 
 // fallbackNormalizeReasoningEffort canonicalizes the per-channel thinking
-// strength. Empty normalizes to "" (supplier default); low/medium/high
-// (case-insensitive, trimmed) normalize to lowercase; anything else is
-// strictly rejected.
+// strength. Empty normalizes to "" (supplier default: strip target strength
+// after conversion); "inherit" preserves the converted request strength;
+// low/medium/high (case-insensitive, trimmed) normalize to lowercase;
+// anything else is strictly rejected.
 func fallbackNormalizeReasoningEffort(raw string) (string, error) {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	if trimmed == "" {
 		return "", nil
 	}
 	switch trimmed {
-	case "low", "medium", "high":
+	case "inherit", "low", "medium", "high":
 		return trimmed, nil
 	default:
-		return "", fmt.Errorf("fallback channel reasoning_effort %q must be \"\", \"low\", \"medium\" or \"high\"", raw)
+		return "", fmt.Errorf("fallback channel reasoning_effort %q must be \"\", \"inherit\", \"low\", \"medium\" or \"high\"", raw)
 	}
 }
 
 // fallbackChannelEffort returns the effective reasoning effort for a channel.
-// Normalized configs always carry ""/low/medium/high; unexpected values
-// defensively read as "" without failing.
+// Normalized configs always carry ""/inherit/low/medium/high; unexpected
+// values defensively read as "" without failing.
 func fallbackChannelEffort(ch FallbackChannelConfig) string {
 	if effort, err := fallbackNormalizeReasoningEffort(ch.ReasoningEffort); err == nil {
 		return effort
@@ -217,14 +295,42 @@ func fallbackChannelEffort(ch FallbackChannelConfig) string {
 	return ""
 }
 
+// stripFallbackReasoningStrength removes target reasoning-strength controls
+// after conversion so the custom supplier chooses its default. Chat removes
+// top-level strength fields; Responses removes the target reasoning control.
+// Reasoning history/content (reasoning_content, input reasoning items,
+// summaries) is never touched.
+func stripFallbackReasoningStrength(converted map[string]any, target Protocol) {
+	if converted == nil {
+		return
+	}
+	if fallbackChannelProtocol(FallbackChannelConfig{Protocol: target}) == ProtocolResponses {
+		delete(converted, "reasoning")
+		delete(converted, "reasoning_effort")
+		delete(converted, "effort")
+		return
+	}
+	delete(converted, "reasoning_effort")
+	delete(converted, "reasoning")
+	delete(converted, "effort")
+}
+
 // applyFallbackReasoningEffort overlays the channel effort on a converted
-// request body built by prepareUpstreamRequest. Chat sets the
+// request body built by prepareUpstreamRequest. "inherit" preserves the
+// converted strength (injecting nothing when absent); "" (supplier default)
+// strips target strength controls; low/medium/high override. Chat sets the
 // reasoning_effort string; Responses merges/creates reasoning:{effort} while
-// preserving other reasoning map keys. Empty effort never injects or
-// overwrites, so existing client fields or the supplier default survive.
+// preserving other reasoning map keys.
 func applyFallbackReasoningEffort(converted map[string]any, effort string, target Protocol) {
 	effort = strings.ToLower(strings.TrimSpace(effort))
-	if effort == "" || converted == nil {
+	if converted == nil {
+		return
+	}
+	if effort == "" {
+		stripFallbackReasoningStrength(converted, target)
+		return
+	}
+	if effort == "inherit" {
 		return
 	}
 	if fallbackChannelProtocol(FallbackChannelConfig{Protocol: target}) == ProtocolResponses {
@@ -244,11 +350,15 @@ func applyFallbackReasoningEffort(converted map[string]any, effort string, targe
 }
 
 // validateFallbackConfig normalizes in place and validates the fallback object.
-// Names are unique; active may be empty but when non-empty must reference an
-// existing channel; every channel requires name/base_url/api_key/model.
-// Empty/missing protocol normalizes to chat; any other value besides chat or
-// responses is strictly rejected. Empty/missing reasoning_effort normalizes
-// to "" (supplier default); only low/medium/high are accepted otherwise.
+// IDs are the stable identity (unique, strict); names are free-form display
+// text (unique for unambiguous UI/migration). Legacy name-only channels
+// derive their ID deterministically; legacy active values referencing a
+// display name normalize to the derived ID. Active may be empty but when
+// non-empty must reference an existing channel ID; every channel requires
+// id/name/base_url/api_key/model. Empty/missing protocol normalizes to chat;
+// any other value besides chat or responses is strictly rejected.
+// Empty/missing reasoning_effort normalizes to "" (supplier default); only
+// inherit/low/medium/high are accepted otherwise.
 func validateFallbackConfig(fb *FallbackConfig) error {
 	if fb == nil {
 		return nil
@@ -257,13 +367,16 @@ func validateFallbackConfig(fb *FallbackConfig) error {
 	if fb.Channels == nil {
 		fb.Channels = []FallbackChannelConfig{}
 	}
-	seen := map[string]bool{}
 	for i := range fb.Channels {
 		ch := &fb.Channels[i]
+		ch.ID = strings.TrimSpace(ch.ID)
 		ch.Name = strings.TrimSpace(ch.Name)
 		ch.BaseURL = strings.TrimSpace(ch.BaseURL)
 		ch.APIKey = strings.TrimSpace(ch.APIKey)
 		ch.Model = strings.TrimSpace(ch.Model)
+		if ch.ID == "" {
+			ch.ID = fallbackDeriveChannelID(ch.Name)
+		}
 		proto, err := fallbackNormalizeProtocol(ch.Protocol)
 		if err != nil {
 			return fmt.Errorf("fallback channel %q: %w", ch.Name, err)
@@ -274,32 +387,85 @@ func validateFallbackConfig(fb *FallbackConfig) error {
 			return fmt.Errorf("fallback channel %q: %w", ch.Name, err)
 		}
 		ch.ReasoningEffort = effort
-		if ch.Name == "" {
-			return errors.New("fallback channel name must not be empty")
-		}
-		if err := validateFallbackChannelName(ch.Name); err != nil {
+		if err := validateFallbackChannelID(ch.ID); err != nil {
 			return err
 		}
-		if seen[ch.Name] {
-			return fmt.Errorf("duplicate fallback channel name %q", ch.Name)
+		if err := validateFallbackDisplayName(ch.Name); err != nil {
+			return err
 		}
-		seen[ch.Name] = true
 		if err := validateFallbackBaseURL(ch.BaseURL); err != nil {
 			return err
 		}
 		if ch.APIKey == "" {
-			return fmt.Errorf("fallback channel %q api_key must not be empty", ch.Name)
+			return fmt.Errorf("fallback channel %q api_key must not be empty", ch.ID)
 		}
 		if ch.Model == "" {
-			return fmt.Errorf("fallback channel %q model must not be empty", ch.Name)
+			return fmt.Errorf("fallback channel %q model must not be empty", ch.ID)
 		}
 	}
-	if fb.Active != "" && !seen[fb.Active] {
-		return fmt.Errorf("fallback active channel %q does not exist", fb.Active)
+	seenID := map[string]bool{}
+	seenName := map[string]bool{}
+	for _, ch := range fb.Channels {
+		if seenID[ch.ID] {
+			return fmt.Errorf("duplicate fallback channel id %q", ch.ID)
+		}
+		seenID[ch.ID] = true
+		if seenName[ch.Name] {
+			return fmt.Errorf("duplicate fallback channel display name %q", ch.Name)
+		}
+		seenName[ch.Name] = true
+	}
+	// Cross-channel namespace ambiguity: one channel's stable ID must not
+	// equal another channel's trimmed display name, otherwise ID-first
+	// lookup with legacy-name fallback could silently select the wrong
+	// channel. Same-channel ID==name stays valid for legacy compatibility.
+	for i := range fb.Channels {
+		for j := range fb.Channels {
+			if i == j {
+				continue
+			}
+			if fb.Channels[i].ID == fb.Channels[j].Name {
+				return fmt.Errorf("fallback channel id %q conflicts with display name %q of another channel", fb.Channels[i].ID, fb.Channels[j].Name)
+			}
+		}
+	}
+	if fb.Active != "" {
+		if seenID[fb.Active] {
+			// Already a stable ID.
+		} else {
+			// Legacy active referencing a display name: normalize to the ID.
+			matched := ""
+			for _, ch := range fb.Channels {
+				if ch.Name == fb.Active {
+					matched = ch.ID
+					break
+				}
+			}
+			if matched == "" {
+				return fmt.Errorf("fallback active channel %q does not exist", fb.Active)
+			}
+			fb.Active = matched
+		}
 	}
 	return nil
 }
 
+func fallbackChannelByID(cfg Config, id string) (FallbackChannelConfig, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return FallbackChannelConfig{}, false
+	}
+	for _, ch := range cfg.Fallback.Channels {
+		if ch.ID == id {
+			return ch, true
+		}
+	}
+	return FallbackChannelConfig{}, false
+}
+
+// fallbackChannelByName resolves by display name (legacy compat). New code
+// should use fallbackChannelByID; this helper stays for legacy API payloads
+// and tests where ID equals name.
 func fallbackChannelByName(cfg Config, name string) (FallbackChannelConfig, bool) {
 	name = strings.TrimSpace(name)
 	for _, ch := range cfg.Fallback.Channels {
@@ -310,18 +476,32 @@ func fallbackChannelByName(cfg Config, name string) (FallbackChannelConfig, bool
 	return FallbackChannelConfig{}, false
 }
 
+// fallbackChannelLookup resolves a channel by stable ID first, then by legacy
+// display name, so old callers sending a name keep working while new callers
+// send IDs. A name-only rename never changes the ID match.
+func fallbackChannelLookup(cfg Config, idOrName string) (FallbackChannelConfig, bool) {
+	if ch, ok := fallbackChannelByID(cfg, idOrName); ok {
+		return ch, true
+	}
+	return fallbackChannelByName(cfg, idOrName)
+}
+
 func activeFallbackChannel(cfg Config) (FallbackChannelConfig, bool) {
 	if strings.TrimSpace(cfg.Fallback.Active) == "" {
 		return FallbackChannelConfig{}, false
 	}
-	return fallbackChannelByName(cfg, cfg.Fallback.Active)
+	return fallbackChannelLookup(cfg, cfg.Fallback.Active)
 }
 
-// fallbackBinding is the session-level takeover value. It freezes the complete
-// channel identity (including protocol) so a later rename, credential, model,
-// URL, or protocol change cannot silently drift an old session.
+// fallbackBinding is the session-level takeover value. It freezes the stable
+// channel identity (ID plus normalized base URL/authority, key hash, model,
+// protocol) so a later display-name rename, credential, model, URL, or
+// protocol change cannot silently drift an old session. Name is carried as
+// display-only snapshot and never participates in matching: a name-only edit
+// preserves the binding.
 type fallbackBinding struct {
-	Name     string
+	ID       string
+	Name     string // display snapshot only, never matched
 	BaseURL  string // normalized base URL (no trailing slash)
 	KeyHash  string // full SHA-256 hex of the api_key
 	KeyFP    string // 10-char fingerprint for redacted diagnostics
@@ -334,6 +514,7 @@ type fallbackBinding struct {
 // bound session and never affects hot-Apply tombstone migration.
 func fallbackBindingFor(ch FallbackChannelConfig) fallbackBinding {
 	return fallbackBinding{
+		ID:       strings.TrimSpace(ch.ID),
 		Name:     strings.TrimSpace(ch.Name),
 		BaseURL:  normalizeFallbackBaseURL(ch.BaseURL),
 		KeyHash:  fallbackKeyHash(strings.TrimSpace(ch.APIKey)),
@@ -344,8 +525,22 @@ func fallbackBindingFor(ch FallbackChannelConfig) fallbackBinding {
 }
 
 func (b fallbackBinding) matchesChannel(ch FallbackChannelConfig) bool {
-	if b.Name != strings.TrimSpace(ch.Name) {
-		return false
+	// Stable path: match by ID; display name is ignored so renames preserve.
+	if strings.TrimSpace(b.ID) != "" {
+		if b.ID != strings.TrimSpace(ch.ID) {
+			return false
+		}
+	} else {
+		// Legacy tombstone (pre-ID binding carries Name only): match the
+		// legacy name against the current ID or display name so derived IDs
+		// (valid legacy names derive to themselves) keep serving.
+		legacy := strings.TrimSpace(b.Name)
+		if legacy == "" {
+			return false
+		}
+		if legacy != strings.TrimSpace(ch.ID) && legacy != strings.TrimSpace(ch.Name) {
+			return false
+		}
 	}
 	if b.BaseURL != normalizeFallbackBaseURL(ch.BaseURL) {
 		return false
@@ -432,7 +627,7 @@ func (st *fallbackTakeoverStore) migrateFallbackFrom(old *fallbackTakeoverStore)
 	}
 	staged := make([]copied, 0, len(old.entries))
 	for k, v := range old.entries {
-		if k == "" || v.Name == "" {
+		if k == "" || (strings.TrimSpace(v.ID) == "" && strings.TrimSpace(v.Name) == "") {
 			continue
 		}
 		staged = append(staged, copied{key: k, val: v})
@@ -697,12 +892,12 @@ func fetchFallbackModels(ctx context.Context, client *http.Client, baseURL, apiK
 }
 
 // fallbackObservabilityChannel names the observability channel for one custom
-// fallback channel. Tier stays "custom"; Channel carries the concrete name
-// ("custom:<channelName>") so per-channel usage/attempts split while
-// tiers.custom still aggregates the total. Old "custom" records keep their
-// merged row and are never rewritten.
-func fallbackObservabilityChannel(name string) string {
-	trimmed := strings.TrimSpace(name)
+// fallback channel. Tier stays "custom"; Channel carries the stable ID
+// ("custom:<channelID>") so per-channel usage/attempts split on the machine
+// identity while the display name is resolved separately in operator copy.
+// Old "custom" records keep their merged row and are never rewritten.
+func fallbackObservabilityChannel(id string) string {
+	trimmed := strings.TrimSpace(id)
 	if trimmed == "" {
 		return string(TierCustom)
 	}
@@ -755,8 +950,8 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	// No supplier session affinity headers; every request carries the full
 	// client-provided history in the chat body.
 	fakeProxy := &proxyTransport{name: normalizeFallbackBaseURL(ch.BaseURL), pool: "fallback"}
-	display := "custom:" + strings.TrimSpace(ch.Name)
-	channel := fallbackObservabilityChannel(ch.Name)
+	display := "custom:" + strings.TrimSpace(ch.ID)
+	channel := fallbackObservabilityChannel(ch.ID)
 	setRequestCredential(ctx, TierCustom, channelProtocol, display, channel, false, fakeProxy)
 	setRequestModel(ctx, channelModel)
 	syncAttemptMeta(ctx, TierCustom, channelProtocol, attemptOffset, 1)

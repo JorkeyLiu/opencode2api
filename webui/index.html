@@ -146,6 +146,7 @@ table.table td.wrap{white-space:normal;word-break:break-all}
 .fb-err,.pool-err{color:var(--bad);font-size:12.5px}
 .key-row{position:relative;display:block;min-width:0;max-width:100%;width:100%}
 .key-row input{width:100%;min-width:0;padding-right:40px;box-sizing:border-box}
+.key-row input.masked{-webkit-text-security:disc;text-security:disc;}
 .key-row button{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:none;background:transparent;min-width:32px;min-height:32px;line-height:1;font-size:16px;padding:4px 8px;cursor:pointer}
 .key-row button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 .key-row button:disabled{opacity:.6;cursor:default}
@@ -539,6 +540,8 @@ function toast(msg,bad){ var n=$("toast"); clear(n); n.appendChild(document.crea
 function shortId(id){ id=String(id||""); if(!id)return "—"; if(id.length<=14)return id; return id.slice(0,8)+"…"+id.slice(-4); }
 function shortHash(h){ h=String(h||""); if(!h)return "—"; if(h.length<=12)return h; return h.slice(0,8)+"…"+h.slice(-4); }
 function proxyLabel(pool,node){ pool=pool||""; node=node||""; if(pool&&node)return pool+"/"+node; return pool||node||"—"; }
+function realtimeProxyLabel(a){ a=a||{}; if(isCustomRow(a))return "—"; var n=a.proxy_node||a.proxy||a.Proxy||a.ProxyNode||""; n=String(n||"").trim(); return n||"—"; }
+function realtimeProxyTitle(a,label){ if(label==="—"){ if(isCustomRow(a))return "自定义渠道不使用代理池节点"; return "代理未知"; } return "代理节点："+label; }
 
 var S = {
   csrf:"", config:null, version:"",
@@ -686,9 +689,9 @@ function clearSensitiveModalsForLogin(){
   try{
     var st=(typeof S!=="undefined"&&S&&S.fbModal)?S.fbModal:null;
     var ki=st&&st.fields&&st.fields.keyInput;
-    if(ki){ try{ki.value="";}catch(e){} try{ki.type="password";}catch(e){} }
+    if(ki){ try{ki.value="";}catch(e){} try{ki.classList.add("masked");}catch(e){} }
   }catch(e){}
-  try{ if(typeof S!=="undefined"&&S)S.fbModal={index:null,origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}; }catch(e){}
+  try{ if(typeof S!=="undefined"&&S)S.fbModal={index:null,chanID:"",origID:"",origName:"",origDisplay:"",origId:"",revealed:false,originalSecret:""}; }catch(e){}
 }
 function showLogin(){
   try{ if(typeof clearSensitiveModalsForLogin==="function")clearSensitiveModalsForLogin(); }catch(e){}
@@ -897,21 +900,21 @@ function pruneCustomAvail(serverCustom){
       var cfgChans=((S.config&&S.config.fallback&&S.config.fallback.channels)||[]);
       if(!cfgChans.length){ S.customAvail=[]; return; }
       var keep0={};
-      cfgChans.forEach(function(c){ keep0[String((c&&c.name)||"")]=1; });
-      S.customAvail=(S.customAvail||[]).filter(function(r){ return keep0[String(((r||{}).name)||"")]; });
+      cfgChans.forEach(function(c){ var k=String((c&&c.id)||(c&&c.name)||""); if(k)keep0[k]=1; });
+      S.customAvail=(S.customAvail||[]).filter(function(r){ var k=String(((r||{}).id)||((r||{}).name)||""); return !!keep0[k]; });
       return;
     }
     var names={};
-    (serverCustom||[]).forEach(function(c){ names[String(((c||{}).name)||"")]=1; });
-    S.customAvail=(S.customAvail||[]).filter(function(r){ return names[String(((r||{}).name)||"")]; });
+    (serverCustom||[]).forEach(function(c){ var k=String(((c||{}).id)||((c||{}).name)||""); if(k)names[k]=1; });
+    S.customAvail=(S.customAvail||[]).filter(function(r){ var k=String(((r||{}).id)||((r||{}).name)||""); return !!names[k]; });
   }catch(e){}
 }
 function pruneCustomAvailByConfig(){
   try{
     var chans=((S.config&&S.config.fallback&&S.config.fallback.channels)||[]);
     var keep={};
-    chans.forEach(function(c){ keep[String((c&&c.name)||"")]=1; });
-    S.customAvail=(S.customAvail||[]).filter(function(r){ return keep[String(((r||{}).name)||"")]; });
+    chans.forEach(function(c){ var k=String((c&&c.id)||(c&&c.name)||""); if(k)keep[k]=1; });
+    S.customAvail=(S.customAvail||[]).filter(function(r){ var k=String(((r||{}).id)||((r||{}).name)||""); return !!keep[k]; });
   }catch(e){}
 }
 
@@ -927,8 +930,8 @@ function renderProxyFilter(){
   var sel=$("f-proxy"); if(!sel)return;
   var cur=sel.value;
   var seen={};
-  ((S.upstream&&S.upstream.recent)||[]).forEach(function(a){ var k=proxyLabel(a.proxy_pool,a.proxy_node||a.proxy); if(k&&k!=="—")seen[k]=1; });
-  ((S.upstream&&S.upstream.requests)||[]).forEach(function(r){ var k=proxyLabel(r.proxy_pool,r.proxy_node||r.proxy); if(k&&k!=="—")seen[k]=1; });
+  ((S.upstream&&S.upstream.recent)||[]).forEach(function(a){ if(isCustomRow(a))return; var k=String(a.proxy_node||a.proxy||"").trim(); if(k)seen[k]=1; });
+  ((S.upstream&&S.upstream.requests)||[]).forEach(function(r){ if(isCustomRow(r))return; var k2=String(r.proxy_node||r.proxy||"").trim(); if(k2)seen[k2]=1; });
   if(cur)seen[cur]=1;
   clear(sel);
   var o0=document.createElement("option"); o0.value=""; o0.textContent="全部代理"; sel.appendChild(o0);
@@ -951,9 +954,9 @@ function finalUsageFor(attempt, reqById){
 function attemptRowCells(tr, a, tokenReq, isFallback){
   cell(tr,fmtTime(a.time!==undefined?a.time:a.Time));
   cell(tr,a.model||a.Model||"—","wrap");
-  (function(){ var td=document.createElement("td"); if(isCustomRow(a)){ var nm=customChannelOf(a)||"自定义"; td.textContent=nm; td.title="自定义渠道："+nm; } else { var raw=a.tier||a.Tier||"—"; td.textContent=tierLabel(raw); td.title=raw==="—"?"上游未知":("上游："+tierLabel(raw)); } tr.appendChild(td); })();
+  (function(){ var td=document.createElement("td"); if(isCustomRow(a)){ var nm=fallbackDisplayNameForID(customChannelOf(a))||"自定义"; td.textContent=nm; td.title="自定义渠道："+nm; } else { var raw=a.tier||a.Tier||"—"; td.textContent=tierLabel(raw); td.title=raw==="—"?"上游未知":("上游："+tierLabel(raw)); } tr.appendChild(td); })();
   (function(){ var td=document.createElement("td"); var raw=a.protocol||a.Protocol||"—"; td.textContent=protoLabel(raw); td.title=raw==="—"?"目标协议未知":("目标协议："+protoLabel(raw)); tr.appendChild(td); })();
-  (function(){ var td=document.createElement("td"); var label=proxyLabel(a.proxy_pool||a.ProxyPool,a.proxy_node||a.proxy||a.Proxy||a.ProxyNode); td.textContent=label; td.title=label==="—"?"代理未知":("代理池/节点："+label); tr.appendChild(td); })();
+  (function(){ var td=document.createElement("td"); var label=realtimeProxyLabel(a); td.textContent=label; td.title=realtimeProxyTitle(a,label); tr.appendChild(td); })();
   (function(){ var td=document.createElement("td"); if(isCustomRow(a)){ var cn=customChannelOf(a); td.textContent="自定义"; td.title=cn?("自定义渠道："+cn):"自定义渠道"; } else { var kl=keyLabel(a); td.textContent=kl; td.title=(kl==="匿名")?"匿名公开凭证":(kl==="—"?"密钥未知":("密钥尾码："+kl)); } tr.appendChild(td); })();
   cell(tr,(a.attempt===undefined?(a.Attempt===undefined?"—":a.Attempt):a.attempt));
   (function(){
@@ -1009,7 +1012,7 @@ function renderRealtime(){
     var ok=(a.success===undefined?a.Success:a.success);
     if(st==="success"&&!ok)return false;
     if(st==="failed"&&ok)return false;
-    if(px&&proxyLabel(a.proxy_pool,a.proxy_node||a.proxy)!==px)return false;
+    if(px&&realtimeProxyLabel(a)!==px)return false;
     if(q){
       var hay=(String(a.request_id||"").toLowerCase()+" "+String(a.client_session_hash||"").toLowerCase()+" "+String(a.model||"").toLowerCase()+" "+String(a.protocol||a.Protocol||"").toLowerCase()+" "+String(a.tier||a.Tier||"").toLowerCase()+" "+String(a.channel||a.Channel||"").toLowerCase()+" "+String(a.proxy_pool||a.ProxyPool||"").toLowerCase()+" "+String(a.proxy_node||a.proxy||a.Proxy||"").toLowerCase()+" "+String(a.key_id||a.KeyID||"").toLowerCase());
       if(hay.indexOf(q)<0)return false;
@@ -1112,7 +1115,7 @@ function renderPersistedKPIs(){
 function usageAggregateDisplay(upstream){
   upstream=String(upstream||"");
   if(upstream==="custom")return {label:"自定义",title:"上游：自定义"};
-  if(upstream.slice(0,7)==="custom:")return {label:upstream.slice(7),title:"自定义渠道："+upstream.slice(7)};
+  if(upstream.slice(0,7)==="custom:"){ var dn2=fallbackDisplayNameForID(upstream.slice(7)); return {label:dn2,title:"自定义渠道："+dn2}; }
   return {label:tierLabel(upstream),title:"上游："+tierLabel(upstream)};
 }
 function renderUsageAggregateTables(){
@@ -1584,7 +1587,7 @@ function renderHealth(){
     var customs=mergeCustomRows((r.custom||[]),(S.customAvail||[]));
     customs.forEach(function(c){
       var tr=document.createElement("tr");
-      (function(){ var td=document.createElement("td"); td.textContent=c.name||"—"; td.title="渠道："+(c.name||"—"); tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); var dn=String(c.name||c.id||"—"); td.textContent=dn; td.title="渠道："+dn; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.base_url||c.BaseURL||"—"; td.title="地址："+(c.base_url||c.BaseURL||"—"); td.className="wrap"; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap"; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); var v=customStatusLabel(c.status||"untested"); td.appendChild(el("span",v,"pill "+(v==="可用"?"ok":(v==="未检测"||v==="未定"?"neutral":(v==="限流"?"warn":"bad"))))); td.title="状态："+v; tr.appendChild(td); })();
@@ -1638,17 +1641,18 @@ function probeProxy(p, btn){
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} });
 }
+function customRowKey(r){ r=r||{}; return String(r.id||r.name||""); }
 function mergeCustomRows(server, cached){
   server=server||[]; cached=cached||[];
-  var byName={}; var out=[];
-  for(var i=0;i<server.length;i++){ var s=server[i]||{}; var n=String(s.name||""); if(!n)continue; if(!byName[n]){ byName[n]=1; out.push(s); } }
-  for(var j=0;j<cached.length;j++){ var c=cached[j]||{}; var m=String(c.name||""); if(!m||byName[m])continue; byName[m]=1; out.push(c); }
+  var byKey={}; var out=[];
+  for(var i=0;i<server.length;i++){ var s=server[i]||{}; var n=customRowKey(s); if(!n)continue; if(!byKey[n]){ byKey[n]=1; out.push(s); } }
+  for(var j=0;j<cached.length;j++){ var c=cached[j]||{}; var m=customRowKey(c); if(!m||byKey[m])continue; byKey[m]=1; out.push(c); }
   return out;
 }
 function mergeCustomRowIntoCache(row){
-  row=row||{}; var n=String(row.name||""); if(!n)return;
+  row=row||{}; var n=customRowKey(row); if(!n)return;
   S.customAvail=S.customAvail||[];
-  for(var i=0;i<S.customAvail.length;i++){ if(String((S.customAvail[i]||{}).name||"")===n){ S.customAvail[i]=row; return; } }
+  for(var i=0;i<S.customAvail.length;i++){ if(customRowKey(S.customAvail[i])===n){ S.customAvail[i]=row; return; } }
   S.customAvail.push(row);
 }
 function probeCredential(k, btn){
@@ -1666,11 +1670,12 @@ function probeCredential(k, btn){
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} });
 }
 function probeCustom(c, btn){
-  var name=c.name||"";
+  var cid=String(c.id||c.name||"");
+  var name=String(c.name||cid||"");
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
-  return api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({name:name})}).then(function(res){
+  return api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({id:cid})}).then(function(res){
     var row=res.custom||null;
     if(row){ mergeCustomRowIntoCache(row); try{ renderHealth(); }catch(e){} }
     var st=row?customStatusLabel(String(row.status||"untested")):"未知";
@@ -1768,7 +1773,7 @@ function renderFallbackEditor(v){
   var fb=(v&&v.fallback)||{active:"",channels:[]};
   S.fbDraft={active:String(fb.active||""),channels:[]};
   (fb.channels||[]).forEach(function(ch){
-    S.fbDraft.channels.push({name:String(ch.name||""),base_url:String(ch.base_url||""),api_key:{id:String((ch.api_key&&ch.api_key.id)||""),display:String((ch.api_key&&ch.api_key.display)||"")},model:String(ch.model||""),protocol:fallbackProtocolValue(ch),reasoning_effort:fallbackEffortValue(ch)});
+    S.fbDraft.channels.push({id:String(ch.id||""),name:String(ch.name||""),base_url:String(ch.base_url||""),api_key:{id:String((ch.api_key&&ch.api_key.id)||""),display:String((ch.api_key&&ch.api_key.display)||"")},model:String(ch.model||""),protocol:fallbackProtocolValue(ch),reasoning_effort:fallbackEffortValue(ch)});
   });
   renderFallbackList();
   var err=$("fallback-error"); if(err)err.textContent="";
@@ -1777,11 +1782,45 @@ function fallbackChannelNames(){
   if(S.fbDraft&&S.fbDraft.channels)return S.fbDraft.channels.map(function(c){return String(c.name||"").trim();});
   return [];
 }
+function fallbackChannelIDs(){
+  if(S.fbDraft&&S.fbDraft.channels)return S.fbDraft.channels.map(function(c){return String(c.id||"").trim();});
+  return [];
+}
+function fallbackGenerateChannelID(){
+  var existing={}; try{ fallbackChannelIDs().forEach(function(v){ if(v)existing[v]=1; }); }catch(e){}
+  for(var t=0;t<20;t++){
+    var rand="";
+    try{
+      if(window.crypto&&crypto.getRandomValues){ var a=new Uint8Array(6); crypto.getRandomValues(a); for(var i=0;i<a.length;i++){ var h=a[i].toString(16); if(h.length<2)h="0"+h; rand+=h; } }
+    }catch(e){ rand=""; }
+    if(!rand){ rand=Math.floor(Math.random()*0xffffff).toString(16)+Math.floor(Math.random()*0xffffff).toString(16); }
+    var cand=("ch-"+rand).slice(0,32);
+    if(cand&&!existing[cand])return cand;
+  }
+  return "ch-"+String(Date.now()%1000000);
+}
+function fallbackDisplayNameForID(id){
+  id=String(id||"").trim(); if(!id)return "";
+  var cfgs=((S.config&&S.config.fallback&&S.config.fallback.channels)||[]);
+  for(var i=0;i<cfgs.length;i++){ if(String(cfgs[i].id||"")===id)return String(cfgs[i].name||id); }
+  var drafts=((S.fbDraft&&S.fbDraft.channels)||[]);
+  for(var j=0;j<drafts.length;j++){ if(String(drafts[j].id||"")===id&&drafts[j].name)return String(drafts[j].name); }
+  return id;
+}
+function fallbackIDForName(nm){
+  nm=String(nm||"").trim(); if(!nm)return "";
+  var drafts=((S.fbDraft&&S.fbDraft.channels)||[]);
+  for(var j=0;j<drafts.length;j++){ if(String(drafts[j].name||"").trim()===nm)return String(drafts[j].id||""); }
+  return "";
+}
 function syncFallbackActive(active){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
   var cur=(active!==undefined&&active!==null)?String(active):String(S.fbDraft.active||"");
-  var names=fallbackChannelNames();
-  if(cur&&names.indexOf(cur)<0)cur="";
+  var ids=fallbackChannelIDs();
+  if(cur&&ids.indexOf(cur)<0){
+    var byName=fallbackIDForName(cur);
+    cur=byName||"";
+  }
   S.fbDraft.active=cur;
   renderFallbackList();
 }
@@ -1796,14 +1835,16 @@ function renderFallbackList(){
     host.appendChild(fallbackListRow(ch, idx));
   });
 }
-function setFallbackActive(name){
+function setFallbackActive(id){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
-  S.fbDraft.active=String(name||"");
+  S.fbDraft.active=String(id||"");
   renderFallbackList();
 }
 function fallbackListRow(ch, idx){
-  var row=document.createElement("div"); row.className="fb-row"+(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name?" active":"");
-  var dot=document.createElement("span"); dot.className="pill "+(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name?"ok":"neutral"); dot.textContent=(String(S.fbDraft.active||"")===String(ch.name||"")&&ch.name)?"已启用":"未启用"; row.appendChild(dot);
+  var cid=String(ch.id||"");
+  var on=(cid&&String(S.fbDraft.active||"")===cid);
+  var row=document.createElement("div"); row.className="fb-row"+(on?" active":""); row.setAttribute("data-id",cid);
+  var dot=document.createElement("span"); dot.className="pill "+(on?"ok":"neutral"); dot.textContent=on?"已启用":"未启用"; row.appendChild(dot);
   var meta=document.createElement("div"); meta.className="meta";
   var nm=document.createElement("div"); nm.className="name"; nm.textContent=ch.name||"(未命名)"; meta.appendChild(nm);
   var sub=document.createElement("div"); sub.className="sub"; sub.textContent=(ch.model||"—")+" · "+(fallbackProtocolValue(ch)==="responses"?"Responses":"Chat Completions")+" · "+(ch.base_url||"—"); meta.appendChild(sub);
@@ -1812,9 +1853,9 @@ function fallbackListRow(ch, idx){
   edit.addEventListener("click",function(ev){ if(ev&&ev.stopPropagation)ev.stopPropagation(); openFallbackModal(idx); });
   row.appendChild(edit);
   row.addEventListener("click",function(){
-    var n=String(ch.name||"").trim(); if(!n){ toast("请先在编辑弹窗中填写渠道名称",true); return; }
-    if(String((S.fbDraft&&S.fbDraft.active)||"")===n)return;
-    setFallbackActive(n);
+    var cid2=String(ch.id||"").trim(); if(!cid2){ toast("请先在编辑弹窗中填写渠道名称",true); return; }
+    if(String((S.fbDraft&&S.fbDraft.active)||"")===cid2)return;
+    setFallbackActive(cid2);
     queueConfigSave(true);
   });
   return row;
@@ -1848,8 +1889,8 @@ function fallbackEndpointURL(base, protocol){
   return root+"/v1/chat/completions";
 }
 function fallbackProtocolValue(ch){ var p=String((ch&&ch.protocol)||"chat").trim().toLowerCase(); if(p==="responses")return "responses"; return "chat"; }
-function fallbackEffortValue(ch){ var e=String((ch&&ch.reasoning_effort)||"").trim().toLowerCase(); if(e==="low"||e==="medium"||e==="high")return e; return ""; }
-function fallbackEffortLabel(e){ if(e==="low")return "Low"; if(e==="medium")return "Medium"; if(e==="high")return "High"; return "供应商默认"; }
+function fallbackEffortValue(ch){ var e=String((ch&&ch.reasoning_effort)||"").trim().toLowerCase(); if(e==="inherit"||e==="low"||e==="medium"||e==="high")return e; return ""; }
+function fallbackEffortLabel(e){ if(e==="inherit")return "继承自请求"; if(e==="low")return "Low"; if(e==="medium")return "Medium"; if(e==="high")return "High"; return "供应商默认"; }
 function fillModelSelect(sel, current, list){
   clear(sel);
   current=String(current||"").trim();
@@ -1915,16 +1956,17 @@ function fallbackSecretById(candidates,savedId){
 function openFallbackModal(idx){
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
   var isNew=(idx===null||idx===undefined);
-  var ch=isNew?{name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat",reasoning_effort:""}:S.fbDraft.channels[idx];
+  var ch=isNew?{id:"",name:"",base_url:"",api_key:{id:"",display:""},model:"",protocol:"chat",reasoning_effort:""}:S.fbDraft.channels[idx];
   if(!ch)return;
-  S.fbModal={index:isNew?null:idx,origName:String(ch.name||""),origDisplay:String((ch.api_key&&ch.api_key.display)||""),origId:String((ch.api_key&&ch.api_key.id)||""),revealed:false,originalSecret:""};
+  var modalChanID=isNew?fallbackGenerateChannelID():String(ch.id||"");
+  S.fbModal={index:isNew?null:idx,chanID:modalChanID,origID:String(ch.id||""),origName:String(ch.name||""),origDisplay:String((ch.api_key&&ch.api_key.display)||""),origId:String((ch.api_key&&ch.api_key.id)||""),revealed:false,originalSecret:""};
   var title=$("fallback-modal-title"); if(title){ clear(title); title.appendChild(document.createTextNode(isNew?"新增备用渠道":"编辑备用渠道")); }
   var body=$("fallback-modal-body"); clear(body);
   var err=$("fallback-modal-error"); if(err)err.textContent="";
   var grid=document.createElement("div"); grid.className="config-item-grid"; body.appendChild(grid);
   var nameWrap=document.createElement("div"); nameWrap.className="field span-12";
-  var nameLabel=document.createElement("label"); nameLabel.textContent="渠道名称（唯一）"; nameWrap.appendChild(nameLabel);
-  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称（唯一）"; nameInput.setAttribute("data-role","fb-name"); nameInput.setAttribute("autocomplete","off"); nameInput.setAttribute("autocapitalize","off"); nameInput.setAttribute("autocorrect","off"); nameInput.setAttribute("spellcheck","false"); nameWrap.appendChild(nameInput);
+  var nameLabel=document.createElement("label"); nameLabel.textContent="渠道名称"; nameWrap.appendChild(nameLabel);
+  var nameInput=document.createElement("input"); nameInput.value=ch.name||""; nameInput.placeholder="渠道名称，如 OpenCode Go"; nameInput.setAttribute("data-role","fb-name"); nameInput.setAttribute("autocomplete","off"); nameInput.setAttribute("autocapitalize","off"); nameInput.setAttribute("autocorrect","off"); nameInput.setAttribute("spellcheck","false"); nameWrap.appendChild(nameInput);
   grid.appendChild(nameWrap);
   var protoWrap=document.createElement("div"); protoWrap.className="field span-3";
   var protoLabelEl=document.createElement("label"); protoLabelEl.textContent="接口协议"; protoWrap.appendChild(protoLabelEl);
@@ -1941,7 +1983,7 @@ function openFallbackModal(idx){
   var effortWrap=document.createElement("div"); effortWrap.className="field span-4";
   var effortLabel=document.createElement("label"); effortLabel.textContent="思考强度"; effortWrap.appendChild(effortLabel);
   var effortSel=document.createElement("select"); effortSel.setAttribute("data-role","fb-effort");
-  [["","供应商默认"],["low","Low"],["medium","Medium"],["high","High"]].forEach(function(pair){ var o=document.createElement("option"); o.value=pair[0]; o.textContent=pair[1]; effortSel.appendChild(o); });
+  [["","供应商默认"],["inherit","继承自请求"],["low","Low"],["medium","Medium"],["high","High"]].forEach(function(pair){ var o=document.createElement("option"); o.value=pair[0]; o.textContent=pair[1]; effortSel.appendChild(o); });
   effortSel.value=fallbackEffortValue(ch);
   effortWrap.appendChild(effortSel);
   grid.appendChild(effortWrap);
@@ -1951,9 +1993,9 @@ function openFallbackModal(idx){
   var savedId=String((ch.api_key&&ch.api_key.id)||"");
   var pendingNew=String(ch._newKey||"");
   var keyRow=document.createElement("div"); keyRow.className="key-row";
-  var keyInput=document.createElement("input"); keyInput.type="password"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.autocomplete="new-password";
-  if(!isNew&&(savedDisplay||savedId)){ keyInput.value=pendingNew||savedDisplay||""; }
-  else { keyInput.value=pendingNew||""; keyInput.placeholder="填写 API 密钥"; }
+  var keyInput=document.createElement("input"); keyInput.type="text"; keyInput.setAttribute("data-role","fb-key-new"); keyInput.setAttribute("autocomplete","off"); keyInput.setAttribute("autocapitalize","off"); keyInput.setAttribute("autocorrect","off"); keyInput.setAttribute("spellcheck","false"); keyInput.classList.add("masked");
+  if(!isNew&&(savedDisplay||savedId)){ keyInput.value=pendingNew||savedDisplay||""; keyInput.classList.add("masked"); }
+  else { keyInput.value=pendingNew||""; keyInput.placeholder="填写 API 密钥"; keyInput.classList.add("masked"); }
   keyRow.appendChild(keyInput);
   var keyToggle=document.createElement("button"); keyToggle.type="button"; keyToggle.className="icon-btn"; keyToggle.setAttribute("data-role","fb-key-toggle"); keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); keyRow.appendChild(keyToggle);
   var eyeSvgNS="http://www.w3.org/2000/svg";
@@ -1970,22 +2012,21 @@ function openFallbackModal(idx){
     else { keyToggle.setAttribute("aria-label","显示密钥"); keyToggle.setAttribute("title","显示密钥"); }
     clear(keyToggle); keyToggle.appendChild(fbEyeIcon(open));
   }
-  setEye(false);
+  function setMasked(masked){ try{ if(masked)keyInput.classList.add("masked"); else keyInput.classList.remove("masked"); }catch(e){} setEye(!masked); }
+  setMasked(true);
   keyToggle.addEventListener("click",function(){
     var st=S.fbModal||{};
     if(st.revealed){
       if(!isNew){ keyInput.value=savedDisplay||""; }
       else { keyInput.value=""; }
-      keyInput.type="password";
-      st.revealed=false; st.originalSecret=""; setEye(false);
-      return;
+      setMasked(true);
+      st.revealed=false; st.originalSecret=""; return;
     }
     if(isNew){
-      keyInput.type=(keyInput.type==="password"?"text":"password");
-      setEye(keyInput.type==="text");
-      return;
+      var maskedNow=false; try{ maskedNow=keyInput.classList.contains("masked"); }catch(e){}
+      setMasked(!maskedNow); return;
     }
-    if(!savedId){ keyInput.type=(keyInput.type==="password"?"text":"password"); setEye(keyInput.type==="text"); return; }
+    if(!savedId){ var m2=false; try{ m2=keyInput.classList.contains("masked"); }catch(e){} setMasked(!m2); return; }
     keyToggle.disabled=true;
     revealConfig().then(function(v){
       var chans=((v&&v.fallback&&v.fallback.channels)||[]);
@@ -1993,7 +2034,7 @@ function openFallbackModal(idx){
       var savedSecretId=String((st.origId||savedId)||"");
       var candidates=[];
       for(var i=0;i<chans.length;i++){
-        if(String(chans[i].name||"")===String(st.origName||"")){
+        if(String(chans[i].id||"")===String(st.chanID||st.origID||"")||String(chans[i].name||"")===String(st.origName||"")){
           var rk=rawOf(chans[i]); if(rk)candidates.push(rk);
         }
       }
@@ -2003,7 +2044,7 @@ function openFallbackModal(idx){
     }).then(function(found){
       if(!found)throw new Error("未找到该渠道密钥");
       st.originalSecret=found; st.revealed=true;
-      keyInput.value=found; keyInput.type="text"; setEye(true);
+      keyInput.value=found; setMasked(false);
     }).catch(function(err){ toast((err&&err.message)||"查看失败",true); })
     .then(function(){ keyToggle.disabled=false; });
   });
@@ -2057,7 +2098,7 @@ function openFallbackModal(idx){
     var kp=fbKeyPayload();
     if(!kp){ toast("请先填写 API 密钥",true); return; }
     var payload={base_url:base,api_key:kp};
-    if(!isNew&&ch.name)payload.channel=String(ch.name||"");
+    if(!isNew&&ch.id)payload.channel=String(ch.id||"");
     discBtn.disabled=true; discBtn.textContent="获取中…";
     (function(){
       var headers={"Accept":"application/json","Content-Type":"application/json"};
@@ -2108,7 +2149,7 @@ function closeFallbackModal(){
   try{
     var st0=(typeof S!=="undefined"&&S&&S.fbModal)?S.fbModal:null;
     var ki=st0&&st0.fields&&st0.fields.keyInput;
-    if(ki){ try{ki.value="";}catch(e){} try{ki.type="password";}catch(e){} try{ki.removeAttribute("value");}catch(e){} }
+    if(ki){ try{ki.value="";}catch(e){} try{ki.classList.add("masked");}catch(e){} try{ki.removeAttribute("value");}catch(e){} }
   }catch(e){}
   var m=$("fallback-modal"); if(m)m.classList.add("hidden");
   var b=$("fallback-modal-body"); if(b)clear(b);
@@ -2123,7 +2164,7 @@ function saveFallbackModal(){
   var base=String((f.baseInput&&f.baseInput.value)||"").trim();
   var proto=String((f.protoSel&&f.protoSel.value)||"chat").toLowerCase()!=="responses"?"chat":"responses";
   var effort=String((f.effortSel&&f.effortSel.value)||"").trim().toLowerCase();
-  if(effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
+  if(effort!=="inherit"&&effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
   var model=String((f.modelSel&&f.modelSel.value)||"").trim();
   var nv=String((f.keyInput&&f.keyInput.value)||"").trim();
   var kid=String((f.keyHidden&&f.keyHidden.value)||"").trim();
@@ -2134,10 +2175,13 @@ function saveFallbackModal(){
   if(!nv&&!kid){ if(errEl)errEl.textContent="请填写 API 密钥"; toast("请填写 API 密钥",true); return; }
   if(!S.fbDraft)S.fbDraft={active:"",channels:[]};
   var chans=S.fbDraft.channels;
-  for(var i=0;i<chans.length;i++){ if(i!==st.index&&String(chans[i].name||"").trim()===name){ if(errEl)errEl.textContent="渠道名称 "+name+" 重复"; toast("渠道名称 "+name+" 重复",true); return; } }
+  var chanID=isNew?String(st.chanID||fallbackGenerateChannelID()):String((chans[st.index]&&chans[st.index].id)||st.origID||st.chanID||"");
+  if(!chanID){ if(errEl)errEl.textContent="渠道 ID 生成失败"; toast("渠道 ID 生成失败",true); return; }
+  for(var i=0;i<chans.length;i++){ if(i!==st.index&&String(chans[i].id||"").trim()===chanID){ if(errEl)errEl.textContent="渠道 ID "+chanID+" 重复"; toast("渠道 ID "+chanID+" 重复",true); return; } }
+  for(var j=0;j<chans.length;j++){ if(j!==st.index&&String(chans[j].name||"").trim()===name){ if(errEl)errEl.textContent="渠道名称 "+name+" 重复"; toast("渠道名称 "+name+" 重复",true); return; } }
   var backup={channels:chans.slice(),active:String(S.fbDraft.active||"")};
   var pushed=false;
-  var entry={name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
+  var entry={id:chanID,name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
   if(isNew){
     entry.api_key={id:"",display:""};
     entry._newKey=nv;
@@ -2151,10 +2195,7 @@ function saveFallbackModal(){
     if(nv===origDisp||(origSec&&nv===origSec)){ delete entry._newKey; }
     else if(nv){ entry._newKey=nv; }
     else { delete entry._newKey; }
-    var oldName=String(st.origName||old.name||"");
     chans[st.index]=entry;
-    var mapped=mapFallbackActiveOnRename(String(S.fbDraft.active||""),oldName,name);
-    S.fbDraft.active=mapped;
   }
   var saveBtn=$("fallback-modal-save"); if(saveBtn)saveBtn.disabled=true;
   return saveConfigAndWait().then(function(res){
@@ -2169,7 +2210,7 @@ function saveFallbackModal(){
       try{
         var cur=S.fbDraft.channels[st.index];
         if(cur){
-          var re={name:name,base_url:base,api_key:{id:kid,display:String((cur.api_key&&cur.api_key.display)||"")},model:model,protocol:proto,reasoning_effort:effort};
+          var re={id:chanID,name:name,base_url:base,api_key:{id:kid,display:String((cur.api_key&&cur.api_key.display)||"")},model:model,protocol:proto,reasoning_effort:effort};
           if(nv&&nv!==String(st.origDisplay||"")&&nv!==String(st.originalSecret||""))re._newKey=nv;
           S.fbDraft.channels[st.index]=re;
         }
@@ -2177,11 +2218,11 @@ function saveFallbackModal(){
     } else if(pushed){
       try{
         for(var k=S.fbDraft.channels.length-1;k>=0;k--){
-          if(String(S.fbDraft.channels[k].name||"")===name&&S.fbDraft.channels[k]._newKey===nv){ S.fbDraft.channels.splice(k,1); break; }
+          if(String(S.fbDraft.channels[k].id||"")===chanID&&S.fbDraft.channels[k]._newKey===nv){ S.fbDraft.channels.splice(k,1); break; }
         }
       }catch(e){}
       try{
-        var draftEntry={name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
+        var draftEntry={id:chanID,name:name,base_url:base,api_key:{id:kid,display:""},model:model,protocol:proto,reasoning_effort:effort};
         if(nv)draftEntry._newKey=nv;
         S.fbDraft.channels.push(draftEntry);
       }catch(e){}
@@ -2195,9 +2236,9 @@ function deleteFallbackModal(){
   if(!S.fbDraft||!S.fbDraft.channels||!S.fbDraft.channels[st.index]){ closeFallbackModal(); return; }
   var errEl=$("fallback-modal-error"); if(errEl)errEl.textContent="";
   var backup={channels:S.fbDraft.channels.slice(),active:String(S.fbDraft.active||"")};
-  var name=String(S.fbDraft.channels[st.index].name||"");
+  var delID=String(S.fbDraft.channels[st.index].id||"");
   S.fbDraft.channels.splice(st.index,1);
-  if(String(S.fbDraft.active||"")===name)S.fbDraft.active="";
+  if(delID&&String(S.fbDraft.active||"")===delID)S.fbDraft.active="";
   var delBtn=$("fallback-modal-delete"); if(delBtn)delBtn.disabled=true;
   return saveConfigAndWait().then(function(res){
     if(delBtn)delBtn.disabled=false;
@@ -2498,16 +2539,17 @@ function fallbackInputs(){
   var out=[];
   for(var i=0;i<S.fbDraft.channels.length;i++){
     var c=S.fbDraft.channels[i];
+    var cid=String(c.id||"").trim();
     var name=String(c.name||"").trim();
     var base=String(c.base_url||"").trim();
     var model=String(c.model||"").trim();
     var proto=String(c.protocol||"chat").toLowerCase()!=="responses"?"chat":"responses";
     var effort=String(c.reasoning_effort||"").trim().toLowerCase();
-    if(effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
+    if(effort!=="inherit"&&effort!=="low"&&effort!=="medium"&&effort!=="high")effort="";
     var nv=String(c._newKey||"").trim();
     var id=String((c.api_key&&c.api_key.id)||"").trim();
     var key=nv?{value:nv}:(id?{id:id}:{value:""});
-    out.push({name:name,base_url:base,api_key:key,model:model,protocol:proto,reasoning_effort:effort});
+    out.push({id:cid,name:name,base_url:base,api_key:key,model:model,protocol:proto,reasoning_effort:effort});
   }
   return out;
 }
@@ -2547,6 +2589,9 @@ function collectConfigUpdate(){
   var cfgWebui=((S.config&&S.config.webui)||{});
   var fbChannels=fallbackInputs();
   var fbActive=(S.fbDraft&&S.fbDraft.active)||"";
+  var seenFbID={}, dupFbID="";
+  fbChannels.forEach(function(c){ if(c.id){ if(seenFbID[c.id])dupFbID=c.id; seenFbID[c.id]=1; } });
+  if(dupFbID){ try{$("fallback-error").textContent="渠道 ID "+dupFbID+" 重复，请先去重再保存。";}catch(e){} return {ok:false,error:"备用渠道 ID "+dupFbID+" 重复，禁止保存"}; }
   var seenFb={}, dupFb="";
   fbChannels.forEach(function(c){ if(c.name){ if(seenFb[c.name])dupFb=c.name; seenFb[c.name]=1; } });
   if(dupFb){ try{$("fallback-error").textContent="渠道名称 "+dupFb+" 重复，请先去重再保存。";}catch(e){} return {ok:false,error:"备用渠道名称 "+dupFb+" 重复，禁止保存"}; }

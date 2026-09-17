@@ -853,10 +853,13 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	if strings.TrimSpace(binding.Model) != "" {
 		effectiveRoute.ID = strings.TrimSpace(binding.Model)
 	}
-	if binding.Name == "" {
+	if strings.TrimSpace(binding.ID) == "" && strings.TrimSpace(binding.Name) == "" {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	ch, ok := fallbackChannelByName(g.cfg, binding.Name)
+	ch, ok := fallbackChannelLookup(g.cfg, binding.ID)
+	if !ok && strings.TrimSpace(binding.Name) != "" {
+		ch, ok = fallbackChannelLookup(g.cfg, binding.Name)
+	}
 	if !ok || !binding.matchesChannel(ch) {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
@@ -895,7 +898,10 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 		}
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, true, nil
 	}
-	current, exists := fallbackChannelByName(g.cfg, stored.Name)
+	current, exists := fallbackChannelLookup(g.cfg, stored.ID)
+	if !exists && strings.TrimSpace(stored.Name) != "" {
+		current, exists = fallbackChannelLookup(g.cfg, stored.Name)
+	}
 	if !exists || !stored.matchesChannel(current) {
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom

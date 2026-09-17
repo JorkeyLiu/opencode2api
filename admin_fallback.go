@@ -9,6 +9,7 @@ import (
 )
 
 type FallbackChannelView struct {
+	ID              string     `json:"id"`
 	Name            string     `json:"name"`
 	BaseURL         string     `json:"base_url"`
 	APIKey          SecretView `json:"api_key"`
@@ -23,6 +24,7 @@ type FallbackView struct {
 }
 
 type FallbackChannelInput struct {
+	ID              string      `json:"id"`
 	Name            string      `json:"name"`
 	BaseURL         string      `json:"base_url"`
 	APIKey          SecretInput `json:"api_key"`
@@ -40,6 +42,7 @@ func fallbackViewFromConfig(cfg Config) FallbackView {
 	view := FallbackView{Active: cfg.Fallback.Active, Channels: []FallbackChannelView{}}
 	for _, ch := range cfg.Fallback.Channels {
 		view.Channels = append(view.Channels, FallbackChannelView{
+			ID:              ch.ID,
 			Name:            ch.Name,
 			BaseURL:         ch.BaseURL,
 			APIKey:          SecretView{ID: secretFingerprint(ch.APIKey), Display: maskValue(ch.APIKey)},
@@ -71,6 +74,23 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 		}
 		known[fp] = ch.APIKey
 	}
+	// Masked-secret resolution is keyed by stable channel ID. Legacy inputs
+	// without an ID derive it deterministically (same rule as config
+	// normalization) so old name-only payloads keep resolving.
+	sameID := map[string]map[string]string{}
+	for _, ch := range current.Channels {
+		id := strings.TrimSpace(ch.ID)
+		if id == "" {
+			id = fallbackDeriveChannelID(ch.Name)
+		}
+		if id == "" {
+			continue
+		}
+		if _, ok := sameID[id]; !ok {
+			sameID[id] = map[string]string{}
+		}
+		sameID[id][secretFingerprint(ch.APIKey)] = ch.APIKey
+	}
 	sameName := map[string]map[string]string{}
 	for _, ch := range current.Channels {
 		if _, ok := sameName[ch.Name]; !ok {
@@ -80,9 +100,15 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 	}
 	out := FallbackConfig{Active: strings.TrimSpace(input.Active), Channels: []FallbackChannelConfig{}}
 	for _, ch := range input.Channels {
+		id := strings.TrimSpace(ch.ID)
 		name := strings.TrimSpace(ch.Name)
 		base := strings.TrimSpace(ch.BaseURL)
 		model := strings.TrimSpace(ch.Model)
+		if id == "" {
+			// Backward compat: legacy payloads without id derive
+			// deterministically from the display name.
+			id = fallbackDeriveChannelID(name)
+		}
 		if name == "" || base == "" || model == "" {
 			return FallbackConfig{}, errors.New("fallback channels require name, base_url and model")
 		}
@@ -91,17 +117,24 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 		case strings.TrimSpace(ch.APIKey.Value) != "":
 			key = strings.TrimSpace(ch.APIKey.Value)
 		case strings.TrimSpace(ch.APIKey.ID) != "":
-			id := strings.TrimSpace(ch.APIKey.ID)
-			if m, ok := sameName[name]; ok {
-				if v, ok := m[id]; ok {
+			sid := strings.TrimSpace(ch.APIKey.ID)
+			if m, ok := sameID[id]; ok {
+				if v, ok := m[sid]; ok {
 					key = v
 					break
 				}
 			}
-			if ambiguous[id] {
+			// Legacy fallback: same display-name scoping for old drafts.
+			if m, ok := sameName[name]; ok {
+				if v, ok := m[sid]; ok {
+					key = v
+					break
+				}
+			}
+			if ambiguous[sid] {
 				return FallbackConfig{}, errors.New("unknown or stale secret id")
 			}
-			v, ok := known[id]
+			v, ok := known[sid]
 			if !ok {
 				return FallbackConfig{}, errors.New("unknown or stale secret id")
 			}
@@ -109,7 +142,7 @@ func resolveFallbackInput(input FallbackInput, current FallbackConfig) (Fallback
 		default:
 			return FallbackConfig{}, errors.New("fallback channel api_key must contain id or value")
 		}
-		out.Channels = append(out.Channels, FallbackChannelConfig{Name: name, BaseURL: base, APIKey: key, Model: model, Protocol: ch.Protocol, ReasoningEffort: ch.ReasoningEffort})
+		out.Channels = append(out.Channels, FallbackChannelConfig{ID: id, Name: name, BaseURL: base, APIKey: key, Model: model, Protocol: ch.Protocol, ReasoningEffort: ch.ReasoningEffort})
 	}
 	if err := validateFallbackConfig(&out); err != nil {
 		return FallbackConfig{}, err
@@ -205,16 +238,20 @@ func (a *AdminServer) handleFallbackDiscover(w http.ResponseWriter, r *http.Requ
 	baseInput := strings.TrimSpace(input.BaseURL)
 	value := strings.TrimSpace(input.APIKey.Value)
 	id := strings.TrimSpace(input.APIKey.ID)
-	channelName := strings.TrimSpace(input.Channel)
+	channelRef := strings.TrimSpace(input.Channel)
 	base := ""
 	key := ""
-	if channelName != "" {
-		ch, ok := fallbackChannelByName(cfg, channelName)
+	channelName := channelRef
+	if channelRef != "" {
+		// Channel reference is the stable ID; legacy display names still
+		// resolve for backward compatibility.
+		ch, ok := fallbackChannelLookup(cfg, channelRef)
 		if !ok {
-			a.logFallbackDiscover(channelName, baseInput, "unknown_channel", false)
+			a.logFallbackDiscover(channelRef, baseInput, "unknown_channel", false)
 			writeAdminError(w, http.StatusBadRequest, "unknown_channel", "fallback channel does not exist")
 			return
 		}
+		channelName = ch.Name
 		savedBaseNorm := normalizeFallbackBaseURL(ch.BaseURL)
 		if baseInput == "" {
 			base = ch.BaseURL

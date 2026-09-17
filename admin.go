@@ -412,7 +412,7 @@ func (a *AdminServer) handleReveal(w http.ResponseWriter, r *http.Request) {
 	}
 	fallbackChannels := make([]any, 0, len(cfg.Fallback.Channels))
 	for _, ch := range cfg.Fallback.Channels {
-		fallbackChannels = append(fallbackChannels, map[string]any{"name": ch.Name, "base_url": ch.BaseURL, "api_key": ch.APIKey, "model": ch.Model, "protocol": string(fallbackChannelProtocol(ch)), "reasoning_effort": fallbackChannelEffort(ch)})
+		fallbackChannels = append(fallbackChannels, map[string]any{"id": ch.ID, "name": ch.Name, "base_url": ch.BaseURL, "api_key": ch.APIKey, "model": ch.Model, "protocol": string(fallbackChannelProtocol(ch)), "reasoning_effort": fallbackChannelEffort(ch)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"server_keys": cfg.ServerKeys, "keys": cfg.Keys, "proxy_pools": pools, "fallback": map[string]any{"active": cfg.Fallback.Active, "channels": fallbackChannels}})
 }

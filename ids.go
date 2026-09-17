@@ -286,16 +286,25 @@ func parentWireSession(rawParent string) string {
 	return buildWireSession(trimmed, "wire-parent-v1")
 }
 
-// Deterministic bulk-probe wire identity: fixed signals, stateless, never
-// touching scheduler route sessions or pins.
-func bulkProbeWireSession() string {
-	return buildWireSession("opencode2api:bulk-probe:session:v1", "wire-probe-session-v1")
-}
+// Deterministic bulk-probe internal identity: fixed signals, stateless, never
+// touching scheduler route sessions or pins. Probes reuse the normal gateway
+// construction path: the internal IDs below are mapped to wire values only
+// through requestWireID/projectWireID, and the upstream route session is the
+// stateless first generation deriveFirstRouteSession for the probe client
+// session plus the target-bound scope, encoded via routeWireSession. Header
+// and body therefore share one internally consistent canonical triple.
+const (
+	bulkProbeClientSessionSignal = "opencode2api:bulk-probe:session:v1"
+	bulkProbeRequestSignal       = "opencode2api:bulk-probe:request:v1"
+	bulkProbeProjectSignal       = "opencode2api:bulk-probe:project:v1"
+)
 
-func bulkProbeWireRequest() string {
-	return buildWireRequest("opencode2api:bulk-probe:request:v1", "wire-probe-request-v1")
-}
-
-func bulkProbeWireProject() string {
-	return buildWireProject("opencode2api:bulk-probe:project:v1", "wire-probe-project-v1")
+// bulkProbeIDs returns the fixed scheduler-neutral internal identity for
+// availability minimal-inference probes.
+func bulkProbeIDs() requestIDs {
+	return requestIDs{
+		Session: bulkProbeClientSessionSignal,
+		Request: bulkProbeRequestSignal,
+		Project: bulkProbeProjectSignal,
+	}
 }

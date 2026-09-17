@@ -379,7 +379,7 @@ type UsagePeriod struct {
 	Models   map[string]TokenCounts `json:"models"`
 	Tiers    map[string]TokenCounts `json:"tiers"`
 	// Channels is the additive channel-qualified usage map. For custom
-	// fallback traffic the key is "custom:<channelName>" (old "custom"
+	// fallback traffic the key is "custom:<channelID>" (old "custom"
 	// records keep that key); zen/go traffic uses its observability
 	// channel ("anonymous"/"key"). Tiers stays aggregated for
 	// compatibility (tiers.custom remains the total).
@@ -975,8 +975,8 @@ func normalizeProxyLabel(value string) string {
 // future credential types collapse here: the shared public credential uses
 // the stable literal, authenticated keys use their (already suffix-only)
 // display ID qualified by channel. Custom channels never double-prefix:
-// KeyID already carries "custom:<name>" (old and new records), so it is
-// returned directly instead of "custom:custom:<name>".
+// KeyID already carries "custom:<id>" (old and new records), so it is
+// returned directly instead of "custom:custom:<id>".
 func resourceCredentialID(attempt UpstreamAttempt) string {
 	if attempt.Anonymous || attempt.KeyID == anonymousCredentialID || attempt.Channel == anonymousCredentialID {
 		return anonymousCredentialID

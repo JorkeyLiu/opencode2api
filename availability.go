@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -81,12 +82,22 @@ type bulkCredentialAvailability struct {
 }
 
 type bulkCustomAvailability struct {
+	ID          string     `json:"id,omitempty"`
 	Name        string     `json:"name"`
 	BaseURL     string     `json:"base_url"`
 	Model       string     `json:"model"`
 	Status      string     `json:"status"`
 	Reason      string     `json:"reason,omitempty"`
 	LastChecked *time.Time `json:"last_checked,omitempty"`
+}
+
+// customAvailabilityKey returns the stable machine key for a custom row:
+// the channel ID when present, otherwise the legacy display name.
+func customAvailabilityKey(c bulkCustomAvailability) string {
+	if strings.TrimSpace(c.ID) != "" {
+		return strings.TrimSpace(c.ID)
+	}
+	return strings.TrimSpace(c.Name)
 }
 
 type bulkAvailabilitySnapshot struct {
@@ -390,43 +401,83 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	return resp
 }
 
+// bulkProbeScope returns the same target-bound route-session scope the
+// gateway uses for one candidate: upstream authority, tier, internal
+// credential identity, pool, raw proxy (proxy-affine for anonymous only),
+// and target protocol. Model is excluded, matching gateway semantics.
+func bulkProbeScope(base string, tgt bulkSendTarget, protocol Protocol) routeSessionScope {
+	cand := targetCandidate{Tier: tgt.Tier, CredID: tgt.CredID, PoolName: tgt.PoolName, ProxyRaw: tgt.Raw}
+	return routeScopeForCandidate(base, cand, protocol)
+}
+
+// bulkProbeCanonicalBody builds the probe body through the single gateway
+// preparation path: minimal client payload for the lane protocol,
+// prepareUpstreamRequest normalization (same-protocol passthrough plus
+// target-protocol reasoning repair), then applyRouteSessionToBody for the
+// target-bound route session (Responses prompt_cache_key/store defaults).
+// Body model and protocol stay aligned to the directory-driven selection.
+func bulkProbeCanonicalBody(model string, protocol Protocol, baseURL, routeSession string) ([]byte, error) {
+	var input map[string]any
+	switch protocol {
+	case ProtocolResponses:
+		input = map[string]any{"model": model, "input": "hi", "max_output_tokens": 1, "stream": false}
+	case ProtocolAnthropic:
+		input = map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1}
+	default:
+		input = map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1, "stream": false}
+	}
+	prepared, err := prepareUpstreamRequest(protocol, protocol, input, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err := json.Marshal(prepared)
+	if err != nil {
+		return nil, errors.New("request contains unsupported JSON values")
+	}
+	return applyRouteSessionToBody(canonical, routeSession, protocol, false)
+}
+
+// buildBulkProbeRequest constructs one scheduler-neutral minimal-inference
+// probe through the shared gateway helpers only: bulkProbeScope for the
+// target-bound scope, stateless deriveFirstRouteSession (never the scheduler
+// override store), bulkProbeCanonicalBody for preparation, and
+// newUpstreamRequest for endpoint/auth/OpenCode/protocol headers. It never
+// reads scheduler cooldowns, route-session overrides, or pins, and never
+// writes metrics/history. Header and body share one internally consistent
+// canonical session/request/project triple.
+func buildBulkProbeRequest(ctx context.Context, base string, tgt bulkSendTarget, protocol Protocol, model string) (*http.Request, requestIDs, string, []byte, error) {
+	ids := bulkProbeIDs()
+	scope := bulkProbeScope(base, tgt, protocol)
+	routeSession := deriveFirstRouteSession(ids.Session, scope)
+	body, err := bulkProbeCanonicalBody(model, protocol, base, routeSession)
+	if err != nil {
+		return nil, ids, routeSession, nil, err
+	}
+	req, err := newUpstreamRequest(ctx, base, protocol, body, ids, tgt.CredKey, routeSession)
+	if err != nil {
+		return nil, ids, routeSession, nil, err
+	}
+	return req, ids, routeSession, body, nil
+}
+
 func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulkSendResult {
 	base := g.cfg.Upstream.Zen
 	protocol := tgt.ProbeProtocol
 	if protocol != ProtocolChat && protocol != ProtocolResponses && protocol != ProtocolAnthropic {
 		protocol = ProtocolChat
 	}
-	model := tgt.ProbeModel
-	if strings.TrimSpace(model) == "" {
-		return bulkSendResult{Target: tgt, StartedNanos: time.Now().UnixNano(), ParseError: true}
-	}
-	body, err := bulkProbeRequestBody(strings.TrimSpace(model), protocol)
-	if err != nil {
+	model := strings.TrimSpace(tgt.ProbeModel)
+	if model == "" {
 		return bulkSendResult{Target: tgt, StartedNanos: time.Now().UnixNano(), ParseError: true}
 	}
 	sendCtx, cancel := context.WithTimeout(parent, bulkPerSendTimeout)
 	defer cancel()
 	started := time.Now()
 	startedNanos := started.UnixNano()
-	req, err := http.NewRequestWithContext(sendCtx, http.MethodPost, strings.TrimRight(base, "/")+protocolPath(protocol), bytes.NewReader(body))
+	req, _, _, _, err := buildBulkProbeRequest(sendCtx, base, tgt, protocol, model)
 	if err != nil {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: max(time.Since(started).Milliseconds(), 0), TransportErr: err, AdminCancelled: parent.Err() != nil, ProbeContextCaused: sendCtx.Err() != nil}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if protocol == ProtocolAnthropic {
-		req.Header.Set("x-api-key", tgt.CredKey)
-	} else {
-		req.Header.Set("Authorization", "Bearer "+tgt.CredKey)
-	}
-	// Official OpenCode wire identity for Zen/Go probes: deterministic
-	// canonical session/request/project, stateless and scheduler-neutral.
-	// No generic affinity headers; custom fallback probes stay separate.
-	req.Header.Set("User-Agent", opencodeWireUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
-	req.Header.Set("x-opencode-session", bulkProbeWireSession())
-	req.Header.Set("x-opencode-request", bulkProbeWireRequest())
-	req.Header.Set("x-opencode-project", bulkProbeWireProject())
 	resp, err := tgt.Proxy.client.Do(req)
 	durationMS := max(time.Since(started).Milliseconds(), 0)
 	if err != nil {

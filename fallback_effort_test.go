@@ -163,9 +163,56 @@ func TestFallbackEffortResponsesPreservesMap(t *testing.T) {
 	}
 }
 
-func TestFallbackEffortEmptyNeverOverrides(t *testing.T) {
-	ch := FallbackChannelConfig{Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolChat, ReasoningEffort: ""}
-	// Chat client already carries reasoning_effort: empty channel must not wipe it.
+func TestFallbackEffortEmptyStripsSupplierDefault(t *testing.T) {
+	ch := FallbackChannelConfig{ID: "c", Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolChat, ReasoningEffort: ""}
+	// Chat client already carries reasoning_effort: supplier-default must strip it.
+	got, err := buildFallbackRequestBody(effortPayload("m", ProtocolChat, map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "reasoning_effort": "medium"}), true, nil, modelRoute{}, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Fatalf("supplier-default must strip chat reasoning_effort, got %v", body["reasoning_effort"])
+	}
+	if _, ok := body["reasoning"]; ok {
+		t.Fatalf("supplier-default must strip chat reasoning, got %v", body["reasoning"])
+	}
+	// Responses supplier-default must remove the target reasoning control.
+	respCh := FallbackChannelConfig{ID: "c", Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolResponses, ReasoningEffort: ""}
+	converted := map[string]any{"model": "cm", "input": "hi", "reasoning": map[string]any{"effort": "high"}}
+	applyFallbackReasoningEffort(converted, fallbackChannelEffort(respCh), ProtocolResponses)
+	if _, ok := converted["reasoning"]; ok {
+		t.Fatalf("supplier-default must strip responses reasoning: %v", converted)
+	}
+	// History/content fields unrelated to strength must survive stripping.
+	histChat := map[string]any{"model": "cm", "messages": []any{map[string]any{"role": "assistant", "content": "hi", "reasoning_content": "kept"}}, "reasoning_effort": "high"}
+	applyFallbackReasoningEffort(histChat, "", ProtocolChat)
+	if _, ok := histChat["reasoning_effort"]; ok {
+		t.Fatal("strength must be stripped")
+	}
+	msgs, _ := histChat["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("history messages must survive: %v", histChat["messages"])
+	}
+	if m, _ := msgs[0].(map[string]any); m["reasoning_content"] != "kept" {
+		t.Fatalf("reasoning_content history must survive: %v", m)
+	}
+	histResp := map[string]any{"model": "cm", "input": []any{map[string]any{"type": "reasoning", "summary": "kept"}}, "reasoning": map[string]any{"effort": "high"}}
+	applyFallbackReasoningEffort(histResp, "", ProtocolResponses)
+	if _, ok := histResp["reasoning"]; ok {
+		t.Fatal("responses strength must be stripped")
+	}
+	if _, ok := histResp["input"]; !ok {
+		t.Fatal("responses input history must survive")
+	}
+}
+
+func TestFallbackEffortInheritPreserves(t *testing.T) {
+	// Inherit preserves the converted strength; absent strength injects nothing.
+	ch := FallbackChannelConfig{ID: "c", Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolChat, ReasoningEffort: "inherit"}
 	got, err := buildFallbackRequestBody(effortPayload("m", ProtocolChat, map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "reasoning_effort": "medium"}), true, nil, modelRoute{}, ch)
 	if err != nil {
 		t.Fatal(err)
@@ -175,14 +222,23 @@ func TestFallbackEffortEmptyNeverOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body["reasoning_effort"] != "medium" {
-		t.Fatalf("empty effort must preserve client reasoning_effort, got %v", body["reasoning_effort"])
+		t.Fatalf("inherit must preserve converted chat strength, got %v", body["reasoning_effort"])
 	}
-	// Responses with empty channel must not inject a reasoning key.
-	respCh := FallbackChannelConfig{Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolResponses, ReasoningEffort: ""}
-	converted := map[string]any{"model": "cm", "input": "hi"}
+	respCh := FallbackChannelConfig{ID: "c", Name: "c", BaseURL: "https://a.example", APIKey: "k", Model: "cm", Protocol: ProtocolResponses, ReasoningEffort: "inherit"}
+	converted := map[string]any{"model": "cm", "input": "hi", "reasoning": map[string]any{"effort": "high", "summary": "auto"}}
 	applyFallbackReasoningEffort(converted, fallbackChannelEffort(respCh), ProtocolResponses)
-	if _, ok := converted["reasoning"]; ok {
-		t.Fatalf("empty effort must not inject reasoning: %v", converted)
+	if got, ok := converted["reasoning"].(map[string]any); !ok || got["effort"] != "high" {
+		t.Fatalf("inherit must preserve responses reasoning: %v", converted["reasoning"])
+	}
+	empty := map[string]any{"model": "cm", "input": "hi"}
+	applyFallbackReasoningEffort(empty, "inherit", ProtocolResponses)
+	if _, ok := empty["reasoning"]; ok {
+		t.Fatalf("inherit with no strength must inject nothing: %v", empty)
+	}
+	emptyChat := map[string]any{"model": "cm", "messages": []any{}}
+	applyFallbackReasoningEffort(emptyChat, "inherit", ProtocolChat)
+	if _, ok := emptyChat["reasoning_effort"]; ok {
+		t.Fatalf("inherit with no strength must inject nothing: %v", emptyChat)
 	}
 }
 

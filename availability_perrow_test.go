@@ -707,7 +707,7 @@ func TestPerRowWebUIContracts(t *testing.T) {
 		`setAttribute("aria-label","检测自定义渠道可用性")`,
 		`k.fingerprint`,
 		`fingerprint:fp`,
-		`JSON.stringify({name:name})`,
+		`JSON.stringify({id:cid})`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("webui per-row contract missing %q", needle)

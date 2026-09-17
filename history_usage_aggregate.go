@@ -25,7 +25,7 @@ import (
 //
 // Identity: per model plus per upstream where upstream is the tier for
 // zen/go and the full channel for tier custom (legacy "custom" keeps its
-// merged row, "custom:<name>" splits per channel). Only identities present
+// merged row, "custom:<id>" splits per channel). Only identities present
 // in range are returned, sorted deterministically (total_tokens desc, then
 // name asc) with a bounded limit. Over-limit sets truncated=true with
 // total_models/total_upstreams preserved, never silent loss.

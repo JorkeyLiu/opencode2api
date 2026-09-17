@@ -208,7 +208,8 @@ func TestWebUIConfigModalPersistence(t *testing.T) {
 		`$("pool-modal-delete")`,
 		"disabled=true",
 		"disabled=false",
-		"mapFallbackActiveOnRename(String(S.fbDraft.active",
+		"fallbackGenerateChannelID",
+		"String(st.chanID",
 		"mapRoutingOnRename(oldSel,oldName,name)",
 	} {
 		if !strings.Contains(html, needle) {
@@ -273,8 +274,8 @@ func TestWebUIConfigInstantRows(t *testing.T) {
 		t.Fatal("missing fallbackNormalizeBase boundary")
 	}
 	rowBlock := html[rowIdx : rowIdx+rowEnd]
-	if !strings.Contains(rowBlock, "setFallbackActive(n)") {
-		t.Fatal("row click must set active")
+	if !strings.Contains(rowBlock, "setFallbackActive(cid2)") {
+		t.Fatal("row click must set active by stable channel ID")
 	}
 	if !strings.Contains(rowBlock, "queueConfigSave(true)") {
 		t.Fatal("row click must persist immediately via queueConfigSave(true)")

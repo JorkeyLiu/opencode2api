@@ -354,8 +354,8 @@ func (a *AdminServer) handleHistorySeries(w http.ResponseWriter, r *http.Request
 
 // historyChannelMatches implements the custom-channel compatibility rule:
 // "custom" matches the legacy merged "custom" row plus every
-// "custom:<name>" series, while "custom:<name>" matches only that series.
-// Old "custom" records never forge a name; new series never collapse.
+// "custom:<id>" series, while "custom:<id>" matches only that series.
+// Old "custom" records never forge an id; new series never collapse.
 func historyChannelMatches(stored, filter string) bool {
 	if filter == "" {
 		return true

@@ -54,6 +54,10 @@ func (g *Gateway) bulkProbeModel(tier Tier, public bool) (string, Protocol, bool
 	return "", "", false
 }
 
+// bulkProbeRequestBody builds minimal-inference bodies for custom fallback
+// probes only (custom suppliers keep their own wire semantics). Native Zen
+// anonymous/authenticated probes use bulkProbeCanonicalBody plus
+// newUpstreamRequest so they share the gateway preparation/header path.
 func bulkProbeRequestBody(model string, protocol Protocol) ([]byte, error) {
 	var payload map[string]any
 	switch protocol {
@@ -100,7 +104,8 @@ func bulkProbeSuccessBody(protocol Protocol, body []byte) bool {
 }
 
 type bulkCustomTarget struct {
-	Name     string
+	ID       string
+	Name     string // display snapshot only
 	BaseURL  string
 	Model    string
 	APIKey   string

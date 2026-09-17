@@ -752,24 +752,41 @@ func proxyChannelLabel(gateway *Gateway, tier Tier, pool, raw string, healthy bo
 
 // projectCustomResources projects every configured fallback channel as a row.
 // Configured channels always appear, even before any probe (as untested);
-// the latest stored custom observation overlays the matching row.
+// the latest stored custom observation overlays the matching row by stable
+// channel ID (legacy name-only rows match by name). The row carries both the
+// stable ID (machine key) and the display name (operator copy).
 func projectCustomResources(cfg Config, snap *bulkAvailabilitySnapshot) []bulkCustomAvailability {
 	stored := map[string]bulkCustomAvailability{}
 	if snap != nil {
 		for _, c := range snap.Custom {
-			if _, ok := stored[c.Name]; !ok {
-				stored[c.Name] = c
+			if key := customAvailabilityKey(c); key != "" {
+				if _, ok := stored[key]; !ok {
+					stored[key] = c
+				}
 			}
 		}
 	}
 	out := make([]bulkCustomAvailability, 0, len(cfg.Fallback.Channels))
 	for _, ch := range cfg.Fallback.Channels {
-		if row, ok := stored[ch.Name]; ok {
+		if row, ok := stored[strings.TrimSpace(ch.ID)]; ok {
+			// Refresh operator copy to the current display name/endpoint.
+			row.ID = ch.ID
+			row.Name = ch.Name
+			row.BaseURL = redactURL(ch.BaseURL)
+			row.Model = ch.Model
+			out = append(out, row)
+			continue
+		}
+		if row, ok := stored[strings.TrimSpace(ch.Name)]; ok {
+			row.ID = ch.ID
+			row.Name = ch.Name
+			row.BaseURL = redactURL(ch.BaseURL)
+			row.Model = ch.Model
 			out = append(out, row)
 			continue
 		}
 		out = append(out, bulkCustomAvailability{
-			Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
+			ID: ch.ID, Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
 			Status: "untested", Reason: "untested",
 		})
 	}
