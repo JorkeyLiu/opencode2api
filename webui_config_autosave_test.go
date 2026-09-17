@@ -328,7 +328,7 @@ func TestWebUIConfigReloadNoConcurrency(t *testing.T) {
 	if reloadIdx < 0 {
 		t.Fatal("missing reloadConfigFromDisk")
 	}
-	reloadEnd := strings.Index(html[reloadIdx:], "function refreshMonitor()")
+	reloadEnd := strings.Index(html[reloadIdx:], "function refreshMonitor(")
 	if reloadEnd < 0 {
 		// Fallback boundary: next top-level listener.
 		reloadEnd = strings.Index(html[reloadIdx:], "(function bindConfigAutosave(){")
@@ -355,9 +355,12 @@ func TestWebUIConfigReloadNoConcurrency(t *testing.T) {
 	if !strings.Contains(afterFlush, "throw err") {
 		t.Fatal("dirty failure must abort before doReload (throw)")
 	}
-	// Topbar reload must not fan out to monitor/debug refresh.
-	if strings.Contains(reloadBlock, "refreshMonitor()") || strings.Contains(reloadBlock, "loadDebugModels()") {
-		t.Fatal("topbar reload must not call refreshMonitor/loadDebugModels")
+	// Successful disk reload refreshes the health snapshot; dirty failure aborts before it.
+	if !strings.Contains(reloadBlock, "refreshMonitor(") {
+		t.Fatal("reload success must await refreshMonitor")
+	}
+	if strings.Contains(reloadBlock, "loadDebugModels()") {
+		t.Fatal("topbar reload must not fan out to debug models")
 	}
 	// Auto monitor polling stays: 5s interval + independent catalog buttons.
 	for _, needle := range []string{"setInterval(refreshMonitor,5000)", "btn-refresh-catalog", "btn-refresh-metadata", "btn-refresh-all"} {

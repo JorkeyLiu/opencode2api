@@ -45,7 +45,7 @@ func TestWebUIUsageAggregateRangeContract(t *testing.T) {
 		}
 	}
 	// refreshMonitor (5s poll) must not overwrite the range aggregate.
-	monIdx := strings.Index(html, "function refreshMonitor()")
+	monIdx := strings.Index(html, "function refreshMonitor(")
 	if monIdx < 0 {
 		t.Fatal("missing refreshMonitor")
 	}
@@ -132,7 +132,7 @@ func TestWebUIUsageAggregateIndependentLoading(t *testing.T) {
 		t.Fatal("period switch must reset aggregate loading before seq bump")
 	}
 	// refreshMonitor must stay independent of the aggregate loading flag.
-	monIdx := strings.Index(html, "function refreshMonitor()")
+	monIdx := strings.Index(html, "function refreshMonitor(")
 	monEnd := strings.Index(html[monIdx:], "function renderTopbar()")
 	monBody := html[monIdx : monIdx+monEnd]
 	if strings.Contains(monBody, "usageAggregateLoading") {

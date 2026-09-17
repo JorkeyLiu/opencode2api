@@ -549,6 +549,7 @@ var S = {
   historyPeriod:"today", history:null, persistedSeries:[],
   proxyStats:[], proxyTruncated:false, proxyTotal:0, histLoading:false, histSeq:0,
   usageAggregate:null, usageAggregateError:"", usageAggregateLoading:false,
+  usageAutoError:"", usageLastRefresh:0, usageTimer:null, activeTab:"realtime", monitorSeq:0,
   logEvents:[], logPaused:false, logGap:"", logFail:0,
   es:null, timer:null,
   bulkCustom:[], bulkNoModel:[], customAvail:[],
@@ -692,13 +693,19 @@ function clearSensitiveModalsForLogin(){
 function showLogin(){
   try{ if(typeof clearSensitiveModalsForLogin==="function")clearSensitiveModalsForLogin(); }catch(e){}
   S.csrf=""; $("view-app").classList.add("hidden"); $("view-login").classList.remove("hidden");
+  S.activeTab="realtime"; S.monitorSeq++; S.histSeq++; S.histLoading=false; S.usageAggregateLoading=false;
   if(S.es){try{S.es.close();}catch(e){} S.es=null;}
   if(S.timer){clearInterval(S.timer); S.timer=null;}
+  if(S.usageTimer){clearInterval(S.usageTimer); S.usageTimer=null;}
 }
+function activeTabName(){ return S.activeTab||"realtime"; }
 function switchTab(name){
+  S.activeTab=name;
   var btns=document.querySelectorAll("#main-nav button");
   for(var i=0;i<btns.length;i++)btns[i].classList.toggle("active",btns[i].getAttribute("data-tab")===name);
   ["realtime","usage","health","config"].forEach(function(t){ $("tab-"+t).classList.toggle("hidden",t!==name); });
+  if(name==="health"){ return refreshMonitor({force:true}); }
+  if(name==="usage"){ ensureUsageFreshOnTabEntry(); }
 }
 function pillForRequest(r){
   return r.success ? "ok" : "bad";
@@ -739,9 +746,13 @@ $("btn-logout").addEventListener("click",function(){
 function enterConsole(sess){
   S.csrf=sess.csrf_token;
   $("view-login").classList.add("hidden"); $("view-app").classList.remove("hidden");
-  return Promise.all([loadConfig(),refreshMonitor(),loadDebugModels()]).then(function(){
+  if(!S.activeTab)S.activeTab="realtime";
+  return Promise.all([loadConfig(),refreshMonitor({force:true}),loadDebugModels()]).then(function(){
     if(S.timer)clearInterval(S.timer);
+    if(S.usageTimer){clearInterval(S.usageTimer); S.usageTimer=null;}
     S.timer=setInterval(refreshMonitor,5000);
+    S.usageTimer=setInterval(usageAutoTick,5000);
+    installVisibilityRefreshOnce();
     connectLogs();
   });
 }
@@ -762,7 +773,9 @@ function reloadConfigFromDisk(btn){
       return loadConfig().then(function(){
         S.cfgSave.dirty=false; S.cfgSave.seq++;
         setSaveStatus("","");
+        try{ pruneCustomAvailByConfig(); }catch(e){}
         toast("磁盘配置已重载");
+        return refreshMonitor({force:true});
       });
     }).catch(function(err){ toast((err&&err.message)||"重载失败",true); throw err; }).then(function(){
       S.cfgSave.reloading=false;
@@ -788,8 +801,14 @@ function reloadConfigFromDisk(btn){
 $("btn-refresh").addEventListener("click",function(){
   reloadConfigFromDisk($("btn-refresh"));
 });
-function refreshMonitor(){
+function refreshMonitor(opts){
+  opts=opts||{};
+  if(!S.csrf)return Promise.resolve();
+  try{ var _app=$("view-app"); if(_app&&_app.classList.contains("hidden"))return Promise.resolve(); }catch(e){}
+  if(document.hidden&&!opts.force)return Promise.resolve();
+  var seq=++S.monitorSeq;
   return api("/api/monitor",{method:"GET"}).then(function(data){
+    if(seq!==S.monitorSeq)return;
     S.monitorError=false;
     S.version=data.version||"";
     S.metrics=data.metrics||null;
@@ -797,8 +816,10 @@ function refreshMonitor(){
     S.upstream=(data.metrics&&data.metrics.upstream)||data.upstream||null;
     S.history=data.history||null;
     S.lastRefresh=new Date().toLocaleTimeString();
+    try{ pruneCustomAvail((data.resources&&data.resources.custom)||null); }catch(e){}
     renderTopbar(); renderRealtime(); renderUsage(); renderHealth(); renderProxyFilter();
   }).catch(function(err){
+    if(seq!==S.monitorSeq)return;
     S.monitorError=true;
     renderTopbar();
     var b=$("monitor-banner"); clear(b);
@@ -825,6 +846,73 @@ function renderTopbar(){
   } else rn.classList.add("hidden");
   var b=$("monitor-banner");
   if(!S.monitorError)b.classList.add("hidden");
+}
+/* ---------- freshness: usage auto-refresh + visibility + ghost cleanup ---------- */
+function usageRefreshIntervalMs(){
+  var p=S.historyPeriod||"today";
+  if(p==="7d"||p==="month")return 60000;
+  return 30000;
+  /* 3 history endpoints per refresh: 30s cadence = 6 req/min, 60s cadence = 3 req/min, comfortably below shared 30 req/min/IP. */
+}
+function isUsageTabActive(){ return activeTabName()==="usage"; }
+function ensureUsageFreshOnTabEntry(){
+  if(!S.csrf)return;
+  if(document.hidden)return;
+  if(!isUsageTabActive())return;
+  if(S.histLoading||S.usageAggregateLoading)return;
+  if(!S.persistedSeries.length&&!S.proxyStats.length&&!S.usageAggregate){ loadPersistedHistory(true); return; }
+  refreshUsageBackground();
+}
+function refreshUsageBackground(){
+  if(!S.csrf)return Promise.resolve();
+  if(document.hidden)return Promise.resolve();
+  if(!isUsageTabActive())return Promise.resolve();
+  if(S.histLoading||S.usageAggregateLoading)return Promise.resolve();
+  return loadPersistedHistory(false);
+}
+function usageAutoTick(){
+  if(!S.csrf)return;
+  if(document.hidden)return;
+  if(!isUsageTabActive())return;
+  if(S.histLoading||S.usageAggregateLoading)return;
+  var now=Date.now();
+  var interval=usageRefreshIntervalMs();
+  if(now-(S.usageLastRefresh||0)<interval)return;
+  refreshUsageBackground();
+}
+function installVisibilityRefreshOnce(){
+  if(installVisibilityRefreshOnce._done)return;
+  installVisibilityRefreshOnce._done=true;
+  document.addEventListener("visibilitychange",function(){
+    if(document.hidden)return;
+    if(!S.csrf)return;
+    try{ var _vapp=$("view-app"); if(_vapp&&_vapp.classList.contains("hidden"))return; }catch(e){}
+    if(activeTabName()==="usage"){ ensureUsageFreshOnTabEntry(); }
+    else if(activeTabName()==="health"){ refreshMonitor({force:true}); }
+  });
+}
+function pruneCustomAvail(serverCustom){
+  try{
+    if(serverCustom===null||serverCustom===undefined){
+      var cfgChans=((S.config&&S.config.fallback&&S.config.fallback.channels)||[]);
+      if(!cfgChans.length){ S.customAvail=[]; return; }
+      var keep0={};
+      cfgChans.forEach(function(c){ keep0[String((c&&c.name)||"")]=1; });
+      S.customAvail=(S.customAvail||[]).filter(function(r){ return keep0[String(((r||{}).name)||"")]; });
+      return;
+    }
+    var names={};
+    (serverCustom||[]).forEach(function(c){ names[String(((c||{}).name)||"")]=1; });
+    S.customAvail=(S.customAvail||[]).filter(function(r){ return names[String(((r||{}).name)||"")]; });
+  }catch(e){}
+}
+function pruneCustomAvailByConfig(){
+  try{
+    var chans=((S.config&&S.config.fallback&&S.config.fallback.channels)||[]);
+    var keep={};
+    chans.forEach(function(c){ keep[String((c&&c.name)||"")]=1; });
+    S.customAvail=(S.customAvail||[]).filter(function(r){ return keep[String(((r||{}).name)||"")]; });
+  }catch(e){}
 }
 
 /* ---------- realtime: single-attempt rows ---------- */
@@ -1082,33 +1170,64 @@ function renderUsageAggregateTables(){
       tt.appendChild(tr);
     });
   }
+  if(S.usageAutoError){ note(mn,S.usageAutoError); note(tn,S.usageAutoError); }
 }
 function histQueryRange(){ var to=new Date(); var from=periodStart(S.historyPeriod||"today"); return {from:from.toISOString(),to:to.toISOString()}; }
 function loadPersistedHistory(reset){
   var seq=++S.histSeq; S.histLoading=true;
-  if(reset){ S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.usageAggregate=null; S.usageAggregateError=""; }
+  var reqPeriod=S.historyPeriod;
+  var isBackground=!reset;
+  var bgFailed=false;
+  S.usageLastRefresh=Date.now();
+  if(reset){ S.persistedSeries=[]; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; S.usageAggregate=null; S.usageAggregateError=""; S.usageAutoError=""; }
   S.usageAggregateLoading=true;
   renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
   var rg=histQueryRange();
-  api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
-    if(seq!==S.histSeq)return;
+  var p1=api("/api/history/series?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=10080"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
     S.persistedSeries=res.items||[];
     renderPersistedSeries(S.persistedSeries);
     renderPersistedKPIs();
-  }).catch(function(){ if(seq!==S.histSeq)return; S.persistedSeries=[]; renderPersistedSeries([]); renderPersistedKPIs(); });
-  api("/api/history/proxy-stats?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
-    if(seq!==S.histSeq)return;
+  }).catch(function(){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
+    if(isBackground){ bgFailed=true; S.usageAutoError="自动刷新失败，已保留旧数据"; renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables(); return; }
+    S.persistedSeries=[]; renderPersistedSeries([]); renderPersistedKPIs();
+  });
+  var p2=api("/api/history/proxy-stats?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
     S.proxyStats=res.items||[];
     S.proxyTruncated=!!res.truncated;
     S.proxyTotal=(res.total_proxies===undefined||res.total_proxies===null)?S.proxyStats.length:res.total_proxies;
     S.histLoading=false;
     renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
-  }).catch(function(err){ if(seq!==S.histSeq)return; S.histLoading=false; S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables(); });
-  api("/api/history/usage-aggregate?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
-    if(seq!==S.histSeq)return;
+  }).catch(function(err){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
+    S.histLoading=false;
+    if(isBackground){ bgFailed=true; S.usageAutoError="自动刷新失败，已保留旧数据"; renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables(); return; }
+    S.proxyStats=[]; S.proxyTruncated=false; S.proxyTotal=0; renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
+  });
+  var p3=api("/api/history/usage-aggregate?"+("from="+encodeURIComponent(rg.from)+"&to="+encodeURIComponent(rg.to)+"&limit=200"),{method:"GET"}).then(function(res){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
     S.usageAggregate=res; S.usageAggregateError=""; S.usageAggregateLoading=false;
     renderUsageAggregateTables();
-  }).catch(function(err){ if(seq!==S.histSeq)return; S.usageAggregate=null; S.usageAggregateError="范围用量加载失败，已保留当前范围空状态"; S.usageAggregateLoading=false; renderUsageAggregateTables(); });
+  }).catch(function(err){
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
+    S.usageAggregateLoading=false;
+    if(isBackground){
+      bgFailed=true;
+      if(!S.usageAggregate){ S.usageAggregateError="范围用量加载失败，已保留当前范围空状态"; }
+      else { S.usageAutoError="自动刷新失败，已保留旧数据"; }
+      renderUsageAggregateTables(); return;
+    }
+    S.usageAggregate=null; S.usageAggregateError="范围用量加载失败，已保留当前范围空状态"; renderUsageAggregateTables();
+  });
+  return Promise.all([p1,p2,p3]).then(function(){
+    if(!isBackground||bgFailed)return;
+    if(seq!==S.histSeq||reqPeriod!==S.historyPeriod)return;
+    if(!S.usageAutoError)return;
+    S.usageAutoError="";
+    renderProxyStats(); renderPersistedKPIs(); renderUsageAggregateTables();
+  });
 }
 function aggregatePersistedSeries(items, maxBuckets){
   maxBuckets=maxBuckets||120;
@@ -1174,8 +1293,11 @@ function renderProxyStats(){
   function setNote(text){ if(note){ clear(note); if(text)note.appendChild(document.createTextNode(text)); } }
   if(!avail.ok){ setNote(avail.text); emptyRow(tb,15,"历史记录未启用"); return; }
   var rows=S.proxyStats||[];
-  if(!rows.length){ setNote(S.histLoading?"代理统计加载中…":("暂无数据（"+periodLabel(S.historyPeriod)+"内无代理尝试）"+(avail.partial?" · "+avail.text:""))); emptyRow(tb,15,S.histLoading?"代理统计加载中…":"暂无数据"); return; }
-  var text="共 "+rows.length+" 个代理"+(S.proxyTruncated?("，仅展示前 "+rows.length+"（共 "+S.proxyTotal+"，已截断）"):"")+(S.histLoading?" · 加载中…":"")+(avail.partial?" · "+avail.text:"");
+  if(!rows.length){
+    if(S.usageAutoError){ setNote(S.usageAutoError); emptyRow(tb,15,S.usageAutoError); return; }
+    setNote(S.histLoading?"代理统计加载中…":("暂无数据（"+periodLabel(S.historyPeriod)+"内无代理尝试）"+(avail.partial?" · "+avail.text:""))); emptyRow(tb,15,S.histLoading?"代理统计加载中…":"暂无数据"); return;
+  }
+  var text="共 "+rows.length+" 个代理"+(S.proxyTruncated?("，仅展示前 "+rows.length+"（共 "+S.proxyTotal+"，已截断）"):"")+(S.histLoading?" · 加载中…":"")+(avail.partial?" · "+avail.text:"")+(S.usageAutoError?(" · "+S.usageAutoError):"");
   setNote(text);
   rows.forEach(function(p){
     var tr=document.createElement("tr");
@@ -1508,11 +1630,11 @@ function probeProxy(p, btn){
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
-  api("/api/availability/check-node",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
+  return api("/api/availability/check-node",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
     var nodes=res.nodes||[];
     var node=nodes[0]||null;
     toast("检测 "+pool+"#"+p.index+": "+(node?nodeResultText(node):"无结果"));
-    refreshMonitor();
+    return refreshMonitor({force:true});
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} });
 }
@@ -1534,12 +1656,12 @@ function probeCredential(k, btn){
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
-  api("/api/availability/check-credential",{method:"POST",body:JSON.stringify({fingerprint:fp})}).then(function(res){
+  return api("/api/availability/check-credential",{method:"POST",body:JSON.stringify({fingerprint:fp})}).then(function(res){
     var cred=res.credential||{};
     var st=credStatusLabel(String(cred.status||"untested"));
     var reason=customReasonLabel(String(cred.reason||""));
     toast("检测 "+(k.id||"")+"："+st+(reason&&reason!=="—"?("（"+reason+"）"):""));
-    refreshMonitor();
+    return refreshMonitor({force:true});
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} });
 }
@@ -1548,12 +1670,12 @@ function probeCustom(c, btn){
   btn.disabled=true; btn.classList.add("is-busy");
   try{btn.setAttribute("aria-busy","true");}catch(e){}
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
-  api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({name:name})}).then(function(res){
+  return api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({name:name})}).then(function(res){
     var row=res.custom||null;
-    if(row)mergeCustomRowIntoCache(row);
+    if(row){ mergeCustomRowIntoCache(row); try{ renderHealth(); }catch(e){} }
     var st=row?customStatusLabel(String(row.status||"untested")):"未知";
     toast("检测 "+name+"："+(st||"未知"));
-    refreshMonitor();
+    return refreshMonitor({force:true});
   }).catch(function(err){ toast("检测失败："+err.message,true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测自定义渠道可用性");}catch(e){} });
 }
@@ -1561,7 +1683,7 @@ function bulkCheck(){
   var btn=$("btn-bulk-check"); var note=$("bulk-state");
   if(btn)btn.disabled=true;
   if(note)note.textContent="批量检测进行中…";
-  api("/api/availability/check",{method:"POST",body:"{}"}).then(function(res){
+  return api("/api/availability/check",{method:"POST",body:"{}"}).then(function(res){
     S.bulkNoModel=res.no_model||[];
     var nodes=res.nodes||[];
     var total=nodes.length;
@@ -1570,7 +1692,7 @@ function bulkCheck(){
     if((res.no_model||[]).length)msg+="（部分通道无可用模型）";
     if(note)note.textContent=msg;
     toast(msg);
-    refreshMonitor();
+    return refreshMonitor({force:true});
   }).catch(function(err){ if(note)note.textContent="批量检测失败"; toast("批量检测失败："+err.message,true); })
   .then(function(){ if(btn)btn.disabled=false; });
 }
@@ -1580,14 +1702,14 @@ function manualRefresh(scope){
   var buttons=ids.map(function(id){return $(id);});
   buttons.forEach(function(b){ if(b)b.disabled=true; });
   var note=$("refresh-state"); if(note)note.textContent="刷新 "+refreshScopeLabel(scope)+" 进行中…";
-  api("/api/models/refresh",{method:"POST",body:JSON.stringify({scope:scope})}).then(function(res){
+  return api("/api/models/refresh",{method:"POST",body:JSON.stringify({scope:scope})}).then(function(res){
     var parts=[];
     var cat=res.catalog||{}, md=res.metadata||{};
     parts.push("目录 "+refreshDoneLabel(cat.refreshed)+(cat.error?("："+cat.error):""));
     parts.push("元数据 "+refreshDoneLabel(md.refreshed)+(md.error?("："+md.error):""));
     if(note)note.textContent=parts.join("；")+"（"+(res.duration_ms||0)+"ms）";
     toast("刷新完成（"+(res.duration_ms||0)+"ms）");
-    refreshMonitor(); loadDebugModels();
+    return refreshMonitor({force:true}).then(function(){ return loadDebugModels(); });
   }).catch(function(err){ if(note)note.textContent="刷新失败"; toast("刷新失败："+err.message,true); })
   .then(function(){ buttons.forEach(function(b){ if(b)b.disabled=false; }); });
 }
@@ -1601,6 +1723,7 @@ function loadConfig(){
   return api("/api/config",{method:"GET"}).then(function(cfg){
     try{clearSecretRevealCache();}catch(e){}
     S.config=cfg; fillConfig(cfg); renderTopbar();
+    try{ pruneCustomAvailByConfig(); }catch(e){}
     try{
       ["server_keys","keys"].forEach(function(n){ var t=$(n+"-new"); if(t)t.value=""; });
       if(S.cfgSave){ try{clearTimeout(S.cfgSave.debounce);}catch(e){} S.cfgSave.debounce=null; S.cfgSave.dirty=false; }
@@ -2034,10 +2157,11 @@ function saveFallbackModal(){
     S.fbDraft.active=mapped;
   }
   var saveBtn=$("fallback-modal-save"); if(saveBtn)saveBtn.disabled=true;
-  saveConfigAndWait().then(function(res){
+  return saveConfigAndWait().then(function(res){
     if(saveBtn)saveBtn.disabled=false;
     closeFallbackModal();
     renderFallbackList();
+    return res;
   }).catch(function(err){
     if(saveBtn)saveBtn.disabled=false;
     S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
@@ -2075,10 +2199,11 @@ function deleteFallbackModal(){
   S.fbDraft.channels.splice(st.index,1);
   if(String(S.fbDraft.active||"")===name)S.fbDraft.active="";
   var delBtn=$("fallback-modal-delete"); if(delBtn)delBtn.disabled=true;
-  saveConfigAndWait().then(function(){
+  return saveConfigAndWait().then(function(res){
     if(delBtn)delBtn.disabled=false;
     closeFallbackModal();
     renderFallbackList();
+    return res;
   }).catch(function(err){
     if(delBtn)delBtn.disabled=false;
     S.fbDraft.channels=backup.channels; S.fbDraft.active=backup.active;
@@ -2307,10 +2432,11 @@ function savePoolModal(){
     if(refs.auth&&poolNamesFromEditor().indexOf(refs.auth)<0)$("c-route-auth").value=poolNamesFromEditor()[0]||"";
   })();
   var saveBtn=$("pool-modal-save"); if(saveBtn)saveBtn.disabled=true;
-  saveConfigAndWait().then(function(){
+  return saveConfigAndWait().then(function(res){
     if(saveBtn)saveBtn.disabled=false;
     closePoolModal();
     renderPoolsList(); syncRoutingSelects(); refreshPoolBadges();
+    return res;
   }).catch(function(err){
     if(saveBtn)saveBtn.disabled=false;
     S.poolDraft.pools=backup.pools;
@@ -2335,10 +2461,11 @@ function deletePoolModal(){
   var backup={pools:S.poolDraft.pools.slice()};
   S.poolDraft.pools.splice(st.index,1);
   var delBtn=$("pool-modal-delete"); if(delBtn)delBtn.disabled=true;
-  saveConfigAndWait().then(function(){
+  return saveConfigAndWait().then(function(res){
     if(delBtn)delBtn.disabled=false;
     closePoolModal();
     renderPoolsList(); syncRoutingSelects(); refreshPoolBadges();
+    return res;
   }).catch(function(err){
     if(delBtn)delBtn.disabled=false;
     S.poolDraft.pools=backup.pools;
@@ -2558,15 +2685,17 @@ function handleConfigSaveSuccess(sentUpdate,res){
   if(!hadDirtyDuring){
     ["server_keys","keys"].forEach(function(n){ try{$(n+"-new").value="";}catch(e){} });
     fillConfig(S.config); renderTopbar();
+    try{ pruneCustomAvailByConfig(); }catch(e){}
     setSaveStatus("已保存","");
     okToast();
-    return res;
+    return refreshMonitor({force:true}).then(function(){ return res; });
   }
   reconcileAfterSuccess(sentUpdate,res.config);
   renderTopbar();
   setSaveStatus("保存中…","");
+  try{ pruneCustomAvailByConfig(); }catch(e){}
   okToast();
-  return res;
+  return refreshMonitor({force:true}).then(function(){ return res; });
 }
 function reconcileAfterSuccess(sentUpdate, serverConfig){
   try{ S.config=serverConfig; }catch(e){}

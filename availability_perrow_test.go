@@ -734,7 +734,7 @@ func TestPerRowWebUIContracts(t *testing.T) {
 		`btn.classList.add("is-busy")`,
 		`btn.classList.remove("is-busy")`,
 		`toast("检测 "`,
-		`refreshMonitor()`,
+		`refreshMonitor(`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("per-row button/toast contract missing %q", needle)
