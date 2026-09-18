@@ -846,6 +846,9 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 // fallback channel. It is exclusive: no anonymous/authenticated send is
 // attempted. A deleted channel or a full-identity mismatch fails locally with
 // 502 and never re-establishes. Custom failures return as-is with no fallback.
+// The session is already bound to this custom authority, so provider-bound
+// Responses refs issued by the custom channel must be preserved (no stale-ref
+// cleanup on this path).
 func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, binding fallbackBinding, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	effectiveRoute := route
 	effectiveRoute.Tier = TierCustom
@@ -881,7 +884,12 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 // safe 502) without a nil-response panic. When no active fallback exists it
 // returns handled=false so the caller keeps the original 429. Capacity
 // exhaustion fails closed with 502. First-wins: a concurrent takeover keeps
-// the existing binding; a tombstone mismatch fails closed with 502.
+// the existing binding; a tombstone mismatch fails closed with 502. This is
+// the only native->custom authority crossing: the first send strips
+// provider-bound Responses refs (native-issued previous_response_id/reasoning
+// items) via the crossing-authority custom send while preserving ordinary
+// history; bound follow-ups via doCustomFallbackPinned keep custom-issued
+// refs. No custom 400 replay is added and custom errors return as-is.
 func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset, attempts int, extra ...upstreamExtra) (*http.Response, modelRoute, int, bool, error) {
 	ch, ok := activeFallbackChannel(g.cfg)
 	if !ok {
@@ -916,7 +924,7 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 	if v, ok := firstUpstreamExtra(extra); ok {
 		ex, hasEx = v, true
 	}
-	resp, effectiveRoute, nextAttempts, takeErr := g.doCustomFallbackRequest(ctx, route, ex, hasEx, bodies, ids, current, stored, attemptOffset+attempts)
+	resp, effectiveRoute, nextAttempts, takeErr := g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, current, stored, attemptOffset+attempts, true)
 	if takeErr != nil {
 		return resp, effectiveRoute, nextAttempts, true, takeErr
 	}

@@ -75,7 +75,12 @@ func bulkProbeRequestBodyWithSession(model string, protocol Protocol, effort str
 	var payload map[string]any
 	switch protocol {
 	case ProtocolResponses:
-		payload = map[string]any{"model": model, "input": "hi", "max_output_tokens": 1, "stream": false}
+		// Compatible minimal output limit: Zen-compatible Responses
+		// upstreams reject max_output_tokens=1 with 400
+		// (param=max_output_tokens) when the full OpenCode fingerprint is
+		// present, while 16 returns 200. Session headers must stay intact
+		// (removing them causes MissingSessionID), so only raise the limit.
+		payload = map[string]any{"model": model, "input": "hi", "max_output_tokens": 16, "stream": false}
 	case ProtocolAnthropic:
 		payload = map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1}
 	default:

@@ -693,8 +693,27 @@ func buildFallbackRequestBody(ex upstreamExtra, hasEx bool, bodies map[Tier][]by
 // (Responses prompt_cache_key/store defaults; chat conversation/metadata
 // overwrite when present, never invented). Empty routeSession preserves the
 // legacy test-only path without wire session stamping; production callers
-// always pass the derived custom route session.
+// always pass the derived custom route session. This wrapper preserves the
+// bound-channel behavior (no provider-bound ref cleanup); first-time
+// native->custom takeover must use the crossing-authority variant below.
 func buildFallbackRequestBodyWithSession(ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, route modelRoute, ch FallbackChannelConfig, routeSession string) ([]byte, error) {
+	return buildFallbackRequestBodyWithSessionCrossingAuthority(ex, hasEx, bodies, route, ch, routeSession, false)
+}
+
+// buildFallbackRequestBodyWithSessionCrossingAuthority is the explicit
+// crossing-authority variant of buildFallbackRequestBodyWithSession. When
+// crossingAuthority is true the Responses stamp additionally strips
+// provider-bound refs (previous_response_id plus input[] reasoning items) via
+// applyRouteSessionToBody(..., true): refs issued by the native authority are
+// not valid at the new custom authority (Responses->Responses is a cloneMap
+// passthrough, so they would otherwise be forwarded verbatim). Ordinary
+// message/function_call/function_call_output history is always preserved.
+// When false the stamp keeps every input item, which is required once the
+// session is bound to the custom channel so refs issued by that channel keep
+// working. The flag is a call-context decision, never derived from error
+// text, and it never adds replay or changes error/binding/protocol/effort
+// semantics.
+func buildFallbackRequestBodyWithSessionCrossingAuthority(ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, route modelRoute, ch FallbackChannelConfig, routeSession string, crossingAuthority bool) ([]byte, error) {
 	model := strings.TrimSpace(ch.Model)
 	if model == "" {
 		return nil, errors.New("fallback channel model must not be empty")
@@ -716,7 +735,7 @@ func buildFallbackRequestBodyWithSession(ex upstreamExtra, hasEx bool, bodies ma
 	if strings.TrimSpace(routeSession) == "" {
 		return encoded, nil
 	}
-	stamped, err := applyRouteSessionToBody(encoded, routeSession, target, false)
+	stamped, err := applyRouteSessionToBody(encoded, routeSession, target, crossingAuthority)
 	if err != nil {
 		return nil, err
 	}
@@ -1020,7 +1039,21 @@ func (g *Gateway) fallbackCustomClient() *http.Client {
 // canonical OpenCode routing metadata (pseudonymous session/request/project
 // derived from the target-bound custom route session): full client history
 // stays in the body and the supplier is never relied on to persist state.
+// This wrapper preserves the bound-channel behavior (provider-bound refs
+// kept); first-time native->custom takeover must call the crossing-authority
+// variant with crossingAuthority=true.
 func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int) (*http.Response, modelRoute, int, error) {
+	return g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset, false)
+}
+
+// doCustomFallbackRequestCrossingAuthority is the explicit crossing-authority
+// variant of doCustomFallbackRequest. crossingAuthority=true is only for the
+// first native->custom takeover send: provider-bound Responses refs are
+// stripped before the send so native-issued previous_response_id/reasoning
+// items never reach the new custom authority. Bound follow-up sends must pass
+// false so refs issued by the custom channel itself are preserved. No custom
+// 400 replay is added; custom errors still return as-is on the bound channel.
+func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int, crossingAuthority bool) (*http.Response, modelRoute, int, error) {
 	channelProtocol := fallbackChannelProtocol(ch)
 	channelModel := strings.TrimSpace(ch.Model)
 	effectiveRoute := route
@@ -1033,7 +1066,7 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 		return nil, effectiveRoute, attemptOffset, ctx.Err()
 	}
 	routeSession := customRouteSession(ids.Session, ch)
-	chatBody, err := buildFallbackRequestBodyWithSession(ex, hasEx, bodies, route, ch, routeSession)
+	chatBody, err := buildFallbackRequestBodyWithSessionCrossingAuthority(ex, hasEx, bodies, route, ch, routeSession, crossingAuthority)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
