@@ -87,15 +87,26 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 		}
 	}
 	// Localized observation labels, never raw backend enums in cells.
+	// Undetected/no-data (untested/inconclusive/empty) renders as "—", never
+	// "未检测"/"未定"; unconfigured/no_model keep operator-facing copy.
 	for _, needle := range []string{
 		`if(v==="unconfigured")return "未配置"`,
 		`if(v==="no_model")return "无可用模型"`,
-		`if(v==="untested")return "未检测"`,
-		`if(v==="inconclusive")return "未定"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("observation label must contain %q", needle)
 		}
+	}
+	for _, stale := range []string{
+		`if(v==="untested")return "未检测"`,
+		`if(v==="inconclusive")return "未定"`,
+	} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("undetected must render as dash, stale label must stay removed: %q", stale)
+		}
+	}
+	if !strings.Contains(html, `v==="untested"||v==="inconclusive")return "—"`) && !strings.Contains(html, `v==="untested"||v==="inconclusive"`) {
+		t.Fatal("undetected/inconclusive must map to dash")
 	}
 	// Dash titles distinguish unrouted-pool / unconfigured-channel.
 	for _, needle := range []string{
@@ -140,9 +151,21 @@ func TestWebUIProxyActualStatusCells(t *testing.T) {
 			t.Fatalf("actual-status cell must contain %q", needle)
 		}
 	}
-	// Transport column still shows the pill.
-	if !strings.Contains(html, `p.healthy?"正常":"不可用"`) {
-		t.Fatal("transport column must keep 正常/不可用 pill")
+	// Transport column uses the independent probe observation, never the
+	// internal healthy default. Undetected renders as dash.
+	for _, needle := range []string{
+		"function transportObsOf(p)",
+		"function transportDisplayLabel(v)",
+		"function transportTone(v)",
+		"transportObsOf(p)",
+		"尚未检测",
+	} {
+		if !strings.Contains(html, needle) {
+			t.Fatalf("transport observation column must contain %q", needle)
+		}
+	}
+	if strings.Contains(html, `p.healthy?"正常":"不可用"`) {
+		t.Fatal("transport column must not use internal healthy default")
 	}
 	// Auth no-key state is visibly 未配置, never a misleading usable state.
 	if !strings.Contains(html, "未配置") {
@@ -190,11 +213,13 @@ func TestWebUICustomAvailabilityProjection(t *testing.T) {
 		t.Fatal("custom status cell must not print raw backend enum strings")
 	}
 	// Toasts report localized status, never raw enums or generic available counts.
+	// Credential toasts carry HTTP status + reason; custom toasts carry HTTP.
 	for _, needle := range []string{
-		`customStatusLabel(String(row.status||"untested"))`,
-		`credStatusLabel(String(cred.status||"untested"))`,
+		`customStatusLabel(String(row.status`,
+		`credStatusLabel(String(cred.status`,
 		"nodeResultText(node)",
 		"批量检测完成：共检测 ",
+		`HTTP "+code`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("detection toast must report actual observation %q", needle)
@@ -378,16 +403,18 @@ func TestWebUIAvailabilityTableAlignment(t *testing.T) {
 		}
 	}
 	// Left/nowrap timestamp parity with matching tooltip semantics in both tables.
+	// Single-row and batch checks share the same per-row timestamp; undetected
+	// renders as dash with 尚未检测.
 	for _, block := range []string{proxyBlock, customBlock} {
 		if !strings.Contains(block, `td.className="avail-ts"`) {
 			t.Fatal("timestamp cell must use avail-ts")
 		}
-		if !strings.Contains(block, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"`) &&
-			!strings.Contains(block, `td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"`) {
-			t.Fatal("timestamp cell must keep 上次检测/尚未批量检测 tooltip semantics")
+		if !strings.Contains(block, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未检测"`) &&
+			!strings.Contains(block, `td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未检测"`) {
+			t.Fatal("timestamp cell must keep 上次检测/尚未检测 tooltip semantics")
 		}
 	}
-	if !strings.Contains(customBlock, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"`) {
+	if !strings.Contains(customBlock, `td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未检测"`) {
 		t.Fatal("custom timestamp must carry title parity without changing timestamp semantics")
 	}
 	// Text columns stay left and keep wrapping for long values.

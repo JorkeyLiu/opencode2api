@@ -1368,15 +1368,61 @@ function authKeysOf(p){
 }
 function proxyAnonDashTitle(p){
   p=p||{};
-  if(p.healthy===false)return "传输不可用";
   if(!proxyRoutingHas(p,"anonymous"))return "该池未用于该通道";
   return "未配置该通道";
 }
 function proxyAuthDashTitle(p){
   p=p||{};
-  if(p.healthy===false)return "传输不可用";
   if(!proxyRoutingHas(p,"authenticated"))return "该池未用于该通道";
   return "未配置该通道";
+}
+function transportObsOf(p){
+  p=p||{};
+  var v=p.transport!==undefined?p.transport:(p.transport_observation!==undefined?p.transport_observation:"");
+  return String(v||"");
+}
+function transportDisplayLabel(v){
+  v=String(v||"");
+  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(v==="healthy")return "正常";
+  if(v==="unhealthy")return "不可用";
+  return obsLabel(v);
+}
+function transportTone(v){
+  v=String(v||"");
+  if(v==="healthy")return "ok";
+  if(v==="unhealthy")return "bad";
+  return "neutral";
+}
+function probeReasonText(p){
+  p=p||{};
+  var v=String(p.reason||p.Reason||"");
+  if(!v||v==="—")return "";
+  return customReasonLabel(v);
+}
+function r_vsprintfTransport(obs,reason){
+  var label=transportDisplayLabel(obs);
+  var title="传输："+label;
+  if(obs==="healthy")title="传输：正常";
+  else if(obs==="unhealthy")title="传输：不可用";
+  else if(!obs||obs==="untested"||obs==="inconclusive"||obs==="—")title="传输：尚未检测";
+  if(reason&&reason!=="—")title+="（原因："+reason+"）";
+  return title;
+}
+function r_vsprintfLane(prefix,obs,code,reason){
+  var label=obsLabel(obs);
+  var title=prefix+"："+label;
+  if(code)title+="（HTTP "+code+"）";
+  if(reason&&reason!=="—"&&obs!=="success")title+="（原因："+reason+"）";
+  return title;
+}
+function r_vsprintfCred(status,code,reason){
+  var label=credStatusLabel(status);
+  if(!status||status==="untested"||status==="inconclusive")return "凭证：尚未检测"+(reason&&reason!=="—"?("（原因："+reason+"）"):"");
+  var title="凭证状态："+label;
+  if(code)title+="（HTTP "+code+"）";
+  if(reason&&reason!=="—")title+="（原因："+reason+"）";
+  return title;
 }
 function obsLabel(v){
   v=String(v||"");
@@ -1394,11 +1440,9 @@ function obsLabel(v){
   if(v==="unhealthy")return "不可用";
   if(v==="available")return "可用";
   if(v==="unavailable")return "不可用";
-  if(v==="untested")return "未检测";
   if(v==="unconfigured")return "未配置";
   if(v==="no_model")return "无可用模型";
-  if(v==="inconclusive")return "未定";
-  if(!v||v==="—")return "—";
+  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
   return "未知";
 }
 function laneObsOf(p,lane){
@@ -1436,18 +1480,15 @@ function customStatusLabel(v){
   if(v==="available")return "可用";
   if(v==="rate_limited")return "限流";
   if(v==="unavailable")return "不可用";
-  if(v==="inconclusive")return "未定";
-  if(v==="untested")return "未检测";
-  if(!v||v==="—")return "—";
+  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
   return obsLabel(v);
 }
 function customReasonLabel(v){
   v=String(v||"");
-  if(!v||v==="—")return "—";
-  if(v==="untested")return "未检测";
+  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
   if(v==="unconfigured")return "未配置";
   if(v==="no_model")return "无可用模型";
-  if(v==="inconclusive"||v==="cancelled"||v==="parse_error")return obsLabel(v);
+  if(v==="cancelled"||v==="parse_error")return obsLabel(v);
   return failureLabel(v)!=="未知"?failureLabel(v):obsLabel(v);
 }
 function credStatusLabel(v){
@@ -1455,10 +1496,15 @@ function credStatusLabel(v){
   if(v==="available")return "可用";
   if(v==="unavailable")return "不可用";
   if(v==="rate_limited")return "限流";
-  if(v==="inconclusive")return "未定";
-  if(v==="untested")return "未检测";
-  if(!v||v==="—")return "—";
+  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
   return obsLabel(v);
+}
+function credProbeOf(k){
+  k=k||{};
+  var st=k.probe_status!==undefined?k.probe_status:(k.probeStatus!==undefined?k.probeStatus:(k.ProbeStatus!==undefined?k.ProbeStatus:""));
+  var rs=k.probe_reason!==undefined?k.probe_reason:(k.probeReason!==undefined?k.probeReason:(k.ProbeReason!==undefined?k.ProbeReason:""));
+  var code=k.probe_http_status!==undefined?k.probe_http_status:(k.probeHttpStatus!==undefined?k.probeHttpStatus:(k.ProbeHTTPStatus!==undefined?k.ProbeHTTPStatus:(k.http_status!==undefined?k.http_status:(k.HTTPStatus!==undefined?k.HTTPStatus:0))));
+  return {status:String(st||""),reason:String(rs||""),code:Number(code||0)||0};
 }
 function renderHealth(){
   var r=S.resources||{proxies:[],keys:[]};
@@ -1477,7 +1523,7 @@ function renderHealth(){
     (function(){ var lt=(r.proxy_rate_limits_total===undefined||r.proxy_rate_limits_total===null)?((r.proxy_rate_limits||[]).length):r.proxy_rate_limits_total; fact(fh,"代理限流冷却",lt+((r.proxy_rate_limits_truncated)?"（已截断）":""),"neutral"); })();
     (function(){ var ct=(r.channel_cooldowns_total===undefined||r.channel_cooldowns_total===null)?((r.channel_cooldowns||[]).length):r.channel_cooldowns_total; fact(fh,"通道可用性冷却",ct+((r.channel_truncated)?"（已截断）":""),"neutral"); })();
     fact(fh,"可暴露模型",((r.models||{}).exposed||0),((r.models||{}).exposed||0)?"ok":"warn");
-    (function(){ var t=r.availability_checked_at?fmtDateTime(r.availability_checked_at):"未检测"; if(r.availability_partial)t+="（部分结果）"; fact(fh,"上次批量检测",t,"neutral"); })();
+    (function(){ var t=r.availability_checked_at?fmtDateTime(r.availability_checked_at):"—"; if(r.availability_partial)t+="（部分结果）"; fact(fh,"上次批量检测",t,"neutral"); })();
     void m;
   }
   var tp=$("tbody-proxies"); clear(tp);
@@ -1486,14 +1532,14 @@ function renderHealth(){
     (function(){ var td=document.createElement("td"); var v=p.address||"—"; td.textContent=v; td.title="节点："+v; td.className="wrap avail-l"; tr.appendChild(td); })();
     cell(tr,p.proxy_pool||p.pool||"—","avail-l"); cell(tr,p.index,"avail-c");
     (function(){ var td=document.createElement("td"); td.textContent=routingRefsLabel(p.routing); td.title="路由："+routingRefsLabel(p.routing); td.className="wrap avail-l"; tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); td.className="avail-c"; var h=el("span",p.healthy?"正常":"不可用","pill "+(p.healthy?"ok":"bad")); h.title=p.healthy?"传输正常":"传输不可用"; td.appendChild(h); tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.className="avail-c"; var tob=transportObsOf(p); var ttxt=transportDisplayLabel(tob); var th=el("span",ttxt,"pill "+transportTone(tob)); var rtxt=probeReasonText(p); th.title=r_vsprintfTransport(tob,rtxt); td.appendChild(th); tr.appendChild(td); })();
     (function(){
       var td=document.createElement("td"); td.className="avail-c";
       if(!proxyAnonLaneOn(p)){ td.textContent="—"; td.title=proxyAnonDashTitle(p); tr.appendChild(td); return; }
       var lane=laneObsOf(p,"anonymous");
       var txt=obsDisplayText(lane.obs,lane.code);
       var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
-      s.title="匿名："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
+      s.title=r_vsprintfLane("匿名",lane.obs,lane.code,probeReasonText(p)); td.appendChild(s); tr.appendChild(td);
     })();
     (function(){
       var td=document.createElement("td"); td.className="avail-c";
@@ -1501,9 +1547,9 @@ function renderHealth(){
       var lane=laneObsOf(p,"authenticated");
       var txt=obsDisplayText(lane.obs,lane.code);
       var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
-      s.title="认证："+obsLabel(lane.obs)+(lane.code?("（"+lane.code+"）"):""); td.appendChild(s); tr.appendChild(td);
+      s.title=r_vsprintfLane("认证",lane.obs,lane.code,probeReasonText(p)); td.appendChild(s); tr.appendChild(td);
     })();
-    (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未检测"; tr.appendChild(td); })();
     var op=document.createElement("td"); op.className="avail-c";
     var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost probe-btn"; probeBtn.setAttribute("aria-label","检测节点可用性");
     var probeLabel=document.createElement("span"); probeLabel.className="probe-label"; probeLabel.textContent="检测"; probeBtn.appendChild(probeLabel);
@@ -1520,11 +1566,11 @@ function renderHealth(){
   (r.keys||[]).forEach(function(k){
     var tr=document.createElement("tr");
     cell(tr,k.id,"wrap"); (function(){ var td=document.createElement("td"); td.textContent=tierLabel(k.tier); td.title="上游："+tierLabel(k.tier); tr.appendChild(td); })(); cell(tr,k.proxy_pool||"—");
-    (function(){ var td=document.createElement("td"); var v=k.status||"available"; var s=el("span",credStatusLabel(v),"pill "+(v==="available"?"ok":(v==="rate_limited"?"warn":"bad"))); s.title="凭证状态："+credStatusLabel(v); td.appendChild(s); tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.className="avail-c"; var probe=credProbeOf(k); var hasProbe=!!(k.last_checked||probe.status||probe.reason||probe.code); var v=hasProbe?probe.status:""; var code=hasProbe?probe.code:0; var txt=code?String(code):credStatusLabel(v||"—"); var tone="neutral"; if(code){ tone=(code===200)?"ok":(code===429?"warn":"bad"); } else if(v==="available"){ tone="ok"; } else if(v==="rate_limited"){ tone="warn"; } else if(v){ tone="bad"; } var s=el("span",txt,"pill "+tone); var rv=hasProbe?customReasonLabel(probe.reason||"—"):"—"; s.title=r_vsprintfCred(v,code,rv); td.appendChild(s); tr.appendChild(td); })();
     (function(){ var td=document.createElement("td"); var a=(k.available_targets===undefined?"—":k.available_targets); var t=(k.total_targets===undefined?"—":k.total_targets); td.textContent=a+" / "+t; td.title="可用目标 / 全部目标"; tr.appendChild(td); })();
     cell(tr,k.failures===undefined?"—":k.failures);
-    (function(){ var td=document.createElement("td"); var v=customReasonLabel(k.reason||"—"); td.textContent=v; td.title="原因："+v; tr.appendChild(td); })();
-    (function(){ var td=document.createElement("td"); td.textContent=k.last_checked?fmtDateTime(k.last_checked):"—"; td.title=k.last_checked?("上次检测："+fmtDateTime(k.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); var probe=credProbeOf(k); var hasProbe=!!(k.last_checked||probe.status||probe.reason||probe.code); var v=hasProbe?customReasonLabel(probe.reason||"—"):"—"; td.textContent=v; td.title="原因："+v+((hasProbe&&probe.code)?("（HTTP "+probe.code+"）"):""); tr.appendChild(td); })();
+    (function(){ var td=document.createElement("td"); td.textContent=k.last_checked?fmtDateTime(k.last_checked):"—"; td.title=k.last_checked?("上次检测："+fmtDateTime(k.last_checked)):"尚未检测"; tr.appendChild(td); })();
     var kop=document.createElement("td");
     var kbtn=document.createElement("button"); kbtn.type="button"; kbtn.className="ghost probe-btn"; kbtn.setAttribute("aria-label","检测凭证可用性");
     var klabel=document.createElement("span"); klabel.className="probe-label"; klabel.textContent="检测"; kbtn.appendChild(klabel);
@@ -1604,7 +1650,7 @@ function renderHealth(){
       (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap avail-l"; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.className="avail-c"; var code=Number(c.http_status!==undefined?c.http_status:(c.HTTPStatus!==undefined?c.HTTPStatus:(c.httpStatus||0)))||0; var v=customStatusLabel(c.status||"untested"); var txt=obsDisplayText(c.status||"untested",code); td.appendChild(el("span",txt,"pill "+obsTone(c.status||"untested",code))); td.title="状态："+v+(code?("（HTTP "+code+"）"):""); tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.className="avail-l"; var rv=customReasonLabel(c.reason||"—"); td.textContent=rv; td.title="原因："+rv; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未检测"; tr.appendChild(td); })();
       var cop=document.createElement("td"); cop.className="avail-c";
       var cbtn=document.createElement("button"); cbtn.type="button"; cbtn.className="ghost probe-btn"; cbtn.setAttribute("aria-label","检测自定义渠道可用性");
       var clabel=document.createElement("span"); clabel.className="probe-label"; clabel.textContent="检测"; cbtn.appendChild(clabel);
@@ -1678,9 +1724,10 @@ function probeCredential(k, btn){
   try{btn.setAttribute("aria-label","正在检测");}catch(e){}
   return api("/api/availability/check-credential",{method:"POST",body:JSON.stringify({fingerprint:fp})}).then(function(res){
     var cred=res.credential||{};
-    var st=credStatusLabel(String(cred.status||"untested"));
+    var st=credStatusLabel(String(cred.status||""));
+    var code=Number(cred.http_status!==undefined?cred.http_status:(cred.HTTPStatus!==undefined?cred.HTTPStatus:(cred.httpStatus||0)))||0;
     var reason=customReasonLabel(String(cred.reason||""));
-    toast("检测 "+(k.id||"")+"："+st+(reason&&reason!=="—"?("（"+reason+"）"):""));
+    toast("检测 "+(k.id||"")+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""));
     return refreshMonitor({force:true});
   }).catch(function(err){ toast(availBusyMessage(err,"检测 "+(k.id||"")),true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} setAvailBusy(false); });

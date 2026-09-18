@@ -55,7 +55,6 @@ type AdminServer struct {
 	probeAttempts    map[string]loginWindow
 	refreshAttempts  map[string]loginWindow
 	historyAttempts  map[string]loginWindow
-	bulkAttempts     map[string]loginWindow
 	fallbackAttempts map[string]loginWindow
 	lastInference    *DebugInferenceResult
 }
@@ -65,7 +64,7 @@ func NewAdminServer(manager *RuntimeManager, monitor *Monitor, logs *LogHub, log
 		manager: manager, monitor: monitor, logs: logs, logger: logger, sessions: make(map[string]adminSession),
 		attempts: make(map[string]loginWindow), debugAttempts: make(map[string]loginWindow),
 		probeAttempts: make(map[string]loginWindow), refreshAttempts: make(map[string]loginWindow),
-		historyAttempts: make(map[string]loginWindow), bulkAttempts: make(map[string]loginWindow),
+		historyAttempts:  make(map[string]loginWindow),
 		fallbackAttempts: make(map[string]loginWindow),
 	}
 }

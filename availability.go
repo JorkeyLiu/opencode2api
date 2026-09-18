@@ -43,8 +43,6 @@ const (
 
 	bulkMaxSnapshotNodes = 256
 	bulkMaxSnapshotCreds = 128
-
-	bulkRateLimit = 3
 )
 
 // bulkNodeAvailability is the per-proxy observation row. Anonymous and
@@ -76,6 +74,7 @@ type bulkCredentialAvailability struct {
 	Pool        string     `json:"proxy_pool"`
 	Status      string     `json:"status"`
 	Reason      string     `json:"reason,omitempty"`
+	HTTPStatus  int        `json:"http_status,omitempty"`
 	TestedNodes int        `json:"tested_nodes,omitempty"`
 	LastChecked *time.Time `json:"last_checked,omitempty"`
 	CredID      string     `json:"-"`
@@ -162,10 +161,6 @@ type bulkSendResult struct {
 	Models             int
 }
 
-func (a *AdminServer) allowBulk(client string) bool {
-	return a.allowWindow(&a.bulkAttempts, client, bulkRateLimit, rateLimitWindowMinute)
-}
-
 func allBulkCancelled(results []bulkSendResult) bool {
 	if len(results) == 0 {
 		return true
@@ -199,11 +194,6 @@ func decodeBulkCheckRequest(w http.ResponseWriter, r *http.Request) error {
 
 func (a *AdminServer) handleBulkCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	if err := decodeBulkCheckRequest(w, r); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -999,7 +989,7 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 		}
 		credentials = append(credentials, bulkCredentialAvailability{
 			Tier: string(ca.tier), KeyTail: ca.disp, Fingerprint: ca.fp, Pool: ca.pool,
-			Status: status, Reason: reason, TestedNodes: ca.tested, LastChecked: &checkedAt,
+			Status: status, Reason: reason, HTTPStatus: ca.lastCode, TestedNodes: ca.tested, LastChecked: &checkedAt,
 			CredID: ca.credID,
 		})
 		if len(credentials) >= bulkMaxSnapshotCreds {

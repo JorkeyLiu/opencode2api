@@ -177,12 +177,15 @@ func TestPerRowRateLimitBusy(t *testing.T) {
 	rt.gateway.cfg.Upstream.Go = srv.URL
 	seedBulkProbeCatalog(rt.gateway)
 	fp := credentialFingerprint(TierZen, rt.gateway.authCreds[0].key)
-	var last *httptest.ResponseRecorder
+	// No per-client rate limit: rapid per-row checks must never return 429.
 	for i := 0; i < 4; i++ {
-		last = serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
-	}
-	if last.Code != http.StatusTooManyRequests {
-		t.Fatalf("4th credential code=%d want 429 body=%s", last.Code, last.Body.String())
+		rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-credential", `{"fingerprint":"`+fp+`"}`, token, csrf))
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("credential check must not rate limit: body=%s", rec.Body.String())
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("credential code=%d want 200 body=%s", rec.Code, rec.Body.String())
+		}
 	}
 	// Busy gate shares bulkMu.
 	_, admin2, token2, csrf2 := credentialAdmin(t,

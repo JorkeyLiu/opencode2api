@@ -99,14 +99,19 @@ func TestBulkRateLimitBusy(t *testing.T) {
 	defer srv.Close()
 	runtime := manager.current.Load()
 	runtime.gateway.cfg.Upstream.Zen = srv.URL
-	var last *httptest.ResponseRecorder
+	// No per-client rate limit applies to availability checks: rapid
+	// repeats must never return 429. Single-flight 409 and timeouts/caps
+	// remain the only safety boundaries.
 	for i := 0; i < 4; i++ {
-		last = serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", `{}`, token, csrf))
+		rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check", `{}`, token, csrf))
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("bulk check must not rate limit: code=429 body=%s", rec.Body.String())
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("bulk code=%d want 200 body=%s", rec.Code, rec.Body.String())
+		}
 	}
-	if last.Code != http.StatusTooManyRequests {
-		t.Fatalf("4th bulk code=%d want 429 body=%s", last.Code, last.Body.String())
-	}
-	// Busy gate: hold the mutex then expect 409 (use a fresh admin to avoid rate limit).
+	// Busy gate: hold the mutex then expect 409.
 	_, admin2, token2, csrf2 := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},
 		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},

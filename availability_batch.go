@@ -16,25 +16,25 @@ import (
 //     (credentialProbeEligible), the shared minimal Zen request path
 //     (bulkProbeOnce), the exact-status classification (buildBulkResponse),
 //     the comparative applyBulkWrites rules, and the per-row snapshot merge
-//     semantics. One rate-limit admission, one bulkMu acquisition,
-//     concurrency 4, overall/per-send timeouts, total-send cap, and
-//     partial/truncated reporting. No keys sends nothing (unconfigured);
+//     semantics. One bulkMu acquisition, concurrency 4, overall/per-send
+//     timeouts, total-send cap, and partial/truncated reporting. No keys
+//     sends nothing (unconfigured);
 //     directory without a model yields inconclusive/no_model rows.
 //     Availability is only ever observed, never inferred from cooldown state.
 //   - POST /api/availability/check-customs checks every configured custom
 //     fallback channel exactly once, including inactive channels. It never
-//     probes proxy nodes or Zen credentials. One rate-limit admission, one
-//     bulkMu acquisition, concurrency 4, overall/per-send timeouts,
-//     total-send cap, and partial/truncated reporting. Results merge only
-//     custom snapshot rows while preserving node/credential rows and the
-//     global timestamp. Custom probes stay isolated: no Zen
-//     scheduler/cooldown/transport-health writes, no inference
-//     metrics/history, no fallback takeover binding/session state.
+//     probes proxy nodes or Zen credentials. One bulkMu acquisition,
+//     concurrency 4, overall/per-send timeouts, total-send cap, and
+//     partial/truncated reporting. Results merge only custom snapshot rows
+//     while preserving node/credential rows and the global timestamp. Custom
+//     probes stay isolated: no Zen scheduler/cooldown/transport-health
+//     writes, no inference metrics/history, no fallback takeover
+//     binding/session state.
 //
 // The existing POST /api/availability/check keeps its proxy-table scope
 // (all proxy nodes, anonymous and authenticated lanes; never custom
 // channels). All three batch operations plus the per-row checks share the
-// bulk rate limiter and the bulkMu single-flight gate, so a second
+// bulkMu single-flight gate (no per-client rate limit), so a second
 // operation reports 409 bulk_busy while one is running.
 
 type credentialsBatchResponse struct {
@@ -60,11 +60,6 @@ type customsBatchResponse struct {
 
 func (a *AdminServer) handleCredentialsBatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	if err := decodeBulkCheckRequest(w, r); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -91,11 +86,6 @@ func (a *AdminServer) handleCredentialsBatch(w http.ResponseWriter, r *http.Requ
 
 func (a *AdminServer) handleCustomsBatch(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	if err := decodeBulkCheckRequest(w, r); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return

@@ -14,9 +14,10 @@ import (
 // Contract:
 //   - Strict admin auth/CSRF/Origin/no-store (wired in admin.go), strict JSON
 //     bodies (DisallowUnknownFields + single value), redaction throughout.
-//   - Share the bulk rate (3/min), concurrency (4), overall (30s), per-send
-//     (10s), and send-cap controls plus bulkMu with the batch and scoped
-//     checks.
+//   - Share concurrency (4), overall (30s), per-send (10s), and send-cap
+//     controls plus bulkMu with the batch and scoped checks. No per-client
+//     rate limit applies to availability checks; single-flight 409, overall
+//     timeout, and send caps remain the safety boundaries.
 //   - Credential: exactly one configured credential identified by the stable
 //     redacted fingerprint (SHA-256 prefix of tier+key, never raw key and
 //     never tail-only). Tier, key, and assigned pool resolve server-side.
@@ -59,11 +60,6 @@ type customCheckResponse struct {
 
 func (a *AdminServer) handleCredentialCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	var input credentialCheckRequest
 	if err := decodeAdminJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -116,11 +112,6 @@ func (a *AdminServer) handleCredentialCheck(w http.ResponseWriter, r *http.Reque
 
 func (a *AdminServer) handleCustomCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	var input customCheckRequest
 	if err := decodeAdminJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())

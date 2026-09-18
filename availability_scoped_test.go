@@ -83,12 +83,15 @@ func TestScopedRateLimitBusy(t *testing.T) {
 	rt.gateway.cfg.Upstream.Zen = srv.URL
 	rt.gateway.cfg.Upstream.Go = srv.URL
 	seedBulkProbeCatalog(rt.gateway)
-	var last *httptest.ResponseRecorder
+	// No per-client rate limit: rapid scoped checks must never return 429.
 	for i := 0; i < 4; i++ {
-		last = serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-node", `{"pool":"shared","index":0}`, token, csrf))
-	}
-	if last.Code != http.StatusTooManyRequests {
-		t.Fatalf("4th scoped code=%d want 429 body=%s", last.Code, last.Body.String())
+		rec := serveAdmin(admin, operabilityRequest(http.MethodPost, "/api/availability/check-node", `{"pool":"shared","index":0}`, token, csrf))
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("scoped check must not rate limit: body=%s", rec.Body.String())
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("scoped code=%d want 200 body=%s", rec.Code, rec.Body.String())
+		}
 	}
 	_, admin2, token2, csrf2 := bulkAdmin(t,
 		map[string][]string{"shared": {"direct"}},

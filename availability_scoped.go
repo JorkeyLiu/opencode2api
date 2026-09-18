@@ -22,8 +22,9 @@ import (
 //     proxy table's per-row 上次检测 refreshes immediately. The global batch
 //     timestamp is preserved when a prior snapshot exists.
 //   - Preserves admin auth/CSRF/Origin/no-store (wired in admin.go),
-//     strict JSON decoding, redaction, and the shared bulk rate (3/min),
-//     concurrency (4), per-send (10s), overall (30s), and send-cap limits.
+//     strict JSON decoding, redaction, and the shared concurrency (4),
+//     per-send (10s), overall (30s), and send-cap limits. No per-client
+//     rate limit applies; single-flight 409, timeouts, and caps remain.
 
 type scopedCheckRequest struct {
 	Pool  string `json:"pool"`
@@ -32,11 +33,6 @@ type scopedCheckRequest struct {
 
 func (a *AdminServer) handleScopedCheck(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	client := clientIP(r)
-	if !a.allowBulk(client) {
-		writeAdminError(w, http.StatusTooManyRequests, "bulk_rate_limited", "too many availability checks; retry in one minute")
-		return
-	}
 	var input scopedCheckRequest
 	if err := decodeAdminJSON(w, r, &input); err != nil {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())

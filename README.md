@@ -128,9 +128,9 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 | 方法 | 路径 | 用途与限速 |
 | --- | --- | --- |
 | `POST` | `/api/proxies/probe` | 按具名 pool 与池内 index 探测单个 proxy 的传输健康；每客户端每分钟最多 10 次。 |
-| `POST` | `/api/availability/check` | 代理批量检测（原生节点匿名/认证通道真实最小推理）：原生按目录实际可服务模型与原生协议 POST 约 1 token（匿名走与推理相同的 agent 形态流式请求并在内部收敛为完成判定，认证保持非流式）；请求体必须为严格空对象 `{}`；每客户端每分钟最多 3 次，同时只允许一次运行（忙时 `409`）。 |
-| `POST` | `/api/availability/check-credentials` | 凭证批量检测（全部已配置认证凭证，不含匿名与自定义渠道）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
-| `POST` | `/api/availability/check-customs` | 渠道批量检测（全部已配置自定义渠道，含未启用渠道，不含原生节点与凭证）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
+| `POST` | `/api/availability/check` | 代理批量检测（原生节点匿名/认证通道真实最小推理）：原生按目录实际可服务模型与原生协议 POST 约 1 token（匿名走与推理相同的 agent 形态流式请求并在内部收敛为完成判定，认证保持非流式）；请求体必须为严格空对象 `{}`；不限客户端频率，同时只允许一次运行（忙时 `409`），整体超时与发送上限保持。 |
+| `POST` | `/api/availability/check-credentials` | 凭证批量检测（全部已配置认证凭证，不含匿名与自定义渠道）；与上行共享单飞/并发/超时/发送上限与严格空对象 `{}` 约束，不限客户端频率。 |
+| `POST` | `/api/availability/check-customs` | 渠道批量检测（全部已配置自定义渠道，含未启用渠道，不含原生节点与凭证）；与上行共享单飞/并发/超时/发送上限与严格空对象 `{}` 约束，不限客户端频率。 |
 | `POST` | `/api/fallback/discover` | 自定义渠道模型发现（GET `{root}/v1/models` 仅下拉，host//v1/完整推理 endpoint 统一归一）：支持未保存新 base_url+明文 key 与已保存 masked secret id；限流 10/分钟，限大小/超时，验证模型 id，`no-store` 不泄露 key；失败保持 `discover_failed` 并附加 `reason`/`endpoint`/`http_status`/`elapsed_ms` 安全分类。 |
 | `POST` | `/api/models/refresh` | 手动刷新模型目录（`catalog`）、models.dev metadata（`metadata`）或两者（`all`）；每客户端每分钟最多 3 次。 |
 

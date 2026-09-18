@@ -543,9 +543,16 @@ type KeyStatus struct {
 	AvailableTargets int `json:"available_targets,omitempty"`
 	TotalTargets     int `json:"total_targets,omitempty"`
 	// Credential availability (operator-facing): status/reason/last checked.
-	Status      string     `json:"status,omitempty"`
-	Reason      string     `json:"reason,omitempty"`
-	LastChecked *time.Time `json:"last_checked,omitempty"`
+	// Status/Reason describe scheduler-derived transport availability and
+	// remain for counts; Probe* carry the latest real minimal-inference
+	// observation for this credential (status/reason/HTTP), empty when never
+	// probed. LastChecked is the probe observation time, nil when unprobed.
+	Status          string     `json:"status,omitempty"`
+	Reason          string     `json:"reason,omitempty"`
+	ProbeStatus     string     `json:"probe_status,omitempty"`
+	ProbeReason     string     `json:"probe_reason,omitempty"`
+	ProbeHTTPStatus int        `json:"probe_http_status,omitempty"`
+	LastChecked     *time.Time `json:"last_checked,omitempty"`
 }
 
 // ProxyStatus is one pool-qualified proxy row. The same raw URL in different
@@ -572,7 +579,14 @@ type ProxyStatus struct {
 	Routing   []string `json:"routing,omitempty"`
 	// AvailableCredentials is the pool-level credential count: auth keys
 	// routed here, plus one when the anonymous credential is routed here.
-	AvailableCredentials     int    `json:"available_credentials,omitempty"`
+	AvailableCredentials int `json:"available_credentials,omitempty"`
+	// Transport is the independent transport observation for this node from
+	// the latest availability probe (healthy/unhealthy/inconclusive), empty
+	// when never probed. It never derives from Healthy: Healthy stays the
+	// internal routing transport signal (defaults true) while Transport is
+	// display-only probe evidence. Reason preserves the bulk node reason.
+	Transport                string `json:"transport,omitempty"`
+	Reason                   string `json:"reason,omitempty"`
 	AnonymousObservation     string `json:"anonymous_observation,omitempty"`
 	AnonymousHTTPStatus      int    `json:"anonymous_http_status,omitempty"`
 	AuthenticatedObservation string `json:"authenticated_observation,omitempty"`
@@ -596,16 +610,16 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 		result.Metadata = gateway.catalog.metadata.Snapshot()
 	}
 	bulkSnap := gateway.bulkSnapshot.Load()
-	credLastChecked := map[string]*time.Time{}
+	credProbe := map[string]bulkCredentialAvailability{}
 	if bulkSnap != nil {
 		for _, c := range bulkSnap.Credentials {
 			// Lookup by internal credential ID (tier-qualified); tail-only
 			// keys would collapse collisions. Fall back to tail key for
 			// snapshots written before CredID existed.
 			if c.CredID != "" {
-				credLastChecked[string(c.Tier)+"\x00"+c.CredID+"\x00"+c.Pool] = c.LastChecked
+				credProbe[string(c.Tier)+"\x00"+c.CredID+"\x00"+c.Pool] = c
 			} else {
-				credLastChecked[string(c.Tier)+"\x00"+c.KeyTail+"\x00"+c.Pool] = c.LastChecked
+				credProbe[string(c.Tier)+"\x00"+c.KeyTail+"\x00"+c.Pool] = c
 			}
 		}
 		if bulkSnap.CheckedAt.IsZero() == false {
@@ -620,7 +634,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	// Restart/Apply may clear observations but never drops configured rows.
 	result.Custom = projectCustomResources(gateway.cfg, bulkSnap)
 	authPoolName := gateway.authPoolName()
-	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.credentials(), authPoolName, credLastChecked)...)
+	result.Keys = append(result.Keys, keyStatusesForTier(gateway, "zen", gateway.credentials(), authPoolName, credProbe)...)
 	routingFor := func(poolName string) []string {
 		out := []string{}
 		if gateway.cfg.ProxyRouting.Anonymous == poolName {
@@ -644,10 +658,13 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	}
 	// Observation snapshot lookup per pool-qualified proxy. The resource view
 	// is observation-driven, never inferred from scheduler cooldowns.
+	// Transport is the independent probe observation (healthy/unhealthy/
+	// inconclusive), never derived from Healthy. Healthy stays the internal
+	// routing signal; Transport is display-only and empty when unprobed.
 	type nodeObs struct {
-		anon, anonHTTP, auth, authHTTP, reason string
-		anonCode, authCode                     int
-		checked                                *time.Time
+		transport, anon, auth, reason string
+		anonCode, authCode            int
+		checked                       *time.Time
 	}
 	nodeObsMap := map[string]*nodeObs{}
 	if bulkSnap != nil {
@@ -666,7 +683,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			if auth == "" {
 				auth = n.Go
 			}
-			nodeObsMap[key] = &nodeObs{anon: anon, auth: auth, anonCode: anonCode, authCode: authCode, reason: n.Reason, checked: n.LastChecked}
+			nodeObsMap[key] = &nodeObs{transport: n.Transport, anon: anon, auth: auth, anonCode: anonCode, authCode: authCode, reason: n.Reason, checked: n.LastChecked}
 		}
 	}
 	for _, pool := range gateway.uniquePools() {
@@ -681,7 +698,7 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 			anonObs, authObs := "untested", "untested"
 			var anonHTTP, authHTTP int
 			var lastChecked *time.Time
-			var reason string
+			var transport, reason string
 			if obs != nil {
 				if obs.anon != "" {
 					anonObs = obs.anon
@@ -690,9 +707,9 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 					authObs = obs.auth
 				}
 				anonHTTP, authHTTP = obs.anonCode, obs.authCode
+				transport = obs.transport
 				reason = obs.reason
 				lastChecked = obs.checked
-				_ = reason
 			}
 			// Unprobed lanes stay untested; lanes that never apply to this
 			// pool stay untested as well. Authenticated without keys is
@@ -706,15 +723,15 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 				AuthKeys: authRouted, ZenKeys: authRouted,
 				Anonymous: gateway.cfg.Anonymous && anonPool == pool,
 				Routing:   routingFor(pool.name), AvailableCredentials: credsForPool(pool.name),
+				Transport: transport, Reason: reason,
 				AnonymousObservation: anonObs, AnonymousHTTPStatus: anonHTTP,
 				AuthenticatedObservation: authObs, AuthenticatedHTTPStatus: authHTTP,
 				Zen: anonObs, Go: authObs,
 			}
+			// Per-node probe time only; never fall back to the global batch
+			// timestamp so unprobed nodes stay empty (display "—").
 			if lastChecked != nil {
 				status.LastChecked = lastChecked
-			} else if bulkSnap != nil && !bulkSnap.CheckedAt.IsZero() {
-				value := bulkSnap.CheckedAt.UTC()
-				status.LastChecked = &value
 			}
 			result.Proxies = append(result.Proxies, status)
 		}
@@ -823,9 +840,10 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 // keyStatusesForTier snapshots credential-level state for one tier without
 // taking pool locks: credential lists are immutable after build and all
 // scheduler counters are mutex-guarded snapshots. Status/reason form the
-// operator-facing 凭证可用性 view: tier, key tail, assigned pool, status,
-// availability counts, reason, last checked. Full secrets never appear.
-func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, poolName string, lastChecked map[string]*time.Time) []KeyStatus {
+// scheduler-derived transport view; Probe* carry the latest real probe
+// observation (empty when never probed) with LastChecked as probe time only.
+// Full secrets never appear.
+func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, poolName string, probe map[string]bulkCredentialAvailability) []KeyStatus {
 	now := time.Now()
 	nowNanos := now.UnixNano()
 	var total, healthy int
@@ -897,13 +915,18 @@ func keyStatusesForTier(gateway *Gateway, tier string, creds []credentialRef, po
 				status.Reason = "success"
 			}
 		}
-		if lc, ok := lastChecked[tier+"\x00"+cred.id+"\x00"+poolName]; ok {
-			status.LastChecked = lc
-		} else if lc, ok := lastChecked[tier+"\x00"+cred.display+"\x00"+poolName]; ok {
-			status.LastChecked = lc
-		} else if snap := gateway.bulkSnapshot.Load(); snap != nil && !snap.CheckedAt.IsZero() {
-			value := snap.CheckedAt.UTC()
-			status.LastChecked = &value
+		// Probe observation overlay only; never fall back to the global batch
+		// timestamp so unprobed credentials stay empty (display "—").
+		if p, ok := probe[tier+"\x00"+cred.id+"\x00"+poolName]; ok {
+			status.ProbeStatus = p.Status
+			status.ProbeReason = p.Reason
+			status.ProbeHTTPStatus = p.HTTPStatus
+			status.LastChecked = p.LastChecked
+		} else if p, ok := probe[tier+"\x00"+cred.display+"\x00"+poolName]; ok {
+			status.ProbeStatus = p.Status
+			status.ProbeReason = p.Reason
+			status.ProbeHTTPStatus = p.HTTPStatus
+			status.LastChecked = p.LastChecked
 		}
 		result = append(result, status)
 	}
