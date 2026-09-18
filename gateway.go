@@ -2477,18 +2477,10 @@ func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("User-Agent", opencodeWireUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
-	// Upstream route session: internal target-bound rss_* token encoded as a
-	// canonical OpenCode-shaped pseudonymous wire session, never raw client
-	// material. Official OpenCode-provider requests use only the official
-	// header set: no generic x-session-affinity / X-Session-Id.
-	req.Header.Set("x-opencode-session", routeWireSession(routeSession))
-	req.Header.Set("x-opencode-request", requestWireID(ids.Request))
-	req.Header.Set("x-opencode-project", projectWireID(ids.Project))
-	if parent := parentWireSession(ids.ParentSession); parent != "" {
-		req.Header.Set("x-parent-session-id", parent)
-	}
+	// Single canonical OpenCode wire header set shared with custom fallback
+	// inference and custom probes (bare UA, client, pseudonymous
+	// session/request/project/parent). Auth below stays per-target.
+	setOpenCodeWireHeaders(req.Header, ids, routeSession)
 	if protocol == ProtocolAnthropic {
 		req.Header.Set("x-api-key", key)
 		req.Header.Set("anthropic-version", "2023-06-01")

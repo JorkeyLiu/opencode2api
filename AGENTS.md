@@ -280,8 +280,10 @@
   configured custom fallback channels are probed in the same response with
   their configured model plus channel protocol (chat → `/v1/chat/completions`,
   responses → `/v1/responses`, via the unified API-root rule);
-  custom results never write Zen scheduler or transport health and never record
-  inference metrics/history. The scoped customs batch probes the channels
+   custom results never write Zen scheduler or transport health and never record
+   inference metrics/history, and custom availability rows keep the exact
+   `http_status` where an HTTP response exists (same factual-observation rule
+   as proxy lanes). The scoped customs batch probes the channels
   under the same per-channel rule while the proxy batch never probes custom
   channels. Model discovery may still use `GET {root}/v1/models`
   (host, `/v1`, either full inference endpoint all normalize to `/v1/models`)
@@ -318,7 +320,7 @@
   reasoning control; history/content untouched), explicit low/medium/high
   override (chat sets `reasoning_effort`, responses merges/creates
   `reasoning:{effort}`)), response/stream transcoded back;
-  never listed in public `/v1/models`; no supplier session affinity; never touches
+  never listed in public `/v1/models`; sends canonical pseudonymous OpenCode routing metadata (target-bound custom route session via the shared wire helpers, never raw session/secrets, full history still sent, never relying on supplier-persisted state); never touches
   Zen scheduler layers)
   and the session binds first to that full channel identity (stable `id` +
   normalized base URL/authority + key fingerprint/identity + configured model +
@@ -334,6 +336,7 @@
   display name. The fallback API-key editor is a non-password text input with
   visual concealment and `autocomplete="off"` (never a password submission);
   the real admin login keeps `username`/`current-password` semantics.
+- Upstream OpenCode client identity: at the upstream boundary the Gateway IS the OpenCode client for every upstream outbound HTTP (native anonymous/authenticated inference, custom fallback sends, availability probes, model/capability discovery). All such egress MUST follow one OpenCode client standard through a single shared, centralized, target-aware request-construction authority. Generation/selection of `User-Agent`, `x-opencode-client`, canonical pseudonymous `x-opencode-session` / `request` / `project` / `parent`, and target-protocol auth headers MUST live in that authority only; call sites MUST NEVER hand-write, copy, trim, or maintain channel/call-site-specific header subsets. Semantically necessary per-category header differences (e.g. inference carries target-bound route-session metadata while pure discovery is sessionless) MUST be explicit request-category policies inside the shared authority, NEVER independent construction logic; this requires one standard plus category policy, NOT literally identical headers on every request. Every session header MUST use the §3 canonical pseudonymous/target-bound mapping; raw client sessions, credentials, or secrets MUST NEVER be passed through. Custom fallback sends full history without relying on supplier-persisted state and MUST still emit the same OpenCode wire routing metadata; `no affinity` MUST NEVER justify omitting it. Any new upstream egress or protocol MUST extend/reuse the shared authority with validation; new functions MUST NEVER directly `Set` the managed headers above.
 - Health readiness: healthz keeps all existing fields and adds additive
   routing readiness (global credential availability plus assigned-pool health;
   per-model target cooldowns, proxy429 cooldowns, channel cooldowns, and credential429

@@ -684,6 +684,17 @@ func buildFallbackChatBody(ex upstreamExtra, hasEx bool, bodies map[Tier][]byte,
 
 // buildFallbackRequestBody is the protocol-aware fallback body builder.
 func buildFallbackRequestBody(ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, route modelRoute, ch FallbackChannelConfig) ([]byte, error) {
+	return buildFallbackRequestBodyWithSession(ex, hasEx, bodies, route, ch, "")
+}
+
+// buildFallbackRequestBodyWithSession converts the client request to the
+// channel protocol, rewrites model, overlays reasoning effort, and stamps the
+// target-bound route session via the shared applyRouteSessionToBody path
+// (Responses prompt_cache_key/store defaults; chat conversation/metadata
+// overwrite when present, never invented). Empty routeSession preserves the
+// legacy test-only path without wire session stamping; production callers
+// always pass the derived custom route session.
+func buildFallbackRequestBodyWithSession(ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, route modelRoute, ch FallbackChannelConfig, routeSession string) ([]byte, error) {
 	model := strings.TrimSpace(ch.Model)
 	if model == "" {
 		return nil, errors.New("fallback channel model must not be empty")
@@ -702,7 +713,14 @@ func buildFallbackRequestBody(ex upstreamExtra, hasEx bool, bodies map[Tier][]by
 	if err != nil {
 		return nil, errors.New("request contains unsupported JSON values")
 	}
-	return encoded, nil
+	if strings.TrimSpace(routeSession) == "" {
+		return encoded, nil
+	}
+	stamped, err := applyRouteSessionToBody(encoded, routeSession, target, false)
+	if err != nil {
+		return nil, err
+	}
+	return stamped, nil
 }
 
 // Structured model-discovery failure reasons. Only reliably distinguishable
@@ -847,13 +865,13 @@ func fetchFallbackModels(ctx context.Context, client *http.Client, baseURL, apiK
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	// All OpenCode discovery identity/auth flows through the shared
+	// centralized discovery authority (bare UA, x-opencode-client, Bearer
+	// auth; sessionless). This call site must not Set managed headers.
+	req, err := newFallbackDiscoveryRequest(reqCtx, trimmedBase, apiKey)
 	if err != nil {
 		return nil, &fallbackDiscoverError{Reason: fallbackDiscoverTransport, Endpoint: redactedEndpoint, ElapsedMS: elapsedMS()}
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", opencodeUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, &fallbackDiscoverError{Reason: fallbackDiscoverTransportReason(err), Endpoint: redactedEndpoint, ElapsedMS: elapsedMS()}
@@ -891,6 +909,56 @@ func fetchFallbackModels(ctx context.Context, client *http.Client, baseURL, apiK
 	return out, nil
 }
 
+// customRouteScopeFor builds the target-bound internal route-session scope for
+// one custom fallback channel. It binds the upstream authority (unified
+// API-root rule), TierCustom, a non-sensitive channel+key identity, a stable
+// fallback pool marker, and the channel protocol; model is excluded like the
+// native scope. Raw sessions, secrets, and body content never enter the scope:
+// CredID carries only "custom:<id>:<8-hex key hash>" (hash prefix, never the
+// key). Stateless first generation via deriveFirstRouteSession keeps the wire
+// session stable per client session + target without scheduler writes.
+func customRouteScopeFor(id, baseURL, apiKey string, proto Protocol) routeSessionScope {
+	trimmedID := strings.TrimSpace(id)
+	normalized := normalizeFallbackBaseURL(baseURL)
+	root := fallbackAPIRoot(normalized)
+	if root == "" {
+		root = normalized
+	}
+	keyHash := ""
+	if strings.TrimSpace(apiKey) != "" {
+		keyHash = fallbackKeyHash(strings.TrimSpace(apiKey))
+		if len(keyHash) > 8 {
+			keyHash = keyHash[:8]
+		}
+	}
+	credID := "custom:" + trimmedID
+	if keyHash != "" {
+		credID += ":" + keyHash
+	}
+	return routeSessionScope{
+		Authority: normalizeRouteAuthority(root),
+		Tier:      TierCustom,
+		CredID:    credID,
+		Pool:      "fallback",
+		ProxyRaw:  "",
+		Protocol:  fallbackChannelProtocol(FallbackChannelConfig{Protocol: proto}),
+	}
+}
+
+// customRouteScope is the FallbackChannelConfig wrapper for customRouteScopeFor.
+func customRouteScope(ch FallbackChannelConfig) routeSessionScope {
+	return customRouteScopeFor(ch.ID, ch.BaseURL, ch.APIKey, fallbackChannelProtocol(ch))
+}
+
+// customRouteSession derives the stable target-bound internal route token for
+// one client session on one custom channel. Stateless (no scheduler store,
+// no override, no pin): the same client+target always yields the same token,
+// different targets always differ. The wire headers/body encode it via the
+// shared routeWireSession mapping, so the raw client session never leaves.
+func customRouteSession(clientSession string, ch FallbackChannelConfig) string {
+	return deriveFirstRouteSession(clientSession, customRouteScope(ch))
+}
+
 // fallbackObservabilityChannel names the observability channel for one custom
 // fallback channel. Tier stays "custom"; Channel carries the stable ID
 // ("custom:<channelID>") so per-channel usage/attempts split on the machine
@@ -907,12 +975,15 @@ func fallbackObservabilityChannel(id string) string {
 // newCustomChannelRequest is the single shared constructor for custom-channel
 // HTTP sends: endpoint (unified API-root rule for the channel protocol),
 // Content-Type, parameterized Accept (streaming sends accept event streams,
-// probes accept JSON only), User-Agent, x-opencode-client, Bearer auth, and
-// the caller-supplied body carrying the channel model/protocol identity.
-// Probes stay sessionless/stateless: no supplier session affinity headers,
-// no binding, no scheduler/health/metrics/history writes (enforced by the
-// callers, which never touch those layers for custom sends).
-func newCustomChannelRequest(ctx context.Context, baseURL string, proto Protocol, body []byte, apiKey string, streaming bool) (*http.Request, error) {
+// probes accept JSON only), the single canonical OpenCode wire header set
+// (bare UA, x-opencode-client, pseudonymous session/request/project/parent
+// derived from ids plus the target-bound route session), Bearer auth, and the
+// caller-supplied body carrying the channel model/protocol identity. The wire
+// session is routing-compatibility metadata only: every request still carries
+// the full client history and never relies on the supplier to persist
+// conversation state. Custom sends never touch Zen scheduler layers; probes
+// additionally write no binding/health/metrics/history (enforced by callers).
+func newCustomChannelRequest(ctx context.Context, baseURL string, proto Protocol, body []byte, apiKey string, streaming bool, ids requestIDs, routeSession string) (*http.Request, error) {
 	endpoint := fallbackEndpointURL(baseURL, proto)
 	if endpoint == "" {
 		return nil, errors.New("fallback channel base_url must not be empty")
@@ -927,8 +998,7 @@ func newCustomChannelRequest(ctx context.Context, baseURL string, proto Protocol
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
+	setOpenCodeWireHeaders(req.Header, ids, routeSession)
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
 	return req, nil
 }
@@ -943,10 +1013,13 @@ func (g *Gateway) fallbackCustomClient() *http.Client {
 }
 
 // doCustomFallbackRequest sends one request to the bound custom channel using
-// the channel protocol (chat or responses). It never touches Zen/Go scheduler
+// the channel protocol (chat or responses). It never touches Zen scheduler
 // cooldowns or proxy transport health. The returned route is TierCustom plus
 // the channel protocol so the caller transcodes back to the client protocol
-// with the existing cross-protocol paths.
+// with the existing cross-protocol paths. The wire carries the single
+// canonical OpenCode routing metadata (pseudonymous session/request/project
+// derived from the target-bound custom route session): full client history
+// stays in the body and the supplier is never relied on to persist state.
 func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int) (*http.Response, modelRoute, int, error) {
 	channelProtocol := fallbackChannelProtocol(ch)
 	channelModel := strings.TrimSpace(ch.Model)
@@ -959,7 +1032,8 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	if isContextCancelled(ctx) {
 		return nil, effectiveRoute, attemptOffset, ctx.Err()
 	}
-	chatBody, err := buildFallbackRequestBody(ex, hasEx, bodies, route, ch)
+	routeSession := customRouteSession(ids.Session, ch)
+	chatBody, err := buildFallbackRequestBodyWithSession(ex, hasEx, bodies, route, ch, routeSession)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
@@ -967,12 +1041,10 @@ func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute,
 	if endpoint == "" {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	req, err := newCustomChannelRequest(ctx, ch.BaseURL, channelProtocol, chatBody, ch.APIKey, true)
+	req, err := newCustomChannelRequest(ctx, ch.BaseURL, channelProtocol, chatBody, ch.APIKey, true, ids, routeSession)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
-	// No supplier session affinity headers; every request carries the full
-	// client-provided history in the chat body.
 	fakeProxy := &proxyTransport{name: normalizeFallbackBaseURL(ch.BaseURL), pool: "fallback"}
 	display := "custom:" + strings.TrimSpace(ch.ID)
 	channel := fallbackObservabilityChannel(ch.ID)

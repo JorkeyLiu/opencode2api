@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -111,13 +112,91 @@ func firstString(values ...string) string {
 	return ""
 }
 
-func opencodeUserAgent() string {
+// genericFetchUserAgent is the generic fetch UA for non-upstream public
+// reads only (capability directory, endpoint docs, models.dev, proxy
+// transport probes). It is explicitly NOT the canonical upstream OpenCode
+// wire identity: only opencodeWireUserAgent defines that standard and only
+// the shared OpenCode request authorities may present it upstream.
+func genericFetchUserAgent() string {
 	return fmt.Sprintf("opencode/1.18.21 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
 }
 
+// setOpenCodeWireHeaders applies the single canonical OpenCode wire header set
+// shared by native Zen inference, custom fallback inference, and custom
+// minimal-inference probes: bare official UA, x-opencode-client, canonical
+// pseudonymous session/request/project derived from the internal IDs plus the
+// target-bound internal route token, and the optional canonical parent.
+// Callers set Content-Type/Accept/auth separately per target rules. The raw
+// client session, secrets, and body content never leave through these headers:
+// session/request/project are stable pseudonymous mappings only.
+func setOpenCodeWireHeaders(h http.Header, ids requestIDs, routeSession string) {
+	if h == nil {
+		return
+	}
+	h.Set("User-Agent", opencodeWireUserAgent())
+	h.Set("x-opencode-client", "cli")
+	h.Set("x-opencode-session", routeWireSession(routeSession))
+	h.Set("x-opencode-request", requestWireID(ids.Request))
+	h.Set("x-opencode-project", projectWireID(ids.Project))
+	if parent := parentWireSession(ids.ParentSession); parent != "" {
+		h.Set("x-parent-session-id", parent)
+	}
+}
+
+// setOpenCodePublicHeaders applies the sessionless public subset for model
+// discovery GETs: bare official UA plus x-opencode-client only. Discovery must
+// not forge an inference session requirement.
+func setOpenCodePublicHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
+	h.Set("User-Agent", opencodeWireUserAgent())
+	h.Set("x-opencode-client", "cli")
+}
+
+// newOpenCodeDiscoveryRequest is the single shared centralized authority for
+// all upstream OpenCode model-discovery GETs (Zen and custom fallback). It
+// owns the discovery category policy: sessionless public identity subset
+// (bare canonical wire UA plus x-opencode-client, never session/request/
+// project/parent) plus the target Bearer auth. Non-OpenCode data-directory
+// fetches (models.opencode.ai, models.dev, GitHub docs) and proxy transport
+// probes are not OpenCode discovery and stay outside this authority.
+func newOpenCodeDiscoveryRequest(ctx context.Context, endpoint, apiKey string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	setOpenCodePublicHeaders(req.Header)
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	return req, nil
+}
+
+// newZenDiscoveryRequest builds the Zen model-discovery GET through the
+// shared discovery authority. The endpoint derives from the Zen base URL with
+// the plain /v1/models suffix.
+func newZenDiscoveryRequest(ctx context.Context, baseURL, apiKey string) (*http.Request, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/v1/models"
+	return newOpenCodeDiscoveryRequest(ctx, endpoint, apiKey)
+}
+
+// newFallbackDiscoveryRequest builds a custom fallback channel
+// model-discovery GET through the shared discovery authority. The endpoint
+// derives from the channel base URL with the unified API-root rule so host,
+// /v1, and full inference endpoints all resolve to /v1/models.
+func newFallbackDiscoveryRequest(ctx context.Context, baseURL, apiKey string) (*http.Request, error) {
+	endpoint := fallbackModelsURL(strings.TrimSpace(baseURL))
+	if endpoint == "" {
+		return nil, fmt.Errorf("fallback channel base_url must not be empty")
+	}
+	return newOpenCodeDiscoveryRequest(ctx, endpoint, apiKey)
+}
+
 // openCodeWireVersion is the current official OpenCode release tracked for the
-// Zen/Go wire identity. The inference plane and Zen/Go availability probes
-// present this bare version; custom fallback suppliers keep their own semantics.
+// canonical upstream OpenCode wire identity. Every upstream OpenCode egress
+// presents this bare version through the single shared construction authority;
+// per-category header differences are category policies inside that authority.
+// Non-upstream public reads use the independent generic fetch UA instead.
 const openCodeWireVersion = "1.18.31"
 
 // opencodeWireUserAgent returns the bare official OpenCode wire identity

@@ -362,9 +362,13 @@ func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) 
 	}
 	label := bulkCustomOutcomeLabel(result)
 	status, reason := bulkCustomStatusFor(label)
+	httpStatus := 0
+	if result.Status != 0 {
+		httpStatus = result.Status
+	}
 	fresh := bulkCustomAvailability{
 		ID: ch.ID, Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
-		Status: status, Reason: reason, LastChecked: &checkedAt,
+		Status: status, Reason: reason, HTTPStatus: httpStatus, LastChecked: &checkedAt,
 	}
 	g.mergeCustomSnapshotRow(checkedAt, fresh)
 	return customCheckResponse{CheckedAt: checkedAt, Custom: fresh, Partial: result.Cancelled}

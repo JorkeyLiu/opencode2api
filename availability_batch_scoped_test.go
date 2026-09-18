@@ -558,6 +558,9 @@ func TestCustomsBatchRequestShapeAndEffort(t *testing.T) {
 		accept      string
 		ua          string
 		cli         string
+		ses         string
+		reqID       string
+		prj         string
 		body        map[string]any
 	}
 	var mu sync.Mutex
@@ -572,6 +575,8 @@ func TestCustomsBatchRequestShapeAndEffort(t *testing.T) {
 			path: req.URL.Path, auth: req.Header.Get("Authorization"),
 			contentType: req.Header.Get("Content-Type"), accept: req.Header.Get("Accept"),
 			ua: req.Header.Get("User-Agent"), cli: req.Header.Get("x-opencode-client"),
+			ses: req.Header.Get("x-opencode-session"), reqID: req.Header.Get("x-opencode-request"),
+			prj:  req.Header.Get("x-opencode-project"),
 			body: payload,
 		}
 		mu.Unlock()
@@ -627,11 +632,14 @@ func TestCustomsBatchRequestShapeAndEffort(t *testing.T) {
 		if s.accept != "application/json" {
 			t.Fatalf("%s accept=%q want non-streaming probe accept", model, s.accept)
 		}
-		if s.ua != opencodeUserAgent() {
+		if s.ua != opencodeWireUserAgent() {
 			t.Fatalf("%s ua=%q", model, s.ua)
 		}
 		if s.cli != "cli" {
 			t.Fatalf("%s x-opencode-client=%q", model, s.cli)
+		}
+		if !isCanonicalWireSession(s.ses) || !isCanonicalWireRequest(s.reqID) || !isCanonicalWireProject(s.prj) {
+			t.Fatalf("%s probe must carry canonical session/request/project, got %q %q %q", model, s.ses, s.reqID, s.prj)
 		}
 		if st, _ := s.body["stream"].(bool); s.path == "/v1/chat/completions" && st {
 			t.Fatalf("%s probe must be non-streaming", model)

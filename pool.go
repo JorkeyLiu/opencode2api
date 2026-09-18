@@ -163,7 +163,7 @@ func (p *transportPool) checkClaimedProxy(ctx context.Context, proxy *proxyTrans
 	defer cancel()
 	req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, target, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", opencodeUserAgent())
+		req.Header.Set("User-Agent", genericFetchUserAgent())
 		resp, requestErr := proxy.client.Do(req)
 		err = requestErr
 		if resp != nil {

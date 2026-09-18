@@ -559,26 +559,50 @@ func TestFallbackConversionAllProtocols(t *testing.T) {
 	for _, tc := range cases {
 		var gotModel string
 		var gotPath string
+		var gotSes, gotReq, gotPrj, gotUA, gotClient string
+		rawSes := "ses_conv_" + string(tc.external)
 		custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			gotPath = r.URL.Path
 			body, _ := io.ReadAll(r.Body)
 			var p map[string]any
 			_ = json.Unmarshal(body, &p)
 			gotModel, _ = p["model"].(string)
+			gotSes = r.Header.Get("x-opencode-session")
+			gotReq = r.Header.Get("x-opencode-request")
+			gotPrj = r.Header.Get("x-opencode-project")
+			gotUA = r.Header.Get("User-Agent")
+			gotClient = r.Header.Get("x-opencode-client")
 			if auth := r.Header.Get("Authorization"); auth == "" {
 				w.WriteHeader(401)
 				return
 			}
-			if r.Header.Get("x-opencode-session") != "" {
+			// Canonical pseudonymized routing metadata is required; the raw
+			// client session or secrets must never appear on the wire.
+			if gotSes == "" || !isCanonicalWireSession(gotSes) {
 				w.WriteHeader(400)
-				_, _ = w.Write([]byte(`{"error":{"message":"session leak"}}`))
+				_, _ = w.Write([]byte(`{"error":{"message":"missing canonical session"}}`))
+				return
+			}
+			if strings.Contains(gotSes, rawSes) || strings.Contains(gotReq, rawSes) || strings.Contains(gotPrj, rawSes) {
+				w.WriteHeader(400)
+				_, _ = w.Write([]byte(`{"error":{"message":"raw session leak"}}`))
+				return
+			}
+			if !isCanonicalWireRequest(gotReq) || !isCanonicalWireProject(gotPrj) {
+				w.WriteHeader(400)
+				_, _ = w.Write([]byte(`{"error":{"message":"missing canonical request/project"}}`))
+				return
+			}
+			if gotUA != opencodeWireUserAgent() || gotClient != "cli" {
+				w.WriteHeader(400)
+				_, _ = w.Write([]byte(`{"error":{"message":"missing canonical identity"}}`))
 				return
 			}
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(fallbackChatOK("configured-m")))
 		}))
 		gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k", Model: "configured-m"}}, "c1")
-		ses := "ses_conv_" + string(tc.external)
+		ses := rawSes
 		bindAnonPin(t, gw, ses, "m")
 		postStub(t, gw, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
 			return responseWithBody(429, `{"error":{"message":"slow"}}`), nil

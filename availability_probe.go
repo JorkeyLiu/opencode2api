@@ -55,15 +55,23 @@ func (g *Gateway) bulkProbeModel(tier Tier, public bool) (string, Protocol, bool
 }
 
 // bulkProbeRequestBody builds minimal-inference bodies for custom fallback
-// probes only (custom suppliers keep their own wire semantics). Native Zen
-// anonymous/authenticated probes use bulkProbeCanonicalBody plus
+// probes only. Custom probes reuse the unified canonical OpenCode wire
+// identity through the shared custom request construction path while keeping
+// scheduler/transport state isolation and minimal-inference semantics. Native
+// Zen anonymous/authenticated probes use bulkProbeCanonicalBody plus
 // newUpstreamRequest so they share the gateway preparation/header path.
 // The configured channel reasoning effort is overlaid with the existing
 // fallback helper: supplier-default ("") strips target strength and
 // "inherit" preserves the converted strength, both no-ops on the minimal
 // body that carries no strength; explicit low/medium/high inject the same
-// target-protocol strength the normal fallback path sends.
+// target-protocol strength the normal fallback path sends. The target-bound
+// custom route session is stamped via the shared applyRouteSessionToBody path
+// so session-requiring compatible upstreams do not return a false 400.
 func bulkProbeRequestBody(model string, protocol Protocol, effort string) ([]byte, error) {
+	return bulkProbeRequestBodyWithSession(model, protocol, effort, "")
+}
+
+func bulkProbeRequestBodyWithSession(model string, protocol Protocol, effort string, routeSession string) ([]byte, error) {
 	var payload map[string]any
 	switch protocol {
 	case ProtocolResponses:
@@ -74,7 +82,14 @@ func bulkProbeRequestBody(model string, protocol Protocol, effort string) ([]byt
 		payload = map[string]any{"model": model, "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 1, "stream": false}
 	}
 	applyFallbackReasoningEffort(payload, effort, protocol)
-	return json.Marshal(payload)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(routeSession) == "" {
+		return encoded, nil
+	}
+	return applyRouteSessionToBody(encoded, routeSession, protocol, false)
 }
 
 func bulkProbeSuccessBody(protocol Protocol, body []byte) bool {
@@ -171,17 +186,23 @@ func (g *Gateway) bulkCustomProbeOnce(parent context.Context, tgt bulkCustomTarg
 	if strings.TrimSpace(tgt.APIKey) == "" || strings.TrimSpace(tgt.Model) == "" {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: 0, Cancelled: parent.Err() != nil}
 	}
-	body, err := bulkProbeRequestBody(strings.TrimSpace(tgt.Model), proto, tgt.Effort)
+	// Canonical stateless probe identity shared with native probes, bound to
+	// the custom target scope. No scheduler reads/writes, no binding, no
+	// product-level persistent affinity: each probe is one independent
+	// minimal inference whose header/body carry the same pseudonymous triple.
+	ids := bulkProbeIDs()
+	scope := customRouteScopeFor(tgt.ID, tgt.BaseURL, tgt.APIKey, proto)
+	routeSession := deriveFirstRouteSession(ids.Session, scope)
+	body, err := bulkProbeRequestBodyWithSession(strings.TrimSpace(tgt.Model), proto, tgt.Effort, routeSession)
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, Cancelled: parent.Err() != nil}
 	}
 	sendCtx, cancel := context.WithTimeout(parent, bulkPerSendTimeout)
 	defer cancel()
 	// Shared custom request construction (endpoint, Content-Type,
-	// non-streaming Accept, User-Agent, x-opencode-client, Bearer auth).
-	// Probes carry no supplier session affinity and write no
-	// binding/scheduler/health/metrics/history state.
-	req, err := newCustomChannelRequest(sendCtx, tgt.BaseURL, proto, body, tgt.APIKey, false)
+	// non-streaming Accept, canonical OpenCode wire headers, Bearer auth).
+	// Probes write no binding/scheduler/health/metrics/history state.
+	req, err := newCustomChannelRequest(sendCtx, tgt.BaseURL, proto, body, tgt.APIKey, false, ids, routeSession)
 	if err != nil {
 		return bulkCustomResult{Target: tgt, StartedNanos: startedNanos, DurationMS: max(time.Since(started).Milliseconds(), 0), TransportErr: err, Cancelled: parent.Err() != nil}
 	}

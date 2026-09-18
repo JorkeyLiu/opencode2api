@@ -192,7 +192,7 @@ func (store *modelMetadataStore) fetch(ctx context.Context, client *http.Client)
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("User-Agent", genericFetchUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

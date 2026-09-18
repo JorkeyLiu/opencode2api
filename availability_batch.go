@@ -352,9 +352,13 @@ func (g *Gateway) runCustomsBatch(ctx context.Context) customsBatchResponse {
 			tested++
 			label := bulkCustomOutcomeLabel(r)
 			status, reason := bulkCustomStatusFor(label)
+			httpStatus := 0
+			if r.Status != 0 {
+				httpStatus = r.Status
+			}
 			rows = append(rows, bulkCustomAvailability{
 				ID: ch.ID, Name: ch.Name, BaseURL: redactURL(ch.BaseURL), Model: ch.Model,
-				Status: status, Reason: reason, LastChecked: &checkedAt,
+				Status: status, Reason: reason, HTTPStatus: httpStatus, LastChecked: &checkedAt,
 			})
 			continue
 		}

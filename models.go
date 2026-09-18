@@ -770,7 +770,7 @@ func fetchProtocolCapabilities(ctx context.Context, client *http.Client, endpoin
 		return protocolCapabilities{}, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("User-Agent", genericFetchUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return protocolCapabilities{}, err
@@ -842,7 +842,7 @@ func fetchProtocolDocs(ctx context.Context, client *http.Client, endpoint string
 		return nil, err
 	}
 	req.Header.Set("Accept", "text/plain, text/markdown, */*")
-	req.Header.Set("User-Agent", opencodeUserAgent())
+	req.Header.Set("User-Agent", genericFetchUserAgent())
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -916,13 +916,13 @@ type modelsResponse struct {
 }
 
 func fetchModels(ctx context.Context, client *http.Client, baseURL, key string) ([]string, int, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/models", nil)
+	// All OpenCode discovery identity/auth flows through the shared
+	// centralized discovery authority (bare UA, x-opencode-client, Bearer
+	// auth; sessionless). This call site must not Set managed headers.
+	req, err := newZenDiscoveryRequest(ctx, baseURL, key)
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", opencodeUserAgent())
-	req.Header.Set("x-opencode-client", "cli")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err

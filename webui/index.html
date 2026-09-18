@@ -1602,7 +1602,7 @@ function renderHealth(){
       (function(){ var td=document.createElement("td"); td.className="avail-l"; var dn=String(c.name||c.id||"—"); td.textContent=dn; td.title="渠道："+dn; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.base_url||c.BaseURL||"—"; td.title="地址："+(c.base_url||c.BaseURL||"—"); td.className="wrap avail-l"; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.textContent=c.model||"—"; td.title="配置模型："+(c.model||"—"); td.className="wrap avail-l"; tr.appendChild(td); })();
-      (function(){ var td=document.createElement("td"); td.className="avail-c"; var v=customStatusLabel(c.status||"untested"); td.appendChild(el("span",v,"pill "+(v==="可用"?"ok":(v==="未检测"||v==="未定"?"neutral":(v==="限流"?"warn":"bad"))))); td.title="状态："+v; tr.appendChild(td); })();
+      (function(){ var td=document.createElement("td"); td.className="avail-c"; var code=Number(c.http_status!==undefined?c.http_status:(c.HTTPStatus!==undefined?c.HTTPStatus:(c.httpStatus||0)))||0; var v=customStatusLabel(c.status||"untested"); var txt=obsDisplayText(c.status||"untested",code); td.appendChild(el("span",txt,"pill "+obsTone(c.status||"untested",code))); td.title="状态："+v+(code?("（HTTP "+code+"）"):""); tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.className="avail-l"; var rv=customReasonLabel(c.reason||"—"); td.textContent=rv; td.title="原因："+rv; tr.appendChild(td); })();
       (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未批量检测"; tr.appendChild(td); })();
       var cop=document.createElement("td"); cop.className="avail-c";
@@ -1697,7 +1697,9 @@ function probeCustom(c, btn){
     var row=res.custom||null;
     if(row){ mergeCustomRowIntoCache(row); try{ renderHealth(); }catch(e){} }
     var st=row?customStatusLabel(String(row.status||"untested")):"未知";
-    toast("检测 "+name+"："+(st||"未知"));
+    var code=row?Number(row.http_status!==undefined?row.http_status:(row.HTTPStatus!==undefined?row.HTTPStatus:(row.httpStatus||0)))||0:0;
+    var reason=row?customReasonLabel(String(row.reason||"")):"";
+    toast("检测 "+name+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""));
     return refreshMonitor({force:true});
   }).catch(function(err){ toast(availBusyMessage(err,"检测 "+name),true); })
   .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测自定义渠道可用性");}catch(e){} setAvailBusy(false); });

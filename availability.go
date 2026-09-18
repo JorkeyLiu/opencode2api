@@ -88,6 +88,7 @@ type bulkCustomAvailability struct {
 	Model       string     `json:"model"`
 	Status      string     `json:"status"`
 	Reason      string     `json:"reason,omitempty"`
+	HTTPStatus  int        `json:"http_status,omitempty"`
 	LastChecked *time.Time `json:"last_checked,omitempty"`
 }
 
@@ -996,9 +997,13 @@ func (g *Gateway) buildBulkResponse(checkedAt time.Time, total, tested, skipped 
 	for _, r := range customResults {
 		label := bulkCustomOutcomeLabel(r)
 		status, reason := bulkCustomStatusFor(label)
+		httpStatus := 0
+		if r.Status != 0 {
+			httpStatus = r.Status
+		}
 		custom = append(custom, bulkCustomAvailability{
-			Name: r.Target.Name, BaseURL: redactURL(r.Target.BaseURL), Model: r.Target.Model,
-			Status: status, Reason: reason, LastChecked: &checkedAt,
+			ID: r.Target.ID, Name: r.Target.Name, BaseURL: redactURL(r.Target.BaseURL), Model: r.Target.Model,
+			Status: status, Reason: reason, HTTPStatus: httpStatus, LastChecked: &checkedAt,
 		})
 	}
 	// Lanes without a directory probe model surface explicit no_model rows
