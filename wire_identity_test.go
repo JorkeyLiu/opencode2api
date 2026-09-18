@@ -289,8 +289,8 @@ func TestReplayWireRotatesAndStaysFinal(t *testing.T) {
 			t.Fatalf("replay wire must be canonical, got %q", s)
 		}
 	}
-	if sessions[0] == sessions[1] {
-		t.Fatalf("replay must rotate wire session")
+	if sessions[0] != sessions[1] {
+		t.Fatalf("replay must keep the same wire session")
 	}
 	for i, raw := range bodies {
 		var p map[string]any

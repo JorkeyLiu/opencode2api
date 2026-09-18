@@ -111,7 +111,8 @@ func TestPinStaysOnPinnedProxy(t *testing.T) {
 	}
 }
 
-// Pinned anonymous 429 surfaces 429 and never sends another proxy/Go.
+// Pinned anonymous 429 walks the same binding to the next proxy with an
+// identical session and updates current.
 func TestPinnedAnonymous429NoFallback(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -153,12 +154,13 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 		t.Fatalf("unexpected pool size")
 	}
 	var pinnedCalls, otherCalls, zenCalls atomic.Int32
-	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
+	cap := &capturedUpstream{}
+	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, cap, func(*http.Request) (*http.Response, error) {
 		r := responseWithBody(429, `{"error":"throttled"}`)
 		r.Header.Set("Retry-After", "7")
 		return r, nil
 	})
-	postStub(t, gateway, "a", otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gateway, "a", otherIdx, &otherCalls, cap, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	postStub(t, gateway, "z", 0, &zenCalls, nil, func(*http.Request) (*http.Response, error) {
@@ -169,22 +171,32 @@ func TestPinnedAnonymous429NoFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pinned 429 must return response, err=%v", err)
 	}
-	if resp2 == nil || resp2.StatusCode != 429 {
-		t.Fatalf("status=%v want 429", resp2)
-	}
-	if got := resp2.Header.Get("Retry-After"); got != "7" {
-		t.Fatalf("Retry-After=%q want 7 (upstream preserved)", got)
+	if resp2 == nil || resp2.StatusCode != 200 {
+		t.Fatalf("status=%v want 200 via same-binding walk", resp2)
 	}
 	drainResp(resp2)
-	if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 0 {
-		t.Fatalf("no cross-proxy fallback: pinned=%d other=%d", postCount(&pinnedCalls), postCount(&otherCalls))
+	if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 1 {
+		t.Fatalf("same-binding walk: pinned=%d other=%d", postCount(&pinnedCalls), postCount(&otherCalls))
 	}
 	if postCount(&zenCalls) != 0 {
-		t.Fatalf("no anon->paid fallback: zen=%d", postCount(&zenCalls))
+		t.Fatalf("pinned walk must not enter auth: zen=%d", postCount(&zenCalls))
+	}
+	sessions, bodies := cap.get()
+	if len(sessions) != 2 || sessions[0] != sessions[1] {
+		t.Fatalf("walk must keep session identical: %q", sessions)
+	}
+	if len(bodies) == 2 && string(bodies[0]) != string(bodies[1]) {
+		t.Fatalf("walk body must stay byte-identical")
+	}
+	pin2, _ := gateway.scheduler.pinGet(ids.Session, "m")
+	otherRaw := gateway.pools["a"].items[otherIdx].name
+	if pin2.ProxyRaw != otherRaw {
+		t.Fatalf("pin current must move to other proxy: %+v", pin2)
 	}
 }
 
-// Subsequent request during cooldown fast-fails without upstream send.
+// Exhaustion fast-fail: after both proxies cool, the next request fast-fails
+// locally with 429 and zero sends.
 func TestPinnedCooldownFastFail(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -212,23 +224,28 @@ func TestPinnedCooldownFastFail(t *testing.T) {
 			pinnedIdx = i
 		}
 	}
-	// Second request cools the pinned target with 429.
-	var pinnedCalls atomic.Int32
+	// Second request: both proxies 429 so the binding exhausts and cools.
+	var pinnedCalls, otherSecond atomic.Int32
 	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
 		r := responseWithBody(429, `{"error":"throttled"}`)
 		r.Header.Set("Retry-After", "60")
 		return r, nil
 	})
 	otherIdx := 1 - pinnedIdx
-	postStub(t, gateway, "a", otherIdx, nil, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
+	postStub(t, gateway, "a", otherIdx, &otherSecond, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"throttled"}`)
+		r.Header.Set("Retry-After", "60")
+		return r, nil
 	})
 	ids2 := pinIDs(ids.Session, "req-pin-2")
 	resp2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
 	if err != nil || resp2.StatusCode != 429 {
-		t.Fatalf("second must surface 429, err=%v resp=%v", err, resp2)
+		t.Fatalf("second must exhaust with 429, err=%v resp=%v", err, resp2)
 	}
 	drainResp(resp2)
+	if postCount(&pinnedCalls) != 1 || postCount(&otherSecond) != 1 {
+		t.Fatalf("exhaustion must send both: %d/%d", postCount(&pinnedCalls), postCount(&otherSecond))
+	}
 	// Third request during cooldown must fast-fail locally: zero sends.
 	var c0, c1, zc, gc atomic.Int32
 	postStub(t, gateway, "a", 0, &c0, nil, func(*http.Request) (*http.Response, error) {
@@ -382,7 +399,7 @@ func TestPinned5xxRetryOnly(t *testing.T) {
 	}
 }
 
-// Pinned exact-400 replays same-target with rotated session.
+// Pinned exact-400 replays same-target with the same session.
 func TestPinned400Replay(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -432,8 +449,11 @@ func TestPinned400Replay(t *testing.T) {
 		t.Fatalf("400 replay same-target: attempts=%d pinned=%d other=%d", attempts, postCount(&pinnedCalls), postCount(&otherCalls))
 	}
 	sessions, _ := cap.get()
-	if len(sessions) != 2 || sessions[0] == sessions[1] {
-		t.Fatalf("replay must rotate session: %q", sessions)
+	if len(sessions) != 2 || sessions[0] != sessions[1] {
+		t.Fatalf("replay must keep the same session: %q", sessions)
+	}
+	if got := gateway.scheduler.routeSessions.count(); got != 0 {
+		t.Fatalf("same-session replay must not store an override, got %d", got)
 	}
 	if _, ok := gateway.scheduler.pinGet(ids.Session, "m"); !ok {
 		t.Fatalf("replay success must remain bound")
@@ -1338,7 +1358,8 @@ func TestPinRestartStartsEmpty(t *testing.T) {
 	}
 }
 
-// Pinned unresolvable/unhealthy fails locally 502 with no alternative.
+// Pinned unresolvable/unhealthy: single unhealthy current walks to the
+// healthy alternate within the same binding; all unhealthy still 502s.
 func TestPinUnresolvableUnhealthy502(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -1353,7 +1374,8 @@ func TestPinUnresolvableUnhealthy502(t *testing.T) {
 	drainResp(resp)
 	pin, _ := gateway.scheduler.pinGet(ids.Session, "m")
 	_ = pin
-	// Make pinned proxy unhealthy: next request must 502 without touching others.
+	// Pinned binding walks to the healthy alternate: next request serves 200
+	// with one send on the alternate and updates current.
 	for _, proxy := range gateway.pools["a"].items {
 		if proxy != nil && proxy.name == pin.ProxyRaw {
 			proxy.healthy.Store(false)
@@ -1371,14 +1393,42 @@ func TestPinUnresolvableUnhealthy502(t *testing.T) {
 	})
 	ids2 := pinIDs(ids.Session, "req-2")
 	resp2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), ids2, 0)
-	if err != nil || resp2.StatusCode != 502 {
-		t.Fatalf("unhealthy pin must 502, err=%v resp=%v", err, resp2)
+	if err != nil || resp2.StatusCode != 200 {
+		t.Fatalf("walk to healthy alternate must 200, err=%v resp=%v", err, resp2)
 	}
 	drainResp(resp2)
-	// Unhealthy check happens before send; stub transport counts only POSTs,
-	// but unhealthy pins never send. Other proxies must also stay untouched.
-	if postCount(&c0)+postCount(&c1)+postCount(&zc) != 0 {
-		t.Fatalf("unhealthy pin must not try alternatives: %d/%d/%d", postCount(&c0), postCount(&c1), postCount(&zc))
+	// Exactly one send on the healthy alternate; the unhealthy current is
+	// skipped and auth is never entered.
+	if postCount(&c0)+postCount(&c1) != 1 || postCount(&zc) != 0 {
+		t.Fatalf("walk must send once on alternate: %d/%d/%d", postCount(&c0), postCount(&c1), postCount(&zc))
+	}
+	pin2, _ := gateway.scheduler.pinGet(ids.Session, "m")
+	if pin2.ProxyRaw == pin.ProxyRaw {
+		t.Fatalf("pin must move away from unhealthy: %+v", pin2)
+	}
+	// All proxies unhealthy still fails closed 502 with no sends.
+	for _, proxy := range gateway.pools["a"].items {
+		if proxy != nil {
+			proxy.healthy.Store(false)
+		}
+	}
+	var d0, d1, dz atomic.Int32
+	postStub(t, gateway, "a", 0, &d0, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	postStub(t, gateway, "a", 1, &d1, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	postStub(t, gateway, "z", 0, &dz, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	resp3, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ids.Session, "req-3"), 0)
+	if err != nil || resp3.StatusCode != 502 {
+		t.Fatalf("all-unhealthy must 502, err=%v resp=%v", err, resp3)
+	}
+	drainResp(resp3)
+	if postCount(&d0)+postCount(&d1)+postCount(&dz) != 0 {
+		t.Fatalf("all-unhealthy must not send: %d/%d/%d", postCount(&d0), postCount(&d1), postCount(&dz))
 	}
 }
 

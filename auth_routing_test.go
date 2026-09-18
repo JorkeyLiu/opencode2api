@@ -124,7 +124,7 @@ func TestAuthSoftAffinityStable(t *testing.T) {
 	}
 }
 
-// Anonymous pin and route-session stay proxy-bound with no fallback.
+// Anonymous pin is proxy-independent with 429 walk and stable session.
 func TestAnonymousStaysProxyBound(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -155,13 +155,14 @@ func TestAnonymousStaysProxyBound(t *testing.T) {
 		t.Fatalf("pinned proxy not found")
 	}
 	otherIdx := 1 - pinnedIdx
+	cap := &capturedUpstream{}
 	var pinnedCalls, otherCalls, zenCalls atomic.Int32
-	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, cap, func(*http.Request) (*http.Response, error) {
 		r := responseWithBody(429, `{"error":"t"}`)
 		r.Header.Set("Retry-After", "5")
 		return r, nil
 	})
-	postStub(t, gateway, "a", otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gateway, "a", otherIdx, &otherCalls, cap, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	postStub(t, gateway, "z", 0, &zenCalls, nil, func(*http.Request) (*http.Response, error) {
@@ -172,21 +173,33 @@ func TestAnonymousStaysProxyBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp2.StatusCode != 429 {
-		t.Fatalf("status=%d want 429", resp2.StatusCode)
+	if resp2.StatusCode != 200 {
+		t.Fatalf("status=%d want 200 via same-pool walk", resp2.StatusCode)
 	}
 	drainResp(resp2)
-	if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 0 || postCount(&zenCalls) != 0 {
-		t.Fatalf("anon no fallback: pinned=%d other=%d zen=%d", postCount(&pinnedCalls), postCount(&otherCalls), postCount(&zenCalls))
+	if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 1 || postCount(&zenCalls) != 0 {
+		t.Fatalf("anon 429 must walk same binding: pinned=%d other=%d zen=%d", postCount(&pinnedCalls), postCount(&otherCalls), postCount(&zenCalls))
 	}
-	// Route-session proxy-bound: different proxies give different values.
+	sessions, bodies := cap.get()
+	if len(sessions) != 2 || sessions[0] != sessions[1] {
+		t.Fatalf("anon walk must keep same wire session: %q", sessions)
+	}
+	if len(bodies) == 2 && string(bodies[0]) != string(bodies[1]) {
+		t.Fatalf("anon walk body must stay byte-identical")
+	}
+	pin2, _ := gateway.scheduler.pinGet(ids.Session, "m")
 	pool := gateway.pools["a"]
+	otherRaw := pool.items[otherIdx].name
+	if pin2.ProxyRaw != otherRaw || pin2.Generation != pin.Generation+1 {
+		t.Fatalf("anon pin must move current with generation: %+v vs %+v", pin, pin2)
+	}
+	// Route-session proxy-independent: different proxies give same value.
 	c0 := targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "a", ProxyRaw: pool.items[0].name, Model: "m"}
 	c1 := targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "a", ProxyRaw: pool.items[1].name, Model: "m"}
 	s0 := gateway.scheduler.routeSessionFor("ses_anon_bound_1", routeScopeForCandidate("https://zen.example", c0, ProtocolChat))
 	s1 := gateway.scheduler.routeSessionFor("ses_anon_bound_1", routeScopeForCandidate("https://zen.example", c1, ProtocolChat))
-	if s0 == "" || s1 == "" || s0 == s1 {
-		t.Fatalf("anon route sessions must differ per proxy: %q vs %q", s0, s1)
+	if s0 == "" || s1 == "" || s0 != s1 {
+		t.Fatalf("anon route sessions must match across proxies: %q vs %q", s0, s1)
 	}
 	if strings.Contains(s0, "ses_anon_bound_1") || strings.Contains(s1, "ses_anon_bound_1") {
 		t.Fatalf("raw client session exposed")
@@ -576,10 +589,17 @@ func TestAuthPinMoveFencing(t *testing.T) {
 	if cur2.ProxyRaw != "p1" {
 		t.Fatalf("must not split: %s", cur2.ProxyRaw)
 	}
-	// Anonymous never moves.
+	// Anonymous moves with generation fencing like authenticated.
 	s.pinBind("ses_anon_fence", "m", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "a", ProxyRaw: "p0", Model: "m", Protocol: ProtocolChat, Authority: auth})
-	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "p1"); ok {
-		t.Fatalf("anon must never move")
+	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "p1"); !ok {
+		t.Fatalf("anon must move with generation fencing")
+	}
+	curAnon, _ := s.pinGet("ses_anon_fence", "m")
+	if curAnon.ProxyRaw != "p1" || curAnon.Generation != 1 {
+		t.Fatalf("anon move must update current+generation: %+v", curAnon)
+	}
+	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "p0"); ok {
+		t.Fatalf("stale anon move must fail")
 	}
 }
 
@@ -714,8 +734,8 @@ func poolIndexByRaw(gateway *Gateway, pool string, raw string) int {
 	return -1
 }
 
-// 3-proxy established auth: first two distinct 429s stop the walk within
-// budget, third untouched, credential429 set with second Retry-After.
+// 3-proxy established auth: first two 429s continue to the third (no
+// two-stop, no max_attempts truncation); third 200 wins without credential429.
 func TestAuthEstablishedThreeProxyTwo429Stops(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authThreeProxyGateway(t, monitor)
@@ -760,38 +780,26 @@ func TestAuthEstablishedThreeProxyTwo429Stops(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
-	if r2.StatusCode != 429 {
-		t.Fatalf("status=%d want 429", r2.StatusCode)
-	}
-	if got := r2.Header.Get("Retry-After"); got != "9" {
-		t.Fatalf("second Retry-After authoritative, got %q want %q", got, "9")
-	}
-	// Target-protocol envelope preserved.
-	rec := &testResponseWriter{header: make(http.Header)}
-	copyErrorResponse(rec, ProtocolChat, r2, "req-3p")
-	if rec.status != 429 || rec.header.Get("Retry-After") != "9" || len(rec.body) == 0 {
-		t.Fatalf("terminal 429 envelope broken: status=%d retry=%q body=%d", rec.status, rec.header.Get("Retry-After"), len(rec.body))
+	if r2.StatusCode != 200 {
+		t.Fatalf("status=%d want 200 via third proxy (no two-stop)", r2.StatusCode)
 	}
 	drainResp(r2)
-	if postCount(&c0) != 1 || postCount(&c1) != 1 {
-		t.Fatalf("exact two distinct sends: %d/%d want 1/1", postCount(&c0), postCount(&c1))
+	if postCount(&c0) != 1 || postCount(&c1) != 1 || postCount(&c2) != 1 {
+		t.Fatalf("all three proxies must send 1/1/1, got %d/%d/%d", postCount(&c0), postCount(&c1), postCount(&c2))
 	}
-	if postCount(&c2) != 0 {
-		t.Fatalf("third proxy untouched, got %d", postCount(&c2))
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3", attempts)
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d want 2", attempts)
+	if got := len(monitor.Snapshot().Upstream.Recent) - before; got != 3 {
+		t.Fatalf("recorded=%d want 3", got)
 	}
-	if got := len(monitor.Snapshot().Upstream.Recent) - before; got != 2 {
-		t.Fatalf("recorded=%d want 2", got)
+	if _, _, ok := gateway.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("partial 429 with success must not set credential429")
 	}
-	if _, status, ok := gateway.scheduler.credential429CooldownStatus(pin.CredID); !ok || status != 429 {
-		t.Fatalf("credential429 must be set")
-	}
-	// Pin must not move on terminal 429 evidence.
+	// Pin must move to the successful third proxy.
 	pin2, _ := gateway.scheduler.pinGet(ses, "m")
-	if pin2.ProxyRaw != pin.ProxyRaw || pin2.Generation != pin.Generation {
-		t.Fatalf("terminal 429 must not move pin: %+v vs %+v", pin, pin2)
+	if pin2.ProxyRaw != thirdRaw || pin2.Generation != pin.Generation+1 {
+		t.Fatalf("success must move pin to third: %+v vs %+v", pin, pin2)
 	}
 }
 
@@ -853,9 +861,9 @@ func TestAuthEstablishedSmallBudgetTransportCap(t *testing.T) {
 	}
 }
 
-// Established 429 evidence never exceeds the real-send budget: at
-// max_attempts=1 only the first proxy 429 is observed, no second send and no
-// credential429, preserving the first Retry-After envelope.
+// Established 429 chain is never truncated by the real-send budget: at
+// max_attempts=1 the walk still covers all eligible proxies; full exhaustion
+// writes credential429 with the last Retry-After envelope.
 func TestAuthEstablished429RespectsBudget1(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authTwoProxyGateway(t, monitor, 1)
@@ -889,20 +897,20 @@ func TestAuthEstablished429RespectsBudget1(t *testing.T) {
 	})
 	r2, _, attempts, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r2"), 0)
 	if err != nil || r2.StatusCode != 429 {
-		t.Fatalf("err=%v resp=%v want first 429 terminal", err, r2)
+		t.Fatalf("err=%v resp=%v want exhausted 429", err, r2)
 	}
-	if got := r2.Header.Get("Retry-After"); got != "4" {
-		t.Fatalf("budget-1 must preserve first Retry-After, got %q", got)
+	if got := r2.Header.Get("Retry-After"); got != "9" {
+		t.Fatalf("exhaustion must preserve last Retry-After, got %q", got)
 	}
 	drainResp(r2)
-	if postCount(&curCalls) != 1 || postCount(&otherCalls) != 0 {
-		t.Fatalf("budget-1 429 must send once only: %d/%d", postCount(&curCalls), postCount(&otherCalls))
+	if postCount(&curCalls) != 1 || postCount(&otherCalls) != 1 {
+		t.Fatalf("budget-1 429 must still walk both: %d/%d", postCount(&curCalls), postCount(&otherCalls))
 	}
-	if attempts != 1 {
-		t.Fatalf("attempts=%d want 1", attempts)
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2", attempts)
 	}
-	if _, _, ok := gateway.scheduler.credential429CooldownStatus(pin.CredID); ok {
-		t.Fatalf("single 429 within budget-1 must not set credential429")
+	if _, _, ok := gateway.scheduler.credential429CooldownStatus(pin.CredID); !ok {
+		t.Fatalf("full exhaustion must set credential429 even at budget-1")
 	}
 }
 

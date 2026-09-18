@@ -173,22 +173,30 @@ func TestFallbackUnbound429Unchanged(t *testing.T) {
 	}))
 	defer custom.Close()
 	gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm"}}, "c1")
+	// Unbound anonymous single-proxy 429 alone does not exhaust the native
+	// route (authenticated lane still has a candidate), so custom stays out.
 	var anonHits atomic.Int32
 	postStub(t, gw, "a", 0, &anonHits, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(429, `{"error":{"message":"slow"}}`), nil
 	})
+	postStub(t, gw, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
 	route := anonAuthRoute()
 	ids := pinIDs("ses_unbound_fb_1", "r1")
-	resp, _, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids, 0, upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids, 0, upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier == TierCustom {
+		t.Fatalf("anon 429 with healthy auth must serve auth 200, got %d %+v", resp.StatusCode, eff)
+	}
 	if customHits.Load() != 0 {
-		t.Fatal("unbound anonymous 429 must not take over custom")
+		t.Fatal("partial native 429 must not take over custom")
 	}
 	if gw.scheduler.fallbacks.count() != 0 {
-		t.Fatal("unbound must not bind fallback")
+		t.Fatal("partial exhaustion must not bind fallback")
 	}
 }
 
@@ -292,10 +300,9 @@ func TestFallbackAuthPinNoTrigger(t *testing.T) {
 	}))
 	defer custom.Close()
 	gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k", Model: "cm"}}, "c1")
-	// Bind authenticated pin.
+	// Bind authenticated pin (single eligible proxy in z pool).
 	pool := gw.pools["z"]
 	if pool == nil {
-		// routing uses z pool for zen auth; fallbackTestGateway has z pool.
 		t.Fatal("z pool missing")
 	}
 	cred := credentialsForKeys(TierZen, []string{"zen-secret-12345"})[0]
@@ -307,19 +314,20 @@ func TestFallbackAuthPinNoTrigger(t *testing.T) {
 	})
 	route := authOnlyRoute()
 	ex := upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
-	resp, _, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-auth"), 0, ex)
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-auth"), 0, ex)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer drainResp(resp)
-	if resp.StatusCode != 429 {
-		t.Fatalf("auth pin 429 must not trigger, got %d", resp.StatusCode)
+	// Single-proxy exhaustion triggers the final custom fallback.
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth pin exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
 	}
-	if customHits.Load() != 0 {
-		t.Fatal("auth pin must not hit custom")
+	if customHits.Load() != 1 {
+		t.Fatalf("auth pin exhaustion must hit custom once, got %d", customHits.Load())
 	}
-	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-		t.Fatal("auth pin must not bind fallback")
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatal("auth pin exhaustion must bind fallback")
 	}
 }
 

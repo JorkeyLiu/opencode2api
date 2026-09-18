@@ -151,8 +151,9 @@ func TestProxy429Target403_5xxStayScoped(t *testing.T) {
 	}
 }
 
-// Pinned cross-model sessions on P both fast-fail 429 after one live 429;
-// no sends/fallback; after expiry same pin sends P.
+// Pinned cross-model sessions share the Zen proxy429 layer; after both pool
+// proxies cool, both models fast-fail 429 with no sends; after expiry the
+// same pins walk within their binding.
 func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081"}},
@@ -170,13 +171,16 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 	}
 	pool := gateway.pools["shared"]
 	auth := normalizeRouteAuthority(normalized.Upstream.Zen)
-	// Anonymous pins remain exactly proxy-affine with no moves: pin same
-	// client session, two models, to the same pool+proxy P.
+	// Anonymous pins are proxy-independent: pin same client session, two
+	// models, to the same pool (current direct).
 	gateway.scheduler.pinBind("ses_429_cross", "model-a", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Model: "model-a", Protocol: ProtocolChat, Authority: auth})
 	gateway.scheduler.pinBind("ses_429_cross", "model-b", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Model: "model-b", Protocol: ProtocolChat, Authority: auth})
-	// One live 429 on P (model-a context) cools P on the Zen channel.
+	// Cool both pool proxies on the Zen channel so the binding has no
+	// sendable proxy left.
 	live := targetCandidate{Tier: TierZen, CredKey: anonymousZenKey, CredID: anonymousSchedulerCredentialID, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: "shared", Proxy: pool.items[0], ProxyRaw: pool.items[0].name, Model: "model-a", Identity: targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", pool.items[0].name, "model-a")}
 	gateway.applyAttemptOutcome(context.Background(), live, responseWithStatus(429), nil, time.Now().UnixNano())
+	live2 := targetCandidate{Tier: TierZen, CredKey: anonymousZenKey, CredID: anonymousSchedulerCredentialID, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: "shared", Proxy: pool.items[1], ProxyRaw: pool.items[1].name, Model: "model-a", Identity: targetIdentity(TierZen, anonymousSchedulerCredentialID, "shared", pool.items[1].name, "model-a")}
+	gateway.applyAttemptOutcome(context.Background(), live2, responseWithStatus(429), nil, time.Now().UnixNano())
 	routeA := modelRoute{ID: "model-a", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: false, KeyTiers: []Tier{TierZen}}
 	routeB := modelRoute{ID: "model-b", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: false, KeyTiers: []Tier{TierZen}}
 	bodiesA := map[Tier][]byte{TierZen: []byte(`{"model":"model-a"}`)}
@@ -214,10 +218,12 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 	if postCount(&c0)+postCount(&c1) != 0 {
 		t.Fatalf("fast-fail must send nothing: %d/%d", postCount(&c0), postCount(&c1))
 	}
-	// After expiry the same pins send only P.
+	// After expiry the same pins walk within their binding (current first).
 	gateway.scheduler.mu.Lock()
-	if entry := gateway.scheduler.proxy429State[proxy429Identity(TierZen, "shared", "direct")]; entry != nil {
-		entry.cooldownUntil = time.Now().Add(-time.Second).UnixNano()
+	for _, entry := range gateway.scheduler.proxy429State {
+		if entry != nil {
+			entry.cooldownUntil = time.Now().Add(-time.Second).UnixNano()
+		}
 	}
 	gateway.scheduler.mu.Unlock()
 	var e0, e1 atomic.Int32
@@ -232,8 +238,8 @@ func TestProxy429PinnedCrossModelFastFailAndExpiry(t *testing.T) {
 		t.Fatalf("after expiry model-a err=%v resp=%v want 200", err, respA2)
 	}
 	drainAndClose(respA2.Body)
-	if postCount(&e0) != 1 || postCount(&e1) != 0 {
-		t.Fatalf("after expiry must send only pinned P: %d/%d", postCount(&e0), postCount(&e1))
+	if postCount(&e0)+postCount(&e1) != 1 {
+		t.Fatalf("after expiry must send exactly once within binding: %d/%d", postCount(&e0), postCount(&e1))
 	}
 }
 

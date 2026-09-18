@@ -142,8 +142,8 @@ func TestAnonymousTransportRetryThenFallback(t *testing.T) {
 	if sessions[0] != sessions[1] {
 		t.Fatalf("first two sends must share the route session: %q", sessions)
 	}
-	if sessions[2] == sessions[0] {
-		t.Fatalf("fallback target must use a different route session: %q", sessions)
+	if sessions[2] != sessions[0] {
+		t.Fatalf("proxy-independent fallback must reuse the same route session: %q", sessions)
 	}
 	if postCount(&a0calls) != 2 || postCount(&a1calls) != 1 {
 		t.Fatalf("sequence must be A,A,B: %d/%d", postCount(&a0calls), postCount(&a1calls))
@@ -481,8 +481,8 @@ func TestAuth400RecoveryIgnoresBudget(t *testing.T) {
 		t.Fatalf("attempts=%d want 2", attempts)
 	}
 	sessions, _ := cap.get()
-	if len(sessions) != 2 || sessions[0] == sessions[1] {
-		t.Fatalf("400 must rotate session: %q", sessions)
+	if len(sessions) != 2 || sessions[0] != sessions[1] {
+		t.Fatalf("400 must keep the same session: %q", sessions)
 	}
 	if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
 		t.Fatalf("recorded=%d want 2", got)

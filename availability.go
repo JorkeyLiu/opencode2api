@@ -397,8 +397,9 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 
 // bulkProbeScope returns the same target-bound route-session scope the
 // gateway uses for one candidate: upstream authority, tier, internal
-// credential identity, pool, raw proxy (proxy-affine for anonymous only),
-// and target protocol. Model is excluded, matching gateway semantics.
+// credential identity, pool, and target protocol. Both native channels are
+// proxy-independent (ProxyRaw always empty). Model is excluded, matching
+// gateway semantics.
 func bulkProbeScope(base string, tgt bulkSendTarget, protocol Protocol) routeSessionScope {
 	cand := targetCandidate{Tier: tgt.Tier, CredID: tgt.CredID, PoolName: tgt.PoolName, ProxyRaw: tgt.Raw}
 	return routeScopeForCandidate(base, cand, protocol)

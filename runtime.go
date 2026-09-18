@@ -367,20 +367,17 @@ type gatewayMigrationSummary struct {
 // proxy health by (pool name, raw proxy URL), target state by full identity,
 // proxy429 and channel state by (tier, pool, raw proxy) identity only, and
 // route-session overrides by target scope (client dimension excluded from
-// validity).
-// Authenticated route-session scopes are proxy-independent; only anonymous
-// scopes require proxy validity, and legacy auth overrides with proxy-bound
-// keys are dropped (new requests derive the proxy-independent session
-// statelessly). Only still-future cooldowns and still-fresh route overrides
+// validity). Both native route-session scopes are proxy-independent; legacy
+// proxy-bound overrides (ProxyRaw != "") are dropped and re-derived
+// statelessly. Only still-future cooldowns and still-fresh route overrides
 // migrate (non-429 remaining capped at the generic 5 minutes, proxy429 and
 // credential429 remaining capped at the NEW configured 429 max, idle TTL
 // for sessions); new resources start at zero/stateless state and removed
-// identities are dropped. Session-affinity pins migrate
-// without validity filtering up to the pin cap as tombstone-like bindings:
-// authenticated pins validate proxy-independently (binding without proxy)
-// while anonymous pins remain full-target; removed/changed bindings still
-// resolve to the pinned path and fail locally with 502. Checking flags never
-// migrate.
+// identities are dropped. Session-affinity pins migrate without validity
+// filtering up to the pin cap as tombstone-like bindings: both channels
+// validate proxy-independently (binding without proxy); removed/changed
+// bindings still resolve to the pinned path and fail locally with 502.
+// Checking flags never migrate.
 // Route-session overrides and pins are in-memory authority (not a
 // projection): they never persist across restarts and never enter logs,
 // metrics, history, or admin output. In-flight requests keep using the old
@@ -444,21 +441,15 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 			if !validCreds[scope.CredID] {
 				return false
 			}
-			// Authenticated scopes are proxy-independent: only pool validity
-			// matters; legacy proxy-bound auth overrides (ProxyRaw != "")
-			// are dropped and re-derived statelessly.
-			if scope.CredID != anonymousSchedulerCredentialID {
-				if scope.ProxyRaw != "" {
-					return false
-				}
-				if _, ok := validPoolProxy[scope.Pool]; !ok {
-					return false
-				}
-			} else {
-				proxies, ok := validPoolProxy[scope.Pool]
-				if !ok || !proxies[scope.ProxyRaw] {
-					return false
-				}
+			// Both native scopes are proxy-independent: only pool validity
+			// matters; legacy proxy-bound overrides (ProxyRaw != "") are
+			// dropped and re-derived statelessly so an old proxy-bound
+			// anonymous override never hits the new proxy-free scope.
+			if scope.ProxyRaw != "" {
+				return false
+			}
+			if _, ok := validPoolProxy[scope.Pool]; !ok {
+				return false
 			}
 			if scope.Protocol != ProtocolChat && scope.Protocol != ProtocolResponses && scope.Protocol != ProtocolAnthropic {
 				return false

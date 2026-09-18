@@ -47,8 +47,11 @@
   channel-qualified `(channel,pool,proxy)` 429 rate-limit cooldowns,
   channel-qualified `(channel,pool,proxy)` comparative channel-availability
   cooldowns for 403/5xx, per-(channel, credential) 401 cooldowns,
-  per-(channel, credential) 429 cooldowns established only by two distinct
-  proxies 429ing in one request, and per-(channel, credential, pool, proxy,
+  per-(channel, credential) 429 cooldowns established only after every
+  currently eligible proxy for that credential has returned live 429 in one
+  request (frozen-eligible exhaustion using the last Retry-After; partial 429
+  never writes it, pre-cooled skips never count as live evidence, single
+  eligible exhausting alone still writes it), and per-(channel, credential, pool, proxy,
   model) target cooldowns for 403/5xx only. Scheduler identity has no
   Zen-vs-Go tier separation on live paths: anonymous and authenticated share
   Zen channel-scoped proxy state as appropriate while retaining
@@ -56,15 +59,15 @@
   There is no static key→proxy binding: one credential+pool deterministically
   prefers a stable proxy (soft affinity, recomputed from current pool
   contents) without any persisted map. Two distinct in-memory affinity
-  authorities sit above these layers: route-session rotation overrides (per
-  target-scope recovery string; the scope includes the proxy for anonymous and
-  excludes it for authenticated sessions) and client-session+model pins
+  authorities sit above these layers: target-bound route sessions (proxy-free
+  native scope; first generation is a stable stateless derivation, the store
+  keeps only legacy/migrated overrides with idle TTL and no live path creates
+  new overrides) and client-session+model pins
   (durable binding selecting which target an established session+model may
-  use); the former rotates the upstream session value, the latter fixes the
-  binding itself. Anonymous pins fix the complete target including the proxy;
-  authenticated pins fix channel, credential, pool, model, protocol, and
-  authority while the proxy remains a mutable current selection under
-  generation fencing.
+  use); the former derives the upstream session value, the latter fixes the
+  binding itself. Both anonymous and authenticated pins fix channel,
+  credential, pool, model, protocol, and authority while the proxy remains a
+  mutable current selection under generation fencing.
 - Proxy identity is two-level: `proxy_pools` names stable pool identities and
   `proxy_routing` assigns exactly one pool each to the anonymous and
   authenticated channels (same or different). Top-level `proxies` /
@@ -113,29 +116,43 @@
   only (bare `opencode/x.y.z` UA, `x-opencode-client`, `x-opencode-session` /
   `request` / `project`, optional canonical parent; no generic affinity headers);
   Responses `prompt_cache_key` / `store` / session body fields match the same
-  wire session. The authenticated route session excludes the proxy so a
-  within-pool proxy move preserves the same upstream session value; the
-  anonymous route session includes it. The first generation is a stable stateless derivation; only
-  a 400 rotation stores a bounded in-memory override. Before a pin exists for
+  wire session. Both native route sessions are proxy-free so a
+  within-pool proxy move preserves the same upstream session value and body
+  bytes. The first generation is a stable stateless derivation; no live path
+  rotates or stores an override (exact-400 replays keep the same session).
+  Before a pin exists for
   session+model, one establishment owner freezes/HRW-orders the currently
   available targets and may walk proxies per §4; concurrent followers
   wait cancellably, then adopt the pin or contend to become the next owner.
   The first upstream 2xx, including a successful exact-400 replay, pins
-  session+model to the complete target (channel, internal credential identity,
-  pool, raw proxy identity, model, protocol/authority validity). After the pin,
-  every request uses exactly that target with no cross-proxy/channel fallback and
-  no anonymous→authenticated promotion; an active proxy429/credential/target
-  cooldown fast-fails locally with the corresponding protocol/status/
-  Retry-After without a send, and a removed/unhealthy/unresolvable target fails
-  locally with 502. Same-target transient retry and exact-400 replay remain per
-  §4. For authenticated pins the binding is proxy-independent (channel,
-  credential, pool, model, protocol, authority) while the current proxy is a
-  fenced mutable selection: an established session may move within the same
-  pool, credential, channel, model, protocol, and authority only after a transport
-  failure under the normal send budget or an HTTP 429, before any client bytes
-  and never across channels, keys, or pools; a successful move updates only the
-  current proxy. No move occurs on 400/401/403/408/425, ordinary 4xx, or 5xx.
-  Anonymous pins stay exactly proxy-affine with no cross-proxy recovery. Pins are process-lifetime and never expire/evict; the store is
+  session+model to the binding (channel, internal credential identity,
+  pool, model, protocol/authority validity) with the successful proxy as the
+  initial current selection. After the pin,
+  every request stays inside that binding with no cross-credential/pool/channel
+  fallback and
+  no anonymous→authenticated promotion; the 429 chain walks the currently
+  sendable proxies of the same credential+pool (current first, stable affinity
+  order, one shared proxy-free route session and identical body bytes, local
+  proxy429 cooldowns skipped without new evidence, never truncated by
+  `retry.max_attempts`) while
+  400/401/403/408/425, ordinary 4xx, and 5xx never move to another proxy; a
+  transport error keeps the existing same-target transient retry only on the
+  anonymous binding, while the authenticated binding may additionally try the
+  next eligible proxy after its same-target transient retry within the ordinary
+  send budget. A removed/unhealthy/unresolvable target fails
+  locally with 502; full 429 exhaustion of the binding tries the custom final
+  fallback per §4 and otherwise keeps the native 429 envelope. Same-target transient retry and exact-400 replay remain per
+  §4. An established session moves within the same
+  pool, credential, channel, model, protocol, and authority only after an HTTP
+  429 on the current proxy walk (local 429 skip or live 429), before any client bytes
+  and never across channels, keys, or pools; a successful 2xx on an alternate
+  updates only the
+  current proxy under generation fencing (concurrent moves converge to one winner).
+  No move occurs on 400/401/403/408/425, ordinary 4xx, or 5xx; transport errors
+  beyond the same-target transient retry never move the anonymous binding (the
+  authenticated binding keeps its existing same-target transient retry plus a
+  budget-limited next-proxy try).
+  Both channels share these pin/move semantics. Pins are process-lifetime and never expire/evict; the store is
   fixed-bounded (see `sessionPinStoreCap` in `scheduler.go`) and a new
   session+model at capacity fails closed locally with 502 before any send
   while existing pins keep serving. Restart is the explicit clearing boundary.
@@ -146,9 +163,10 @@
   filtering as tombstone-like identity (credential by channel+key, proxy health
   by pool+URL, target by full identity, proxy429 and channel by
   channel+pool+URL identity with aggregate counts in the migration log,
-  credential 429 by channel+key, route session by target scope with the client
-  dimension excluded from validity — authenticated scopes migrate only when
-  proxy-free and pool-routable — and still-fresh/idle-TTL filtering, pins
+  credential 429 by channel+key, route session by native target scope with the client
+  dimension excluded from validity — both native scopes are proxy-free and
+  migrate only when pool-routable; legacy proxy-bound overrides drop and
+  re-derive statelessly — and still-fresh/idle-TTL filtering, pins
   migrated by identity up to the pin cap with aggregate count
   only where a removed target remains pinned and fails locally with 502 rather
   than re-establishing; new resources start at
@@ -179,11 +197,14 @@
   first, non-free models skip it entirely. Anonymous free-tier sends go
   upstream as agent-shaped streams with core tools; non-stream callers receive
   collapsed protocol-correct JSON and native anonymous availability uses the
-  same path. Proxy fallback below applies
-  only to unpinned establishment; once pinned, the pinned target serves alone
-  per the Session affinity spine. Dispersion and fallback belong to
+  same path. Unpinned establishment walks the frozen proxy order and, on full
+  anonymous 429 exhaustion without a 400, still enters the authenticated
+  channel; once pinned, the binding walks the same credential+pool per the
+  Session affinity spine (not a single target).
+  Dispersion and fallback belong to
   the frozen order only (HRW/round-robin); same-target retry never disperses.
-  Each available proxy gets at most one fallback send and is NEVER truncated
+  Each available proxy gets at most one fallback send and the 429 chain is NEVER
+  truncated
   by `retry.max_attempts`; the whole channel additionally owns one shared
   transient token for the first transport error, 408/425, or 5xx (same target,
   same route session, same body). Ordinary 4xx MUST end the anonymous channel
@@ -191,27 +212,35 @@
   only proxy exhaustion without a 400 enters it otherwise. Client cancel or
   the shared request deadline ends the route immediately with no further
   retry/fallback and no state change. The first exact HTTP 400 on any
-  candidate replays exactly once on the same target with a rotated route
-  session (same request ID, same credential/proxy/protocol, always before any
+  candidate replays exactly once on the same target with the same route
+  session (same request ID, same credential/proxy/protocol, same wire session
+  bytes, always before any
   client bytes; Responses replays also drop stale previous_response_id/
-  reasoning refs; never consumes the transient token). The replay result is
+  reasoning refs; never consumes the transient token; no override is stored).
+  The replay result is
   final for the whole route: success returns normally, a second 400 returns
   that 400, and any other replay outcome returns as-is without scanning
   remaining proxies or entering the authenticated channel. A replay 2xx pins the
   session+model when still unbound.
-- Authenticated channel: the channel owns its own `retry.max_attempts`
-  real-send budget (each first send plus each same-target transient retry
-  consumes it) and its own transient token. Inside the channel, while still
+- Authenticated channel: the channel owns a `retry.max_attempts`
+  real-send budget for ordinary (non-429) sends only (each first send plus each
+  same-target transient retry consumes it); 429 sends are budget-neutral and walk
+  all currently sendable credential×proxy candidates to exhaustion. The channel
+  owns its own transient token. Inside the channel, while still
   unpinned, only transport errors, 408/425, 401/403, 429, 5xx, and other
   retryable responses advance the frozen list; 401/403/429 never retry
   same-target; transport/408/425/5xx retry same-target at most once; any other
-  4xx MUST end the route. The first exact HTTP 400 on any candidate follows
-  the same same-target one-replay rule as anonymous (route-session rotation,
+  4xx MUST end the route. Exhaustion of one credential's frozen eligible set
+  writes that credential's 429 (last Retry-After) without stopping other
+  credential/channel candidates; partial 429 and pre-cooled skips never do.
+  The first exact HTTP 400 on any candidate follows
+  the same same-target one-replay rule as anonymous (same route/wire session,
   Responses stale-ref cleanup, replay is the route's last recovery action,
-  always allowed once extra beyond the ordinary budget); a second 400
+  always allowed once extra beyond the ordinary budget; no override is stored);
+  a second 400
   terminates the whole route. Cancel/deadline ends the route. A
   replay 2xx pins the session+model when still unbound; once pinned, the
-  pinned target serves alone per the Session affinity spine.
+  binding walks the same credential+pool on 429 only per the Session affinity spine.
 - Scheduler state: proxy health is transport connectivity only (HTTP statuses
   never change it); a single foreground transport error never cools
   credential/target/proxy429/channel state and never flips proxy healthy directly —
@@ -224,7 +253,10 @@
   stays isolated), so one proxy's rate limit filters every model/credential
   using that channel+pool+proxy; two distinct proxies 429ing with the same
   channel+credential in one request additionally cool that channel+credential
-  using the second Retry-After, while a single proxy429 never does; 403/5xx
+  using the last Retry-After only after every currently eligible proxy for
+  that credential has returned live 429 in the same request, while a partial
+  429 never does (a single eligible proxy exhausting alone still writes it;
+  pre-cooled skips never count as live evidence); 403/5xx
   cool the single (channel, credential, pool, proxy, model) target,
   so one model's 403/5xx never affects another, and only with comparative success
   (same channel+credential succeeding on another node) cool the
@@ -242,7 +274,8 @@
   proportional to proxy resources, and still-future migration by
   channel+pool+proxy with aggregate counts only. Route-session overrides
   are bounded in-memory Gateway authority (first generation stateless,
-  rotation stored with idle TTL and deterministic eviction; never persisted,
+  the store keeps only legacy/migrated overrides with idle TTL and
+  deterministic eviction and no live path creates a new override; never persisted,
   never projected, never logged), in contrast to session+model pins which are
   process-lifetime, never expire/evict, and are fixed-bounded fail-closed.
   Restart clears all in-memory cooldowns/overrides/pins. Model/capability refresh is stateless and
@@ -311,10 +344,14 @@
   channels receive a generated stable ID (never the display name)) persists via config authority/RuntimeManager.Apply
   with masked GET, authenticated-session reveal (POST-only non-GET behind admin
   session auth + CSRF + Origin, no-store response, and full-chain
-  redaction without plaintext logging). Only a request
-  entering with an existing anonymous session+model pin that gets HTTP 429 on the
-  pinned anonymous path (live 429 or channel-qualified proxy429 local 429) may take
-  over; unbound anonymous 429 and authenticated-pin 429 never trigger. Without an
+  redaction without plaintext logging). When `active` names a channel, it is
+  the final 429 backstop for every request shape (new/unbound/established,
+  anonymous/authenticated): only a request whose allowed native route finally
+  exhausts with 429 (unbound full-route 429, or established-binding full
+  eligible-set 429 including local proxy429 exhaustion) may take over;
+  any non-429 terminal (400/401/403/408/425, ordinary 4xx, transport errors,
+  5xx) never triggers even when 429s were seen earlier on other candidates.
+  Without an
   active channel the original 429 stands; with one, the current request retries at
   once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
   for chat, `{root}/v1/responses` for responses via the unified API-root rule,
@@ -326,7 +363,9 @@
   override (chat sets `reasoning_effort`, responses merges/creates
   `reasoning:{effort}`)), response/stream transcoded back;
   never listed in public `/v1/models`; sends canonical pseudonymous OpenCode routing metadata (target-bound custom route session via the shared wire helpers, never raw session/secrets, full history still sent, never relying on supplier-persisted state); never touches
-  Zen scheduler layers)
+  Zen scheduler layers; the first native→custom crossing strips
+  provider-bound Responses refs (`previous_response_id` and input reasoning
+  items) while bound follow-ups preserve custom-issued refs)
   and the session binds first to that full channel identity (stable `id` +
   normalized base URL/authority + key fingerprint/identity + configured model +
   protocol; display `name` is snapshot-only and a rename preserves the binding) so later

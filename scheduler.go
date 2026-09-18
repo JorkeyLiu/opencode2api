@@ -31,9 +31,10 @@ import (
 //     participate.
 //   - credentialState: global per-credential cooldown, 401 only.
 //   - credential429State: per (tier, credential) rate-limit cooldown, 429
-//     only. Set only when one established/unbound authenticated request
-//     observes 429 from two distinct eligible proxies in sequence with the
-//     same credential. Single-proxy 429 never sets it.
+//     only. Set only when all currently eligible proxies for one credential
+//     have returned live 429 in one request (exhaustion semantics using the
+//     last Retry-After). A single live 429 with remaining eligible proxies
+//     never sets it; pre-cooled skips never count as live evidence.
 //   - targetState: per (tier, credential, pool, proxy, model) cooldown for
 //     403/5xx only. Transport errors, 408/425, and ordinary 4xx (including
 //     400) are neutral no-ops and 2xx clears only the single target (plus the
@@ -43,11 +44,10 @@ import (
 // Target identity uses the raw configured proxy URL string qualified by pool
 // name for internal matching; external output always uses redactURL.
 //
-// Authenticated session+model bindings are proxy-independent: the durable
-// identity fixes tier, credential, pool, model, protocol, and authority but
-// not the proxy node. The pin's ProxyRaw is the mutable current/preferred
-// proxy with generation fencing. Anonymous bindings remain full-target
-// (proxy is identity) with no cross-proxy recovery.
+// Authenticated and anonymous session+model bindings are proxy-independent:
+// the durable identity fixes tier, credential, pool, model, protocol, and
+// authority but not the proxy node. The pin's ProxyRaw is the mutable
+// current/preferred proxy with generation fencing for both channels.
 
 const (
 	// anonymousSchedulerCredentialID is the internal scheduler identity for the
@@ -338,19 +338,15 @@ func normalizeRouteAuthority(baseURL string) string {
 }
 
 func routeScopeForCandidate(authority string, cand targetCandidate, protocol Protocol) routeSessionScope {
-	// Authenticated sessions are NOT proxy-affine: the route-session scope
+	// Both native channels are proxy-independent: the route-session scope
 	// excludes the proxy node so moving within the bound pool preserves the
-	// same upstream session value. Anonymous Zen remains exactly proxy-affine.
-	proxyRaw := cand.ProxyRaw
-	if cand.CredID != anonymousSchedulerCredentialID {
-		proxyRaw = ""
-	}
+	// same upstream session value and body bytes.
 	return routeSessionScope{
 		Authority: normalizeRouteAuthority(authority),
 		Tier:      cand.Tier,
 		CredID:    cand.CredID,
 		Pool:      cand.PoolName,
-		ProxyRaw:  proxyRaw,
+		ProxyRaw:  "",
 		Protocol:  protocol,
 	}
 }
@@ -941,10 +937,11 @@ func (s *targetScheduler) noteCredentialSuccess(credID string) credentialChange 
 }
 
 // noteCredential429Failure sets the per-(tier, credential) rate-limit
-// cooldown. Callers must only invoke it after observing 429 from two distinct
-// eligible proxies in sequence with the same credential in one request; a
-// single-proxy 429 must never reach here. Retry-After uses the second 429
-// with deterministic capped backoff conventions. The key is the internal
+// cooldown. Callers must only invoke it after all currently eligible proxies
+// for the credential have returned live 429 in one request (exhaustion
+// semantics); a partial 429 with remaining eligible proxies must never reach
+// here. Retry-After uses the last 429 in the exhaustion chain with
+// deterministic capped backoff conventions. The key is the internal
 // credential ID (already tier-qualified), so identical key text on Zen vs Go
 // stays isolated.
 func (s *targetScheduler) noteCredential429Failure(credID, failureClass string, status int, retryAfter time.Duration, startedNanos int64) credentialChange {
@@ -2200,25 +2197,23 @@ func credentialDisplayForID(credID string) string {
 }
 
 // Session-affinity pin layer: derived client session + model ID binds to one
-// target. Anonymous bindings are full-target (proxy is identity, no moves).
-// Authenticated bindings are proxy-independent: the durable identity fixes
-// tier, credential, pool, model, protocol, and authority but not the proxy
-// node; ProxyRaw is the mutable current/preferred proxy with generation
-// fencing. In-memory Gateway authority only: no persistence, no
-// log/admin/history projection. Strict process-lifetime semantics: once
-// pinned, a binding never expires and is never evicted during the process
-// lifetime. Memory stays bounded by sessionPinStoreCap entries; at the cap a
-// new unpinned session+model fails closed locally before any upstream send
-// and existing pins keep serving. Restart clears pins (map lives in the
-// Gateway); no disk persistence.
+// target. Both anonymous and authenticated bindings are proxy-independent:
+// the durable identity fixes tier, credential, pool, model, protocol, and
+// authority but not the proxy node; ProxyRaw is the mutable current/preferred
+// proxy with generation fencing. In-memory Gateway authority only: no
+// persistence, no log/admin/history projection. Strict process-lifetime
+// semantics: once pinned, a binding never expires and is never evicted during
+// the process lifetime. Memory stays bounded by sessionPinStoreCap entries; at
+// the cap a new unpinned session+model fails closed locally before any
+// upstream send and existing pins keep serving. Restart clears pins (map lives
+// in the Gateway); no disk persistence.
 
 const sessionPinStoreCap = 4096
 
 // sessionPin is the bound target for one derived session + model. It carries
-// the binding identity plus the mutable current proxy and generation. For
-// anonymous bindings ProxyRaw is identity; for authenticated bindings it is
-// the current/preferred selection fenced by Generation. Raw client signals,
-// key material, and pin state never leave this struct.
+// the binding identity plus the mutable current proxy and generation. For both
+// channels ProxyRaw is the current/preferred selection fenced by Generation.
+// Raw client signals, key material, and pin state never leave this struct.
 type sessionPin struct {
 	Tier      Tier
 	CredID    string
@@ -2235,16 +2230,12 @@ type sessionPin struct {
 // isAnonymousPin reports whether the pin uses the shared public credential.
 func (p sessionPin) isAnonymousPin() bool { return p.CredID == anonymousSchedulerCredentialID }
 
-// bindingEqual reports durable identity equality: full-target for anonymous
-// (including proxy), proxy-independent for authenticated (excluding proxy
-// and generation).
+// bindingEqual reports durable identity equality: proxy-independent for both
+// channels (excluding proxy and generation).
 func (p sessionPin) bindingEqual(other sessionPin) bool {
 	if p.Tier != other.Tier || p.CredID != other.CredID || p.Pool != other.Pool ||
 		p.Model != other.Model || p.Protocol != other.Protocol || p.Authority != other.Authority {
 		return false
-	}
-	if p.isAnonymousPin() {
-		return p.ProxyRaw == other.ProxyRaw
 	}
 	return true
 }
@@ -2443,11 +2434,11 @@ func (st *sessionPinStore) reservedCount() int {
 }
 
 // pinMoveCurrent performs generation-fenced current-proxy update for an
-// established authenticated binding. It succeeds only when the stored binding
-// identity still matches (proxy-independent) and the generation equals the
-// observed generation; stale in-flight outcomes cannot move the pin back and
-// competing moves cannot overwrite a newer selection or split one session.
-// Anonymous pins never move. Returns the new generation on success.
+// established binding on either native channel. It succeeds only when the
+// stored binding identity still matches (proxy-independent) and the generation
+// equals the observed generation; stale in-flight outcomes cannot move the pin
+// back and competing moves cannot overwrite a newer selection or split one
+// session. Returns the new generation on success.
 func (s *targetScheduler) pinMoveCurrent(session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
 	if s == nil || s.pins == nil || session == "" || model == "" || newProxyRaw == "" {
 		return 0, false
@@ -2463,7 +2454,7 @@ func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	entry, ok := st.entries[key]
-	if !ok || entry == nil || entry.isAnonymousPin() {
+	if !ok || entry == nil {
 		return 0, false
 	}
 	if entry.Generation != expectedGen {
@@ -2480,10 +2471,9 @@ func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64
 // migratePinsFrom carries all existing pin identities up to the cap without
 // validity filtering. Removed or changed targets migrate as unresolved
 // tombstone-like bindings: the pinned resolver still matches them and fails
-// locally with 502 rather than re-establishing or falling back. Authenticated
-// pins migrate with their current proxy and generation intact; validity is
-// proxy-independent (binding without proxy) while anonymous remains full
-// target. Insertion is deterministic key order and stops at the cap without
+// locally with 502 rather than re-establishing or falling back. Both channels
+// migrate with their current proxy and generation intact; validity is
+// proxy-independent (binding without proxy). Insertion is deterministic key
 // evicting. Restart remains the only clearing boundary (fresh store starts
 // empty).
 func (st *sessionPinStore) migratePinsFrom(old *sessionPinStore) int {

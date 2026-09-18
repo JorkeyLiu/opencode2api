@@ -200,12 +200,12 @@ func TestBulkProbeSchedulerNeutrality(t *testing.T) {
 	if rs1 != rs2 || string(b1) != string(b2) || r1.Header.Get("x-opencode-session") != r2.Header.Get("x-opencode-session") {
 		t.Fatalf("probe construction must be deterministic")
 	}
-	// Scope parity with the gateway helper: anonymous keeps proxy affinity,
-	// authenticated excludes it.
+	// Scope parity with the gateway helper: both native channels are
+	// proxy-independent.
 	anonTgt := bulkSendTarget{PoolName: "shared", Tier: TierZen, CredID: anonymousSchedulerCredentialID, Raw: "direct"}
 	authTgt := bulkSendTarget{PoolName: "shared", Tier: TierZen, CredID: cred.id, Raw: "direct"}
-	if bulkProbeScope("https://zen.example", anonTgt, ProtocolChat).ProxyRaw != "direct" {
-		t.Fatalf("anonymous scope must stay proxy-affine")
+	if bulkProbeScope("https://zen.example", anonTgt, ProtocolChat).ProxyRaw != "" {
+		t.Fatalf("anonymous scope must be proxy-independent")
 	}
 	if bulkProbeScope("https://zen.example", authTgt, ProtocolChat).ProxyRaw != "" {
 		t.Fatalf("authenticated scope must exclude proxy")

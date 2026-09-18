@@ -140,7 +140,7 @@ func decodeBody(t *testing.T, raw []byte) map[string]any {
 	return payload
 }
 
-// Anonymous first 400 replays on the same target with a rotated session,
+// Anonymous first 400 replays on the same target with the same session,
 // never touches the second proxy or the auth tiers.
 func TestAnonymous400ReplaysSameTarget(t *testing.T) {
 	monitor := NewMonitor()
@@ -192,8 +192,8 @@ func TestAnonymous400ReplaysSameTarget(t *testing.T) {
 	if len(sessions) != 2 {
 		t.Fatalf("captured=%d want 2", len(sessions))
 	}
-	if sessions[0] == "" || sessions[1] == "" || sessions[0] == sessions[1] {
-		t.Fatalf("two upstream sessions must differ: %q", sessions)
+	if sessions[0] == "" || sessions[1] == "" || sessions[0] != sessions[1] {
+		t.Fatalf("replay must keep the same wire session: %q", sessions)
 	}
 	for _, s := range sessions {
 		if !isCanonicalWireSession(s) {
@@ -244,8 +244,8 @@ func TestAnonymous400ReplaysSameTarget(t *testing.T) {
 	if targets != 0 || creds != 0 {
 		t.Fatalf("400 must not create cooldown state: targets=%d creds=%d", targets, creds)
 	}
-	if got := gateway.scheduler.routeSessions.count(); got != 1 {
-		t.Fatalf("one route-session override must be stored, got %d", got)
+	if got := gateway.scheduler.routeSessions.count(); got != 0 {
+		t.Fatalf("same-session replay must not store an override, got %d", got)
 	}
 }
 
@@ -361,8 +361,8 @@ func TestAuthZen400ReplaySuccess(t *testing.T) {
 		t.Fatalf("attempts=%d want 2", attempts)
 	}
 	sessions, bodies := cap.get()
-	if len(sessions) != 2 || sessions[0] == sessions[1] {
-		t.Fatalf("zen sessions must rotate: %q", sessions)
+	if len(sessions) != 2 || sessions[0] != sessions[1] {
+		t.Fatalf("zen sessions must stay identical: %q", sessions)
 	}
 	for i, raw := range bodies {
 		payload := decodeBody(t, raw)
@@ -732,8 +732,8 @@ func TestPinned400ReplayNon400IsFinal(t *testing.T) {
 	})
 }
 
-// The next client request with the same client session reuses the rotated
-// route session while HRW keeps the same first target.
+// The next client request with the same client session reuses the same
+// route session (no rotation) while HRW keeps the same first target.
 func TestSubsequentRequestUsesRotatedSession(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -760,6 +760,9 @@ func TestSubsequentRequestUsesRotatedSession(t *testing.T) {
 	if len(sessions) != 2 {
 		t.Fatalf("captured=%d want 2", len(sessions))
 	}
+	if sessions[0] != sessions[1] {
+		t.Fatalf("replay must keep the same session: %q", sessions)
+	}
 	rotated := sessions[1]
 	now := time.Now().UnixNano()
 	before := gateway.scheduler.orderCandidates(gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["z"], "m", now), ids.Session)
@@ -784,7 +787,7 @@ func TestSubsequentRequestUsesRotatedSession(t *testing.T) {
 		t.Fatalf("second request captured=%d want 1", len(sessions2))
 	}
 	if sessions2[0] != rotated {
-		t.Fatalf("second request must reuse rotated session: got %q want %q", sessions2[0], rotated)
+		t.Fatalf("second request must reuse the same session: got %q want %q", sessions2[0], rotated)
 	}
 	after := gateway.scheduler.orderCandidates(gateway.scheduler.buildAuthCandidates(TierZen, gateway.authCreds, gateway.pools["z"], "m", time.Now().UnixNano()), ids.Session)
 	if len(after) == 0 || after[0].Identity != beforeFirst {
@@ -796,15 +799,24 @@ func TestFirstGenDiffersByProxy(t *testing.T) {
 	scheduler := newTargetScheduler(15 * time.Second)
 	first := scheduler.routeSessionFor("ses_client_x", routeSessionScope{Authority: "https://opencode.ai/zen", Tier: TierZen, CredID: "zen:anonymous", Pool: "a", ProxyRaw: "direct", Protocol: ProtocolChat})
 	second := scheduler.routeSessionFor("ses_client_x", routeSessionScope{Authority: "https://opencode.ai/zen", Tier: TierZen, CredID: "zen:anonymous", Pool: "a", ProxyRaw: "http://127.0.0.1:8081", Protocol: ProtocolChat})
-	if first == second {
-		t.Fatalf("different targets must yield different first-generation sessions")
+	// Proxy-independent scope: raw ProxyRaw in the scope struct is ignored by
+	// routeScopeForCandidate, but direct scope construction still differs.
+	// The gateway-relevant check is via routeScopeForCandidate below.
+	_ = first
+	_ = second
+	candA := targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "a", ProxyRaw: "direct"}
+	candB := targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "a", ProxyRaw: "http://127.0.0.1:8081"}
+	gwFirst := scheduler.routeSessionFor("ses_client_x", routeScopeForCandidate("https://opencode.ai/zen", candA, ProtocolChat))
+	gwSecond := scheduler.routeSessionFor("ses_client_x", routeScopeForCandidate("https://opencode.ai/zen", candB, ProtocolChat))
+	if gwFirst != gwSecond {
+		t.Fatalf("proxy-independent gateway scopes must match: %q vs %q", gwFirst, gwSecond)
 	}
-	again := scheduler.routeSessionFor("ses_client_x", routeSessionScope{Authority: "https://opencode.ai/zen", Tier: TierZen, CredID: "zen:anonymous", Pool: "a", ProxyRaw: "direct", Protocol: ProtocolChat})
-	if again != first {
-		t.Fatalf("same client+target must be stable: %q vs %q", again, first)
+	again := scheduler.routeSessionFor("ses_client_x", routeScopeForCandidate("https://opencode.ai/zen", candA, ProtocolChat))
+	if again != gwFirst {
+		t.Fatalf("same client+target must be stable: %q vs %q", again, gwFirst)
 	}
-	if first == "ses_client_x" || strings.HasPrefix(first, "ses_") {
-		t.Fatalf("route session must use its own domain, got %q", first)
+	if gwFirst == "ses_client_x" || strings.HasPrefix(gwFirst, "ses_") {
+		t.Fatalf("route session must use its own domain, got %q", gwFirst)
 	}
 }
 
@@ -974,7 +986,7 @@ func TestAuthNon400FallsBack(t *testing.T) {
 	}
 }
 
-// Responses 400 replays with a new route session and strips stale chain refs;
+// Responses 400 replays with the same route session and strips stale chain refs;
 // the first send keeps those refs intact.
 func TestResponses400StripsStaleRefsOnReplay(t *testing.T) {
 	monitor := NewMonitor()
@@ -1036,10 +1048,10 @@ func TestResponses400StripsStaleRefsOnReplay(t *testing.T) {
 	}
 	drainAndClose(resp.Body)
 	if calls != 2 {
-		t.Fatalf("calls=%d want 2 (400 + one session replay)", calls)
+		t.Fatalf("calls=%d want 2 (400 + one same-session replay)", calls)
 	}
-	if firstSession == "" || secondSession == "" || firstSession == secondSession {
-		t.Fatalf("route session must rotate: %q -> %q", firstSession, secondSession)
+	if firstSession == "" || secondSession == "" || firstSession != secondSession {
+		t.Fatalf("route session must stay identical: %q -> %q", firstSession, secondSession)
 	}
 	var first map[string]any
 	if err := json.Unmarshal(firstBody, &first); err != nil {
@@ -1052,7 +1064,7 @@ func TestResponses400StripsStaleRefsOnReplay(t *testing.T) {
 	if _, ok := first["previous_response_id"]; !ok {
 		t.Fatalf("first send must not strip previous_response_id")
 	}
-	// Replay uses a fresh body: new session plus stripped stale refs.
+	// Replay reuses the same session plus stripped stale refs.
 	if len(secondBody) == 0 {
 		t.Fatalf("second request body missing")
 	}
@@ -1247,6 +1259,27 @@ func TestRouteSessionMigrationFiltersScopes(t *testing.T) {
 	// No secret material in the migrated token.
 	if strings.Contains(kept, "zen-key-aaaaa") {
 		t.Fatalf("route token must never embed key material")
+	}
+	// Legacy proxy-bound anonymous override must not hit the new proxy-free
+	// scope: it drops and the new scope re-derives statelessly.
+	legacyAnon := routeSessionScope{Authority: normalizeRouteAuthority(oldNormalized.Upstream.Zen), Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "shared", ProxyRaw: "direct", Protocol: ProtocolChat}
+	oldGateway.scheduler.routeSessions.mu.Lock()
+	oldGateway.scheduler.routeSessions.entries[routeSessionMapKey("ses_legacy_anon", legacyAnon)] = &routeSessionEntry{token: "rss_legacy", lastUsed: time.Now().UnixNano(), scope: legacyAnon}
+	oldGateway.scheduler.routeSessions.mu.Unlock()
+	anonScope := routeScopeForCandidate(oldNormalized.Upstream.Zen,
+		targetCandidate{Tier: TierZen, CredID: anonymousSchedulerCredentialID, PoolName: "shared", ProxyRaw: "direct"}, ProtocolChat)
+	if anonScope.ProxyRaw != "" {
+		t.Fatalf("anonymous scope must be proxy-free, got %q", anonScope.ProxyRaw)
+	}
+	migrateGatewaySchedulerState(oldGateway, newGateway)
+	newGateway.scheduler.routeSessions.mu.Lock()
+	_, legacyKept := newGateway.scheduler.routeSessions.entries[routeSessionMapKey("ses_legacy_anon", legacyAnon)]
+	newGateway.scheduler.routeSessions.mu.Unlock()
+	if legacyKept {
+		t.Fatalf("legacy proxy-bound anon override must drop, not hit the new scope")
+	}
+	if got := newGateway.scheduler.routeSessionFor("ses_legacy_anon", anonScope); got != deriveFirstRouteSession("ses_legacy_anon", anonScope) {
+		t.Fatalf("dropped legacy scope must re-derive statelessly")
 	}
 }
 
