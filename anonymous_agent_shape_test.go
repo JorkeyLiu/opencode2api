@@ -308,6 +308,119 @@ func TestAnonymousCollapseErrorsNotSuccess(t *testing.T) {
 	}
 }
 
+// collapseTerminalTailReader serves head bytes first and fails any further
+// Read. A correct terminal stop must return before the tail is requested.
+type collapseTerminalTailReader struct {
+	head      []byte
+	off       int
+	tailReads int
+}
+
+func (r *collapseTerminalTailReader) Read(p []byte) (int, error) {
+	if r.off < len(r.head) {
+		n := copy(p, r.head[r.off:])
+		r.off += n
+		return n, nil
+	}
+	r.tailReads++
+	return 0, fmt.Errorf("tail read must not happen after terminal")
+}
+
+func responsesCompletedSSE() string {
+	return "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"m\"}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"model\":\"m\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n"
+}
+
+func anthropicStoppedSSE() string {
+	return "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"m\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":6}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+}
+
+func TestAnonymousCollapseResponsesTrailingDoneIgnored(t *testing.T) {
+	raw := responsesCompletedSSE() + "data: [DONE]\n\n"
+	body, usage, reported, err := collapseUpstreamSSE(strings.NewReader(raw), ProtocolResponses, ProtocolResponses, "m")
+	if err != nil {
+		t.Fatalf("trailing [DONE] after terminal must be ignored: %v", err)
+	}
+	if !reported || usage.Input != 3 || usage.Output != 4 {
+		t.Fatalf("usage %+v reported=%v", usage, reported)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["status"] != "completed" {
+		t.Fatalf("status=%v", payload["status"])
+	}
+}
+
+func TestAnonymousCollapseResponsesTerminalStopsBeforeTailError(t *testing.T) {
+	reader := &collapseTerminalTailReader{head: []byte(responsesCompletedSSE())}
+	body, _, reported, err := collapseUpstreamSSE(reader, ProtocolResponses, ProtocolResponses, "m")
+	if err != nil {
+		t.Fatalf("terminal must stop before tail error: %v", err)
+	}
+	if !reported {
+		t.Fatalf("usage must be reported")
+	}
+	if reader.tailReads != 0 {
+		t.Fatalf("tail must not be read after terminal, tailReads=%d", reader.tailReads)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["status"] != "completed" {
+		t.Fatalf("status=%v", payload["status"])
+	}
+}
+
+func TestAnonymousCollapseAnthropicTrailingDoneIgnored(t *testing.T) {
+	raw := anthropicStoppedSSE() + "data: [DONE]\n\n"
+	body, usage, reported, err := collapseUpstreamSSE(strings.NewReader(raw), ProtocolAnthropic, ProtocolAnthropic, "m")
+	if err != nil {
+		t.Fatalf("trailing [DONE] after message_stop must be ignored: %v", err)
+	}
+	if !reported || usage.Output != 6 {
+		t.Fatalf("usage %+v reported=%v", usage, reported)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stop_reason"] != "end_turn" {
+		t.Fatalf("stop=%v", payload["stop_reason"])
+	}
+}
+
+func TestAnonymousCollapseAnthropicTerminalStopsBeforeTailError(t *testing.T) {
+	reader := &collapseTerminalTailReader{head: []byte(anthropicStoppedSSE())}
+	body, usage, reported, err := collapseUpstreamSSE(reader, ProtocolAnthropic, ProtocolAnthropic, "m")
+	if err != nil {
+		t.Fatalf("terminal message_stop must stop before tail error: %v", err)
+	}
+	if !reported {
+		t.Fatalf("usage must be reported")
+	}
+	if usage.Output != 6 {
+		t.Fatalf("usage %+v", usage)
+	}
+	if reader.tailReads != 0 {
+		t.Fatalf("tail must not be read after terminal, tailReads=%d", reader.tailReads)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["stop_reason"] != "end_turn" {
+		t.Fatalf("stop=%v", payload["stop_reason"])
+	}
+}
+
 func TestAnonymousGatewayNonStreamCollapses(t *testing.T) {
 	cfg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfg.Anonymous = true

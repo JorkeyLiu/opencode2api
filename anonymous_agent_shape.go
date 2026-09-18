@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -285,15 +286,20 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 				return collapseErr(firstString(event.Error, "upstream stream failed"))
 			case "done":
 				normalDone = true
+				return errStreamNormalTermination
 			}
 		}
 		return nil
 	})
 	if readErr != nil {
-		if strings.HasPrefix(readErr.Error(), "upstream stream failed:") {
-			return nil, bridgeUsage{}, false, readErr
+		if errors.Is(readErr, errStreamNormalTermination) {
+			readErr = nil
+		} else {
+			if strings.HasPrefix(readErr.Error(), "upstream stream failed:") {
+				return nil, bridgeUsage{}, false, readErr
+			}
+			return nil, bridgeUsage{}, false, fmt.Errorf("upstream SSE stream failed: %v", readErr)
 		}
-		return nil, bridgeUsage{}, false, fmt.Errorf("upstream SSE stream failed: %v", readErr)
 	}
 	if !normalDone {
 		return nil, bridgeUsage{}, false, fmt.Errorf("upstream SSE stream ended before a terminal event")
