@@ -457,6 +457,13 @@ func buildBulkProbeRequest(ctx context.Context, base string, tgt bulkSendTarget,
 	if err != nil {
 		return nil, ids, routeSession, nil, err
 	}
+	if tgt.IsPublic {
+		shaped, shapeErr := shapedAnonymousBody(body, protocol)
+		if shapeErr != nil {
+			return nil, ids, routeSession, nil, shapeErr
+		}
+		body = shaped
+	}
 	req, err := newUpstreamRequest(ctx, base, protocol, body, ids, tgt.CredKey, routeSession)
 	if err != nil {
 		return nil, ids, routeSession, nil, err
@@ -511,6 +518,12 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
+	}
+	if tgt.IsPublic {
+		if _, ok := collapseAnonymousProbeBody(protocol, model, raw); !ok {
+			return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
+		}
+		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, Success: true, Models: 1}
 	}
 	if !bulkProbeSuccessBody(protocol, raw) {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}

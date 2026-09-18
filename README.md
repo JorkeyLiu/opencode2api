@@ -128,7 +128,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 | 方法 | 路径 | 用途与限速 |
 | --- | --- | --- |
 | `POST` | `/api/proxies/probe` | 按具名 pool 与池内 index 探测单个 proxy 的传输健康；每客户端每分钟最多 10 次。 |
-| `POST` | `/api/availability/check` | 代理批量检测（原生节点匿名/认证通道真实最小推理）：原生按目录实际可服务模型与原生协议 POST `stream:false` 约 1 token；请求体必须为严格空对象 `{}`；每客户端每分钟最多 3 次，同时只允许一次运行（忙时 `409`）。 |
+| `POST` | `/api/availability/check` | 代理批量检测（原生节点匿名/认证通道真实最小推理）：原生按目录实际可服务模型与原生协议 POST 约 1 token（匿名走与推理相同的 agent 形态流式请求并在内部收敛为完成判定，认证保持非流式）；请求体必须为严格空对象 `{}`；每客户端每分钟最多 3 次，同时只允许一次运行（忙时 `409`）。 |
 | `POST` | `/api/availability/check-credentials` | 凭证批量检测（全部已配置认证凭证，不含匿名与自定义渠道）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
 | `POST` | `/api/availability/check-customs` | 渠道批量检测（全部已配置自定义渠道，含未启用渠道，不含原生节点与凭证）；与上行共享限速/单飞/并发/超时/发送上限与严格空对象 `{}` 约束。 |
 | `POST` | `/api/fallback/discover` | 自定义渠道模型发现（GET `{root}/v1/models` 仅下拉，host//v1/完整推理 endpoint 统一归一）：支持未保存新 base_url+明文 key 与已保存 masked secret id；限流 10/分钟，限大小/超时，验证模型 id，`no-store` 不泄露 key；失败保持 `discover_failed` 并附加 `reason`/`endpoint`/`http_status`/`elapsed_ms` 安全分类。 |
@@ -290,7 +290,7 @@ cp config.example.json config.json
 
 ### Zen 匿名模式
 
-OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Zen 服务端将它转换为匿名请求，并按出口 IP 对允许匿名访问的模型限流。本项目使用相同协议：OpenAI/Responses 上游请求发送 `Authorization: Bearer public`，Anthropic 上游请求发送 `x-api-key: public`。
+OpenCode 客户端在没有配置 Zen key 时使用固定的 `public` 凭证；Zen 服务端将它转换为匿名请求，并按出口 IP 对允许匿名访问的模型限流。本项目使用相同协议：OpenAI/Responses 上游请求发送 `Authorization: Bearer public`，Anthropic 上游请求发送 `x-api-key: public`。匿名免费请求在上游一律以 agent 形态流式发送（携带核心工具），调用方请求的流式/非流式语义保持不变：非流式调用方仍收到协议正确的 JSON（网关在写客户端字节前完整收敛上游 SSE）。
 
 启用 `anonymous` 后，以下任一条件成立即视为免费模型：
 

@@ -463,6 +463,14 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
+		if route.Anonymous {
+			if canonical := bodies[route.Tier]; len(canonical) > 0 {
+				if _, shapeErr := shapedAnonymousBody(canonical, route.ProtocolFor(route.Tier)); shapeErr != nil {
+					writeAPIError(w, external, http.StatusBadRequest, shapeErr.Error(), "invalid_request_error", "")
+					return
+				}
+			}
+		}
 		ids := deriveRequestIDs(r, payload)
 		if meta != nil {
 			meta.Request = ids.Request
@@ -505,6 +513,22 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		w.Header().Set("x-request-id", ids.Request)
 		if resp.StatusCode/100 != 2 {
 			copyErrorResponse(w, external, resp, ids.Request)
+			return
+		}
+		_, _, anonymousLane := requestCredential(requestCtx)
+		if !stream && anonymousLane && upstreamRoute.Tier == TierZen {
+			collapsed, collapsedUsage, collapsedReported, collapseErr := collapseUpstreamSSE(resp.Body, upstreamRoute.Protocol, external, model)
+			if collapseErr != nil {
+				g.logger.Warn("anonymous upstream stream collapse failed", "component", "stream", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "client_session_hash", clientSessionHash(ids.Session), "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", collapseErr)
+				writeAPIError(w, external, http.StatusBadGateway, "upstream stream failed", "upstream_error", ids.Request)
+				return
+			}
+			if meta != nil {
+				meta.Usage, meta.UsageReported = collapsedUsage, collapsedReported
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			_, _ = w.Write(collapsed)
 			return
 		}
 		if stream {
@@ -1305,7 +1329,11 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 	}
 	scope := routeScopeForCandidate(baseURL, cand, protocol)
 	routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
-	candBody, err := applyRouteSessionToBody(body, routeSession, protocol, false)
+	shaped, err := shapedAnonymousBody(body, protocol)
+	if err != nil {
+		return nil, effectiveRoute, attemptOffset, err
+	}
+	candBody, err := applyRouteSessionToBody(shaped, routeSession, protocol, false)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
@@ -1737,7 +1765,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		scope := routeScopeForCandidate(g.cfg.Upstream.Zen, cand, route.Protocol)
 		routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
-		candBody, err := applyRouteSessionToBody(body, routeSession, route.Protocol, false)
+		shaped, err := shapedAnonymousBody(body, route.Protocol)
+		if err != nil {
+			attempts++
+			syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
+			return nil, err, attempts, false, false
+		}
+		candBody, err := applyRouteSessionToBody(shaped, routeSession, route.Protocol, false)
 		if err != nil {
 			attempts++
 			syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
@@ -1863,7 +1897,18 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 		credDisplay = "anonymous"
 	}
 	newSession := g.scheduler.rotateRouteSession(ids.Session, scope, observed)
-	replayBody, cleanup, err := applyRouteSessionToBodyWithReport(canonical, newSession, protocol, true)
+	shapedCanonical := canonical
+	if anonymous {
+		shaped, shapeErr := shapedAnonymousBody(canonical, protocol)
+		if shapeErr != nil {
+			if firstResp != nil {
+				drainAndClose(firstResp.Body)
+			}
+			return nil, shapeErr, attempts
+		}
+		shapedCanonical = shaped
+	}
+	replayBody, cleanup, err := applyRouteSessionToBodyWithReport(shapedCanonical, newSession, protocol, true)
 	if err != nil {
 		if firstResp != nil {
 			drainAndClose(firstResp.Body)

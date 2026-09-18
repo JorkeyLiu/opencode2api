@@ -176,7 +176,10 @@
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
-  first, non-free models skip it entirely. Proxy fallback below applies
+  first, non-free models skip it entirely. Anonymous free-tier sends go
+  upstream as agent-shaped streams with core tools; non-stream callers receive
+  collapsed protocol-correct JSON and native anonymous availability uses the
+  same path. Proxy fallback below applies
   only to unpinned establishment; once pinned, the pinned target serves alone
   per the Session affinity spine. Dispersion and fallback belong to
   the frozen order only (HRW/round-robin); same-target retry never disperses.
@@ -250,8 +253,10 @@
   scheduler state.
 - Availability management: `POST /api/availability/check` (proxy scope: all
   nodes, anonymous and authenticated lanes) sends real minimal
-  inference (`stream:false`, minimal messages, ~1 token max output) per lane,
-  never `GET /v1/models` as an availability verdict. `POST
+  inference (minimal messages, ~1 token max output) per lane,
+  never `GET /v1/models` as an availability verdict. The native anonymous
+  lane uses the same agent-shaped stream path as inference and collapses the
+  stream internally for a factual non-stream observation. `POST
   /api/availability/check-credentials` covers all configured authenticated
   credentials only (no anonymous, no custom); `POST
   /api/availability/check-customs` covers every configured custom channel
