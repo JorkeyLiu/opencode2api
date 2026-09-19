@@ -113,7 +113,7 @@ func TestAnonymousTransportRetrySuccess(t *testing.T) {
 	}
 }
 
-// 2. Anonymous transport retry still fails, then falls back; shared token blocks a second retry.
+// 2. Anonymous transport retry still fails, then falls back; per-candidate transient attempts exhaust before next candidate.
 func TestAnonymousTransportRetryThenFallback(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
@@ -136,20 +136,17 @@ func TestAnonymousTransportRetryThenFallback(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 	sessions, _ := cap.get()
-	if len(sessions) != 3 {
-		t.Fatalf("anon sends=%d want 3 (A,A,B)", len(sessions))
+	if len(sessions) != 4 {
+		t.Fatalf("anon sends=%d want 4 (A,A,B,B)", len(sessions))
 	}
-	if sessions[0] != sessions[1] {
-		t.Fatalf("first two sends must share the route session: %q", sessions)
+	if sessions[0] != sessions[1] || sessions[0] != sessions[2] || sessions[0] != sessions[3] {
+		t.Fatalf("all anon sends must share the same route session: %q", sessions)
 	}
-	if sessions[2] != sessions[0] {
-		t.Fatalf("proxy-independent fallback must reuse the same route session: %q", sessions)
+	if postCount(&a0calls) != 2 || postCount(&a1calls) != 2 {
+		t.Fatalf("sequence must be A,A,B,B: %d/%d", postCount(&a0calls), postCount(&a1calls))
 	}
-	if postCount(&a0calls) != 2 || postCount(&a1calls) != 1 {
-		t.Fatalf("sequence must be A,A,B: %d/%d", postCount(&a0calls), postCount(&a1calls))
-	}
-	if attempts != 4 {
-		t.Fatalf("attempts=%d want 4 (3 anon + zen)", attempts)
+	if attempts != 5 {
+		t.Fatalf("attempts=%d want 5 (4 anon + zen)", attempts)
 	}
 	if postCount(&zenCalls) != 1 {
 		t.Fatalf("auth must be entered after anon exhaustion: zen=%d", postCount(&zenCalls))

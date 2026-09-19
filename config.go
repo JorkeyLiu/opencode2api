@@ -72,8 +72,10 @@ type UpstreamConfig struct {
 }
 
 type RetryConfig struct {
-	MaxAttempts    int `json:"max_attempts"`
-	TimeoutSeconds int `json:"timeout_seconds"`
+	MaxAttempts                   int `json:"max_attempts"`
+	TimeoutSeconds                int `json:"timeout_seconds"`
+	TransientMaxAttempts          int `json:"transient_max_attempts"`
+	TransientRetryIntervalSeconds int `json:"transient_retry_interval_seconds"`
 }
 
 type ModelsConfig struct {
@@ -121,7 +123,7 @@ func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen"},
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300},
+		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, TransientMaxAttempts: 3, TransientRetryIntervalSeconds: 3},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
@@ -411,6 +413,12 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")
+	}
+	if cfg.Retry.TransientMaxAttempts < 1 || cfg.Retry.TransientMaxAttempts > 10 {
+		return Config{}, errors.New("retry.transient_max_attempts must be between 1 and 10")
+	}
+	if cfg.Retry.TransientRetryIntervalSeconds < 0 || cfg.Retry.TransientRetryIntervalSeconds > 30 {
+		return Config{}, errors.New("retry.transient_retry_interval_seconds must be between 0 and 30")
 	}
 	if cfg.Models.RefreshSeconds < 1 {
 		return Config{}, errors.New("models.refresh_seconds must be at least 1")

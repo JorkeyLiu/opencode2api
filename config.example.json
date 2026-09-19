@@ -31,7 +31,9 @@
   },
   "retry": {
     "max_attempts": 3,
-    "timeout_seconds": 300
+    "timeout_seconds": 300,
+    "transient_max_attempts": 3,
+    "transient_retry_interval_seconds": 3
   },
   "models": {
     "refresh_seconds": 300,
