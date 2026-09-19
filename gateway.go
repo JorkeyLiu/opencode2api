@@ -879,9 +879,11 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies 
 // fallback channel. It is exclusive: no anonymous/authenticated send is
 // attempted. A deleted channel or a full-identity mismatch fails locally with
 // 502 and never re-establishes. Custom failures return as-is with no fallback.
-// The session is already bound to this custom authority, so provider-bound
-// Responses refs issued by the custom channel must be preserved (no stale-ref
-// cleanup on this path).
+// Pending bindings (no HTTP 2xx yet) keep crossing the authority: the send
+// strips provider-bound Responses refs so a failed first custom attempt never
+// forwards native-issued previous_response_id/reasoning items. Only
+// established bindings (first 2xx observed) preserve refs issued by the custom
+// channel itself. The first 2xx on this path flips the binding to established.
 func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, binding fallbackBinding, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	effectiveRoute := route
 	effectiveRoute.Tier = TierCustom
@@ -904,7 +906,12 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	if v, ok := firstUpstreamExtra(extra); ok {
 		ex, hasEx = v, true
 	}
-	return g.doCustomFallbackRequest(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset)
+	crossing := !binding.Established
+	resp, effectiveRoute, nextAttempts, sendErr := g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset, crossing)
+	if isCustomFallbackSuccess(resp, sendErr) && g != nil && g.scheduler != nil && g.scheduler.fallbacks != nil {
+		g.scheduler.fallbacks.markEstablished(ids.Session)
+	}
+	return resp, effectiveRoute, nextAttempts, sendErr
 }
 
 // maybeTakeoverCustomFallback binds the session to the currently active custom
@@ -921,8 +928,12 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 // the only native->custom authority crossing: the first send strips
 // provider-bound Responses refs (native-issued previous_response_id/reasoning
 // items) via the crossing-authority custom send while preserving ordinary
-// history; bound follow-ups via doCustomFallbackPinned keep custom-issued
-// refs. No custom 400 replay is added and custom errors return as-is.
+// history; the binding stays pending until its first HTTP 2xx, so every later
+// attempt on a still-pending binding (via doCustomFallbackPinned) keeps
+// crossing until success flips it to established. Bound established follow-ups
+// keep custom-issued refs. No custom 400 replay is added, no custom retry is
+// added, and custom errors (including 429/400/5xx/transport) return as-is
+// without re-entering native. No error-text sniffing is used anywhere.
 func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset, attempts int, extra ...upstreamExtra) (*http.Response, modelRoute, int, bool, error) {
 	ch, ok := activeFallbackChannel(g.cfg)
 	if !ok {
@@ -963,6 +974,9 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 	}
 	if resp == nil {
 		return nil, effectiveRoute, nextAttempts, true, contextError("custom fallback transport failed")
+	}
+	if isCustomFallbackSuccess(resp, nil) && g != nil && g.scheduler != nil && g.scheduler.fallbacks != nil {
+		g.scheduler.fallbacks.markEstablished(ids.Session)
 	}
 	return resp, effectiveRoute, nextAttempts, true, nil
 }

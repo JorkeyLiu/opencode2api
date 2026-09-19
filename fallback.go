@@ -498,34 +498,47 @@ func activeFallbackChannel(cfg Config) (FallbackChannelConfig, bool) {
 // protocol) so a later display-name rename, credential, model, URL, or
 // protocol change cannot silently drift an old session. Name is carried as
 // display-only snapshot and never participates in matching: a name-only edit
-// preserves the binding.
+// preserves the binding. Established tracks the custom authority handshake:
+// false (pending) until the first HTTP 2xx on this binding, true afterwards.
+// Pending sends must use crossingAuthority=true so native-issued
+// previous_response_id/reasoning refs never reach the new authority; only
+// established follow-ups may use crossingAuthority=false to preserve
+// custom-issued refs. The zero value (false) is the safe default for legacy
+// tombstones and migrated bindings: at worst one extra crossing cleanup.
 type fallbackBinding struct {
-	ID       string
-	Name     string // display snapshot only, never matched
-	BaseURL  string // normalized base URL (no trailing slash)
-	KeyHash  string // full SHA-256 hex of the api_key
-	KeyFP    string // 10-char fingerprint for redacted diagnostics
-	Model    string // configured channel model
-	Protocol Protocol
+	ID          string
+	Name        string // display snapshot only, never matched
+	BaseURL     string // normalized base URL (no trailing slash)
+	KeyHash     string // full SHA-256 hex of the api_key
+	KeyFP       string // 10-char fingerprint for redacted diagnostics
+	Model       string // configured channel model
+	Protocol    Protocol
+	Established bool // true only after the first HTTP 2xx on this binding
 }
 
 // fallbackBindingFor freezes the takeover identity. ReasoningEffort is
 // intentionally excluded: an effort change never drifts or invalidates a
-// bound session and never affects hot-Apply tombstone migration.
+// bound session and never affects hot-Apply tombstone migration. The new
+// binding is always pending (Established=false): the first custom send and
+// every retry until the first HTTP 2xx must cross with stale-ref cleanup.
+// Established is likewise excluded from identity matching.
 func fallbackBindingFor(ch FallbackChannelConfig) fallbackBinding {
 	return fallbackBinding{
-		ID:       strings.TrimSpace(ch.ID),
-		Name:     strings.TrimSpace(ch.Name),
-		BaseURL:  normalizeFallbackBaseURL(ch.BaseURL),
-		KeyHash:  fallbackKeyHash(strings.TrimSpace(ch.APIKey)),
-		KeyFP:    secretFingerprint(strings.TrimSpace(ch.APIKey)),
-		Model:    strings.TrimSpace(ch.Model),
-		Protocol: fallbackChannelProtocol(ch),
+		ID:          strings.TrimSpace(ch.ID),
+		Name:        strings.TrimSpace(ch.Name),
+		BaseURL:     normalizeFallbackBaseURL(ch.BaseURL),
+		KeyHash:     fallbackKeyHash(strings.TrimSpace(ch.APIKey)),
+		KeyFP:       secretFingerprint(strings.TrimSpace(ch.APIKey)),
+		Model:       strings.TrimSpace(ch.Model),
+		Protocol:    fallbackChannelProtocol(ch),
+		Established: false,
 	}
 }
 
 func (b fallbackBinding) matchesChannel(ch FallbackChannelConfig) bool {
 	// Stable path: match by ID; display name is ignored so renames preserve.
+	// Established and Name never participate: a pending/established flip or a
+	// display rename must not drift or invalidate the binding.
 	if strings.TrimSpace(b.ID) != "" {
 		if b.ID != strings.TrimSpace(ch.ID) {
 			return false
@@ -612,10 +625,38 @@ func (st *fallbackTakeoverStore) bind(session string, b fallbackBinding) (fallba
 	return b, true, false
 }
 
+// markEstablished flips a pending binding to established after its first
+// HTTP 2xx. It is idempotent, first-wins safe (the session identity never
+// changes, only the flag), and never creates an entry: unknown sessions stay
+// absent so capacity accounting is unchanged. Concurrent pending sends that
+// snapshot false still send crossing=true (conservative); the flip only
+// affects later gets.
+func (st *fallbackTakeoverStore) markEstablished(session string) {
+	if st == nil || session == "" {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if b, ok := st.entries[session]; ok && !b.Established {
+		b.Established = true
+		st.entries[session] = b
+	}
+}
+
+// isCustomFallbackSuccess reports the single custom success signal: an HTTP
+// 2xx with no transport/build error. It mirrors the existing custom success
+// semantics (header status only; stream vs non-stream body handling is
+// unchanged downstream) and never inspects error text.
+func isCustomFallbackSuccess(resp *http.Response, err error) bool {
+	return err == nil && resp != nil && resp.StatusCode/100 == 2
+}
+
 // migrateFallbackFrom copies all takeover identities without validity
 // filtering (tombstone semantics). Removed or changed channels still resolve
 // to the pinned fallback path and fail locally with 502. Deterministic key
-// order, stops at the cap without evicting.
+// order, stops at the cap without evicting. The Established flag travels with
+// the identity; legacy bindings without it decode as pending (safe default:
+// one extra crossing cleanup until the next HTTP 2xx).
 func (st *fallbackTakeoverStore) migrateFallbackFrom(old *fallbackTakeoverStore) int {
 	if st == nil || old == nil || st == old {
 		return 0
@@ -1039,20 +1080,23 @@ func (g *Gateway) fallbackCustomClient() *http.Client {
 // canonical OpenCode routing metadata (pseudonymous session/request/project
 // derived from the target-bound custom route session): full client history
 // stays in the body and the supplier is never relied on to persist state.
-// This wrapper preserves the bound-channel behavior (provider-bound refs
-// kept); first-time native->custom takeover must call the crossing-authority
-// variant with crossingAuthority=true.
+// This wrapper derives crossing from the binding: pending bindings strip
+// provider-bound refs, established bindings keep custom-issued refs. Direct
+// session paths (doCustomFallbackPinned, maybeTakeoverCustomFallback) pass
+// the flag explicitly; this wrapper keeps direct/body-level callers safe by
+// default.
 func (g *Gateway) doCustomFallbackRequest(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int) (*http.Response, modelRoute, int, error) {
-	return g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset, false)
+	return g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset, !binding.Established)
 }
 
 // doCustomFallbackRequestCrossingAuthority is the explicit crossing-authority
-// variant of doCustomFallbackRequest. crossingAuthority=true is only for the
-// first native->custom takeover send: provider-bound Responses refs are
-// stripped before the send so native-issued previous_response_id/reasoning
-// items never reach the new custom authority. Bound follow-up sends must pass
-// false so refs issued by the custom channel itself are preserved. No custom
-// 400 replay is added; custom errors still return as-is on the bound channel.
+// variant of doCustomFallbackRequest. crossingAuthority=true is for every
+// pending native->custom send (first takeover plus every retry until the
+// first HTTP 2xx): provider-bound Responses refs are stripped before the
+// send so native-issued previous_response_id/reasoning items never reach the
+// new custom authority. Established follow-ups must pass false so refs issued
+// by the custom channel itself are preserved. No custom 400 replay or retry
+// is added; custom errors still return as-is on the bound channel.
 func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, route modelRoute, ex upstreamExtra, hasEx bool, bodies map[Tier][]byte, ids requestIDs, ch FallbackChannelConfig, binding fallbackBinding, attemptOffset int, crossingAuthority bool) (*http.Response, modelRoute, int, error) {
 	channelProtocol := fallbackChannelProtocol(ch)
 	channelModel := strings.TrimSpace(ch.Model)
