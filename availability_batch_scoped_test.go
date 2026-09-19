@@ -902,9 +902,9 @@ func TestScopedBatchWebUIContracts(t *testing.T) {
 	for _, needle := range []string{
 		`id="btn-bulk-check"`,
 		`id="btn-bulk-check-credentials"`,
-		`>批量检测凭证</button>`,
+		`>批量检测凭证</span>`,
 		`id="btn-bulk-check-customs"`,
-		`>批量检测渠道</button>`,
+		`>批量检测渠道</span>`,
 		`id="bulk-credentials-state"`,
 		`id="bulk-customs-state"`,
 		`function bulkCheck(`,
@@ -994,7 +994,7 @@ func TestScopedBatchWebUIContracts(t *testing.T) {
 	}
 	// Operator copy stays concise: batch button labels carry no API paths
 	// or probe payload mechanics.
-	for _, label := range []string{`>批量检测</button>`, `>批量检测凭证</button>`, `>批量检测渠道</button>`} {
+	for _, label := range []string{`>批量检测</span>`, `>批量检测凭证</span>`, `>批量检测渠道</span>`} {
 		idx := strings.Index(html, label)
 		if idx < 0 {
 			t.Fatalf("missing batch label %q", label)

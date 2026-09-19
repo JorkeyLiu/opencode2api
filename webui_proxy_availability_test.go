@@ -87,11 +87,16 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 		}
 	}
 	// Localized observation labels, never raw backend enums in cells.
-	// Undetected/no-data (untested/inconclusive/empty) renders as "—", never
-	// "未检测"/"未定"; unconfigured/no_model keep operator-facing copy.
+	// Untested (no check) renders as 尚未检测, inconclusive (checked but
+	// unclear) as 结果不明; transport failures and other diagnostic
+	// failures never render as a bare dash. Unconfigured/no_model keep
+	// operator-facing copy.
 	for _, needle := range []string{
 		`if(v==="unconfigured")return "未配置"`,
 		`if(v==="no_model")return "无可用模型"`,
+		`return "尚未检测"`,
+		`return "结果不明"`,
+		`if(v==="transport_failure")return "传输失败"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("observation label must contain %q", needle)
@@ -102,11 +107,8 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 		`if(v==="inconclusive")return "未定"`,
 	} {
 		if strings.Contains(html, stale) {
-			t.Fatalf("undetected must render as dash, stale label must stay removed: %q", stale)
+			t.Fatalf("stale label must stay removed: %q", stale)
 		}
-	}
-	if !strings.Contains(html, `v==="untested"||v==="inconclusive")return "—"`) && !strings.Contains(html, `v==="untested"||v==="inconclusive"`) {
-		t.Fatal("undetected/inconclusive must map to dash")
 	}
 	// Dash titles distinguish unrouted-pool / unconfigured-channel.
 	for _, needle := range []string{
@@ -121,29 +123,43 @@ func TestWebUIProxyLaneProjection(t *testing.T) {
 
 func TestWebUIProxyActualStatusCells(t *testing.T) {
 	html := proxyAvailHTML(t)
-	// Header carries the canonical three columns.
-	for _, needle := range []string{`<th class="avail-c">传输</th>`, `<th class="avail-c">匿名</th>`, `<th class="avail-c">认证</th>`} {
+	// Header carries the simplified two columns: 传输 + 状态.
+	for _, needle := range []string{`<th class="avail-c">传输</th>`, `<th class="avail-c">状态</th>`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("proxy table must contain canonical column %q", needle)
 		}
+	}
+	if strings.Contains(html, `<th class="avail-c">匿名</th>`) {
+		t.Fatal("proxy 匿名 column must stay removed (renamed to 状态)")
+	}
+	if strings.Contains(html, `<th class="avail-c">认证</th>`) {
+		t.Fatal("proxy 认证 column must stay removed")
 	}
 	for _, stale := range []string{"<th>Zen 通道</th>", "<th>Go 通道</th>", "Go 通道", "Zen 通道", "冷却原因", "p.cooldown_reason"} {
 		if strings.Contains(html, stale) {
 			t.Fatalf("legacy proxy column must stay removed: %q", stale)
 		}
 	}
-	// Cells gate on the canonical lane, not on transport health.
+	// Proxy status cell gates on the anonymous lane only, not on transport health.
 	if got := strings.Count(html, "!proxyAnonLaneOn(p)"); got < 1 {
-		t.Fatal("anonymous cell must gate on !proxyAnonLaneOn(p)")
+		t.Fatal("status cell must gate on !proxyAnonLaneOn(p)")
 	}
-	if got := strings.Count(html, "!proxyAuthLaneOn(p)"); got < 1 {
-		t.Fatal("authenticated cell must gate on !proxyAuthLaneOn(p)")
+	proxyBlock := sliceFn(html, `var tp=$("tbody-proxies")`, `emptyRow(tp,8,`)
+	if proxyBlock == "" {
+		t.Fatal("missing proxy render block")
+	}
+	if strings.Contains(proxyBlock, "!proxyAuthLaneOn(p)") {
+		t.Fatal("proxy table must not render the authenticated lane cell")
+	}
+	if strings.Contains(proxyBlock, "proxyAuthDashTitle(p)") {
+		t.Fatal("proxy table must not use the authenticated dash title")
+	}
+	if strings.Contains(proxyBlock, "laneObsOf(p,\"authenticated\")") {
+		t.Fatal("proxy table must not read the authenticated lane observation")
 	}
 	for _, needle := range []string{
 		"td.title=proxyAnonDashTitle(p)",
-		"td.title=proxyAuthDashTitle(p)",
 		"laneObsOf(p,\"anonymous\")",
-		"laneObsOf(p,\"authenticated\")",
 		"obsTone(lane.obs,lane.code)",
 		"obsDisplayText(lane.obs,lane.code)",
 	} {
@@ -152,13 +168,15 @@ func TestWebUIProxyActualStatusCells(t *testing.T) {
 		}
 	}
 	// Transport column uses the independent probe observation, never the
-	// internal healthy default. Undetected renders as dash.
+	// internal healthy default. Untested renders as 尚未检测, inconclusive
+	// as 结果不明, never a bare dash for a diagnostic failure.
 	for _, needle := range []string{
 		"function transportObsOf(p)",
 		"function transportDisplayLabel(v)",
 		"function transportTone(v)",
 		"transportObsOf(p)",
 		"尚未检测",
+		"结果不明",
 	} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("transport observation column must contain %q", needle)
@@ -253,7 +271,7 @@ func TestWebUIProxySingleProbeButton(t *testing.T) {
 		`btn.classList.remove("is-busy")`,
 		`setAttribute("aria-busy","true")`,
 		`removeAttribute("aria-busy")`,
-		`setAttribute("aria-label","正在检测")`,
+		`setAttribute("aria-label",busyLabel||"正在检测")`,
 		`setAttribute("aria-label","检测节点可用性")`,
 		`btn.disabled=true`,
 		`btn.disabled=false`,
@@ -338,8 +356,7 @@ func TestWebUIAvailabilityTableAlignment(t *testing.T) {
 		`<th class="avail-c">序号</th>`,
 		`<th class="avail-l">路由通道</th>`,
 		`<th class="avail-c">传输</th>`,
-		`<th class="avail-c">匿名</th>`,
-		`<th class="avail-c">认证</th>`,
+		`<th class="avail-c">状态</th>`,
 		`<th class="avail-ts">上次检测</th>`,
 		`<th class="avail-c">操作</th>`,
 	} {
@@ -372,8 +389,8 @@ func TestWebUIAvailabilityTableAlignment(t *testing.T) {
 			t.Fatalf("proxy cell must contain %q", needle)
 		}
 	}
-	if got := strings.Count(html, `td.className="avail-c"`); got < 3 {
-		t.Fatalf("proxy status/action cells must use avail-c at least 3 times, got %d", got)
+	if got := strings.Count(html, `td.className="avail-c"`); got < 2 {
+		t.Fatalf("proxy status/action cells must use avail-c at least 2 times, got %d", got)
 	}
 	// Custom cells: th/td class parity.
 	for _, needle := range []string{
@@ -385,7 +402,7 @@ func TestWebUIAvailabilityTableAlignment(t *testing.T) {
 			t.Fatalf("custom cell must contain %q", needle)
 		}
 	}
-	proxyBlock := sliceFn(html, `var tp=$("tbody-proxies")`, `emptyRow(tp,9,`)
+	proxyBlock := sliceFn(html, `var tp=$("tbody-proxies")`, `emptyRow(tp,8,`)
 	customBlock := sliceFn(html, `var tcb=$("tbody-custom")`, `emptyRow(tcb,7,`)
 	if proxyBlock == "" {
 		t.Fatal("missing proxy render block")
@@ -426,8 +443,8 @@ func TestWebUIAvailabilityTableAlignment(t *testing.T) {
 			t.Fatalf("custom text cell must contain %q", needle)
 		}
 	}
-	// Empty-row colspans unchanged.
-	for _, needle := range []string{`emptyRow(tp,9,"暂无代理")`, `emptyRow(tcb,7,"暂无自定义渠道")`} {
+	// Empty-row colspans: proxy table uses 8 columns after 认证 removal.
+	for _, needle := range []string{`emptyRow(tp,8,"暂无代理")`, `emptyRow(tcb,7,"暂无自定义渠道")`} {
 		if !strings.Contains(html, needle) {
 			t.Fatalf("empty row must stay %q", needle)
 		}

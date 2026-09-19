@@ -106,8 +106,11 @@ func TestWebUIGlobalFormatRules(t *testing.T) {
 	}
 
 	// 4. Single scoped availability toast uses node-result semantics (no transport trivia).
-	if !strings.Contains(html, `"检测 "+pool+"#"+p.index+": "`) {
+	if !strings.Contains(html, `nodeResultText(node)`) {
 		t.Fatal("scoped single-check toast must use node-result semantics")
+	}
+	if !strings.Contains(html, `"检测 "+pool+"#"+idx+"："`) && !strings.Contains(html, `"检测 "+pool+"#"+p.index`) {
+		t.Fatal("scoped single-check toast must identify the pool#index node")
 	}
 	if strings.Contains(html, `res.duration_ms+"ms）"`) {
 		t.Fatal("single-check toast must not expose transport duration trivia")

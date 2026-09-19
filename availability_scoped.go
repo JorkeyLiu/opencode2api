@@ -25,6 +25,9 @@ import (
 //     strict JSON decoding, redaction, and the shared concurrency (4),
 //     per-send (10s), overall (30s), and send-cap limits. No per-client
 //     rate limit applies; single-flight 409, timeouts, and caps remain.
+//   - Concurrency gate: singles hold the availability RW gate for reading
+//     (TryRLock), so independent singles run concurrently while any batch
+//     write lock fails them fast with 409 bulk_busy.
 
 type scopedCheckRequest struct {
 	Pool  string `json:"pool"`
@@ -69,11 +72,11 @@ func (a *AdminServer) handleScopedCheck(w http.ResponseWriter, r *http.Request) 
 		writeAdminError(w, http.StatusBadRequest, "invalid_index", "index is outside the configured pool")
 		return
 	}
-	if !gateway.bulkMu.TryLock() {
+	if !gateway.bulkMu.TryRLock() {
 		writeAdminError(w, http.StatusConflict, "bulk_busy", "an availability check is already running")
 		return
 	}
-	defer gateway.bulkMu.Unlock()
+	defer gateway.bulkMu.RUnlock()
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOverallTimeout)
 	defer cancel()
 	resp := gateway.runScopedCheck(ctx, poolName, *input.Index)
@@ -201,6 +204,9 @@ func (g *Gateway) runScopedCheck(ctx context.Context, poolName string, index int
 // batch state. The global batch timestamp is preserved when a prior snapshot
 // exists so 上次批量检测 does not move on a single-node check.
 func (g *Gateway) mergeScopedSnapshotRows(checkedAt time.Time, nodes []bulkNodeAvailability, creds []bulkCredentialAvailability) {
+	// Serialized merge only; network sends stay outside this lock.
+	g.bulkSnapMu.Lock()
+	defer g.bulkSnapMu.Unlock()
 	existing := g.bulkSnapshot.Load()
 	if existing == nil || existing.CheckedAt.IsZero() {
 		snap := &bulkAvailabilitySnapshot{

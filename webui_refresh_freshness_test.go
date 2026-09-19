@@ -344,8 +344,11 @@ func TestWebUICustomImmediateAndGhostCleanup(t *testing.T) {
 	if !strings.Contains(probeBlock, "mergeCustomRowIntoCache(row)") {
 		t.Fatal("custom probe must merge the fresh row into cache")
 	}
-	if !strings.Contains(probeBlock, "renderHealth()") {
-		t.Fatal("custom probe must render the merged cache immediately")
+	if strings.Contains(probeBlock, "renderHealth()") {
+		t.Fatal("custom probe must not render mid-flight before refreshMonitor (detaches busy button)")
+	}
+	if !strings.Contains(probeBlock, "return refreshMonitor({force:true})") {
+		t.Fatal("custom probe must rely on the subsequent refreshMonitor render")
 	}
 	// Ghost cleanup: cached rows never override server rows, deleted/renamed pruned.
 	for _, needle := range []string{

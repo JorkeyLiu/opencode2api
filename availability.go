@@ -358,10 +358,15 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	resp := g.buildBulkResponse(checkedAt, totalNodes, tested, skipped, truncated, partial, results, []bulkCustomResult{}, sortedNoModelList(noModel))
 	resp.Custom = nil
 	// Atomically replace the admin-only latest-result snapshot (fixed
-	// bounded). It is a projection and never routing authority. Preserve
-	// useful partial node rows but visibly mark partial; never overwrite a
-	// newer complete snapshot with a fully cancelled zero-tested result.
-	// Stored per-channel custom rows are preserved verbatim.
+	// bounded) under the snapshot merge lock. It is a projection and never
+	// routing authority. Preserve useful partial node rows but visibly mark
+	// partial; never overwrite a newer complete snapshot with a fully
+	// cancelled zero-tested result. Stored per-channel custom rows are
+	// preserved verbatim. Batches hold the availability write lock so no
+	// concurrent single merge can interleave, but the merge lock still
+	// bounds the critical section to in-memory copy/store.
+	g.bulkSnapMu.Lock()
+	defer g.bulkSnapMu.Unlock()
 	existingSnap := g.bulkSnapshot.Load()
 	preservedCustom := []bulkCustomAvailability(nil)
 	if existingSnap != nil {

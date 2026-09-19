@@ -45,11 +45,20 @@ type Gateway struct {
 	// Both paths use TryLock so a busy refresh returns 409 instead of
 	// stacking. No new dependency is introduced.
 	catalogRefreshMu sync.Mutex
-	// bulkMu gates overlapping bulk availability checks (409 busy).
+	// availGate is the availability RW gate: single (per-row/scoped)
+	// detections hold read locks (TryRLock) so independent singles run
+	// concurrently; batch detections hold the write lock (TryLock) so
+	// batches are single-flight with each other and mutually exclusive
+	// with singles in both directions. Any failed acquisition returns
+	// fail-fast 409 bulk_busy without queueing.
 	// bulkSnapshot is the admin-only latest-result projection: fixed
 	// bounded, replaced atomically per completed/partial run, never
 	// routing authority. Restart/Apply clears via fresh Gateway.
-	bulkMu       sync.Mutex
+	// bulkSnapMu serializes concurrent single-merge load/copy/store
+	// sections only (never network sends) so independent single results
+	// are not lost.
+	bulkMu       sync.RWMutex
+	bulkSnapMu   sync.Mutex
 	bulkSnapshot atomic.Pointer[bulkAvailabilitySnapshot]
 }
 

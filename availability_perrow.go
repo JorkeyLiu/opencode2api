@@ -15,9 +15,12 @@ import (
 //   - Strict admin auth/CSRF/Origin/no-store (wired in admin.go), strict JSON
 //     bodies (DisallowUnknownFields + single value), redaction throughout.
 //   - Share concurrency (4), overall (30s), per-send (10s), and send-cap
-//     controls plus bulkMu with the batch and scoped checks. No per-client
-//     rate limit applies to availability checks; single-flight 409, overall
-//     timeout, and send caps remain the safety boundaries.
+//     controls plus the availability RW gate with the batch and scoped
+//     checks. Singles hold the gate for reading (TryRLock) so independent
+//     singles run concurrently; a batch write lock fails them fast with
+//     409 bulk_busy. No per-client rate limit applies to availability
+//     checks; single-flight 409, overall timeout, and send caps remain
+//     the safety boundaries.
 //   - Credential: exactly one configured credential identified by the stable
 //     redacted fingerprint (SHA-256 prefix of tier+key, never raw key and
 //     never tail-only). Tier, key, and assigned pool resolve server-side.
@@ -94,11 +97,11 @@ func (a *AdminServer) handleCredentialCheck(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	resolved := matches[0]
-	if !gateway.bulkMu.TryLock() {
+	if !gateway.bulkMu.TryRLock() {
 		writeAdminError(w, http.StatusConflict, "bulk_busy", "an availability check is already running")
 		return
 	}
-	defer gateway.bulkMu.Unlock()
+	defer gateway.bulkMu.RUnlock()
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOverallTimeout)
 	defer cancel()
 	resp, status, code, msg := gateway.runCredentialCheck(ctx, resolved.tier, resolved.cred, resolved.pool)
@@ -137,11 +140,11 @@ func (a *AdminServer) handleCustomCheck(w http.ResponseWriter, r *http.Request) 
 		writeAdminError(w, http.StatusBadRequest, "unknown_channel", "fallback channel does not exist")
 		return
 	}
-	if !gateway.bulkMu.TryLock() {
+	if !gateway.bulkMu.TryRLock() {
 		writeAdminError(w, http.StatusConflict, "bulk_busy", "an availability check is already running")
 		return
 	}
-	defer gateway.bulkMu.Unlock()
+	defer gateway.bulkMu.RUnlock()
 	ctx, cancel := context.WithTimeout(r.Context(), bulkOverallTimeout)
 	defer cancel()
 	resp := gateway.runCustomCheck(ctx, ch)
@@ -252,6 +255,9 @@ func (g *Gateway) runCredentialCheck(ctx context.Context, tier Tier, cred creden
 }
 
 func (g *Gateway) mergeCredentialSnapshotRow(checkedAt time.Time, fresh bulkCredentialAvailability) {
+	// Serialized merge only; network sends stay outside this lock.
+	g.bulkSnapMu.Lock()
+	defer g.bulkSnapMu.Unlock()
 	existing := g.bulkSnapshot.Load()
 	if existing == nil || existing.CheckedAt.IsZero() {
 		snap := &bulkAvailabilitySnapshot{
@@ -337,9 +343,9 @@ func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) 
 		APIKey: ch.APIKey, Protocol: fallbackChannelProtocol(ch),
 		Effort: fallbackChannelEffort(ch),
 	}
-	// Single send on the shared bulk budget (sem guards against concurrent
-	// batch/scoped/per-row checks only via bulkMu; the semaphore keeps the
-	// per-send admission consistent).
+	// Single send on the shared bulk budget (the availability RW gate
+	// serializes batch vs singles; the semaphore keeps the per-send
+	// admission consistent).
 	sem := make(chan struct{}, bulkProbeConcurrency)
 	var result bulkCustomResult
 	select {
@@ -366,6 +372,9 @@ func (g *Gateway) runCustomCheck(ctx context.Context, ch FallbackChannelConfig) 
 }
 
 func (g *Gateway) mergeCustomSnapshotRow(checkedAt time.Time, fresh bulkCustomAvailability) {
+	// Serialized merge only; network sends stay outside this lock.
+	g.bulkSnapMu.Lock()
+	defer g.bulkSnapMu.Unlock()
 	existing := g.bulkSnapshot.Load()
 	if existing == nil || existing.CheckedAt.IsZero() {
 		snap := &bulkAvailabilitySnapshot{

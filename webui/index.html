@@ -336,18 +336,18 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
       </div>
       <div class="section">
         <h2>代理可用性</h2>
-        <div class="cap">各代理节点的连通性与匿名、认证通道实测结果。节点名为配置名称，不代表出口 IP，可逐个检测。</div>
+        <div class="cap">各代理节点的连通性与匿名通道实测状态。节点名为配置名称，不代表出口 IP，可逐个检测。</div>
         <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
-          <button class="ghost" id="btn-bulk-check" type="button">批量检测</button>
+          <button class="ghost probe-btn" id="btn-bulk-check" type="button"><span class="probe-label">批量检测</span><span class="probe-spin" aria-hidden="true"></span></button>
         </div>
-        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th class="avail-l">节点</th><th class="avail-l">代理池</th><th class="avail-c">序号</th><th class="avail-l">路由通道</th><th class="avail-c">传输</th><th class="avail-c">匿名</th><th class="avail-c">认证</th><th class="avail-ts">上次检测</th><th class="avail-c">操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
+        <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th class="avail-l">节点</th><th class="avail-l">代理池</th><th class="avail-c">序号</th><th class="avail-l">路由通道</th><th class="avail-c">传输</th><th class="avail-c">状态</th><th class="avail-ts">上次检测</th><th class="avail-c">操作</th></tr></thead><tbody id="tbody-proxies"></tbody></table></div>
         <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px"><span class="note" id="proxies-note"></span><span class="note" id="bulk-state" style="text-align:right"></span></div>
       </div>
       <div class="section">
         <h2>备用模型渠道可用性</h2>
         <div class="cap">已配置渠道列表与最近检测结果，可整体或逐个检测。</div>
         <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
-          <button class="ghost" id="btn-bulk-check-customs" type="button">批量检测渠道</button>
+          <button class="ghost probe-btn" id="btn-bulk-check-customs" type="button"><span class="probe-label">批量检测渠道</span><span class="probe-spin" aria-hidden="true"></span></button>
         </div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th class="avail-l">渠道</th><th class="avail-l">地址</th><th class="avail-l">模型</th><th class="avail-c">状态</th><th class="avail-l">原因</th><th class="avail-ts">上次检测</th><th class="avail-c">操作</th></tr></thead><tbody id="tbody-custom"></tbody></table></div>
         <div style="display:flex;justify-content:space-between;gap:8px;margin-top:6px"><span class="note" id="custom-note"></span><span class="note" id="bulk-customs-state" style="text-align:right"></span></div>
@@ -356,7 +356,7 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
         <h2>凭证可用性</h2>
         <div class="cap">各密钥的检测状态与所属池，可整体或逐个检测。完整密钥不在页面显示。</div>
         <div class="actions" style="justify-content:flex-end;margin-bottom:10px">
-          <button class="ghost" id="btn-bulk-check-credentials" type="button">批量检测凭证</button>
+          <button class="ghost probe-btn" id="btn-bulk-check-credentials" type="button"><span class="probe-label">批量检测凭证</span><span class="probe-spin" aria-hidden="true"></span></button>
         </div>
         <div class="table-wrap scroll-bound"><table class="table"><thead><tr><th>密钥尾码</th><th>上游</th><th>代理池</th><th>状态</th><th>可用/全部</th><th>失败次数</th><th>原因</th><th>上次检测</th><th>操作</th></tr></thead><tbody id="tbody-keys"></tbody></table></div>
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px"><span class="note" id="bulk-credentials-state" style="text-align:right"></span></div>
@@ -568,6 +568,8 @@ var S = {
   es:null, timer:null,
   bulkCustom:[], bulkNoModel:[], customAvail:[],
   availBusy:false,
+  availBatchBusy:false,
+  availSingles:{},
   secretReveal:{seq:0,promise:null,data:null}
 };
 
@@ -1383,7 +1385,8 @@ function transportObsOf(p){
 }
 function transportDisplayLabel(v){
   v=String(v||"");
-  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(!v||v==="—"||v==="untested")return "尚未检测";
+  if(v==="inconclusive")return "结果不明";
   if(v==="healthy")return "正常";
   if(v==="unhealthy")return "不可用";
   return obsLabel(v);
@@ -1442,7 +1445,8 @@ function obsLabel(v){
   if(v==="unavailable")return "不可用";
   if(v==="unconfigured")return "未配置";
   if(v==="no_model")return "无可用模型";
-  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(!v||v==="—"||v==="untested")return "尚未检测";
+  if(v==="inconclusive")return "结果不明";
   return "未知";
 }
 function laneObsOf(p,lane){
@@ -1480,12 +1484,14 @@ function customStatusLabel(v){
   if(v==="available")return "可用";
   if(v==="rate_limited")return "限流";
   if(v==="unavailable")return "不可用";
-  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(!v||v==="—"||v==="untested")return "尚未检测";
+  if(v==="inconclusive")return "结果不明";
   return obsLabel(v);
 }
 function customReasonLabel(v){
   v=String(v||"");
-  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(!v||v==="—"||v==="untested")return "—";
+  if(v==="inconclusive")return "结果不明";
   if(v==="unconfigured")return "未配置";
   if(v==="no_model")return "无可用模型";
   if(v==="cancelled"||v==="parse_error")return obsLabel(v);
@@ -1496,7 +1502,8 @@ function credStatusLabel(v){
   if(v==="available")return "可用";
   if(v==="unavailable")return "不可用";
   if(v==="rate_limited")return "限流";
-  if(!v||v==="—"||v==="untested"||v==="inconclusive")return "—";
+  if(!v||v==="—"||v==="untested")return "尚未检测";
+  if(v==="inconclusive")return "结果不明";
   return obsLabel(v);
 }
 function credProbeOf(k){
@@ -1539,28 +1546,22 @@ function renderHealth(){
       var lane=laneObsOf(p,"anonymous");
       var txt=obsDisplayText(lane.obs,lane.code);
       var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
-      s.title=r_vsprintfLane("匿名",lane.obs,lane.code,probeReasonText(p)); td.appendChild(s); tr.appendChild(td);
-    })();
-    (function(){
-      var td=document.createElement("td"); td.className="avail-c";
-      if(!proxyAuthLaneOn(p)){ td.textContent="—"; td.title=proxyAuthDashTitle(p); tr.appendChild(td); return; }
-      var lane=laneObsOf(p,"authenticated");
-      var txt=obsDisplayText(lane.obs,lane.code);
-      var s=el("span",txt,"pill "+obsTone(lane.obs,lane.code));
-      s.title=r_vsprintfLane("认证",lane.obs,lane.code,probeReasonText(p)); td.appendChild(s); tr.appendChild(td);
+      s.title=r_vsprintfLane("状态",lane.obs,lane.code,probeReasonText(p)); td.appendChild(s); tr.appendChild(td);
     })();
     (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=p.last_checked?fmtDateTime(p.last_checked):"—"; td.title=p.last_checked?("上次检测："+fmtDateTime(p.last_checked)):"尚未检测"; tr.appendChild(td); })();
     var op=document.createElement("td"); op.className="avail-c";
     var probeBtn=document.createElement("button"); probeBtn.type="button"; probeBtn.className="ghost probe-btn"; probeBtn.setAttribute("aria-label","检测节点可用性");
+    try{ probeBtn.setAttribute("data-avail-key", availSingleKey("node", (p.proxy_pool||p.pool||"")+"#"+p.index)); }catch(e){}
     var probeLabel=document.createElement("span"); probeLabel.className="probe-label"; probeLabel.textContent="检测"; probeBtn.appendChild(probeLabel);
     var probeSpin=document.createElement("span"); probeSpin.className="probe-spin"; probeSpin.setAttribute("aria-hidden","true"); probeBtn.appendChild(probeSpin);
+    try{ applyAvailBusyState(probeBtn); }catch(e){}
     (function(proxy,btn){
       btn.addEventListener("click",function(ev){ ev.stopPropagation(); probeProxy(proxy,btn); });
     })(p,probeBtn);
     op.appendChild(probeBtn); tr.appendChild(op);
     tp.appendChild(tr);
   });
-  if(!(r.proxies||[]).length)emptyRow(tp,9,"暂无代理");
+  if(!(r.proxies||[]).length)emptyRow(tp,8,"暂无代理");
   (function(){ var n=$("proxies-note"); if(n){ clear(n); var total=(r.proxies||[]).length; n.appendChild(document.createTextNode("共 "+total+" 个代理。")); } })();
   var tk=$("tbody-keys"); clear(tk);
   (r.keys||[]).forEach(function(k){
@@ -1573,8 +1574,10 @@ function renderHealth(){
     (function(){ var td=document.createElement("td"); td.textContent=k.last_checked?fmtDateTime(k.last_checked):"—"; td.title=k.last_checked?("上次检测："+fmtDateTime(k.last_checked)):"尚未检测"; tr.appendChild(td); })();
     var kop=document.createElement("td");
     var kbtn=document.createElement("button"); kbtn.type="button"; kbtn.className="ghost probe-btn"; kbtn.setAttribute("aria-label","检测凭证可用性");
+    try{ kbtn.setAttribute("data-avail-key", availSingleKey("credential", (k.fingerprint||k.Fingerprint||""))); }catch(e){}
     var klabel=document.createElement("span"); klabel.className="probe-label"; klabel.textContent="检测"; kbtn.appendChild(klabel);
     var kspin=document.createElement("span"); kspin.className="probe-spin"; kspin.setAttribute("aria-hidden","true"); kbtn.appendChild(kspin);
+    try{ applyAvailBusyState(kbtn); }catch(e){}
     (function(cred,btn){
       btn.addEventListener("click",function(ev){ ev.stopPropagation(); probeCredential(cred,btn); });
     })(k,kbtn);
@@ -1653,8 +1656,10 @@ function renderHealth(){
       (function(){ var td=document.createElement("td"); td.className="avail-ts"; td.textContent=c.last_checked?fmtDateTime(c.last_checked):"—"; td.title=c.last_checked?("上次检测："+fmtDateTime(c.last_checked)):"尚未检测"; tr.appendChild(td); })();
       var cop=document.createElement("td"); cop.className="avail-c";
       var cbtn=document.createElement("button"); cbtn.type="button"; cbtn.className="ghost probe-btn"; cbtn.setAttribute("aria-label","检测自定义渠道可用性");
+      try{ cbtn.setAttribute("data-avail-key", availSingleKey("custom", String(c.id||c.name||""))); }catch(e){}
       var clabel=document.createElement("span"); clabel.className="probe-label"; clabel.textContent="检测"; cbtn.appendChild(clabel);
       var cspin=document.createElement("span"); cspin.className="probe-spin"; cspin.setAttribute("aria-hidden","true"); cbtn.appendChild(cspin);
+      try{ applyAvailBusyState(cbtn); }catch(e){}
       (function(ch,btn){
         btn.addEventListener("click",function(ev){ ev.stopPropagation(); probeCustom(ch,btn); });
       })(c,cbtn);
@@ -1675,31 +1680,74 @@ function renderHealth(){
   fact(fc,"元数据更新", fmtDateTime(md.updated_at), md.stale?"warn":"ok");
   fact(fc,"元数据错误", md.last_error||"无", md.last_error?"bad":"ok");
 }
+function nodeAnonObsOf(n){ n=n||{}; var o=(n.anonymous!==undefined?n.anonymous:(n.Anonymous!==undefined?n.Anonymous:(n.anonymous_observation!==undefined?n.anonymous_observation:"untested"))); return String(o||"untested"); }
+function nodeAnonCodeOf(n){ n=n||{}; var c=(n.anonymous_http_status!==undefined?n.anonymous_http_status:(n.AnonymousHTTPStatus!==undefined?n.AnonymousHTTPStatus:(n.anonymousHttpStatus||0))); return Number(c||0)||0; }
+function nodeTransportObsOf(n){ n=n||{}; var v=(n.transport!==undefined?n.transport:(n.transport_observation!==undefined?n.transport_observation:"untested")); return String(v||"untested"); }
+function nodeReasonOf(n){ n=n||{}; var v=(n.reason!==undefined?n.reason:(n.Reason!==undefined?n.Reason:"")); return String(v||""); }
+function nodeStatusText(obs,code,reason){
+  obs=String(obs||"untested"); code=Number(code||0)||0; reason=String(reason||"");
+  var label=obsLabel(obs);
+  var base=code?("HTTP "+code+"（"+label+"）"):label;
+  if(!code&&obs==="transport_failure"&&base==="传输失败")base+="（未收到上游响应）";
+  if(reason&&reason!=="—"&&reason!=="untested"&&reason!=="inconclusive"){
+    var rl=failureLabel(reason)!=="未知"?failureLabel(reason):obsLabel(reason);
+    if(rl&&rl!=="—"&&rl!=="结果不明"&&rl!=="尚未检测"&&rl!==label)base+="（"+rl+"）";
+    else if(rl&&rl!=="—"&&code&&rl!==label)base+="（"+rl+"）";
+  } else if(reason==="inconclusive"&&!code&&obs==="untested"){
+    base+="（结果不明）";
+  }
+  return base;
+}
 function nodeResultText(node){
   node=node||{};
-  function laneText(lane){
-    var obs="",code=0;
-    if(lane==="anonymous"){ obs=String(node.anonymous!==undefined?node.anonymous:(node.Anonymous!==undefined?node.Anonymous:(node.anonymous_observation||"untested"))); code=Number(node.anonymous_http_status||node.AnonymousHTTPStatus||0)||0; }
-    else { obs=String(node.authenticated!==undefined?node.authenticated:(node.Authenticated!==undefined?node.Authenticated:(node.authenticated_observation||"untested"))); code=Number(node.authenticated_http_status||node.AuthenticatedHTTPStatus||0)||0; }
-    if(code)return String(code);
-    return obsLabel(obs||"untested");
-  }
-  return "匿名 "+laneText("anonymous")+"，认证 "+laneText("authenticated");
+  var tObs=nodeTransportObsOf(node);
+  var obs=nodeAnonObsOf(node);
+  var code=nodeAnonCodeOf(node);
+  var reason=nodeReasonOf(node);
+  var tLabel=transportDisplayLabel(tObs);
+  if(!code&&obs==="transport_failure"&&tLabel==="尚未检测")tLabel="传输失败";
+  var status=nodeStatusText(obs,code,reason);
+  return "传输 "+tLabel+"，状态 "+status;
+}
+function nodeResultIsSuccess(node){
+  node=node||{};
+  var code=nodeAnonCodeOf(node);
+  if(code===200)return true;
+  if(String(nodeAnonObsOf(node))==="success")return true;
+  return false;
+}
+function markProbeBusy(btn,busyLabel){
+  if(!btn)return;
+  try{btn.disabled=true;}catch(e){}
+  try{btn.classList.add("is-busy");}catch(e){}
+  try{btn.setAttribute("aria-busy","true");}catch(e){}
+  try{btn.setAttribute("aria-label",busyLabel||"正在检测");}catch(e){}
+}
+function markProbeIdle(btn,idleLabel){
+  if(!btn)return;
+  try{btn.classList.remove("is-busy");}catch(e){}
+  try{btn.removeAttribute("aria-busy");}catch(e){}
+  try{btn.setAttribute("aria-label",idleLabel||"检测");}catch(e){}
 }
 function probeProxy(p, btn){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
   var pool=p.proxy_pool||p.pool||"";
-  btn.disabled=true; btn.classList.add("is-busy");
-  try{btn.setAttribute("aria-busy","true");}catch(e){}
-  try{btn.setAttribute("aria-label","正在检测");}catch(e){}
-  return api("/api/availability/check-node",{method:"POST",body:JSON.stringify({pool:pool,index:p.index})}).then(function(res){
-    var nodes=res.nodes||[];
+  var idx=p.index;
+  var skey=availSingleKey("node", pool+"#"+idx);
+  if((S.availSingles||{})[skey]){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  availSingleBegin(skey, btn);
+  return api("/api/availability/check-node",{method:"POST",body:JSON.stringify({pool:pool,index:idx})}).then(function(res){
+    var nodes=(res&&res.nodes)||[];
     var node=nodes[0]||null;
-    toast("检测 "+pool+"#"+p.index+": "+(node?nodeResultText(node):"无结果"));
-    return refreshMonitor({force:true});
-  }).catch(function(err){ toast(availBusyMessage(err,"检测 "+pool+"#"+p.index),true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测节点可用性");}catch(e){} setAvailBusy(false); });
+    if(!node){ toast("检测 "+pool+"#"+idx+"：无有效结果",true); }
+    else {
+      var suffix=(res&&res.partial)?"（部分结果）":"";
+      var bad=!nodeResultIsSuccess(node);
+      toast("检测 "+pool+"#"+idx+"："+nodeResultText(node)+suffix,bad);
+    }
+  }).catch(function(err){ toast(availBusyMessage(err,"检测 "+pool+"#"+idx),true); })
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ availSingleEnd(skey, btn,"检测节点可用性"); });
 }
 function customRowKey(r){ r=r||{}; return String(r.id||r.name||""); }
 function mergeCustomRows(server, cached){
@@ -1716,46 +1764,87 @@ function mergeCustomRowIntoCache(row){
   S.customAvail.push(row);
 }
 function probeCredential(k, btn){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
   var fp=k.fingerprint||k.Fingerprint||"";
-  btn.disabled=true; btn.classList.add("is-busy");
-  try{btn.setAttribute("aria-busy","true");}catch(e){}
-  try{btn.setAttribute("aria-label","正在检测");}catch(e){}
+  var skey=availSingleKey("credential", fp);
+  if((S.availSingles||{})[skey]){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  availSingleBegin(skey, btn);
   return api("/api/availability/check-credential",{method:"POST",body:JSON.stringify({fingerprint:fp})}).then(function(res){
-    var cred=res.credential||{};
-    var st=credStatusLabel(String(cred.status||""));
-    var code=Number(cred.http_status!==undefined?cred.http_status:(cred.HTTPStatus!==undefined?cred.HTTPStatus:(cred.httpStatus||0)))||0;
-    var reason=customReasonLabel(String(cred.reason||""));
-    toast("检测 "+(k.id||"")+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""));
-    return refreshMonitor({force:true});
+    var cred=(res&&res.credential)||null;
+    if(!cred||(!cred.status&&!cred.reason&&!cred.http_status&&!cred.HTTPStatus&&!cred.httpStatus)){ toast("检测 "+(k.id||"")+"：无有效结果",true); }
+    else {
+      var st=credStatusLabel(String(cred.status||"untested"));
+      var code=Number(cred.http_status!==undefined?cred.http_status:(cred.HTTPStatus!==undefined?cred.HTTPStatus:(cred.httpStatus||0)))||0;
+      var reason=customReasonLabel(String(cred.reason||""));
+      toast("检测 "+(k.id||"")+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""),!(code===200||String(cred.status||"")==="available"));
+    }
   }).catch(function(err){ toast(availBusyMessage(err,"检测 "+(k.id||"")),true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测凭证可用性");}catch(e){} setAvailBusy(false); });
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ availSingleEnd(skey, btn,"检测凭证可用性"); });
 }
 function probeCustom(c, btn){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
   var cid=String(c.id||c.name||"");
   var name=String(c.name||cid||"");
-  btn.disabled=true; btn.classList.add("is-busy");
-  try{btn.setAttribute("aria-busy","true");}catch(e){}
-  try{btn.setAttribute("aria-label","正在检测");}catch(e){}
+  var skey=availSingleKey("custom", cid);
+  if((S.availSingles||{})[skey]){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  availSingleBegin(skey, btn);
   return api("/api/availability/check-custom",{method:"POST",body:JSON.stringify({id:cid})}).then(function(res){
-    var row=res.custom||null;
-    if(row){ mergeCustomRowIntoCache(row); try{ renderHealth(); }catch(e){} }
-    var st=row?customStatusLabel(String(row.status||"untested")):"未知";
-    var code=row?Number(row.http_status!==undefined?row.http_status:(row.HTTPStatus!==undefined?row.HTTPStatus:(row.httpStatus||0)))||0:0;
-    var reason=row?customReasonLabel(String(row.reason||"")):"";
-    toast("检测 "+name+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""));
-    return refreshMonitor({force:true});
+    var row=(res&&res.custom)||null;
+    if(row){ mergeCustomRowIntoCache(row); }
+    if(!row){ toast("检测 "+name+"：无有效结果",true); }
+    else {
+      var st=customStatusLabel(String(row.status||"untested"));
+      var code=Number(row.http_status!==undefined?row.http_status:(row.HTTPStatus!==undefined?row.HTTPStatus:(row.httpStatus||0)))||0;
+      var reason=customReasonLabel(String(row.reason||""));
+      var ok=(code===200||String(row.status||"")==="available");
+      toast("检测 "+name+"："+(code?("HTTP "+code+"（"+st+"）"):st)+(reason&&reason!=="—"?("（"+reason+"）"):""),!ok);
+    }
   }).catch(function(err){ toast(availBusyMessage(err,"检测 "+name),true); })
-  .then(function(){ btn.disabled=false; btn.classList.remove("is-busy"); try{btn.removeAttribute("aria-busy");}catch(e){} try{btn.setAttribute("aria-label","检测自定义渠道可用性");}catch(e){} setAvailBusy(false); });
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ availSingleEnd(skey, btn,"检测自定义渠道可用性"); });
 }
 function availBatchButtons(){ var out=[]; ["btn-bulk-check","btn-bulk-check-credentials","btn-bulk-check-customs"].forEach(function(id){ var b=$(id); if(b)out.push(b); }); return out; }
-function setAvailBusy(on){
-  try{ S.availBusy=!!on; }catch(e){}
-  availBatchButtons().forEach(function(b){ b.disabled=!!on; });
-  try{ var rows=document.querySelectorAll(".probe-btn"); for(var i=0;i<rows.length;i++){ rows[i].disabled=!!on; } }catch(e){}
+function isAvailBatchActive(){ try{ return !!(S.availBatchBusy||S.availBusy); }catch(e){ return false; } }
+function availSingleKey(prefix, key){ return String(prefix||"")+"::"+String(key||""); }
+function availSinglesActive(){ try{ var s=S.availSingles||{}; for(var k in s){ if(Object.prototype.hasOwnProperty.call(s,k))return true; } }catch(e){} return false; }
+function applyAvailBusyState(btn){ try{ var k=null; try{ k=btn.getAttribute("data-avail-key"); }catch(e){ k=null; } if(isAvailBatchActive()){ try{ btn.disabled=true; }catch(e){} if(k&&(S.availSingles||{})[k])markProbeBusy(btn,"正在检测"); return; } if(k&&(S.availSingles||{})[k])markProbeBusy(btn,"正在检测"); }catch(e){} }
+function setAvailBatchBusy(on){
+  on=!!on;
+  try{ S.availBatchBusy=on; S.availBusy=on; }catch(e){}
+  if(on){
+    availBatchButtons().forEach(function(b){ try{ b.disabled=true; }catch(e){} });
+    try{ var rows=document.querySelectorAll(".probe-btn"); for(var i=0;i<rows.length;i++){ rows[i].disabled=true; } }catch(e){}
+    return;
+  }
+  availBatchButtons().forEach(function(b){ try{ b.disabled=false; }catch(e){} try{ b.classList.remove("is-busy"); }catch(e){} try{ b.removeAttribute("aria-busy"); }catch(e){} });
+  try{
+    var singles=S.availSingles||{};
+    var rows2=document.querySelectorAll(".probe-btn");
+    for(var k=0;k<rows2.length;k++){
+      var b2=rows2[k]; var key=null;
+      try{ key=b2.getAttribute("data-avail-key"); }catch(e){ key=null; }
+      if(key&&singles[key]){ markProbeBusy(b2,"正在检测"); continue; }
+      try{ b2.disabled=false; }catch(e){}
+      try{ b2.classList.remove("is-busy"); }catch(e){}
+      try{ b2.removeAttribute("aria-busy"); }catch(e){}
+    }
+  }catch(e){}
+}
+function setAvailBusy(on){ setAvailBatchBusy(on); }
+function availSingleBegin(key, btn){
+  try{ if(!S.availSingles)S.availSingles={}; S.availSingles[key]=1; }catch(e){}
+  markProbeBusy(btn,"正在检测");
+}
+function availSingleEnd(key, btn, idleLabel){
+  try{ if(S.availSingles)delete S.availSingles[key]; }catch(e){}
+  if(isAvailBatchActive())return;
+  var done=false;
+  try{
+    var sel=document.querySelectorAll('.probe-btn[data-avail-key="'+String(key).replace(/"/g,"")+'"]');
+    for(var i=0;i<sel.length;i++){ var b=sel[i]; try{ b.disabled=false; }catch(e){} markProbeIdle(b,idleLabel); done=true; }
+  }catch(e){}
+  try{ if(btn&&btn.isConnected!==false){ btn.disabled=false; markProbeIdle(btn,idleLabel); } else if(btn){ try{btn.disabled=false;}catch(e){} markProbeIdle(btn,idleLabel); } }catch(e){}
 }
 function availBusyMessage(err, scope){
   var m=String((err&&err.message)||"");
@@ -1763,12 +1852,15 @@ function availBusyMessage(err, scope){
   return scope+"失败："+(m||"未知错误");
 }
 function bulkCheck(){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  if(availSinglesActive()){ toast("单个检测进行中，请完成后再开始批量检测",true); return Promise.resolve(); }
+  setAvailBatchBusy(true);
   var btn=$("btn-bulk-check"); var note=$("bulk-state");
-  if(btn)btn.disabled=true;
+  if(btn){btn.disabled=true; markProbeBusy(btn,"正在批量检测");}
+  if(btn){ try{btn.setAttribute("aria-label","正在批量检测");}catch(e){} }
   if(note)note.textContent="批量检测进行中…";
   return api("/api/availability/check",{method:"POST",body:"{}"}).then(function(res){
+    res=res||{};
     S.bulkNoModel=res.no_model||[];
     var nodes=res.nodes||[];
     var total=nodes.length;
@@ -1777,17 +1869,22 @@ function bulkCheck(){
     if((res.no_model||[]).length)msg+="（部分通道无可用模型）";
     if(note)note.textContent=msg;
     toast(msg);
-    return refreshMonitor({force:true});
   }).catch(function(err){ if(note)note.textContent="批量检测失败"; toast(availBusyMessage(err,"批量检测"),true); })
-  .then(function(){ if(btn)btn.disabled=false; setAvailBusy(false); });
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ if(btn){btn.disabled=false; markProbeIdle(btn,"批量检测"); try{btn.setAttribute("aria-label","批量检测");}catch(e){} try{btn.classList.remove("is-busy");}catch(e){} try{btn.removeAttribute("aria-busy");}catch(e){} } setAvailBatchBusy(false); });
 }
 (function(){ var b=$("btn-bulk-check"); if(b)b.addEventListener("click",bulkCheck); })();
 function bulkCheckCredentials(){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  if(availSinglesActive()){ toast("单个检测进行中，请完成后再开始批量检测",true); return Promise.resolve(); }
+  setAvailBatchBusy(true);
+  var btn=$("btn-bulk-check-credentials");
+  if(btn){btn.disabled=true; markProbeBusy(btn,"正在批量检测凭证");}
+  if(btn){ try{btn.setAttribute("aria-label","正在批量检测凭证");}catch(e){} }
   var note=$("bulk-credentials-state");
   if(note)note.textContent="批量检测凭证进行中…";
   return api("/api/availability/check-credentials",{method:"POST",body:"{}"}).then(function(res){
+    res=res||{};
     var creds=res.credentials||[];
     var msg="批量检测凭证完成：共检测 "+creds.length+" 个凭证";
     if(res.truncated)msg+="（部分截断）";
@@ -1795,26 +1892,31 @@ function bulkCheckCredentials(){
     if((res.no_model||[]).length)msg+="（部分通道无可用模型）";
     if(note)note.textContent=msg;
     toast(msg);
-    return refreshMonitor({force:true});
   }).catch(function(err){ if(note)note.textContent="批量检测凭证失败"; toast(availBusyMessage(err,"批量检测凭证"),true); })
-  .then(function(){ setAvailBusy(false); });
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ if(btn){btn.disabled=false; markProbeIdle(btn,"批量检测凭证"); try{btn.setAttribute("aria-label","批量检测凭证");}catch(e){} try{btn.classList.remove("is-busy");}catch(e){} try{btn.removeAttribute("aria-busy");}catch(e){} } setAvailBatchBusy(false); });
 }
 (function(){ var b=$("btn-bulk-check-credentials"); if(b)b.addEventListener("click",bulkCheckCredentials); })();
 function bulkCheckCustoms(){
-  if(S.availBusy){ toast("检测进行中，请稍候"); return Promise.resolve(); }
-  setAvailBusy(true);
+  if(isAvailBatchActive()){ toast("检测进行中，请稍候"); return Promise.resolve(); }
+  if(availSinglesActive()){ toast("单个检测进行中，请完成后再开始批量检测",true); return Promise.resolve(); }
+  setAvailBatchBusy(true);
+  var btn=$("btn-bulk-check-customs");
+  if(btn){btn.disabled=true; markProbeBusy(btn,"正在批量检测渠道");}
+  if(btn){ try{btn.setAttribute("aria-label","正在批量检测渠道");}catch(e){} }
   var note=$("bulk-customs-state");
   if(note)note.textContent="批量检测渠道进行中…";
   return api("/api/availability/check-customs",{method:"POST",body:"{}"}).then(function(res){
+    res=res||{};
     var customs=res.custom||[];
     var msg="批量检测渠道完成：共检测 "+customs.length+" 个渠道";
     if(res.truncated)msg+="（部分截断）";
     if(res.partial)msg+="（部分结果）";
     if(note)note.textContent=msg;
     toast(msg);
-    return refreshMonitor({force:true});
   }).catch(function(err){ if(note)note.textContent="批量检测渠道失败"; toast(availBusyMessage(err,"批量检测渠道"),true); })
-  .then(function(){ setAvailBusy(false); });
+  .then(function(){ return refreshMonitor({force:true}); })
+  .then(function(){ if(btn){btn.disabled=false; markProbeIdle(btn,"批量检测渠道"); try{btn.setAttribute("aria-label","批量检测渠道");}catch(e){} try{btn.classList.remove("is-busy");}catch(e){} try{btn.removeAttribute("aria-busy");}catch(e){} } setAvailBatchBusy(false); });
 }
 (function(){ var b=$("btn-bulk-check-customs"); if(b)b.addEventListener("click",bulkCheckCustoms); })();
 function manualRefresh(scope){

@@ -33,9 +33,11 @@ import (
 //
 // The existing POST /api/availability/check keeps its proxy-table scope
 // (all proxy nodes, anonymous and authenticated lanes; never custom
-// channels). All three batch operations plus the per-row checks share the
-// bulkMu single-flight gate (no per-client rate limit), so a second
-// operation reports 409 bulk_busy while one is running.
+// channels). All three batch operations hold the availability RW gate for
+// writing (TryLock, no per-client rate limit): batches are single-flight
+// with each other and mutually exclusive with read-side singles in both
+// directions, so a second operation reports fail-fast 409 bulk_busy while
+// one is running.
 
 type credentialsBatchResponse struct {
 	CheckedAt        time.Time                    `json:"checked_at"`
