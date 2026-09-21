@@ -95,9 +95,9 @@ func TestWebUIConfigAutosaveBindings(t *testing.T) {
 		t.Fatal("missing revealConfig boundary")
 	}
 	bindBlock := html[bindIdx : bindIdx+bindEnd]
-	numericIDs := []string{"c-session", "c-attempts", "c-timeout", "c-refresh", "c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown", "c-ratelimit-cooldown", "c-ring", "c-hist-retention", "c-hist-max"}
+	numericIDs := []string{"c-session", "c-attempts", "c-timeout", "c-attempt-timeout", "c-refresh", "c-idle", "c-idle-host", "c-max-host", "c-idle-timeout", "c-connect", "c-cooldown", "c-ratelimit-cooldown", "c-suspect-cooldown", "c-ring", "c-hist-retention", "c-hist-max"}
 	textList := `["c-listen","c-web-listen","c-up-zen","c-hist-dir"]`
-	numericList := `["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-retention","c-hist-max"]`
+	numericList := `["c-session","c-attempts","c-timeout","c-attempt-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-suspect-cooldown","c-ring","c-hist-retention","c-hist-max"]`
 	if !strings.Contains(bindBlock, textList) {
 		t.Fatal("text/URL autosave list must stay explicit")
 	}

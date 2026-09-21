@@ -324,7 +324,7 @@ func TestWebUIRateLimitFieldAndAutosave(t *testing.T) {
 		t.Fatal("missing revealConfig boundary")
 	}
 	bindBlock := html[bindIdx : bindIdx+bindEnd]
-	numericList := `["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-retention","c-hist-max"]`
+	numericList := `["c-session","c-attempts","c-timeout","c-attempt-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-suspect-cooldown","c-ring","c-hist-retention","c-hist-max"]`
 	numIdx := strings.Index(bindBlock, numericList)
 	if numIdx < 0 {
 		t.Fatal("bind block must carry the numeric commit-only list with the single 429 field")

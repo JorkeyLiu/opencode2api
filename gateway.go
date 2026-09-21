@@ -112,7 +112,10 @@ type healthRouting struct {
 }
 
 func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, error) {
-	timeout := time.Duration(cfg.Retry.TimeoutSeconds) * time.Second
+	timeout := time.Duration(cfg.Retry.AttemptTimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	pools := make(map[string]*transportPool, len(cfg.UniqueActivePools()))
 	for _, name := range cfg.UniqueActivePools() {
 		transports, err := newTransportPool(name, cfg.RuntimeProxiesFor(name), cfg.Performance, timeout)
@@ -142,6 +145,10 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 	if rateCooldown <= 0 {
 		rateCooldown = defaultRateLimitBaseSeconds * time.Second
 	}
+	suspectCooldown := secondsToDuration(cfg.Performance.TransportSuspectCooldownSeconds)
+	if suspectCooldown <= 0 {
+		suspectCooldown = 15 * time.Second
+	}
 	catalog := newModelCatalog("", cfg.Models.Protocols)
 	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
 	authCreds := credentialsForKeys(TierZen, cfg.Keys)
@@ -149,7 +156,7 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		cfg:       cfg,
 		logger:    logger,
 		pools:     pools,
-		scheduler: newTargetScheduler(cooldown, rateCooldown),
+		scheduler: newTargetScheduler(cooldown, rateCooldown, suspectCooldown),
 		authCreds: authCreds,
 		zenCreds:  authCreds,
 		catalog:   catalog,
@@ -847,6 +854,20 @@ func (g *Gateway) transientInterval() time.Duration {
 	return d
 }
 
+func (g *Gateway) attemptTimeout() time.Duration {
+	if g == nil {
+		return 5 * time.Second
+	}
+	d := secondsToDuration(g.cfg.Retry.AttemptTimeoutSeconds)
+	if d <= 0 {
+		d = 5 * time.Second
+	}
+	if d > secondsToDuration(g.cfg.Retry.TimeoutSeconds) {
+		d = secondsToDuration(g.cfg.Retry.TimeoutSeconds)
+	}
+	return d
+}
+
 func isStreamContext(ctx context.Context) bool {
 	meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta)
 	return meta != nil && meta.Stream
@@ -854,6 +875,21 @@ func isStreamContext(ctx context.Context) bool {
 
 func isStreamStartupFailureErr(err error) bool {
 	return err != nil && err.Error() == "upstream stream startup failure"
+}
+
+func isTrueTransportError(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if isContextCancelled(ctx) {
+		return false
+	}
+	if isStreamStartupFailureErr(err) {
+		return false
+	}
+	// 408/425 are HTTP statuses, not transport err, so not here.
+	// Context cancellation already excluded.
+	return true
 }
 
 // gatedStreamBody is the post-commit stream wrapper for streaming inference.
@@ -1042,6 +1078,26 @@ func (g *Gateway) applyStreamSuccess(cand targetCandidate, startedNanos int64) {
 	proxyCleared := g.scheduler.noteProxy429Success(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
 	channelCleared := g.scheduler.noteChannelSuccess(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
 	cred429Cleared := g.scheduler.noteCredential429Success(cand.CredID, startedNanos)
+	suspectCleared := g.scheduler.noteTransportSuspectSuccess(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
+	if suspectCleared.Changed && g.logger != nil {
+		proxyNode := ""
+		poolName := cand.PoolName
+		if cand.Proxy != nil {
+			proxyNode = redactURL(cand.Proxy.name)
+			poolName = cand.Proxy.pool
+			if poolName == "" {
+				poolName = cand.PoolName
+			}
+		} else if cand.ProxyRaw != "" {
+			proxyNode = redactURL(cand.ProxyRaw)
+		}
+		g.logger.Debug("proxy transport suspect cleared",
+			"component", "scheduler", "event", "proxy_transport_suspect_cleared",
+			"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+			"channel", credentialChannel(cand),
+			"proxy_pool", poolName, "proxy_node", proxyNode,
+			"failures", suspectCleared.Failures)
+	}
 	g.logSchedulerCleared(cand, targetCleared, credCleared, proxyCleared, channelCleared, cred429Cleared)
 	if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
 		wasHealthy := cand.Proxy.healthy.Swap(true)
@@ -1615,6 +1671,9 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
 			continue
 		}
+		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+			continue
+		}
 		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
 	}
 	if len(eligible) == 0 {
@@ -1643,6 +1702,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			return local, effectiveRoute, attemptOffset, nil
 		}
+		// Suspect exhaustion is 502, not 429: do not trigger custom fallback.
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: anonymousZenKey, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
@@ -2018,12 +2078,15 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
 			continue
 		}
+		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+			continue
+		}
 		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
 	}
 	if len(eligible) == 0 {
 		// No eligible proxy: distinguish 429 exhaustion from 502. If any
 		// proxy is under tier-429 cooldown, fast-fail 429 with max remaining
-		// and try the custom final fallback; channel cooling alone fast-fails
+		// and try the custom final fallback; channel/suspect cooling alone fast-fails
 		// 502 (its 403/5xx status is kept in the channel detail table, not as
 		// a pinned envelope); otherwise 502 (unhealthy/removed).
 		var latest int64
@@ -2545,6 +2608,30 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 	}
 	now := time.Now().UnixNano()
 	cands := g.scheduler.orderCandidates(g.scheduler.buildAnonymousCandidates(pool, route.ID, now), ids.Session)
+	if len(cands) == 0 {
+		// Empty anonymous candidate set: distinguish transport-suspect-only
+		// exhaustion (local 502, never custom) from proxy429 exhaustion
+		// (local 429 with Retry-After and existing custom fallback
+		// semantics). Channel-only or health/unknown-model emptiness also
+		// maps to 502. Do not let a stale historic 429 mask a later
+		// transport/non-429 outcome: only an actively cooling proxy429 with a
+		// future deadline triggers 429.
+		var latest int64
+		if pool != nil {
+			for _, p := range pool.items {
+				if p == nil {
+					continue
+				}
+				if until, _, ok := g.scheduler.proxy429CooldownStatus(TierZen, pool.name, p.name); ok && until > latest {
+					latest = until
+				}
+			}
+		}
+		if latest > time.Now().UnixNano() {
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), nil, 0, false, false
+		}
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), nil, 0, false, false
+	}
 	attempts := 0
 	maxTransient := g.transientAttempts()
 	interval := g.transientInterval()
@@ -2937,6 +3024,29 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		}
 	}
 	cands := g.scheduler.orderCandidates(g.scheduler.buildAuthCandidates(route.Tier, creds, pool, route.ID, now), ids.Session)
+	if len(cands) == 0 {
+		// Empty authenticated candidate set: same distinction as anonymous
+		// — transport-suspect-only exhaustion maps to local 502 (never
+		// custom), while an active proxy429 deadline maps to local 429 with
+		// Retry-After and existing custom fallback semantics. Preserve the
+		// credential429 pre-check above and all-suspect 502 behavior; do not
+		// let a stale historic 429 mask a later transport/non-429 outcome.
+		var latest int64
+		if pool != nil {
+			for _, p := range pool.items {
+				if p == nil {
+					continue
+				}
+				if until, _, ok := g.scheduler.proxy429CooldownStatus(route.Tier, pool.name, p.name); ok && until > latest {
+					latest = until
+				}
+			}
+		}
+		if latest > time.Now().UnixNano() {
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), nil, 0, false, false
+		}
+		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), nil, 0, false, false
+	}
 	// Exhaustion evidence per credential for this unbound request: live 429
 	// proxies observed plus the last Retry-After/started for the eventual
 	// credential429 write. Only same-credential live 429s on the frozen
@@ -3289,6 +3399,26 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 		proxyCleared := g.scheduler.noteProxy429Success(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
 		channelCleared := g.scheduler.noteChannelSuccess(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
 		cred429Cleared := g.scheduler.noteCredential429Success(cand.CredID, startedNanos)
+		suspectCleared := g.scheduler.noteTransportSuspectSuccess(cand.Tier, cand.PoolName, cand.ProxyRaw, startedNanos)
+		if suspectCleared.Changed && g.logger != nil {
+			proxyNode := ""
+			poolName := cand.PoolName
+			if cand.Proxy != nil {
+				proxyNode = redactURL(cand.Proxy.name)
+				poolName = cand.Proxy.pool
+				if poolName == "" {
+					poolName = cand.PoolName
+				}
+			} else if cand.ProxyRaw != "" {
+				proxyNode = redactURL(cand.ProxyRaw)
+			}
+			g.logger.Debug("proxy transport suspect cleared",
+				"component", "scheduler", "event", "proxy_transport_suspect_cleared",
+				"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+				"channel", credentialChannel(cand),
+				"proxy_pool", poolName, "proxy_node", proxyNode,
+				"failures", suspectCleared.Failures)
+		}
 		g.logSchedulerCleared(cand, targetCleared, credCleared, proxyCleared, channelCleared, cred429Cleared)
 		if cand.Proxy != nil && !cand.Proxy.healthy.Load() {
 			wasHealthy := cand.Proxy.healthy.Swap(true)
@@ -3298,6 +3428,10 @@ func (g *Gateway) applyAttemptOutcome(ctx context.Context, cand targetCandidate,
 		}
 	case err != nil:
 		g.verifyProxyAfterError(ctx, cand.Proxy, 0)
+		if isTrueTransportError(ctx, err) {
+			ch := g.scheduler.noteTransportSuspect(cand.Tier, cand.PoolName, cand.ProxyRaw, class.Class, 0, startedNanos)
+			g.logSuspectCooldownSet(cand, ch)
+		}
 		return class
 	case status == http.StatusUnauthorized:
 		change := g.scheduler.noteCredentialAuthFailure(cand.CredID)
@@ -3438,8 +3572,38 @@ func (g *Gateway) logChannelCooldownSet(tier Tier, pool, proxyRaw, keyDisplay, f
 		"remaining_ms", time.Duration(remaining).Milliseconds())
 }
 
+func (g *Gateway) logSuspectCooldownSet(cand targetCandidate, change transportSuspectChange) {
+	if g.logger == nil || !change.Changed {
+		return
+	}
+	remaining := change.CooldownUntil - time.Now().UnixNano()
+	if remaining < 0 {
+		remaining = 0
+	}
+	proxyNode := ""
+	poolName := cand.PoolName
+	if cand.Proxy != nil {
+		proxyNode = redactURL(cand.Proxy.name)
+		poolName = cand.Proxy.pool
+		if poolName == "" {
+			poolName = cand.PoolName
+		}
+	} else if cand.ProxyRaw != "" {
+		proxyNode = redactURL(cand.ProxyRaw)
+	}
+	g.logger.Debug("proxy transport suspect cooldown extended",
+		"component", "scheduler", "event", "proxy_transport_suspect_set",
+		"tier", string(cand.Tier), "key_id", cand.CredDisplay,
+		"channel", credentialChannel(cand),
+		"proxy_pool", poolName, "proxy_node", proxyNode,
+		"failure_class", change.FailureClass,
+		"status", change.Status, "failures", change.Failures,
+		"cooldown_until", time.Unix(0, change.CooldownUntil).UTC(),
+		"remaining_ms", time.Duration(remaining).Milliseconds())
+}
+
 // logSchedulerCleared emits clear events only when 2xx actually removed
-// stored credential/target/proxy429/channel/credential429 state.
+// stored credential/target/proxy429/channel/credential429/suspect state.
 func (g *Gateway) logSchedulerCleared(cand targetCandidate, target targetChange, cred credentialChange, proxy proxy429Change, channel channelChange, cred429 credentialChange) {
 	if g.logger == nil {
 		return

@@ -127,6 +127,22 @@ const (
 	// layer: expired failure memory is kept for backoff escalation, then
 	// pruned once out of cooldown and past retention.
 	channelStaleRetention = targetBackoffCap
+
+	// maxTransportSuspectStates bounds the live transport-suspect map
+	// (tier x pool x proxy). Live size stays proportional to proxy resources.
+	// Creation at the cap first prunes expired-stale entries, then
+	// deterministically evicts the oldest idle entry. If every entry is in
+	// active cooldown the map temporarily exceeds the cap rather than
+	// breaking active state.
+	maxTransportSuspectStates = 1024
+
+	// maxTransportSuspectSnapshotEntries bounds the admin suspect list.
+	maxTransportSuspectSnapshotEntries = 256
+
+	// transportSuspectStaleRetention mirrors other layers: expired memory
+	// is kept briefly for escalation, then pruned once out of cooldown and
+	// past retention.
+	transportSuspectStaleRetention = targetBackoffCap
 )
 
 // credentialIDForKey returns the internal credential identity:
@@ -230,6 +246,27 @@ func channelIdentity(tier Tier, pool, proxyRaw string) string {
 	return string(tier) + "\x00" + pool + "\x00" + proxyRaw
 }
 
+// transportSuspectEntry is the per-(tier, pool, raw proxy) short-lived
+// transport-unavailable state for true transport failures. It is independent
+// of proxy health, proxy429, channel, credential, and target cooldowns and
+// never participates in readiness degradation.
+type transportSuspectEntry struct {
+	failures         uint32
+	cooldownUntil    int64 // unix nanos
+	lastFailureAt    int64 // unix nanos
+	lastStartedNanos int64 // send-start nanos of latest recorded failure; guards success clears
+	lastFailureClass string
+	lastStatus       int
+}
+
+func suspectIdentity(tier Tier, pool, proxyRaw string) string {
+	return string(tier) + "\x00" + pool + "\x00" + proxyRaw
+}
+
+func parseSuspectIdentity(identity string) (tier Tier, pool, proxyRaw string) {
+	return parseProxy429Identity(identity)
+}
+
 func parseChannelIdentity(identity string) (tier Tier, pool, proxyRaw string) {
 	return parseProxy429Identity(identity)
 }
@@ -239,11 +276,13 @@ type targetScheduler struct {
 	baseCooldown      time.Duration
 	rateLimitCooldown time.Duration
 	rateLimitMaxDur   time.Duration
+	suspectCooldown   time.Duration
 	credState         map[string]*credentialEntry
 	cred429State      map[string]*credential429Entry
 	targetState       map[string]*targetEntry
 	proxy429State     map[string]*proxy429Entry
 	channelState      map[string]*channelEntry
+	suspectState      map[string]*transportSuspectEntry
 	credDisplay       map[string]string
 	roundRobin        atomic.Uint64
 	routeSessions     *routeSessionStore
@@ -256,6 +295,7 @@ func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Durat
 		baseCooldown = 15 * time.Second
 	}
 	rateLimitCooldown := baseCooldown
+	suspectCooldown := 15 * time.Second
 	if len(rateLimitBases) > 0 && rateLimitBases[0] > 0 {
 		rateLimitCooldown = rateLimitBases[0]
 	} else if len(rateLimitBases) == 0 {
@@ -264,21 +304,29 @@ func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Durat
 	} else if rateLimitCooldown <= 0 {
 		rateLimitCooldown = defaultRateLimitBaseSeconds * time.Second
 	}
+	if len(rateLimitBases) > 1 && rateLimitBases[1] > 0 {
+		suspectCooldown = rateLimitBases[1]
+	}
 	// The 429 maximum is fixed at 3600s; any legacy max argument is accepted
 	// for compatibility but ignored.
 	rateLimitMax := rateLimitMaxFixedSeconds * time.Second
 	if rateLimitMax < rateLimitCooldown {
 		rateLimitMax = rateLimitCooldown
 	}
+	if suspectCooldown <= 0 {
+		suspectCooldown = 15 * time.Second
+	}
 	return &targetScheduler{
 		baseCooldown:      baseCooldown,
 		rateLimitCooldown: rateLimitCooldown,
 		rateLimitMaxDur:   rateLimitMax,
+		suspectCooldown:   suspectCooldown,
 		credState:         make(map[string]*credentialEntry),
 		cred429State:      make(map[string]*credential429Entry),
 		targetState:       make(map[string]*targetEntry),
 		proxy429State:     make(map[string]*proxy429Entry),
 		channelState:      make(map[string]*channelEntry),
+		suspectState:      make(map[string]*transportSuspectEntry),
 		credDisplay:       make(map[string]string),
 		routeSessions:     newRouteSessionStore(),
 		pins:              newSessionPinStore(),
@@ -1347,6 +1395,223 @@ func (s *targetScheduler) rateLimitDelayLocked(failures uint32, identity string,
 	return backoffDelayForBaseWithCap(s.rateLimitBase(), s.rateLimitMax(), failures, identity, retryAfter)
 }
 
+// suspectDelay returns the fixed suspect cooldown with deterministic jitter,
+// capped at the configured suspect cooldown itself (no exponential escalation).
+func (s *targetScheduler) suspectDelay(identity string, failures uint32) time.Duration {
+	base := s.suspectBase()
+	if base <= 0 {
+		base = 15 * time.Second
+	}
+	// Fixed cooldown with jitter: deterministic +/-20% band, same as other layers.
+	return deterministicJitter(base, identity, failures)
+}
+
+func (s *targetScheduler) suspectBase() time.Duration {
+	if s == nil || s.suspectCooldown <= 0 {
+		return 15 * time.Second
+	}
+	return s.suspectCooldown
+}
+
+// transportSuspectChange is the delta snapshot for the suspect layer.
+type transportSuspectChange struct {
+	Changed       bool
+	Cleared       bool
+	Failures      uint32
+	CooldownUntil int64
+	PreviousUntil int64
+	FailureClass  string
+	Status        int
+}
+
+// suspectCooldownStatus reports an active suspect cooldown.
+func (s *targetScheduler) suspectCooldownStatus(tier Tier, pool, proxyRaw string) (until int64, status int, ok bool) {
+	now := time.Now().UnixNano()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.suspectState[suspectIdentity(tier, pool, proxyRaw)]
+	if entry == nil || entry.cooldownUntil <= now {
+		return 0, 0, false
+	}
+	status = entry.lastStatus
+	if status == 0 {
+		status = 502
+	}
+	return entry.cooldownUntil, status, true
+}
+
+func (s *targetScheduler) suspectCoolUntil(tier Tier, pool, proxyRaw string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry := s.suspectState[suspectIdentity(tier, pool, proxyRaw)]; entry != nil {
+		return entry.cooldownUntil
+	}
+	return 0
+}
+
+// noteTransportSuspect writes/extends the short-lived suspect cooldown for a
+// true transport failure. No Retry-After, fixed policy.
+func (s *targetScheduler) noteTransportSuspect(tier Tier, pool, proxyRaw, failureClass string, status int, startedNanos int64) transportSuspectChange {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	if startedNanos == 0 {
+		startedNanos = nowNanos
+	}
+	identity := suspectIdentity(tier, pool, proxyRaw)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.suspectState[identity]
+	var previous int64
+	if entry == nil {
+		if len(s.suspectState) >= maxTransportSuspectStates {
+			s.pruneStaleSuspectLocked(nowNanos)
+			if len(s.suspectState) >= maxTransportSuspectStates {
+				s.evictOldestIdleSuspectLocked(nowNanos)
+			}
+		}
+		entry = &transportSuspectEntry{}
+		if s.suspectState == nil {
+			s.suspectState = make(map[string]*transportSuspectEntry)
+		}
+		s.suspectState[identity] = entry
+	} else {
+		previous = entry.cooldownUntil
+	}
+	entry.failures++
+	delay := s.suspectDelay(identity, entry.failures)
+	entry.cooldownUntil = cooldownDeadline(now.UnixNano(), delay)
+	entry.lastFailureAt = nowNanos
+	if startedNanos > entry.lastStartedNanos {
+		entry.lastStartedNanos = startedNanos
+	}
+	entry.lastFailureClass = failureClass
+	entry.lastStatus = status
+	return transportSuspectChange{
+		Changed: entry.cooldownUntil > previous, Failures: entry.failures,
+		CooldownUntil: entry.cooldownUntil, PreviousUntil: previous,
+		FailureClass: failureClass, Status: status,
+	}
+}
+
+// noteTransportSuspectSuccess clears suspect state only when success started at/after latest failure.
+func (s *targetScheduler) noteTransportSuspectSuccess(tier Tier, pool, proxyRaw string, startedNanos int64) transportSuspectChange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identity := suspectIdentity(tier, pool, proxyRaw)
+	entry := s.suspectState[identity]
+	if entry == nil {
+		return transportSuspectChange{}
+	}
+	if startedNanos == 0 {
+		startedNanos = time.Now().UnixNano()
+	}
+	if startedNanos < entry.lastStartedNanos {
+		return transportSuspectChange{}
+	}
+	failures := entry.failures
+	delete(s.suspectState, identity)
+	return transportSuspectChange{Cleared: true, Changed: true, Failures: failures}
+}
+
+func (s *targetScheduler) pruneStaleSuspectLocked(nowNanos int64) {
+	for identity, entry := range s.suspectState {
+		if entry == nil {
+			delete(s.suspectState, identity)
+			continue
+		}
+		if entry.cooldownUntil > nowNanos {
+			continue
+		}
+		if entry.lastFailureAt == 0 || nowNanos-entry.lastFailureAt > int64(transportSuspectStaleRetention) {
+			delete(s.suspectState, identity)
+		}
+	}
+}
+
+func (s *targetScheduler) evictOldestIdleSuspectLocked(nowNanos int64) bool {
+	var victim string
+	var victimAt int64
+	found := false
+	for identity, entry := range s.suspectState {
+		if entry == nil || entry.cooldownUntil > nowNanos {
+			continue
+		}
+		at := entry.lastFailureAt
+		if !found || at < victimAt || (at == victimAt && identity < victim) {
+			victim, victimAt, found = identity, at, true
+		}
+	}
+	if !found {
+		return false
+	}
+	delete(s.suspectState, victim)
+	return true
+}
+
+// suspectSnapshot types
+type TransportSuspectStatus struct {
+	Tier             string     `json:"tier,omitempty"`
+	ProxyPool        string     `json:"proxy_pool"`
+	ProxyNode        string     `json:"proxy_node"`
+	Active           bool       `json:"active"`
+	Failures         uint32     `json:"failures"`
+	CooldownUntil    *time.Time `json:"cooldown_until,omitempty"`
+	RemainingSeconds *int64     `json:"remaining_seconds,omitempty"`
+	NextAvailableAt  *time.Time `json:"next_available_at,omitempty"`
+	LastFailureClass string     `json:"last_failure_class,omitempty"`
+	LastStatus       int        `json:"last_status,omitempty"`
+}
+
+func (s *targetScheduler) snapshotSuspect() (entries []TransportSuspectStatus, total int) {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	type parsed struct {
+		status   TransportSuspectStatus
+		identity string
+	}
+	s.mu.Lock()
+	s.pruneStaleSuspectLocked(nowNanos)
+	all := make([]parsed, 0, len(s.suspectState))
+	for identity, entry := range s.suspectState {
+		if entry == nil || (entry.failures == 0 && entry.cooldownUntil <= nowNanos) {
+			continue
+		}
+		tier, pool, proxyRaw := parseSuspectIdentity(identity)
+		st := TransportSuspectStatus{
+			Tier: string(tier), ProxyPool: pool, ProxyNode: redactURL(proxyRaw), Failures: entry.failures,
+			LastFailureClass: entry.lastFailureClass, LastStatus: entry.lastStatus,
+		}
+		if entry.cooldownUntil > nowNanos {
+			value := time.Unix(0, entry.cooldownUntil).UTC()
+			st.Active = true
+			st.CooldownUntil = &value
+			st.NextAvailableAt = &value
+			st.RemainingSeconds = cooldownRemainingSeconds(entry.cooldownUntil, now)
+		}
+		all = append(all, parsed{status: st, identity: identity})
+	}
+	s.mu.Unlock()
+	sort.Slice(all, func(i, j int) bool { return all[i].identity < all[j].identity })
+	total = len(all)
+	if len(all) > maxTransportSuspectSnapshotEntries {
+		all = all[:maxTransportSuspectSnapshotEntries]
+	}
+	entries = make([]TransportSuspectStatus, 0, len(all))
+	for _, p := range all {
+		entries = append(entries, p.status)
+	}
+	return entries, total
+}
+
+func (s *targetScheduler) suspectEntrySnapshot(tier Tier, pool, proxyRaw string) (failures uint32, cooldownUntil int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry := s.suspectState[suspectIdentity(tier, pool, proxyRaw)]; entry != nil {
+		return entry.failures, entry.cooldownUntil
+	}
+	return 0, 0
+}
+
 // hrwScore is a pure Rendezvous/HRW score over the full target identity plus
 // the already-hashed session. Higher scores sort first; ties break on the
 // identity string so ordering is fully deterministic.
@@ -1564,6 +1829,9 @@ func (s *targetScheduler) buildAuthCandidates(tier Tier, creds []credentialRef, 
 			if entry := s.channelState[channelIdentity(tier, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
 				continue
 			}
+			if entry := s.suspectState[suspectIdentity(tier, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+				continue
+			}
 			identity := targetIdentity(tier, cred.id, pool.name, proxy.name, model)
 			if entry := s.targetState[identity]; entry != nil && entry.cooldownUntil > now {
 				continue
@@ -1579,7 +1847,7 @@ func (s *targetScheduler) buildAuthCandidates(tier Tier, creds []credentialRef, 
 }
 
 // buildAnonymousCandidates returns the fixed anonymous credential x every
-// healthy, target-, proxy429-, and channel-available proxy in the assigned
+// healthy, target-, proxy429-, channel- and suspect-available proxy in the assigned
 // pool. The tier-qualified (Zen channel) proxy429 and channel filters match
 // the authenticated Zen path: an actively cooling Zen proxy is excluded for
 // every model and credential on Zen; Go stays isolated.
@@ -1604,6 +1872,9 @@ func (s *targetScheduler) buildAnonymousCandidates(pool *transportPool, model st
 			continue
 		}
 		if entry := s.channelState[channelIdentity(TierZen, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
+			continue
+		}
+		if entry := s.suspectState[suspectIdentity(TierZen, pool.name, proxy.name)]; entry != nil && entry.cooldownUntil > now {
 			continue
 		}
 		identity := targetIdentity(TierZen, anonymousSchedulerCredentialID, pool.name, proxy.name, model)
@@ -1886,6 +2157,7 @@ type migrationSummary struct {
 	Targets       int
 	Proxy429      int
 	Channel       int
+	Suspect       int
 }
 
 func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
@@ -1929,6 +2201,13 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 			continue
 		}
 		channel[id] = *entry
+	}
+	suspect := make(map[string]transportSuspectEntry, len(old.suspectState))
+	for id, entry := range old.suspectState {
+		if entry == nil {
+			continue
+		}
+		suspect[id] = *entry
 	}
 	displays := make(map[string]string, len(old.credDisplay))
 	for id, display := range old.credDisplay {
@@ -2038,6 +2317,29 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		s.channelState[id] = &fresh
 		summary.Channel++
 	}
+	for id, entry := range suspect {
+		if len(splitNul3(id)) != 3 {
+			continue
+		}
+		if entry.cooldownUntil <= now {
+			continue
+		}
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > s.suspectBase() {
+			entry.cooldownUntil = cooldownDeadline(now, s.suspectBase())
+		}
+		if s.suspectState == nil {
+			s.suspectState = make(map[string]*transportSuspectEntry)
+		}
+		if len(s.suspectState) >= maxTransportSuspectStates {
+			s.pruneStaleSuspectLocked(now)
+			if len(s.suspectState) >= maxTransportSuspectStates {
+				s.evictOldestIdleSuspectLocked(now)
+			}
+		}
+		fresh := entry
+		s.suspectState[id] = &fresh
+		summary.Suspect++
+	}
 	return summary
 }
 
@@ -2104,6 +2406,21 @@ func (s *targetScheduler) retainOnly(validCreds map[string]bool, validPoolProxy 
 		}
 		if pools, ok := validTierPool[string(tier)]; !ok || !pools[pool] {
 			delete(s.channelState, identity)
+		}
+	}
+	for identity, entry := range s.suspectState {
+		tier, pool, proxyRaw := parseSuspectIdentity(identity)
+		if entry == nil {
+			delete(s.suspectState, identity)
+			continue
+		}
+		proxies, ok := validPoolProxy[pool]
+		if !ok || !proxies[proxyRaw] {
+			delete(s.suspectState, identity)
+			continue
+		}
+		if pools, ok := validTierPool[string(tier)]; !ok || !pools[pool] {
+			delete(s.suspectState, identity)
 		}
 	}
 }

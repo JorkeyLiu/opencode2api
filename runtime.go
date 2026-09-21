@@ -356,6 +356,7 @@ type gatewayMigrationSummary struct {
 	Targets       int
 	Proxy429      int
 	Channel       int
+	Suspect       int
 	Proxies       int
 	Pins          int
 	Fallbacks     int
@@ -414,6 +415,7 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	summary.Targets = migrated.Targets
 	summary.Proxy429 = migrated.Proxy429
 	summary.Channel = migrated.Channel
+	summary.Suspect = migrated.Suspect
 	validCreds := make(map[string]bool, len(newGateway.credentials())+1)
 	for _, cred := range newGateway.credentials() {
 		validCreds[cred.id] = true
@@ -485,24 +487,27 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 }
 
 type ResourceSnapshot struct {
-	Models                   modelCatalogSnapshot        `json:"models"`
-	Keys                     []KeyStatus                 `json:"keys"`
-	Proxies                  []ProxyStatus               `json:"proxies"`
-	Anonymous                bool                        `json:"anonymous"`
-	Targets                  []TargetStatus              `json:"targets,omitempty"`
-	TargetsTotal             int                         `json:"targets_total,omitempty"`
-	TargetsTruncated         bool                        `json:"targets_truncated,omitempty"`
-	ProxyRateLimits          []ProxyRateLimitStatus      `json:"proxy_rate_limits,omitempty"`
-	ProxyRateLimitsTotal     int                         `json:"proxy_rate_limits_total,omitempty"`
-	ProxyRateLimitsTruncated bool                        `json:"proxy_rate_limits_truncated,omitempty"`
-	ChannelCooldowns         []ChannelAvailabilityStatus `json:"channel_cooldowns,omitempty"`
-	ChannelCooldownsTotal    int                         `json:"channel_cooldowns_total,omitempty"`
-	ChannelTruncated         bool                        `json:"channel_truncated,omitempty"`
-	AvailabilityCheckedAt    *time.Time                  `json:"availability_checked_at,omitempty"`
-	AvailabilityTruncated    bool                        `json:"availability_truncated,omitempty"`
-	AvailabilityPartial      bool                        `json:"availability_partial,omitempty"`
-	Custom                   []bulkCustomAvailability    `json:"custom,omitempty"`
-	Metadata                 MetadataSnapshot            `json:"metadata"`
+	Models                     modelCatalogSnapshot        `json:"models"`
+	Keys                       []KeyStatus                 `json:"keys"`
+	Proxies                    []ProxyStatus               `json:"proxies"`
+	Anonymous                  bool                        `json:"anonymous"`
+	Targets                    []TargetStatus              `json:"targets,omitempty"`
+	TargetsTotal               int                         `json:"targets_total,omitempty"`
+	TargetsTruncated           bool                        `json:"targets_truncated,omitempty"`
+	ProxyRateLimits            []ProxyRateLimitStatus      `json:"proxy_rate_limits,omitempty"`
+	ProxyRateLimitsTotal       int                         `json:"proxy_rate_limits_total,omitempty"`
+	ProxyRateLimitsTruncated   bool                        `json:"proxy_rate_limits_truncated,omitempty"`
+	ChannelCooldowns           []ChannelAvailabilityStatus `json:"channel_cooldowns,omitempty"`
+	ChannelCooldownsTotal      int                         `json:"channel_cooldowns_total,omitempty"`
+	ChannelTruncated           bool                        `json:"channel_truncated,omitempty"`
+	TransportSuspects          []TransportSuspectStatus    `json:"transport_suspects,omitempty"`
+	TransportSuspectsTotal     int                         `json:"transport_suspects_total,omitempty"`
+	TransportSuspectsTruncated bool                        `json:"transport_suspects_truncated,omitempty"`
+	AvailabilityCheckedAt      *time.Time                  `json:"availability_checked_at,omitempty"`
+	AvailabilityTruncated      bool                        `json:"availability_truncated,omitempty"`
+	AvailabilityPartial        bool                        `json:"availability_partial,omitempty"`
+	Custom                     []bulkCustomAvailability    `json:"custom,omitempty"`
+	Metadata                   MetadataSnapshot            `json:"metadata"`
 }
 
 // KeyStatus is the per-credential availability row (凭证可用性). ID is the
@@ -739,6 +744,10 @@ func (m *RuntimeManager) Resources() ResourceSnapshot {
 	result.ChannelCooldowns = channels
 	result.ChannelCooldownsTotal = channelsTotal
 	result.ChannelTruncated = channelsTotal > len(channels)
+	suspects, suspectsTotal := gateway.scheduler.snapshotSuspect()
+	result.TransportSuspects = suspects
+	result.TransportSuspectsTotal = suspectsTotal
+	result.TransportSuspectsTruncated = suspectsTotal > len(suspects)
 	return result
 }
 

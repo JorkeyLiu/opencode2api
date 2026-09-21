@@ -58,11 +58,13 @@ type Config struct {
 	Proxies      []string                   `json:"proxies,omitempty"`
 	ProxyFile    string                     `json:"proxyfile,omitempty"`
 
-	effectivePools         map[string][]string
-	legacyProxiesPresent   bool
-	legacyProxyFilePresent bool
-	proxyPoolsPresent      bool
-	proxyRoutingPresent    bool
+	effectivePools             map[string][]string
+	legacyProxiesPresent       bool
+	legacyProxyFilePresent     bool
+	proxyPoolsPresent          bool
+	proxyRoutingPresent        bool
+	retryAttemptTimeoutPresent bool
+	performanceSuspectPresent  bool
 }
 
 type UpstreamConfig struct {
@@ -74,6 +76,7 @@ type UpstreamConfig struct {
 type RetryConfig struct {
 	MaxAttempts                   int `json:"max_attempts"`
 	TimeoutSeconds                int `json:"timeout_seconds"`
+	AttemptTimeoutSeconds         int `json:"attempt_timeout_seconds"`
 	TransientMaxAttempts          int `json:"transient_max_attempts"`
 	TransientRetryIntervalSeconds int `json:"transient_retry_interval_seconds"`
 }
@@ -98,13 +101,14 @@ type WebUIConfig struct {
 }
 
 type PerformanceConfig struct {
-	MaxIdleConns             int `json:"max_idle_conns"`
-	MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
-	MaxConnsPerHost          int `json:"max_conns_per_host"`
-	IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
-	ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
-	FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
-	RateLimitCooldownSeconds int `json:"rate_limit_cooldown_seconds"`
+	MaxIdleConns                    int `json:"max_idle_conns"`
+	MaxIdleConnsPerHost             int `json:"max_idle_conns_per_host"`
+	MaxConnsPerHost                 int `json:"max_conns_per_host"`
+	IdleConnTimeoutSeconds          int `json:"idle_conn_timeout_seconds"`
+	ConnectTimeoutSeconds           int `json:"connect_timeout_seconds"`
+	FailureCooldownSeconds          int `json:"failure_cooldown_seconds"`
+	RateLimitCooldownSeconds        int `json:"rate_limit_cooldown_seconds"`
+	TransportSuspectCooldownSeconds int `json:"transport_suspect_cooldown_seconds"`
 	// Legacy compat input only: accepted on load, ignored at runtime, never emitted.
 	// The 429 maximum is the fixed 3600s backoff cap.
 	RateLimitCooldownMaxSeconds int `json:"rate_limit_cooldown_max_seconds,omitempty"`
@@ -123,9 +127,9 @@ func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen"},
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, TransientMaxAttempts: 3, TransientRetryIntervalSeconds: 3},
+		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, AttemptTimeoutSeconds: 5, TransientMaxAttempts: 3, TransientRetryIntervalSeconds: 3},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
-		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300},
+		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300, TransportSuspectCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
 		WebUI:       WebUIConfig{Listen: "0.0.0.0:8081", SessionTTLMinutes: 720},
 		History:     HistoryConfig{Enabled: true, Directory: "", RetentionDays: 7, MaxBytesMB: 128},
@@ -167,13 +171,14 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 		Zen string `json:"zen"`
 	}
 	type diskPerformance struct {
-		MaxIdleConns             int `json:"max_idle_conns"`
-		MaxIdleConnsPerHost      int `json:"max_idle_conns_per_host"`
-		MaxConnsPerHost          int `json:"max_conns_per_host"`
-		IdleConnTimeoutSeconds   int `json:"idle_conn_timeout_seconds"`
-		ConnectTimeoutSeconds    int `json:"connect_timeout_seconds"`
-		FailureCooldownSeconds   int `json:"failure_cooldown_seconds"`
-		RateLimitCooldownSeconds int `json:"rate_limit_cooldown_seconds"`
+		MaxIdleConns                    int `json:"max_idle_conns"`
+		MaxIdleConnsPerHost             int `json:"max_idle_conns_per_host"`
+		MaxConnsPerHost                 int `json:"max_conns_per_host"`
+		IdleConnTimeoutSeconds          int `json:"idle_conn_timeout_seconds"`
+		ConnectTimeoutSeconds           int `json:"connect_timeout_seconds"`
+		FailureCooldownSeconds          int `json:"failure_cooldown_seconds"`
+		RateLimitCooldownSeconds        int `json:"rate_limit_cooldown_seconds"`
+		TransportSuspectCooldownSeconds int `json:"transport_suspect_cooldown_seconds"`
 	}
 	type diskConfig struct {
 		Listen       string                     `json:"listen"`
@@ -214,7 +219,7 @@ func (cfg Config) MarshalJSON() ([]byte, error) {
 			MaxIdleConns: cfg.Performance.MaxIdleConns, MaxIdleConnsPerHost: cfg.Performance.MaxIdleConnsPerHost,
 			MaxConnsPerHost: cfg.Performance.MaxConnsPerHost, IdleConnTimeoutSeconds: cfg.Performance.IdleConnTimeoutSeconds,
 			ConnectTimeoutSeconds: cfg.Performance.ConnectTimeoutSeconds, FailureCooldownSeconds: cfg.Performance.FailureCooldownSeconds,
-			RateLimitCooldownSeconds: cfg.Performance.RateLimitCooldownSeconds,
+			RateLimitCooldownSeconds: cfg.Performance.RateLimitCooldownSeconds, TransportSuspectCooldownSeconds: cfg.Performance.TransportSuspectCooldownSeconds,
 		},
 		Logging: cfg.Logging, WebUI: cfg.WebUI, History: cfg.History,
 	})
@@ -235,6 +240,30 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 	}
 	def := defaultConfig()
 	*cfg = def
+	// Attempt and suspect have legacy presence semantics: missing must be
+	// distinguishable from explicit zero so NormalizeConfig can preserve
+	// deployed behavior (legacy attempt = timeout, suspect = 15) while
+	// explicit values are validated strictly.
+	cfg.Retry.AttemptTimeoutSeconds = 0
+	cfg.Performance.TransportSuspectCooldownSeconds = 0
+	cfg.retryAttemptTimeoutPresent = false
+	cfg.performanceSuspectPresent = false
+	if rawRetry, ok := raw["retry"]; ok {
+		var retryMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawRetry, &retryMap); err == nil {
+			if _, has := retryMap["attempt_timeout_seconds"]; has {
+				cfg.retryAttemptTimeoutPresent = true
+			}
+		}
+	}
+	if rawPerf, ok := raw["performance"]; ok {
+		var perfMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawPerf, &perfMap); err == nil {
+			if _, has := perfMap["transport_suspect_cooldown_seconds"]; has {
+				cfg.performanceSuspectPresent = true
+			}
+		}
+	}
 	cfg.legacyProxiesPresent = hasKey(raw, "proxies")
 	cfg.legacyProxyFilePresent = hasKey(raw, "proxyfile")
 	cfg.proxyPoolsPresent = hasKey(raw, "proxy_pools")
@@ -414,6 +443,16 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")
 	}
+	// attempt_timeout_seconds preserves deployed semantics: legacy missing
+	// (absent in JSON, zero in direct construction) normalizes to the
+	// whole-route budget so existing deployments do not silently shorten
+	// header waits to 5s. Explicit values are strictly validated.
+	if !cfg.retryAttemptTimeoutPresent && cfg.Retry.AttemptTimeoutSeconds == 0 {
+		cfg.Retry.AttemptTimeoutSeconds = cfg.Retry.TimeoutSeconds
+	}
+	if cfg.Retry.AttemptTimeoutSeconds < 1 || cfg.Retry.AttemptTimeoutSeconds > cfg.Retry.TimeoutSeconds {
+		return Config{}, errors.New("retry.attempt_timeout_seconds must be between 1 and retry.timeout_seconds")
+	}
 	if cfg.Retry.TransientMaxAttempts < 1 || cfg.Retry.TransientMaxAttempts > 10 {
 		return Config{}, errors.New("retry.transient_max_attempts must be between 1 and 10")
 	}
@@ -434,6 +473,12 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	cfg.Performance.RateLimitCooldownMaxSeconds = 0
 	if cfg.Performance.RateLimitCooldownSeconds < 300 || cfg.Performance.RateLimitCooldownSeconds > 3600 {
 		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be between 300 and 3600")
+	}
+	if !cfg.performanceSuspectPresent && cfg.Performance.TransportSuspectCooldownSeconds == 0 {
+		cfg.Performance.TransportSuspectCooldownSeconds = 15
+	}
+	if cfg.Performance.TransportSuspectCooldownSeconds < 1 || cfg.Performance.TransportSuspectCooldownSeconds > 300 {
+		return Config{}, errors.New("performance.transport_suspect_cooldown_seconds must be between 1 and 300")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")

@@ -444,7 +444,9 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>Zen 地址（URL）</label><input id="c-up-zen"></div>
             <div class="field"><label>每个密钥上游最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
             <div class="field"><label>请求超时（秒）</label><input id="c-timeout" type="number" min="1"></div>
+            <div class="field"><label>单次尝试超时（秒）</label><input id="c-attempt-timeout" type="number" min="1"></div>
           </div>
+          <div class="note">单次尝试超时限制单个上游尝试的头部等待时间，需小于等于请求超时；超时后尝试下一个可用代理。</div>
         </div>
         <div class="section config-card">
           <h2>模型目录</h2>
@@ -465,7 +467,9 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>连接超时（秒）</label><input id="c-connect" type="number"></div>
             <div class="field"><label>失败冷却（秒）</label><input id="c-cooldown" type="number"></div>
             <div class="field"><label>429 冷却（秒）</label><input id="c-ratelimit-cooldown" type="number" min="300" max="3600"></div>
+            <div class="field"><label>传输暂不可用冷却（秒）</label><input id="c-suspect-cooldown" type="number" min="1" max="300"></div>
           </div>
+          <div class="note">传输暂不可用为短暂网络异常冷却，超时后自动恢复。</div>
         </div>
         <div class="section config-card">
           <h2>日志与历史</h2>
@@ -1966,6 +1970,7 @@ function fillConfig(v){
   $("c-up-zen").value=(v.upstream&&v.upstream.zen)||"";
   $("c-attempts").value=v.retry.max_attempts||"";
   $("c-timeout").value=v.retry.timeout_seconds||"";
+  $("c-attempt-timeout").value=v.retry.attempt_timeout_seconds||"";
   $("c-refresh").value=v.models.refresh_seconds||"";
   try{$("c-protocols").value=JSON.stringify(v.models.protocols||{},null,2);}catch(e){$("c-protocols").value="{}";}
   $("c-idle").value=v.performance.max_idle_conns||"";
@@ -1975,6 +1980,7 @@ function fillConfig(v){
   $("c-connect").value=v.performance.connect_timeout_seconds||"";
   $("c-cooldown").value=v.performance.failure_cooldown_seconds||"";
   $("c-ratelimit-cooldown").value=(v.performance&&v.performance.rate_limit_cooldown_seconds)||300;
+  $("c-suspect-cooldown").value=(v.performance&&v.performance.transport_suspect_cooldown_seconds)||15;
   $("c-level").value=v.logging.level||"info";
   $("c-ring").value=v.logging.ring_size||"";
   var hh=(v&&v.history)||{};
@@ -2801,13 +2807,16 @@ function collectConfigUpdate(){
     anonymous:$("c-anonymous").checked, proxy_pools:pools, proxy_routing:{anonymous:anon,authenticated:auth},
     fallback:{active:fbActive,channels:fbChannels},
     upstream:{zen:$("c-up-zen").value},
-    retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout")},
+    retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout"),attempt_timeout_seconds:num("c-attempt-timeout")},
     models:{refresh_seconds:num("c-refresh"),protocols:protocols},
-    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown")},
+    performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown"),transport_suspect_cooldown_seconds:num("c-suspect-cooldown")},
     logging:{level:$("c-level").value,ring_size:num("c-ring")},
     history:{enabled:$("c-hist-enabled").checked,directory:$("c-hist-dir").value.trim(),retention_days:num("c-hist-retention"),max_bytes_mb:num("c-hist-max")},
     webui:{enabled:preservedEnabled,listen:$("c-web-listen").value,username:cfgWebui.username||"",session_ttl_minutes:num("c-session")}
   };
+  if(update.retry.attempt_timeout_seconds>update.retry.timeout_seconds){
+    return {ok:false,error:"单次尝试超时不能超过请求超时",field:"c-attempt-timeout"};
+  }
   return {ok:true,update:update};
 }
 function validateConfigUpdate(){
@@ -3031,7 +3040,7 @@ $("config-form").addEventListener("submit",function(e){
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
-  ["c-session","c-attempts","c-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
+  ["c-session","c-attempts","c-timeout","c-attempt-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-suspect-cooldown","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
