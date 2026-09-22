@@ -51,28 +51,29 @@
 - 现有代码仍为“同目标单次重放”基线，统一恢复逻辑尚未编码、未验证。
 - 首个有界重构缺口已闭合（Bounded Increment 1）：`internal/app/gateway.go` 已建立结构化单次发送执行器 `executeAttempt` 并已将 `doPinnedAnonymous` 迁移至该边界（行为等价、无恢复语义变更），为后续统一恢复提供了单一收敛边界。
 - 第二个有界重构缺口已闭合（Bounded Increment 2）：`internal/app/gateway.go` 内 `attemptOutcome` 已新增 `Started int64`，`executeAttempt` 已对普通与重试发送均返回该 `Started` 并以同一值完成流式成功/启动失败的调度与监控记录，`doPinnedAuth` 两处直连 `sendUpstreamOnce` 块已迁移至该边界（行为等价、无恢复语义变更）；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
+- 第三个有界重构缺口已闭合（Bounded Increment 3）：`internal/app/gateway.go` 内 `doAnonymousUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`TierZen`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel=anonymous`/`credDisplay=anonymous`/`anonymous=true`/`attemptOffset+attempts`），行为等价、无恢复语义变更；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 
-## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 2）
+## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 3）
 
 > 已明确为本增量的唯一执行范围；不存在“下一单元未指定”的开放状态。
 
-- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doPinnedAuth`** 至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`。
+- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doAnonymousUpstream`** 两处直连发送/门控块至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`/依赖/配置 schema。
 - 设计边界：
-  - 仅扩展 `attemptOutcome` 一个真实事实：`Started int64`（`sendUpstreamOnce` 的 send-start nanos）。`executeAttempt` 必须对普通与重试发送均返回该 `Started`，同时继续在内部以同一 `started` 值完成流式成功/启动失败的调度与监控记录（即对外返回与对内使用同一事实）。
-  - `Started` 必须被保留的原因：`doPinnedAuth` 的 `credential429` 写入（`noteCredential429Failure`）依赖 send-start 做 stale fencing（`lastStartedNanos`），若执行器不透传该时间，外层无法在 `firstStarted/retryStarted` 上保持与 `proxy429/channel` 一致的 `started >= lastFailureStarted` 判定；这是 Increment 2 唯一需要扩展的事实。
-  - `executeAttempt` 仍为单次发送执行器，不拥有：候选选择/推进（`eligible`/`ordered`）、ordinary-send 预算与 429 refund（`ordinarySends`/`budget`）、credential429 证据累积（`observed429`/`cred429Evidence`/`last429Started/RetryAfter`）、exact 400 重放（`replayCandidate400`）、pin 绑定/移动（`pinMoveCurrent`/`bindSessionPin`）、custom fallback 调用（`maybeTakeoverCustomFallback`）、路由会话/体构造、或任何冷却归属。以上仍由 `doPinnedAuth` 及其相邻所有者负责。
-  - 仅替换 `doPinnedAuth` 内两处直连 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 块为 `executeAttempt` 调用，复用 `doPinnedAnonymous` 已迁移模式；精确保留 `firstStarted`/`retryStarted` 赋值、`response/err/diag/buildErr` 处理、`discardLast429`、`attempt` 偏移、transient 启动失败行为、取消与所有返回 envelope。
+  - 精确替换两处：首发 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 与 transient 重试 `sendUpstreamOnce` + 同样门控块，改为 `executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)`；`executeAttempt` 已完整拥有流式门控与记录，外层不再重复。
+  - Preserving exact anonymous metadata：`TierZen`、`g.cfg.Upstream.Zen`、路由 `route.Protocol`、同一 `candBody`/`ids`/`cand`/`routeSession`，通道与凭证展示值 `channel=anonymous`/`credDisplay=anonymous`/`anonymous=true`，监控序号 `attemptOffset+attempts`；不在此增量引入 `Started` 新事实或其它状态扩展。
+  - `executeAttempt` 仍为单次发送执行器，不拥有：冻结匿名候选顺序（`buildAnonymousCandidates`/`orderCandidates`）、pinHit 检测、单 transient token/delay（`maxTransient`/`transientDelay`/`sleepWithContext`）、exact 400 同目标重放（`replayCandidate400` 与 `recovered=true` 终态）、ordinary 拒绝判定、lastResponse/lastErr 保持、`bindSessionPin`、匿名 429 耗尽与外层已认证 tier 迁移。以上仍由 `doAnonymousUpstream` 及其相邻所有者负责，`doKeyUpstream` 保持不迁移。
+  - 精确保留：build 错误直接返回、`Resp/Err/Diag` 映射、取消（`isContextCancelled`/`ctx.Err()`）与流启动 sentinel（`upstream stream startup failure` 同目标 transient 重试）行为、attempt 编号（`attempts`/`syncAttemptMeta`/`attemptOffset+attempts`）、discard/drain 语义、与语义相关的日志与所有协议 envelope；不改变当前 exact-400 终态语义。
 - 保持不变：
-  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doPinnedAuth` 的 eligible 过滤、budget、429 链、observed429 证据、400 同目标重放、pin 代际围栏、custom 接管、相同体/会话、attempts 编号与监控均保持不变。
-  - 流式语义：`executeAttempt` 内部仍以 `started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层不再重复门控。
+  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doAnonymousUpstream` 的冻结顺序、pinHit、transient 预算、400 重放、外层 429/回退、attempts 编号与监控均保持不变。
+  - 流式语义：`executeAttempt` 内部仍以 `started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层不再重复门控；匿名非流式成功仍由外层完成 `bindSessionPin` 与对应日志。
 
-## 8. 验收证据（Acceptance Evidence · Increment 2）
+## 8. 验收证据（Acceptance Evidence · Increment 3）
 
-- 文档：本文件已更新，当前自然工作单元与设计边界明确为本增量，阐明 `attemptOutcome.Started` 仅为满足 `credential429` stale fencing 的最小事实，且 budgets/evidence/candidate/fallback/pin/replay 仍在执行器外。
-- 代码：`internal/app/gateway.go` 内 `attemptOutcome` 仅新增 `Started int64`；`executeAttempt` 对普通与重试发送均返回 `started` 且内部仍以同一值做流式成功/失败记录；`doPinnedAuth` 两处直连发送块已替换为 `executeAttempt`，保留 `firstStarted/retryStarted` 精确赋值与所有外层语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
+- 文档：本文件已更新，当前自然工作单元与设计边界明确为本增量，阐明仅迁移 `doAnonymousUpstream` 两处直连块至 `executeAttempt`（匿名元数据精确一致），且 `frozen ordering/pinHit/transient/400 replay/lastResponse/bind/fallback` 仍在执行器外，统一恢复仍未实现。
+- 代码：`internal/app/gateway.go` 内 `doAnonymousUpstream` 仅两处直连发送块已替换为 `executeAttempt`（`TierZen`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`"anonymous"/"anonymous"/true`/`attemptOffset+attempts`），保留 `buildErr`/`Diag`/`isContextCancelled`/`startup failure` sentinel、`attempts`/`lastResponse/lastErr`/`bindSessionPin`/日志 envelope 语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
 - 验证：
-  - 新增最小聚焦回归：在既有 pinned-auth 429 路径上扩展断言，验证 `credential429` 状态具有非零/未来 `cooldownUntil` 且保留最后 `Retry-After`（不做脆弱 wall-clock 断言，仅校验 `Started` 已用于 live 证据写入）。
-  - 既有 pinned anonymous/auth 429、stale429、stream、400 重放用例保持权威回归；执行最聚焦的相关包/用例并报告命令与结果。
+  - 新增最小聚焦回归：`internal/app` 内新增匿名流启动失败同目标重试用例，验证首发空 SSE 启动失败被同目标 transient 重试吸收（不推进候选/不跨 tier），成功门控重试正常绑定且 `attempts==2`、首代理发送 `2` 次、次代理与已认证通道零发送；现有匿名流/400 语义保持权威回归。
+  - 既有 pinned anonymous/auth 429、stale429、stream、400 重放与匿名 transport/429 用例保持权威回归；执行最聚焦的相关包/用例并报告命令与结果。
   - `go test ./...` / `go build -o opencode2api ./cmd/opencode2api` 按需通过。
 
 ## 9. 未决问题（Unresolved Questions）

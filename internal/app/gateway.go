@@ -2613,43 +2613,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		attempts++
 		syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-		resp, err, _, _, firstDiag, firstStarted, buildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
-		if buildErr != nil {
-			return nil, buildErr, attempts, false, false
+		out := g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+		if out.BuildErr != nil {
+			return nil, out.BuildErr, attempts, false, false
 		}
+		resp := out.Resp
+		err = out.Err
+		firstDiag := out.Diag
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
-			if !isStreamContext(ctx) {
-				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
-				g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
-				return resp, nil, attempts, false, false
-			}
-			gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, route.Protocol)
-			if verifyErr != nil && isContextCancelled(ctx) {
-				drainAndClose(resp.Body)
-				return nil, ctx.Err(), attempts, false, false
-			}
-			if gate.ShouldCommit() {
-				g.applyStreamSuccess(cand, firstStarted)
-				class := attemptClassification{Class: AttemptClassSuccess}
-				g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, resp, nil, streamedAttemptDuration(firstStarted), class, false, false, false, badRequestDiag{})
+			if isStreamContext(ctx) {
 				g.logger.Debug("anonymous upstream stream committed", "component", "upstream", "event", "anonymous_stream_committed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
-				g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
-				resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
-				return resp, nil, attempts, false, false
-			}
-			if gate.HasStartupFailure() {
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				// Treat as same-target transient for retry; fall through to retry logic below.
-				err = errors.New("upstream stream startup failure")
-				resp = nil
 			} else {
-				// No commit and no failure but verify ended (should be failure via EOF) - treat as failure
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				err = errors.New("upstream stream startup failure")
-				resp = nil
+				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			}
+			g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
+			return resp, nil, attempts, false, false
 		}
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false
@@ -2684,42 +2662,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				}
 				attempts++
 				syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-				retryResp, retryErr, _, _, retryDiag, retryStarted, retryBuildErr := g.sendUpstreamOnce(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
-				if retryBuildErr != nil {
-					return nil, retryBuildErr, attempts, false, false
+				outRetry := g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+				if outRetry.BuildErr != nil {
+					return nil, outRetry.BuildErr, attempts, false, false
 				}
+				retryResp := outRetry.Resp
+				retryErr := outRetry.Err
+				retryDiag := outRetry.Diag
 				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if !isStreamContext(ctx) {
-						g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-						g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
-						return retryResp, nil, attempts, false, false
-					}
-					gate2, pending2, parser2, verifyErr2 := g.verifyStreamGate(ctx, retryResp.Body, route.Protocol)
-					if verifyErr2 != nil && isContextCancelled(ctx) {
-						drainAndClose(retryResp.Body)
-						return nil, ctx.Err(), attempts, false, false
-					}
-					if gate2.ShouldCommit() {
-						g.applyStreamSuccess(cand, retryStarted)
-						class2 := attemptClassification{Class: AttemptClassSuccess}
-						g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, retryResp, nil, streamedAttemptDuration(retryStarted), class2, false, false, false, badRequestDiag{})
+					if isStreamContext(ctx) {
 						g.logger.Debug("anonymous transient retry stream committed", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-						g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
-						retryResp.Body = newGatedStreamBody(gate2, pending2, retryResp.Body, parser2)
-						return retryResp, nil, attempts, false, false
-					}
-					if gate2.HasStartupFailure() {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
-						// fall through to retry logic below (isSameTargetTransient will handle)
 					} else {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
+						g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
 					}
+					g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
+					return retryResp, nil, attempts, false, false
 				}
 				if isContextCancelled(ctx) {
 					return retryResp, retryErr, attempts, false, false
