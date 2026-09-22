@@ -1525,3 +1525,112 @@ func TestPinnedCredentialCooldown401(t *testing.T) {
 	}
 	drainResp(resp3)
 }
+
+// Pinned anonymous 401/403/ordinary 4xx must not walk proxies, must preserve pin, and must not write proxy429.
+// Table covers 401, 403, 404, 422 with one POST to current, zero to alternate/auth/custom.
+func TestPinnedAnonymousNon429NoWalk(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{"401", 401},
+		{"403", 403},
+		{"404", 404},
+		{"422", 422},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			monitor := NewMonitor()
+			gateway := routing400Gateway(t, monitor)
+			// Establish anonymous pin via 2xx on whichever anon proxy HRW picks.
+			postStub(t, gateway, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			postStub(t, gateway, "a", 1, nil, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			ses := "ses_pin_anon_walk_" + tc.name
+			ids := pinIDs(ses, "req-pin-1")
+			route := anonAuthRoute()
+			resp, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids, 0)
+			if err != nil || resp == nil || resp.StatusCode != 200 {
+				t.Fatalf("pin establishment err=%v resp=%v", err, resp)
+			}
+			drainResp(resp)
+			pin, ok := gateway.scheduler.pinGet(ses, "m")
+			if !ok {
+				t.Fatalf("must pin anon success")
+			}
+			genBefore := pin.Generation
+			rawBefore := pin.ProxyRaw
+			pool := gateway.pools["a"]
+			pinnedIdx := -1
+			for i, proxy := range pool.items {
+				if proxy != nil && proxy.name == pin.ProxyRaw {
+					pinnedIdx = i
+				}
+			}
+			if pinnedIdx < 0 {
+				t.Fatalf("pinned proxy not found %+v", pin)
+			}
+			otherIdx := 1 - pinnedIdx
+			var pinnedCalls, otherCalls, zenCalls atomic.Int32
+			postStub(t, gateway, "a", pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(tc.status, `{"error":"test"}`), nil
+			})
+			postStub(t, gateway, "a", otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			postStub(t, gateway, "z", 0, &zenCalls, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(200, `{"ok":true}`), nil
+			})
+			ids2 := pinIDs(ses, "req-pin-2")
+			resp2, _, attempts, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
+			if err != nil {
+				t.Fatalf("case %s err=%v", tc.name, err)
+			}
+			if resp2 == nil || resp2.StatusCode != tc.status {
+				t.Fatalf("case %s status=%v want %d", tc.name, resp2, tc.status)
+			}
+			drainResp(resp2)
+			if postCount(&pinnedCalls) != 1 {
+				t.Fatalf("case %s pinned sends=%d want 1", tc.name, postCount(&pinnedCalls))
+			}
+			if postCount(&otherCalls) != 0 {
+				t.Fatalf("case %s other sends=%d want 0 (only 429 walks)", tc.name, postCount(&otherCalls))
+			}
+			if postCount(&zenCalls) != 0 {
+				t.Fatalf("case %s auth sends=%d want 0 (pinned must not enter auth)", tc.name, postCount(&zenCalls))
+			}
+			if attempts != 1 {
+				t.Fatalf("case %s attempts=%d want 1", tc.name, attempts)
+			}
+			pin2, ok := gateway.scheduler.pinGet(ses, "m")
+			if !ok {
+				t.Fatalf("case %s pin lost", tc.name)
+			}
+			if pin2.Generation != genBefore || pin2.ProxyRaw != rawBefore {
+				t.Fatalf("case %s pin moved generation %d->%d raw %q->%q", tc.name, genBefore, pin2.Generation, rawBefore, pin2.ProxyRaw)
+			}
+			// No proxy429 write for 401/403/ordinary 4xx.
+			now := time.Now().UnixNano()
+			for _, proxy := range pool.items {
+				if proxy == nil {
+					continue
+				}
+				if until, _, ok := gateway.scheduler.proxy429CooldownStatus(TierZen, pool.name, proxy.name); ok && until > now {
+					t.Fatalf("case %s proxy429 must not be written for proxy %s until=%d", tc.name, proxy.name, until)
+				}
+			}
+			// Monitor must have recorded exactly one attempt with correct status.
+			recent := monitor.Snapshot().Upstream.Recent
+			if len(recent) == 0 {
+				t.Fatalf("case %s no monitor record", tc.name)
+			}
+			last := recent[len(recent)-1]
+			if last.Status != tc.status {
+				t.Fatalf("case %s monitor status=%d want %d", tc.name, last.Status, tc.status)
+			}
+		})
+	}
+}

@@ -1134,6 +1134,50 @@ func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandi
 	_ = ctx
 }
 
+// attemptOutcome is the structured single-send result owned by executeAttempt.
+// It carries the upstream response/error, request-build error, diagnostic,
+// and send-start time sufficient for the outer loop to decide candidate
+// advance, proxy fallback, budgets, 400 replay, pin moves, and custom fallback
+// without re-implementing send/classification/stream gating.
+type attemptOutcome struct {
+	Resp     *http.Response
+	Err      error
+	BuildErr error
+	Diag     badRequestDiag
+}
+
+// executeAttempt is the single-attempt executor. It owns: invoking the existing
+// request send/state-classification authority (sendUpstreamOnce), applying the
+// streaming startup gate before client commitment, stream-success
+// scheduler/monitor recording, startup-failure classification/recording, and
+// returning a structured outcome. It does NOT select/advance candidates, decide
+// proxy fallback, own ordinary-send budgets, accumulate credential429 evidence,
+// invoke custom fallback, replay exact 400, bind/move pins, or change
+// route-session/body construction.
+func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) attemptOutcome {
+	resp, err, _, _, diag, started, buildErr := g.sendUpstreamOnce(ctx, route, tier, baseURL, protocol, candBody, ids, cand, routeSession, channel, credDisplay, anonymous, monitorAttempt)
+	if buildErr != nil {
+		return attemptOutcome{BuildErr: buildErr, Diag: diag}
+	}
+	if err == nil && resp != nil && resp.StatusCode/100 == 2 && isStreamContext(ctx) {
+		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
+		if verifyErr != nil && isContextCancelled(ctx) {
+			drainAndClose(resp.Body)
+			return attemptOutcome{Resp: nil, Err: ctx.Err(), Diag: diag}
+		}
+		if gate.ShouldCommit() {
+			g.applyStreamSuccess(cand, started)
+			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{})
+			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
+			return attemptOutcome{Resp: resp, Err: nil, Diag: diag}
+		}
+		g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started)
+		drainAndClose(resp.Body)
+		return attemptOutcome{Resp: nil, Err: errors.New("upstream stream startup failure"), Diag: diag}
+	}
+	return attemptOutcome{Resp: resp, Err: err, Diag: diag}
+}
+
 func transientDelay(interval time.Duration, resp *http.Response) time.Duration {
 	d := interval
 	if resp != nil {
@@ -1746,57 +1790,24 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		}
 		attempts++
 		syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-		resp, sendErr, _, _, firstDiag, firstStarted, buildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
-		if buildErr != nil {
+		out := g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+		if out.BuildErr != nil {
 			if last429 != nil {
 				drainAndClose(last429.Body)
 			}
-			return nil, effectiveRoute, attemptOffset + attempts, buildErr
+			return nil, effectiveRoute, attemptOffset + attempts, out.BuildErr
 		}
+		resp := out.Resp
+		sendErr := out.Err
+		firstDiag := out.Diag
 		if sendErr == nil && resp != nil && resp.StatusCode/100 == 2 {
-			if !isStreamContext(ctx) {
-				if last429 != nil {
-					drainAndClose(last429.Body)
-				}
-				if ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-				}
-				return resp, effectiveRoute, attemptOffset + attempts, nil
+			if last429 != nil {
+				drainAndClose(last429.Body)
 			}
-			gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
-			if verifyErr != nil && isContextCancelled(ctx) {
-				if last429 != nil {
-					drainAndClose(last429.Body)
-				}
-				drainAndClose(resp.Body)
-				return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
+			if ep.raw != pin.ProxyRaw {
+				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 			}
-			if gate.ShouldCommit() {
-				if last429 != nil {
-					drainAndClose(last429.Body)
-				}
-				g.applyStreamSuccess(cand, firstStarted)
-				class := attemptClassification{Class: AttemptClassSuccess}
-				g.recordUpstreamAttemptWithClass(route, protocol, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, resp, nil, streamedAttemptDuration(firstStarted), class, false, false, false, badRequestDiag{})
-				if ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-				}
-				resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
-				return resp, effectiveRoute, attemptOffset + attempts, nil
-			}
-			if gate.HasStartupFailure() {
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				// Pinned startup failure is target-only: retry same proxy up to maxTransient, then 502.
-				// Do not walk to next proxy; handle via transient retry loop below.
-				sendErr = errors.New("upstream stream startup failure")
-				resp = nil
-			} else {
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				sendErr = errors.New("upstream stream startup failure")
-				resp = nil
-			}
+			return resp, effectiveRoute, attemptOffset + attempts, nil
 		}
 		if isContextCancelled(ctx) {
 			if last429 != nil {
@@ -1843,61 +1854,27 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				}
 				attempts++
 				syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-				retryResp, retryErr, _, _, retryDiag, retryStarted, retryBuildErr := g.sendUpstreamOnce(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
-				if retryBuildErr != nil {
+				outRetry := g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
+				if outRetry.BuildErr != nil {
 					if last429 != nil {
 						drainAndClose(last429.Body)
 					}
-					return nil, effectiveRoute, attemptOffset + attempts, retryBuildErr
+					return nil, effectiveRoute, attemptOffset + attempts, outRetry.BuildErr
 				}
+				retryResp := outRetry.Resp
+				retryErr := outRetry.Err
+				retryDiag := outRetry.Diag
 				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if !isStreamContext(ctx) {
-						if last429 != nil {
-							drainAndClose(last429.Body)
-						}
-						if ep.raw != pin.ProxyRaw {
-							_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-						}
-						return retryResp, effectiveRoute, attemptOffset + attempts, nil
+					if last429 != nil {
+						drainAndClose(last429.Body)
 					}
-					gate2, pending2, parser2, verifyErr2 := g.verifyStreamGate(ctx, retryResp.Body, protocol)
-					if verifyErr2 != nil && isContextCancelled(ctx) {
-						if last429 != nil {
-							drainAndClose(last429.Body)
-						}
-						drainAndClose(retryResp.Body)
-						return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
+					if ep.raw != pin.ProxyRaw {
+						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 					}
-					if gate2.ShouldCommit() {
-						if last429 != nil {
-							drainAndClose(last429.Body)
-						}
-						g.applyStreamSuccess(cand, retryStarted)
-						class2 := attemptClassification{Class: AttemptClassSuccess}
-						g.recordUpstreamAttemptWithClass(route, protocol, ids, attemptOffset+attempts, "anonymous", "anonymous", true, cand.Proxy, retryResp, nil, streamedAttemptDuration(retryStarted), class2, false, false, false, badRequestDiag{})
-						if ep.raw != pin.ProxyRaw {
-							_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-						}
-						retryResp.Body = newGatedStreamBody(gate2, pending2, retryResp.Body, parser2)
-						return retryResp, effectiveRoute, attemptOffset + attempts, nil
-					}
-					if gate2.HasStartupFailure() {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
-						if retryIdx+1 == maxTransient {
-							retryExhausted = true
-						}
-					} else {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
-						if retryIdx+1 == maxTransient {
-							retryExhausted = true
-						}
-					}
+					return retryResp, effectiveRoute, attemptOffset + attempts, nil
+				}
+				if isStreamStartupFailureErr(retryErr) && retryIdx+1 == maxTransient {
+					retryExhausted = true
 				}
 				if isContextCancelled(ctx) {
 					if last429 != nil {
