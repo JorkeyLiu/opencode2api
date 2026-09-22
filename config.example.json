@@ -29,6 +29,7 @@
   "upstream": {
     "zen": "https://opencode.ai/zen"
   },
+  // retry.max_attempts: L1 观察层判定稳定性所需的最小请求/观察计数（minimum observation/request count），不是对所有错误的统一重试额度或对象队列配额；逐状态码在统一语义三层（L1 观察 / L2 解决 / L3 继续或返回）下的映射与退避由 ADR/后续实现决定，不冻结矩阵/预算/退避，统一三层尚未完全落地。
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300,

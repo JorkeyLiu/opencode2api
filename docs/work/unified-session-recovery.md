@@ -12,9 +12,9 @@
 
 ## 1. 结论（Outcome）
 
-- 统一会话恢复未落地，当前实现保持原有按候选同目标单次 400 重放语义。
-- 本文档为唯一持久化决策载体，不代表功能已完成。
-- 任何新增 `internal/app/recovery.go`（历史路径 `recovery.go`）并行路径均视为偏离基线的废弃方案，已否决。
+- 统一会话恢复的最高原则已于 2026-09-22 按维护者裁决固化为统一语义三层/闭环投影：`observe stability -> resolve stable cause -> continue session or faithfully return`（L1 观察稳定性含 retry、L2 解决稳定原因含 400 修正与所有对象粒度 fallback、L3 继续或返回；代理/池/凭证/备用渠道/恢复域均为对象/候选粒度，非 L2/L3 固定层级；fallback 为 L2 对象选择非固定末级；恢复域为候选组织与可用性过滤上下文），网关是会话恢复系统而非 HTTP 状态码重试器，文档层面已对齐 `AGENTS.md` / ADR；本次裁决已关闭“L2/L3 对象层级 / 固定线性升级 / 对象层级是恢复层级”等疑问。
+- 代码实现仅部分落地：Increment 1-4 的结构收敛已闭合，400 同目标修正后终态（L2 动作按 L3 终止）、503 受约束同目标稳定性观察（L2 内受 deadline/cancel/committed bytes/观察策略约束非无限）、取消/deadline/已提交字节后停止均已有基线；custom fallback 仍为 429 耗尽限定（未扩展至广义恢复域可用对象耗尽的 L2 对象选择），广义统一语义三层及其逐状态码映射与 `retry.max_attempts` 向 L1 单一观察计数归一仍未实现；现有代码/测试仅为候选对象序列与特定 429 fallback 基线，不应反推为统一三层架构已实现。
+- 本文档为唯一持久化工作记录载体，原则固化不代表代码已完成广义统一恢复；任何新增 `internal/app/recovery.go`（历史路径 `recovery.go`）并行路径仍属废弃方案；统一三层模型尚未在 Go 代码中完全落地，不冻结逐状态码矩阵/预算/退避，不把 503 写成无限 retry。
 
 ## 2. 已提交基线（Committed Baseline）
 
@@ -47,41 +47,44 @@
 
 ## 6. 当前缺口（Current Gap）
 
-- 统一会话恢复的触发条件、跨候选/跨通道统一策略、与现有 400 重放及 transient 重试的优先级仍未定义并落地。
-- 现有代码仍为“同目标单次重放”基线，统一恢复逻辑尚未编码、未验证。
+- 原则层面已固化为统一语义三层/闭环投影（L1 观察稳定性 / L2 解决稳定原因 / L3 继续或返回；retry 属 L1、400 属 L2 按 L3 终止、fallback 为 L2 对象选择非固定末级、恢复域为上下文非层级，已关闭对象队列解读）；代码实现仅部分落地，广义统一恢复仍未完成，现有代码/测试仅为候选对象序列与特定 429 fallback 基线，不应反推为三层已实现。
+- 已落地基线：400 同目标修正后终态（非法请求、非波动态；重放为 L2 解除策略/修正动作而非 L1 retry，同目标/同会话/同身份，重放后按 L3 终态）与基线一致；503 已有 L2 内受约束持续观察（受 deadline/取消/已提交字节/观察策略约束，非无限，最终仍可按 L3 忠实返回）；取消/deadline/已提交字节后停止（L3 边界）不变式已有；Increment 1-4 结构收敛已闭合（`executeAttempt` 单次发送边界）。
+- 未落地缺口：广义统一语义三层（L1 观察稳定性 / L2 解决稳定原因含全部对象粒度 fallback / L3 继续或返回）的逐状态码（429/401/403/5xx/408/425/普通 4xx 等）完整映射、`retry.max_attempts` 向 L1 最小观察计数单一权威迁移与预算/退避、与 transient 重试的优先级归一仍待后续工作；`fallback` 作为 L2 对象选择的耗尽资格当前仅实现 429 耗尽限定，广义恢复域可用对象耗尽的 L2 选择仍未实现；代理/池/凭证/备用渠道均为对象/候选，恢复域为上下文，不映射为固定 L2/L3。
 - 首个有界重构缺口已闭合（Bounded Increment 1）：`internal/app/gateway.go` 已建立结构化单次发送执行器 `executeAttempt` 并已将 `doPinnedAnonymous` 迁移至该边界（行为等价、无恢复语义变更），为后续统一恢复提供了单一收敛边界。
 - 第二个有界重构缺口已闭合（Bounded Increment 2）：`internal/app/gateway.go` 内 `attemptOutcome` 已新增 `Started int64`，`executeAttempt` 已对普通与重试发送均返回该 `Started` 并以同一值完成流式成功/启动失败的调度与监控记录，`doPinnedAuth` 两处直连 `sendUpstreamOnce` 块已迁移至该边界（行为等价、无恢复语义变更）；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 - 第三个有界重构缺口已闭合（Bounded Increment 3）：`internal/app/gateway.go` 内 `doAnonymousUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`TierZen`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel=anonymous`/`credDisplay=anonymous`/`anonymous=true`/`attemptOffset+attempts`），行为等价、无恢复语义变更；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
-- 第四个有界重构缺口已闭合（Bounded Increment 4）：`internal/app/gateway.go` 内 `doKeyUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`route.Tier`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel="key"`/`credDisplay=cand.CredDisplay`/`anonymous=false`/`attemptOffset+attempts`，`firstStarted`/`retryStarted` 取 `out.Started` 并向 `cred429Evidence`/`noteCredential429Failure` 传播以保留 `lastStartedNanos` stale fencing），行为等价、无恢复语义变更；聚焦 `Started` 回归已补齐（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径，双 429 `Retry-After 9`/`future cooldown`/`lastStartedNanos>1`/`nanos=1` fencing），门槛待重跑；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
+- 第四个有界重构缺口已闭合（Bounded Increment 4）：`internal/app/gateway.go` 内 `doKeyUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`route.Tier`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel="key"`/`credDisplay=cand.CredDisplay`/`anonymous=false`/`attemptOffset+attempts`，`firstStarted`/`retryStarted` 取 `out.Started` 并向 `cred429Evidence`/`noteCredential429Failure` 传播以保留 `lastStartedNanos` stale fencing），行为等价、无恢复语义变更；聚焦 `Started` 回归已通过（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径的 `TestUnboundAuthStartedCredentialEvidence`，双 429 `Retry-After 9`/`future cooldown`/`lastStartedNanos>1`/`nanos=1` fencing），`gofmt` 干净、`go test ./...` 已通过（聚焦与全量门槛均已执行），`go build -o opencode2api ./cmd/opencode2api` 按执行记录已通过；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 
-## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 4）
+## 7. 下一自然工作单元（Bounded Increment 5 · 统一三层语义的最小代码单元待选择）
 
-> 已明确为本增量的唯一执行范围；不存在“下一单元未指定”的开放状态。以内容定位待迁移点，不依赖陈旧行号（Increment 3 已位移）。
+> 统一三层语义已固化，实现待选取最小行为单元；本轮为文档对齐，不产生 Go 行为变更。下述仅为候选行为域与裁决前提，不构成执行指令，不声称统一恢复已完成。
 
-- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doKeyUpstream`** 两处直连发送/门控块至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`/依赖/配置 schema。
-- 设计边界：
-  - 精确替换两处（按内容定位，不按行号）：首发 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 与 transient 重试 `sendUpstreamOnce` + 同样门控块，改为 `executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)`；其中 `route.Tier`/`baseURL=g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`channel="key"`/`credDisplay=cand.CredDisplay`/`anonymous=false`/`monitorAttempt=attemptOffset+attempts` 与现有 `sendUpstreamOnce` 实参精确一致；`executeAttempt` 已完整拥有流式门控与记录，外层不再重复。`firstStarted`/`retryStarted` 均取 `out.Started` 赋值，保留 `Started` 向 `cred429Evidence` 与 `noteCredential429Failure` 的传播与 stale fencing。
-  - `executeAttempt` 仍为单次发送执行器，不拥有：冻结已认证候选顺序（`buildAuthCandidates`/`orderCandidates`）、`ordinarySends` 预算与 429 `ordinarySends--` 退款（429 budget-neutral）、`cred429Evidence` 累积与 `noteCredential429Failure` 的全量 eligible 计数门控（以 last `Retry-After` 与 `Started` 的 stale fencing 为准）、单 transient token/delay（`maxTransient`/`transientDelay`/`sleepWithContext`）、pinHit 早退、`exact-400` 同目标单次重放终态（`replayCandidate400` 与 `recovered=true` 超预算最终性）、`isOrdinaryClientRejection` 判定、`lastResponse`/`lastErr` 保持、`bindSessionPin`、上下文取消（`isContextCancelled`/`ctx.Err()`）与 `upstream stream startup failure` sentinel 的同目标 transient 重试语义、attempt 编号（`attempts`/`syncAttemptMeta`/`attemptOffset+attempts`）、drain 语义、日志与协议 envelope。以上仍由 `doKeyUpstream` 及其外层 `doUpstreamTiersUnbound`/custom fallback 负责。
-  - 自定义 fallback 与 tier 迁移仍在外层调用方，不在本增量执行器内。
-  - 精确保留：build 错误直接返回、`Resp/Err/Diag/Started` 映射、取消与流启动 sentinel 行为、429 `Retry-After` 末值与 `credential429` 写入的 `future cooldown`、attempt 连续性、discard/drain 语义、与语义相关的日志与所有协议 envelope；不改变当前 exact-400 终态语义。
-  - 不触及 `doAnonymousUpstream`/`doPinnedAnonymous`/`doPinnedAuth` 及其测试。
-- 保持不变：
-  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doKeyUpstream` 的冻结顺序、`ordinarySends` 预算与 429 退款、`cred429Evidence` 全量门控与 `Started` 传播、transient 预算、400 重放、pinHit、`lastResponse`/`drain`/`bind` 均保持不变。
-  - 流式语义：`executeAttempt` 内部仍以 `Started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层仅保留成功日志与 `bindSessionPin`；启动失败以 `upstream stream startup failure` 同目标重试，不推进候选。
-  - 统一会话恢复仍未实现：本增量仅为结构化收敛，不引入跨候选/跨通道统一恢复策略。
+- 现状：最高原则已于 2026-09-22 固化为统一语义三层/闭环投影 `observe stability -> resolve stable cause -> continue session or faithfully return`（L1 观察稳定性含 retry、L2 解决稳定原因含 400 修正与所有对象粒度 fallback、L3 继续或返回；代理/池/凭证/备用渠道/恢复域均为对象/候选，非固定 L2/L3；已关闭对象队列解读），文档已对齐 `AGENTS.md` / ADR；代码层面 Increment 1-4 结构收敛已闭合，400 同目标修正后终态（L2 按 L3 终止）、503 受约束观察（L2 内受 deadline/cancel/committed bytes/观察策略约束非无限）、取消/deadline/已提交字节后停止（L3 边界）已有基线，custom fallback 仍为 429 耗尽限定的 L2 保底，广义统一语义三层逐状态码映射与 `retry.max_attempts` 向 L1 单一观察计数归一仍未落地；现有代码/测试仅为候选对象序列与特定 429 fallback 基线，不应反推为三层已实现；`internal/app/gateway.go` 已无外层 `sendUpstreamOnce` 直连迁移点，下一行为增量无可直接迁移的技术点。
+- 候选行为域（待后续工作、未立项）：
+  - 候选 A：`exact-400` 语义——已裁决为终态（同目标修正后即路由最终结果，不回流正常恢复，属 L2 完成后按 L3 终止），本候选不再待裁决；当前代码已符合裁决，无需新实现；
+  - 候选 B：统一语义三层恢复——逐状态码（429/401/403/5xx/408/425/普通 4xx 等）在统一语义三层（L1 观察稳定性 / L2 解决稳定原因含全部对象粒度、fallback 为 L2 动作 / L3 继续或返回）下的映射、单一预算归一（`retry.max_attempts` 明确为 L1 最小观察次数非统一错误额度/对象队列配额，且不预先冻结数值与退避）与停止条件（含 503 在 L2 内受约束持续观察非无限、无法解决时按 L3 忠实返回）仍待定义与落地；`fallback` 广义恢复域可用对象耗尽的 L2 选择仍未实现。
+- 裁决前提（未满足则不进入实现）：
+  - 需先明确逐状态码在统一语义三层下的映射与优先级、单一预算（`retry.max_attempts` 规范化为 L1 最小观察次数非统一错误额度/对象队列配额）与 429 budget-neutral 的归一方式、停止条件（取消/deadline/已提交字节后不切换为 L3 边界，503 受约束观察为 L2 内非无限）的边界；`fallback` 需以当前对象稳定不可用且恢复域可用性过滤后无可发送对象的 L2 耗尽证据为准（代理/池/凭证/备用渠道均为对象/候选，恢复域为上下文，不映射为固定层级），不因单个错误码机械直切；
+  - 已裁决的 400 终态语义（L2 修正按 L3 终止）与现有 `replayCandidate400` / `AGENTS.md` §4 不变式保持一致，后续工作不得将其回流至正常恢复或视为 L1 retry；
+  - 已裁决的最高原则与恢复域定义（上下文非层级）保持不变，广义统一语义三层与单一预算仍显式待实现，不虚报完成；
+  - 由 Nexus 裁决选定唯一最小行为增量后，方可形成新的“当前自然工作单元”并进入执行；本轮不自行设计或实现上述任一行为。
+- 约束重申：不新增 `internal/app/recovery.go`，不拆包，不改 `README`/`AGENTS`/`ADR`/`config.example.json` 以外文件、依赖或配置 schema；未声称统一恢复已完成；已裁决的最高原则不再作为待裁决项；未裁决前不产生新的代码行为变更；不把 503 写成无限 retry，不冻结逐状态码矩阵/预算/退避。
 
-## 8. 验收证据（Acceptance Evidence · Increment 4）
+## 8. 验收状态（Acceptance Status · 截至 Increment 4 已闭合）
 
-- 文档：本文件已更新，当前自然工作单元与设计边界明确为 Bounded Increment 4 已闭合，阐明仅迁移 `doKeyUpstream` 两处直连块至 `executeAttempt`（已认证元数据 `route.Tier`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`"key"/cand.CredDisplay/false`/`attemptOffset+attempts` 精确一致，`firstStarted`/`retryStarted` 取 `out.Started`），且 `frozen ordering/ordinarySends+429 refund/cred429Evidence+Started fencing/transient/400 replay/pinHit/lastResponse/bind/fallback` 仍在执行器外；未声称更广义的统一恢复已实现。
-- 代码：`internal/app/gateway.go` 内 `doKeyUpstream` 仅两处直连发送块已替换为 `executeAttempt`，保留 `buildErr`/`Diag`/`Started`/`isContextCancelled`/`startup failure` sentinel、`ordinarySends`/`cred429Evidence`/`attempts`/`lastResponse/lastErr`/`bindSessionPin`/日志 envelope 语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
-- 验证：
-  - 新增聚焦回归（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径，`internal/app/unbound_auth_started_test.go:TestUnboundAuthStartedCredentialEvidence`）：`doKeyUpstream` 双 eligible 代理各 live 429（`Retry-After` 如 `4` 与 `9`，冻结全量）→ 断言 `credential429` 以末个 `Retry-After=9` 写入、`future cooldown` 生效、`lastStartedNanos` 为真实传播值（`non-zero` 且 `>1` 且 `<` 末次 429 到达时 `time.Now().UnixNano()`，非 `0` 回退）且 `nanos=1` 陈旧成功不能清除。
-  - 既有 key/auth/429/stream/400/pinned 429、stale429 与匿名 transport/429 用例保持权威回归；已执行 `gofmt`、聚焦 `go test ./internal/app -run TestUnboundAuthStartedCredentialEvidence` 与全量 `go test ./...`，门槛待重跑（执行结果见本次报告）；`go build -o opencode2api ./cmd/opencode2api` 按需通过。
+> Increment 1-4 均为已闭合的结构化收敛增量，非当前执行单元；本节为历史验收摘要，下一增量待裁决（见 §7）。
+
+- 文档：本文件已同步 Increment 1-4 闭合事实（`doPinnedAnonymous` / `doPinnedAuth` / `doAnonymousUpstream` / `doKeyUpstream` 的直连 `sendUpstreamOnce` 块均已迁移至 `executeAttempt`，`frozen ordering/ordinarySends+429 refund/cred429Evidence+Started fencing/transient/400 replay/pinHit/lastResponse/bind/fallback` 仍在执行器外）；400 语义已对齐（L2 修正按 L3 终态），未声称 ADR 0001 的统一语义三层（L1 观察 / L2 解决 / L3 继续或返回）或单一预算已实现，现有代码/测试仅为候选对象序列与特定 429 fallback 基线，不应反推为三层已实现，统一恢复整体仍为待实现。
+- 代码：`internal/app/gateway.go` 内四处收敛均保持行为等价、无恢复语义变更；未新增 `internal/app/recovery.go`；`gofmt` 干净；现有基线即权威实现。
+- 验证（已执行且通过）：
+  - 聚焦回归 `internal/app/unbound_auth_started_test.go:TestUnboundAuthStartedCredentialEvidence`（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径）：`doKeyUpstream` 双 eligible 代理各 live 429（`Retry-After` 如 `4` 与 `9`，冻结全量）→ 已通过 `credential429` 以末个 `Retry-After=9` 写入、`future cooldown` 生效、`lastStartedNanos` 为真实传播值（`non-zero` 且 `>1` 且 `<` 末次 429 到达时 `time.Now().UnixNano()`，非 `0` 回退）且 `nanos=1` 陈旧成功不能清除。
+  - 全量回归 `go test ./...` 已通过，聚焦用例 `go test ./internal/app -run TestUnboundAuthStartedCredentialEvidence` 已通过，`gofmt` 干净；`go build -o opencode2api ./cmd/opencode2api` 按执行记录已通过。
+- 当前状态说明：Increment 4 闭合后，`gateway.go` 已无外层 `sendUpstreamOnce` 直连迁移点；400 语义已裁决并对齐，下一行为增量仅余 L1/L2/L3 映射与单一预算的稳定性观察归一等统一恢复工作待后续裁决，本轮无已批准执行单元。
 
 ## 9. 未决问题（Unresolved Questions）
 
-- 统一恢复是否允许跨代理或跨凭证迁移，抑或仍限定同目标同会话？
-- 与 Responses `previous_response_id` 清理及自定义 fallback 接管的交互边界？
+- 统一恢复是否允许跨代理或跨凭证迁移，抑或仍限定同目标同会话？（注：L2/L3 对象层级疑问已于 2026-09-22 裁决关闭——代理/池/凭证/备用渠道/恢复域均为对象/候选或上下文，不映射为固定 L2/L3；fallback 为 L2 对象选择非固定末级）
+- 与 Responses `previous_response_id` 清理及自定义 fallback 接管的交互边界？（400 为 L2 修正按 L3 终态，不回流正常恢复）
 - 是否需要新增可观测事件/指标，或复用现有 `route_session_recovery_*` 事件？
 
 ## 10. 已否决路径（Rejected Approach）

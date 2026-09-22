@@ -7,6 +7,8 @@
 
 ## 1. System Mental Model
 
+> **Supreme Principle — Session Recovery (会话恢复) is the highest behavioral principle.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier. Purpose: every recovery exists to let the session continue. Closed loop: `observe stability -> resolve stable cause -> continue session or faithfully return` (per target protocol). Unified semantic three layers (not object-queue projection): **L1 / Observe stability** — 观察稳定性，先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 执行受 deadline/cancel/committed bytes/观察策略约束的持续观察策略，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道/恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级。Stability first. Recovery domain: bound session = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single status code alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避仍由 ADR/后续实现决定且不冻结逐状态码矩阵，本指南仅保留抽象不变式。
+
 - opencode2api is a Go 1.24 protocol gateway for OpenCode Zen. It
   exposes OpenAI-compatible Chat Completions, Responses, and Models APIs plus
   the Anthropic Messages API, and forwards to upstream Zen endpoints.
@@ -104,6 +106,7 @@
   only) → authenticated keys → same-protocol passthrough or cross-protocol
   conversion → result recording (metrics, upstream attempts, usage when the
   upstream reports it).
+- **Supreme recovery closed loop (gateway first) — `observe stability -> resolve stable cause -> continue session or faithfully return`.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier; every recovery exists to let the session continue. The gateway absorbs steady-state fluctuations before exposing them to the client. **Unified semantic three layers (not object queue):** **L1 / Observe stability** — 先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 执行受 deadline/cancel/committed bytes/观察策略约束的持续观察策略，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3。Recovery domain: bound = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single HTTP status alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避仍由 ADR/后续实现决定且不冻结逐状态码矩阵，本指南仅保留抽象不变式，MUST NOT be invented as a complete matrix here. HTTP 400 is an illegal request and non-fluctuating: its same-target replay after cleaning Responses reasoning/`previous_response_id` 属于 L2 的稳定非法请求解决动作（corrective / policy-removal），不是 L1 retry，完成後按 L3 终止/忠实返回；it MUST keep same target, same route session, and same request identity, and its outcome is always the route's last recovery action with no further candidate, channel, or fallback. `fallback` is an L2 object-selection action taken only when the current object is stably unavailable and recovery-domain availability filtering leaves no sendable object; a single error code MUST NOT mechanically cut to fallback without exhaustion evidence of the current domain's available objects. The existing scheduler / pin / route-session domain ownership and the streaming committed-bytes stop invariant remain unchanged.
 - Session affinity spine: explicit client session headers or
   `metadata.session_id` win; otherwise the first user message derives a stable
   client session hash. The derived client session is the establishment identity
@@ -192,6 +195,8 @@
 
 ## 4. Invariants (MUST Preserve)
 
+> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码仍是历史的按候选/429 fallback 等实现（400 同目标 corrective replay 终态、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、custom 仅 429 耗尽保底），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；广义逐状态码语义映射、预算归一与退避仍待定，MUST NOT be read as completed — see ADR 0001.
+
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
   first, non-free models skip it entirely. Anonymous free-tier sends go
@@ -212,12 +217,12 @@
   only proxy exhaustion without a 400 enters it otherwise. Client cancel or
   the shared request deadline ends the route immediately with no further
   retry/fallback and no state change. The first exact HTTP 400 on any
-  candidate replays exactly once on the same target with the same route
-  session (same request ID, same credential/proxy/protocol, same wire session
-  bytes, always before any
+  candidate is a corrective / policy-removal action, not a retry: it replays
+  exactly once on the same target with the same route session (same request
+  ID, same credential/proxy/protocol, same wire session bytes, always before any
   client bytes; Responses replays also drop stale previous_response_id/
   reasoning refs; never consumes the transient token; no override is stored).
-  The replay result is
+   The replay result is
   final for the whole route: success returns normally, a second 400 returns
   that 400, and any other replay outcome returns as-is without scanning
   remaining proxies or entering the authenticated channel. A replay 2xx pins the
@@ -225,18 +230,21 @@
 - Authenticated channel: the channel owns a `retry.max_attempts`
   real-send budget for ordinary (non-429) sends only (each first send plus each
   same-target transient retry consumes it); 429 sends are budget-neutral and walk
-  all currently sendable credential×proxy candidates to exhaustion. The channel
-  owns its own transient token. Inside the channel, while still
+  all currently sendable credential×proxy candidates to exhaustion. `retry.max_attempts`
+  is the minimum observation/request count to judge stability, not a uniform
+  error-count quota; per-status mapping is still governed by the state matrix.
+  The channel owns its own transient token. Inside the channel, while still
   unpinned, only transport errors, 408/425, 401/403, 429, 5xx, and other
   retryable responses advance the frozen list; 401/403/429 never retry
   same-target; transport/408/425/5xx retry same-target at most once; any other
   4xx MUST end the route. Exhaustion of one credential's frozen eligible set
   writes that credential's 429 (last Retry-After) without stopping other
   credential/channel candidates; partial 429 and pre-cooled skips never do.
-  The first exact HTTP 400 on any candidate follows
-  the same same-target one-replay rule as anonymous (same route/wire session,
-  Responses stale-ref cleanup, replay is the route's last recovery action,
-  always allowed once extra beyond the ordinary budget; no override is stored);
+   The first exact HTTP 400 on any candidate is a corrective / policy-removal
+  action, not a retry, and follows the same same-target one-replay rule as
+  anonymous (same route/wire session, Responses stale-ref cleanup, replay is the
+  route's last recovery action, always allowed once extra beyond the ordinary
+  budget; no override is stored);
   a second 400
   terminates the whole route. Cancel/deadline ends the route. A
   replay 2xx pins the session+model when still unbound; once pinned, the
@@ -263,12 +271,14 @@
   channel-qualified `(channel,pool,proxy)` channel — a lone 403/5xx without
   comparative success is display-only; 408/425 are transient neutral
   (retryable, never cooling); ordinary 4xx (including exact 400) is neutral
-  and 2xx clears this target and this credential's 401 state, plus the
+  and   2xx clears this target and this credential's 401 state, plus the
   channel-qualified proxy429/channel and credential429 state only when the send
   started at or after the latest recorded failure (stale in-flight 2xx never
   clears a newer cooldown; newer failures stay authoritative). 429 config is
   one base/cooldown seconds value default 300, validated 300..3600; fixed
   internal exponential backoff cap 3600; no second configurable max.
+  `retry.max_attempts` canonical migration is toward a single definition of
+  minimum stability-observation count, not a uniform per-status error-count quota.
   Proxy429/channel use deterministic exponential backoff with Retry-After
   max/cap, no same-target retry, bounded maps with stale prune/eviction
   proportional to proxy resources, and still-future migration by
