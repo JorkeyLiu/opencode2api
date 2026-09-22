@@ -327,6 +327,68 @@ type ConfigUpdate struct {
 	Prefer       Tier                      `json:"prefer"`
 	History      HistoryConfig             `json:"history"`
 	WebUI        WebUIView                 `json:"webui"`
+
+	retryMaxAttemptsPresent       bool
+	retryAttemptTimeoutPresent    bool
+	retryTransientMaxPresent      bool
+	retryTransientIntervalPresent bool
+	performanceSuspectPresent     bool
+}
+
+var allowedConfigUpdateKeys = map[string]bool{
+	"listen": true, "server_keys": true, "keys": true, "zen_keys": true, "go_keys": true,
+	"anonymous": true, "proxy_pools": true, "proxy_routing": true, "fallback": true,
+	"upstream": true, "retry": true, "models": true, "performance": true,
+	"logging": true, "prefer": true, "history": true, "webui": true,
+}
+
+func (cu *ConfigUpdate) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for key := range raw {
+		if !allowedConfigUpdateKeys[key] {
+			return fmt.Errorf("json: unknown field %q", key)
+		}
+	}
+	type plain ConfigUpdate
+	var tmp plain
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&tmp); err != nil {
+		return err
+	}
+	if err := ensureJSONEOF(dec); err != nil {
+		return err
+	}
+	*cu = ConfigUpdate(tmp)
+	if rawRetry, ok := raw["retry"]; ok {
+		var retryMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawRetry, &retryMap); err == nil {
+			if _, has := retryMap["max_attempts"]; has {
+				cu.retryMaxAttemptsPresent = true
+			}
+			if _, has := retryMap["attempt_timeout_seconds"]; has {
+				cu.retryAttemptTimeoutPresent = true
+			}
+			if _, has := retryMap["transient_max_attempts"]; has {
+				cu.retryTransientMaxPresent = true
+			}
+			if _, has := retryMap["transient_retry_interval_seconds"]; has {
+				cu.retryTransientIntervalPresent = true
+			}
+		}
+	}
+	if rawPerf, ok := raw["performance"]; ok {
+		var perfMap map[string]json.RawMessage
+		if err := json.Unmarshal(rawPerf, &perfMap); err == nil {
+			if _, has := perfMap["transport_suspect_cooldown_seconds"]; has {
+				cu.performanceSuspectPresent = true
+			}
+		}
+	}
+	return nil
 }
 
 func (a *AdminServer) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
@@ -380,6 +442,36 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	candidate.proxyPoolsPresent = true
 	candidate.proxyRoutingPresent = true
+	// Presence propagation: explicit values keep strict validation, omitted
+	// WebUI fields preserve current effective values (attempt, interval, suspect, transient).
+	candidate.retryMaxAttemptsPresent = update.retryMaxAttemptsPresent
+	if !update.retryMaxAttemptsPresent {
+		candidate.Retry.MaxAttempts = current.Retry.MaxAttempts
+		candidate.retryMaxAttemptsPresent = true
+	}
+	candidate.retryAttemptTimeoutPresent = update.retryAttemptTimeoutPresent
+	if !update.retryAttemptTimeoutPresent {
+		candidate.Retry.AttemptTimeoutSeconds = current.Retry.AttemptTimeoutSeconds
+		candidate.retryAttemptTimeoutPresent = true
+	}
+	candidate.retryTransientMaxPresent = update.retryTransientMaxPresent
+	if !update.retryTransientMaxPresent {
+		candidate.Retry.TransientMaxAttempts = current.Retry.TransientMaxAttempts
+		candidate.retryTransientMaxPresent = true
+		if candidate.Retry.TransientMaxAttempts == 0 {
+			candidate.Retry.TransientMaxAttempts = 3
+		}
+	}
+	candidate.retryTransientIntervalPresent = update.retryTransientIntervalPresent
+	if !update.retryTransientIntervalPresent {
+		candidate.Retry.TransientRetryIntervalSeconds = current.Retry.TransientRetryIntervalSeconds
+		candidate.retryTransientIntervalPresent = true
+	}
+	candidate.performanceSuspectPresent = update.performanceSuspectPresent
+	if !update.performanceSuspectPresent {
+		candidate.Performance.TransportSuspectCooldownSeconds = current.Performance.TransportSuspectCooldownSeconds
+		candidate.performanceSuspectPresent = true
+	}
 	result, err := a.manager.Apply(candidate, true)
 	if err != nil {
 		a.logger.Warn("configuration update rejected", "component", "config", "event", "config_rejected", "error", err)

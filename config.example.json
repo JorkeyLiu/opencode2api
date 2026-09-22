@@ -33,7 +33,6 @@
     "max_attempts": 3,
     "timeout_seconds": 300,
     "attempt_timeout_seconds": 5,
-    "transient_max_attempts": 3,
     "transient_retry_interval_seconds": 3
   },
   "models": {

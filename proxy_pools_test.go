@@ -17,6 +17,8 @@ func testBaseConfig() Config {
 	cfg.Keys = []string{"zen-key-12345", "go-key-12345"}
 	cfg.Retry.TransientMaxAttempts = 2
 	cfg.Retry.TransientRetryIntervalSeconds = 0
+	cfg.retryTransientMaxPresent = true
+	cfg.retryTransientIntervalPresent = true
 	return cfg
 }
 

@@ -445,8 +445,9 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>每个密钥上游最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
             <div class="field"><label>请求超时（秒）</label><input id="c-timeout" type="number" min="1"></div>
             <div class="field"><label>单次尝试超时（秒）</label><input id="c-attempt-timeout" type="number" min="1"></div>
+            <div class="field"><label>观测重试间隔（秒）</label><input id="c-transient-interval" type="number" min="0" max="30"></div>
           </div>
-          <div class="note">单次尝试超时限制单个上游尝试的头部等待时间，需小于等于请求超时；超时后尝试下一个可用代理。</div>
+          <div class="note">单次尝试超时限制单个上游尝试的头部等待时间，需小于等于请求超时；超时后尝试下一个可用代理。观测重试间隔用于稳定性恢复观察。</div>
         </div>
         <div class="section config-card">
           <h2>模型目录</h2>
@@ -1971,6 +1972,7 @@ function fillConfig(v){
   $("c-attempts").value=v.retry.max_attempts||"";
   $("c-timeout").value=v.retry.timeout_seconds||"";
   $("c-attempt-timeout").value=v.retry.attempt_timeout_seconds||"";
+  $("c-transient-interval").value=(v.retry&&v.retry.transient_retry_interval_seconds!==undefined&&v.retry.transient_retry_interval_seconds!==null)?v.retry.transient_retry_interval_seconds:3;
   $("c-refresh").value=v.models.refresh_seconds||"";
   try{$("c-protocols").value=JSON.stringify(v.models.protocols||{},null,2);}catch(e){$("c-protocols").value="{}";}
   $("c-idle").value=v.performance.max_idle_conns||"";
@@ -2807,7 +2809,7 @@ function collectConfigUpdate(){
     anonymous:$("c-anonymous").checked, proxy_pools:pools, proxy_routing:{anonymous:anon,authenticated:auth},
     fallback:{active:fbActive,channels:fbChannels},
     upstream:{zen:$("c-up-zen").value},
-    retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout"),attempt_timeout_seconds:num("c-attempt-timeout")},
+    retry:{max_attempts:num("c-attempts"),timeout_seconds:num("c-timeout"),attempt_timeout_seconds:num("c-attempt-timeout"),transient_retry_interval_seconds:num("c-transient-interval")},
     models:{refresh_seconds:num("c-refresh"),protocols:protocols},
     performance:{max_idle_conns:num("c-idle"),max_idle_conns_per_host:num("c-idle-host"),max_conns_per_host:num("c-max-host"),idle_conn_timeout_seconds:num("c-idle-timeout"),connect_timeout_seconds:num("c-connect"),failure_cooldown_seconds:num("c-cooldown"),rate_limit_cooldown_seconds:num("c-ratelimit-cooldown"),transport_suspect_cooldown_seconds:num("c-suspect-cooldown")},
     logging:{level:$("c-level").value,ring_size:num("c-ring")},
@@ -3040,7 +3042,7 @@ $("config-form").addEventListener("submit",function(e){
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
-  ["c-session","c-attempts","c-timeout","c-attempt-timeout","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-suspect-cooldown","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
+  ["c-session","c-attempts","c-timeout","c-attempt-timeout","c-transient-interval","c-refresh","c-idle","c-idle-host","c-max-host","c-idle-timeout","c-connect","c-cooldown","c-ratelimit-cooldown","c-suspect-cooldown","c-ring","c-hist-retention","c-hist-max"].forEach(function(id){
     on(id,"change",function(){ queueConfigSave(true).catch(function(){}); });
     on(id,"blur",function(){ if(S.cfgSave.debounce||S.cfgSave.dirty)queueConfigSave(true).catch(function(){}); });
   });
