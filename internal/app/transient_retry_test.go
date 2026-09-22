@@ -338,12 +338,12 @@ func TestRetryAfterLowerBound(t *testing.T) {
 	cfg.Retry.MaxAttempts = 5
 	gw, _ := NewGateway(cfg, discardGatewayLogger(), monitor)
 	var calls atomic.Int32
+	var seq atomic.Int32
 	postStub(t, gw, "a", 0, &calls, nil, func(*http.Request) (*http.Response, error) {
-		n := calls.Add(1)
+		n := seq.Add(1)
 		if n == 1 {
 			resp := responseWithBody(503, `{"error":"svc"}`)
-			// use short Retry-After via http date 200ms in future
-			resp.Header.Set("Retry-After", time.Now().Add(200*time.Millisecond).UTC().Format(http.TimeFormat))
+			resp.Header.Set("Retry-After", "1")
 			return resp, nil
 		}
 		return responseWithBody(200, `{"ok":true}`), nil
@@ -357,12 +357,11 @@ func TestRetryAfterLowerBound(t *testing.T) {
 	}
 	drainAndClose(resp.Body)
 	elapsed := time.Since(start)
-	// Lower bound: should be at least 100ms (Retry-After 200ms) but allow some slack for CI
-	if elapsed < 50*time.Millisecond {
-		t.Logf("warning: Retry-After delay short, elapsed %v (may be truncated due to second precision)", elapsed)
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("Retry-After 1s must delay retry as lower bound: elapsed %v < 900ms", elapsed)
 	}
-	if elapsed > 3000*time.Millisecond {
-		t.Fatalf("elapsed too long %v", elapsed)
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("elapsed too long %v want <2.5s", elapsed)
 	}
 	if postCount(&calls) != 2 {
 		t.Fatalf("calls %d want 2", postCount(&calls))
