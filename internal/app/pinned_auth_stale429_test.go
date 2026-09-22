@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type trackCloseBody struct {
@@ -201,6 +202,78 @@ func TestPinnedAuthStale429RetryNon429NoCustom(t *testing.T) {
 
 // 4) Pure full-eligible 429 still exhausts: custom takeover + credential429
 // with last Retry-After; no-custom keeps last 429 envelope.
+func TestPinnedAuthStartedCredentialEvidence(t *testing.T) {
+	// Focused regression for Increment 2: pinned-auth must propagate the live
+	// send-start timestamp to credential429 so stale fencing and last
+	// Retry-After are preserved without brittle wall-clock assumptions.
+	monitor := NewMonitor()
+	gw2 := authTwoProxyGateway(t, monitor, 5)
+	cred2 := gw2.authCreds[0]
+	ses2 := "ses_pinned_started_evidence_1"
+	raw2 := gw2.pools["z"].items[0].name
+	gw2.bindSessionPin(ses2, "m", TierZen, cred2.id, "z", raw2, ProtocolChat, normalizeRouteAuthority(gw2.cfg.Upstream.Zen))
+	pin2, _ := gw2.scheduler.pinGet(ses2, "m")
+	ord2 := affinityProxyOrder(gw2.pools["z"], pin2.CredID, pin2.ProxyRaw)
+	postStub(t, gw2, "z", poolIndexByRaw(gw2, "z", ord2[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw2, "z", poolIndexByRaw(gw2, "z", ord2[1].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "9")
+		return r, nil
+	})
+	resp2, _, _, err := gw2.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses2, "r1"), 0)
+	if err != nil || resp2 == nil || resp2.StatusCode != 429 {
+		t.Fatalf("full 429 must keep 429, err=%v resp=%v", err, resp2)
+	}
+	if got := resp2.Header.Get("Retry-After"); got != "9" {
+		drainResp(resp2)
+		t.Fatalf("last Retry-After=%q want 9 (Started must retain last live 429)", got)
+	}
+	drainResp(resp2)
+	until, status, ok := gw2.scheduler.credential429CooldownStatus(pin2.CredID)
+	if !ok || status != 429 {
+		t.Fatalf("full exhaustion must write credential429")
+	}
+	if until <= 0 {
+		t.Fatalf("credential429 until=%d must be non-zero future deadline", until)
+	}
+	if until <= time.Now().UnixNano() {
+		t.Fatalf("credential429 until=%d must be future (non-zero)", until)
+	}
+	// Prove real Started was propagated, not the scheduler's startedNanos==0 fallback.
+	// Direct white-box read of the credential429 entry (same package) provides
+	// deterministic evidence without wall-clock brittleness.
+	entry := gw2.scheduler.cred429State[pin2.CredID]
+	if entry == nil {
+		t.Fatalf("credential429 entry missing")
+	}
+	if entry.lastStartedNanos == 0 {
+		t.Fatalf("credential429 lastStartedNanos must be non-zero (real Started propagated, not fallback)")
+	}
+	if entry.lastStartedNanos <= 1 {
+		t.Fatalf("credential429 lastStartedNanos=%d must be >1 to make stale fencing meaningful", entry.lastStartedNanos)
+	}
+	if entry.failures == 0 {
+		t.Fatalf("credential429 failures must be non-zero")
+	}
+	// Deterministic snapshot accessor cross-check (existing accessor) stays consistent.
+	if failures, snapUntil := gw2.scheduler.credential429Snapshot(pin2.CredID); failures == 0 || snapUntil != until {
+		t.Fatalf("credential429 snapshot mismatch failures=%d until=%d want non-zero and %d", failures, snapUntil, until)
+	}
+	// Stale fencing: a success started far in the past (nanos=1) must NOT clear
+	// the just-written credential429. If Started were not propagated, lastStarted
+	// would be 0 and this stale check would incorrectly clear.
+	if ch := gw2.scheduler.noteCredential429Success(pin2.CredID, 1); ch.Changed {
+		t.Fatalf("stale Started=1 must not clear credential429 (fencing)")
+	}
+	if _, _, ok := gw2.scheduler.credential429CooldownStatus(pin2.CredID); !ok {
+		t.Fatalf("credential429 must remain after stale success")
+	}
+}
+
 func TestPinnedAuthFull429StillCustom(t *testing.T) {
 	var customHits atomic.Int32
 	gw := pinnedAuthCustomGateway(t, &customHits)

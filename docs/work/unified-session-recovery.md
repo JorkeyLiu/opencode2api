@@ -49,29 +49,30 @@
 
 - 统一会话恢复的触发条件、跨候选/跨通道统一策略、与现有 400 重放及 transient 重试的优先级仍未定义并落地。
 - 现有代码仍为“同目标单次重放”基线，统一恢复逻辑尚未编码、未验证。
-- 首个有界重构缺口已闭合（Bounded Increment 1）：`internal/app/gateway.go` 已建立结构化单次发送执行器 `executeAttempt` 并已将 `doPinnedAnonymous` 迁移至该边界（行为等价、无恢复语义变更），为后续统一恢复提供了单一收敛边界；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
+- 首个有界重构缺口已闭合（Bounded Increment 1）：`internal/app/gateway.go` 已建立结构化单次发送执行器 `executeAttempt` 并已将 `doPinnedAnonymous` 迁移至该边界（行为等价、无恢复语义变更），为后续统一恢复提供了单一收敛边界。
+- 第二个有界重构缺口已闭合（Bounded Increment 2）：`internal/app/gateway.go` 内 `attemptOutcome` 已新增 `Started int64`，`executeAttempt` 已对普通与重试发送均返回该 `Started` 并以同一值完成流式成功/启动失败的调度与监控记录，`doPinnedAuth` 两处直连 `sendUpstreamOnce` 块已迁移至该边界（行为等价、无恢复语义变更）；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 
-## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 1）
+## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 2）
 
 > 已明确为本增量的唯一执行范围；不存在“下一单元未指定”的开放状态。
 
-- 目标：在现有 `internal/app/gateway.go` 内建立真实的结构化单次尝试执行器 `executeAttempt`，并**仅迁移 `doPinnedAnonymous`** 至该边界，行为等价、无恢复语义变更。
+- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doPinnedAuth`** 至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`。
 - 设计边界：
-  - 代码保留在现有 `gateway.go`；不新增 `internal/app/recovery.go` 或拆包。
-  - 新/重命名 `executeAttempt` 边界仅拥有单次发送事实：调用现有请求发送/状态分类权威、流式启动门控（落字节前）、流成功调度/监控记录、启动失败分类/记录，并返回足以支撑外层循环的结构化结果。
-  - 不拥有候选选择/推进、代理回退决策、ordinary-send 预算、credential429 证据累积、custom fallback 调用、exact 400 重放、pin 绑定/移动、或路由会话/体构造。以上仍由 `doPinnedAnonymous`/相邻所有者负责。
-  - 仅迁移 `doPinnedAnonymous`；其他 native 循环保持现行路径，不引入第二套策略表或未使用的策略抽象。
+  - 仅扩展 `attemptOutcome` 一个真实事实：`Started int64`（`sendUpstreamOnce` 的 send-start nanos）。`executeAttempt` 必须对普通与重试发送均返回该 `Started`，同时继续在内部以同一 `started` 值完成流式成功/启动失败的调度与监控记录（即对外返回与对内使用同一事实）。
+  - `Started` 必须被保留的原因：`doPinnedAuth` 的 `credential429` 写入（`noteCredential429Failure`）依赖 send-start 做 stale fencing（`lastStartedNanos`），若执行器不透传该时间，外层无法在 `firstStarted/retryStarted` 上保持与 `proxy429/channel` 一致的 `started >= lastFailureStarted` 判定；这是 Increment 2 唯一需要扩展的事实。
+  - `executeAttempt` 仍为单次发送执行器，不拥有：候选选择/推进（`eligible`/`ordered`）、ordinary-send 预算与 429 refund（`ordinarySends`/`budget`）、credential429 证据累积（`observed429`/`cred429Evidence`/`last429Started/RetryAfter`）、exact 400 重放（`replayCandidate400`）、pin 绑定/移动（`pinMoveCurrent`/`bindSessionPin`）、custom fallback 调用（`maybeTakeoverCustomFallback`）、路由会话/体构造、或任何冷却归属。以上仍由 `doPinnedAuth` 及其相邻所有者负责。
+  - 仅替换 `doPinnedAuth` 内两处直连 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 块为 `executeAttempt` 调用，复用 `doPinnedAnonymous` 已迁移模式；精确保留 `firstStarted`/`retryStarted` 赋值、`response/err/diag/buildErr` 处理、`discardLast429`、`attempt` 偏移、transient 启动失败行为、取消与所有返回 envelope。
 - 保持不变：
-  - attempts 编号与监控记录完全一致，含流式启动失败与上下文取消路径。
-  - `doPinnedAnonymous` 行为：仅 429 可遍历代理；同目标 transient 观测保留；400 重放保持同目标且在当前基线下为终态；401/403/普通 4xx/408/425/5xx 在现行同目标规则后不移动；live/local 429 证据、custom fallback、相同体/会话、pinMoveCurrent 代际围栏与最终 envelope 保持不变。
+  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doPinnedAuth` 的 eligible 过滤、budget、429 链、observed429 证据、400 同目标重放、pin 代际围栏、custom 接管、相同体/会话、attempts 编号与监控均保持不变。
+  - 流式语义：`executeAttempt` 内部仍以 `started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层不再重复门控。
 
-## 8. 验收证据（Acceptance Evidence · Increment 1）
+## 8. 验收证据（Acceptance Evidence · Increment 2）
 
-- 文档：本文件已更新，当前自然工作单元与验收标准明确为本增量，不再表述为“下一单元未指定”。
-- 代码：`internal/app/gateway.go` 内新增 `executeAttempt` 结构化结果与边界；`doPinnedAnonymous` 唯一迁移至该边界；未新增 `internal/app/recovery.go`；`gofmt` 干净。
+- 文档：本文件已更新，当前自然工作单元与设计边界明确为本增量，阐明 `attemptOutcome.Started` 仅为满足 `credential429` stale fencing 的最小事实，且 budgets/evidence/candidate/fallback/pin/replay 仍在执行器外。
+- 代码：`internal/app/gateway.go` 内 `attemptOutcome` 仅新增 `Started int64`；`executeAttempt` 对普通与重试发送均返回 `started` 且内部仍以同一值做流式成功/失败记录；`doPinnedAuth` 两处直连发送块已替换为 `executeAttempt`，保留 `firstStarted/retryStarted` 精确赋值与所有外层语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
 - 验证：
-  - 新增聚焦回归覆盖 pinned anonymous 401、403 与普通 4xx（404 或 422）：对当前代理单次 POST、对端/auth/custom 零次、原状态原样返回、pin generation/current 未变、无 proxy429 写入（表格测试位于既有相关 `*_test.go`，复用既有 helper）。
-  - 既有 pinned anonymous 429/transient/400/stream 用例保持权威回归；执行最聚焦的相关包/用例并报告命令与结果。
+  - 新增最小聚焦回归：在既有 pinned-auth 429 路径上扩展断言，验证 `credential429` 状态具有非零/未来 `cooldownUntil` 且保留最后 `Retry-After`（不做脆弱 wall-clock 断言，仅校验 `Started` 已用于 live 证据写入）。
+  - 既有 pinned anonymous/auth 429、stale429、stream、400 重放用例保持权威回归；执行最聚焦的相关包/用例并报告命令与结果。
   - `go test ./...` / `go build -o opencode2api ./cmd/opencode2api` 按需通过。
 
 ## 9. 未决问题（Unresolved Questions）
