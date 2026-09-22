@@ -1831,7 +1831,6 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		if isSameTargetTransient(resp, sendErr) {
 			curResp := resp
 			curErr := sendErr
-			curDiag := firstDiag
 			retryExhausted := false
 			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
 				if isContextCancelled(ctx) {
@@ -1910,7 +1909,6 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 						if retryIdx+1 < maxTransient {
 							curResp = retryResp
 							curErr = retryErr
-							curDiag = retryDiag
 							continue
 						}
 						// Exhausted, return 502 for pinned
@@ -1931,7 +1929,6 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 					if retryIdx+1 < maxTransient && isSameTargetTransient(retryResp, retryErr) {
 						curResp = retryResp
 						curErr = retryErr
-						curDiag = retryDiag
 						continue
 					}
 					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
@@ -1946,8 +1943,6 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				// still transient, keep for next iteration or final return
 				curResp = retryResp
 				curErr = retryErr
-				curDiag = retryDiag
-				_ = curDiag
 				if retryIdx+1 == maxTransient {
 					retryExhausted = true
 				}
@@ -2123,8 +2118,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	ordinarySends := 0
 	observed429 := make(map[string]time.Duration)
 	var last429 *http.Response
-	var last429RetryAfter time.Duration
-	var last429Started int64
 	discardLast429 := func() {
 		if last429 != nil {
 			drainAndClose(last429.Body)
@@ -2196,8 +2189,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			if _, seen := observed429[ep.raw]; !seen {
 				observed429[ep.raw] = retryAfter
 			}
-			last429RetryAfter = retryAfter
-			last429Started = firstStarted
 			// Full exhaustion of this binding's eligible set writes
 			// credential429 (last Retry-After) and then tries custom;
 			// partial exhaustion drains and continues.
@@ -2225,7 +2216,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				}
 				last429 = resp
 			}
-			_ = idx
 			continue
 		}
 		if sendErr != nil || status == http.StatusRequestTimeout || status == 425 || (status >= 500 && status <= 599) {
@@ -2233,8 +2223,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			interval := g.transientInterval()
 			curResp := resp
 			curErr := sendErr
-			curDiag := firstDiag
-			curStarted := firstStarted
 			// curResp/curErr is first transient failure; retry same target up to maxTransient-1 more times
 			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
 				if ordinarySends >= budget {
@@ -2297,8 +2285,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					if _, seen := observed429[ep.raw]; !seen {
 						observed429[ep.raw] = retryAfter
 					}
-					last429RetryAfter = retryAfter
-					last429Started = retryStarted
 					if len(observed429) >= len(eligible) {
 						_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, retryStatus, retryAfter, retryStarted)
 						if ids.Session != "" {
@@ -2334,10 +2320,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 						if retryIdx+1 < maxTransient && ordinarySends < budget {
 							curResp = retryResp
 							curErr = retryErr
-							curDiag = retryDiag
-							curStarted = retryStarted
-							_ = curDiag
-							_ = curStarted
 							continue
 						}
 						discardLast429()
@@ -2350,10 +2332,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					if retryIdx+1 < maxTransient && ordinarySends < budget && isSameTargetTransient(retryResp, retryErr) {
 						curResp = retryResp
 						curErr = retryErr
-						curDiag = retryDiag
-						curStarted = retryStarted
-						_ = curDiag
-						_ = curStarted
 						continue
 					}
 					discardLast429()
@@ -2368,10 +2346,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				// still transient 5xx/408/425: continue loop if more attempts
 				curResp = retryResp
 				curErr = retryErr
-				curDiag = retryDiag
-				curStarted = retryStarted
-				_ = curDiag
-				_ = curStarted
 				if retryIdx+1 == maxTransient {
 					// exhausted, return final transient for pinned (no walk)
 					discardLast429()
@@ -2451,8 +2425,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				return resp2, eff, next, nil
 			}
 		}
-		_ = last429RetryAfter
-		_ = last429Started
 		return last429, effectiveRoute, attemptOffset + attempts, nil
 	}
 	if last429 != nil {
@@ -2647,8 +2619,6 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		if isSameTargetTransient(resp, err) {
 			curResp := resp
 			curErr := err
-			curDiag := firstDiag
-			_ = curDiag
 			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
 				if isContextCancelled(ctx) {
 					return curResp, curErr, attempts, false, false
@@ -2706,7 +2676,6 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				}
 				curResp = retryResp
 				curErr = retryErr
-				curDiag = retryDiag
 				if retryIdx+1 == maxTransient {
 					lastResponse = curResp
 					lastErr = curErr
@@ -3060,10 +3029,6 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		if isSameTargetTransient(resp, err) {
 			curResp := resp
 			curErr := err
-			curDiag := firstDiag
-			curStarted := firstStarted
-			_ = curDiag
-			_ = curStarted
 			retryLoopDone := false
 			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
 				if ordinarySends >= budget {
@@ -3150,8 +3115,6 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				}
 				curResp = retryResp
 				curErr = retryErr
-				curDiag = retryDiag
-				curStarted = retryStarted
 				if retryIdx+1 == maxTransient {
 					lastResponse = curResp
 					lastErr = curErr
