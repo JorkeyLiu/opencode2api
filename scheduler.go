@@ -1395,15 +1395,17 @@ func (s *targetScheduler) rateLimitDelayLocked(failures uint32, identity string,
 	return backoffDelayForBaseWithCap(s.rateLimitBase(), s.rateLimitMax(), failures, identity, retryAfter)
 }
 
-// suspectDelay returns the fixed suspect cooldown with deterministic jitter,
-// capped at the configured suspect cooldown itself (no exponential escalation).
+// suspectDelay returns the suspect cooldown with deterministic exponential
+// backoff, starting at the configured transport_suspect_cooldown_seconds and
+// capped at 300 seconds (the validated max). It reuses the established
+// scheduler backoff/jitter style (base*2^min(failures-1,3) with jitter, capped).
 func (s *targetScheduler) suspectDelay(identity string, failures uint32) time.Duration {
 	base := s.suspectBase()
 	if base <= 0 {
 		base = 15 * time.Second
 	}
-	// Fixed cooldown with jitter: deterministic +/-20% band, same as other layers.
-	return deterministicJitter(base, identity, failures)
+	cap := 300 * time.Second
+	return backoffDelayForBaseWithCap(base, cap, failures, identity, 0)
 }
 
 func (s *targetScheduler) suspectBase() time.Duration {
@@ -2324,8 +2326,8 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > s.suspectBase() {
-			entry.cooldownUntil = cooldownDeadline(now, s.suspectBase())
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > 300*time.Second {
+			entry.cooldownUntil = cooldownDeadline(now, 300*time.Second)
 		}
 		if s.suspectState == nil {
 			s.suspectState = make(map[string]*transportSuspectEntry)

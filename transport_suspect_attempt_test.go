@@ -30,7 +30,7 @@ func TestAttemptTimeoutValidation(t *testing.T) {
 		t.Fatalf("attempt > timeout must fail")
 	}
 	cfg.Retry.AttemptTimeoutSeconds = 0
-	// legacy zero via direct struct normalizes to timeout (not 5) when present flag absent.
+	// legacy missing via direct struct normalizes to 5 (clamped to timeout) when present flag absent.
 	cfg2 := testBaseConfig()
 	cfg2.Retry.TimeoutSeconds = 300
 	cfg2.Retry.AttemptTimeoutSeconds = 0
@@ -38,16 +38,24 @@ func TestAttemptTimeoutValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("zero normalize err %v", err)
 	}
-	if norm.Retry.AttemptTimeoutSeconds != 300 {
-		t.Fatalf("zero normalize want 300 got %d", norm.Retry.AttemptTimeoutSeconds)
+	if norm.Retry.AttemptTimeoutSeconds != 5 {
+		t.Fatalf("zero normalize want 5 got %d", norm.Retry.AttemptTimeoutSeconds)
 	}
-	// legacy zero normalizes to timeout 30 -> attempt 30
+	// timeout 60 with missing attempt => 5
+	cfg2m := testBaseConfig()
+	cfg2m.Retry.TimeoutSeconds = 60
+	cfg2m.Retry.AttemptTimeoutSeconds = 0
+	normM, _ := NormalizeConfig("config.json", cfg2m)
+	if normM.Retry.AttemptTimeoutSeconds != 5 {
+		t.Fatalf("timeout60 zero normalize want 5 got %d", normM.Retry.AttemptTimeoutSeconds)
+	}
+	// timeout 3 with missing => clamp to 3
 	cfg2b := testBaseConfig()
-	cfg2b.Retry.TimeoutSeconds = 30
+	cfg2b.Retry.TimeoutSeconds = 3
 	cfg2b.Retry.AttemptTimeoutSeconds = 0
 	normB, _ := NormalizeConfig("config.json", cfg2b)
-	if normB.Retry.AttemptTimeoutSeconds != 30 {
-		t.Fatalf("timeout30 zero normalize want 30 got %d", normB.Retry.AttemptTimeoutSeconds)
+	if normB.Retry.AttemptTimeoutSeconds != 3 {
+		t.Fatalf("timeout3 zero normalize want 3 got %d", normB.Retry.AttemptTimeoutSeconds)
 	}
 	// timeout 1 => attempt 1
 	cfg3 := testBaseConfig()
@@ -86,7 +94,7 @@ func TestPerformanceUnknownFieldStrict(t *testing.T) {
 }
 
 func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
-	// legacy JSON without attempt_timeout_seconds must normalize to timeout (not 5)
+	// legacy JSON without attempt_timeout_seconds must normalize to 5 (clamped to timeout)
 	rawMissing := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"transient_max_attempts":3,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
 	var cfg Config
 	if err := json.Unmarshal([]byte(rawMissing), &cfg); err != nil {
@@ -96,8 +104,8 @@ func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize missing attempt: %v", err)
 	}
-	if norm.Retry.AttemptTimeoutSeconds != 300 {
-		t.Fatalf("missing attempt normalize want 300 got %d", norm.Retry.AttemptTimeoutSeconds)
+	if norm.Retry.AttemptTimeoutSeconds != 5 {
+		t.Fatalf("missing attempt normalize want 5 got %d", norm.Retry.AttemptTimeoutSeconds)
 	}
 	if norm.Retry.TimeoutSeconds != 300 {
 		t.Fatalf("timeout should stay 300 got %d", norm.Retry.TimeoutSeconds)
@@ -180,19 +188,33 @@ func TestGatewayAttemptTimeoutTransport(t *testing.T) {
 	if transport.ResponseHeaderTimeout != 1*time.Second {
 		t.Fatalf("ResponseHeaderTimeout want 1s got %v", transport.ResponseHeaderTimeout)
 	}
-	// legacy missing should preserve whole timeout: 300 -> attempt 300 => header 300
+	// legacy missing should normalize to 5 (clamped): 300 -> attempt 5 => header 5
 	cfgLeg := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
 	cfgLeg.Retry.TimeoutSeconds = 300
 	cfgLeg.Retry.AttemptTimeoutSeconds = 0
 	cfgLeg.retryAttemptTimeoutPresent = false
 	normLeg, _ := NormalizeConfig("config.json", cfgLeg)
-	if normLeg.Retry.AttemptTimeoutSeconds != 300 {
-		t.Fatalf("legacy missing header want 300 got %d", normLeg.Retry.AttemptTimeoutSeconds)
+	if normLeg.Retry.AttemptTimeoutSeconds != 5 {
+		t.Fatalf("legacy missing header want 5 got %d", normLeg.Retry.AttemptTimeoutSeconds)
 	}
 	gwLeg, _ := NewGateway(normLeg, discardGatewayLogger(), NewMonitor())
 	trLeg := gwLeg.pools["shared"].items[0].client.Transport.(*http.Transport)
-	if trLeg.ResponseHeaderTimeout != 300*time.Second {
-		t.Fatalf("legacy header timeout want 300s got %v", trLeg.ResponseHeaderTimeout)
+	if trLeg.ResponseHeaderTimeout != 5*time.Second {
+		t.Fatalf("legacy header timeout want 5s got %v", trLeg.ResponseHeaderTimeout)
+	}
+	// clamped: timeout 3 missing => 3
+	cfgClamp := testGatewayConfig(map[string][]string{"shared": {"direct"}}, ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
+	cfgClamp.Retry.TimeoutSeconds = 3
+	cfgClamp.Retry.AttemptTimeoutSeconds = 0
+	cfgClamp.retryAttemptTimeoutPresent = false
+	normClamp, _ := NormalizeConfig("config.json", cfgClamp)
+	if normClamp.Retry.AttemptTimeoutSeconds != 3 {
+		t.Fatalf("clamp header want 3 got %d", normClamp.Retry.AttemptTimeoutSeconds)
+	}
+	gwClamp, _ := NewGateway(normClamp, discardGatewayLogger(), NewMonitor())
+	trClamp := gwClamp.pools["shared"].items[0].client.Transport.(*http.Transport)
+	if trClamp.ResponseHeaderTimeout != 3*time.Second {
+		t.Fatalf("clamp header timeout want 3s got %v", trClamp.ResponseHeaderTimeout)
 	}
 }
 

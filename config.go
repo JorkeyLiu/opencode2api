@@ -443,12 +443,16 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")
 	}
-	// attempt_timeout_seconds preserves deployed semantics: legacy missing
-	// (absent in JSON, zero in direct construction) normalizes to the
-	// whole-route budget so existing deployments do not silently shorten
-	// header waits to 5s. Explicit values are strictly validated.
+	// attempt_timeout_seconds load-time migration correction: a config loaded
+	// from disk where the field is absent normalizes to the canonical default
+	// single-attempt timeout (5 seconds), clamped down to the whole-route
+	// timeout when that is smaller. Explicitly present values keep strict
+	// validation. New/default/example config remains 5.
 	if !cfg.retryAttemptTimeoutPresent && cfg.Retry.AttemptTimeoutSeconds == 0 {
-		cfg.Retry.AttemptTimeoutSeconds = cfg.Retry.TimeoutSeconds
+		cfg.Retry.AttemptTimeoutSeconds = 5
+		if cfg.Retry.AttemptTimeoutSeconds > cfg.Retry.TimeoutSeconds {
+			cfg.Retry.AttemptTimeoutSeconds = cfg.Retry.TimeoutSeconds
+		}
 	}
 	if cfg.Retry.AttemptTimeoutSeconds < 1 || cfg.Retry.AttemptTimeoutSeconds > cfg.Retry.TimeoutSeconds {
 		return Config{}, errors.New("retry.attempt_timeout_seconds must be between 1 and retry.timeout_seconds")
