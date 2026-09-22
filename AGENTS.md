@@ -466,7 +466,7 @@
 ## 7. Validation and Done
 
 - Authoritative gate: `go test ./...` MUST pass (this is the CI gate).
-  `go build -o opencode2api ./` is the supported build check.
+  `go build -o opencode2api ./cmd/opencode2api` is the supported build check.
 - Go changes MUST be `gofmt`-clean before finishing.
 - A task is done only when: the gate above passes for Go-affecting changes
   (or the change is provably not Go-affecting), preserved semantics in
@@ -495,10 +495,10 @@
   ports, healthcheck, volume/seed wiring.
 - `.github/workflows/release.yml` — CI gate (`go test ./...`) and release
   build matrix.
-- Source of truth for behavior: `gateway.go`, `scheduler.go`, `availability.go`, `convert.go`, `stream.go`,
-  `models.go`, `model_metadata.go`, `pool.go`, `runtime.go`, `config.go`,
-  `admin.go`, `observability.go`, `password.go`, `ids.go`, `main.go`,
-  `fallback.go`, `availability_probe.go`, `admin_fallback.go`
+- Source of truth for behavior: `cmd/opencode2api/main.go`, `internal/app/app.go`, `internal/app/gateway.go`, `internal/app/scheduler.go`, `internal/app/availability.go`, `internal/app/convert.go`, `internal/app/stream.go`,
+  `internal/app/models.go`, `internal/app/model_metadata.go`, `internal/app/pool.go`, `internal/app/runtime.go`, `internal/app/config.go`,
+  `internal/app/admin.go`, `internal/app/observability.go`, `internal/app/password.go`, `internal/app/ids.go`,
+  `internal/app/fallback.go`, `internal/app/availability_probe.go`, `internal/app/admin_fallback.go`
   (read them; this guide states relationships, not code locations).
 - No `CLAUDE.md` exists in this repo and none SHOULD be created; tool-specific
   entries, if ever needed, MUST be pointers to or synchronized copies of this

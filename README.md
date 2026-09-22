@@ -148,7 +148,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 需要 Go 1.24 或更高版本。
 
 ```bash
-go build -o opencode2api ./
+go build -o opencode2api ./cmd/opencode2api
 ```
 
 ## 下载

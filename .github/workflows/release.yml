@@ -122,7 +122,7 @@ jobs:
           ARCHIVE_FORMAT: ${{ matrix.archive }}
         run: |
           mkdir -p "dist/$PACKAGE_NAME"
-          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" -o "dist/$PACKAGE_NAME/opencode2api$EXTENSION" ./
+          go build -trimpath -ldflags="-s -w -X main.version=$RELEASE_TAG" -o "dist/$PACKAGE_NAME/opencode2api$EXTENSION" ./cmd/opencode2api
           cp README.md config.example.json "dist/$PACKAGE_NAME/"
           if [[ "$ARCHIVE_FORMAT" == "zip" ]]; then
             (cd dist && zip -q -r "$PACKAGE_NAME.zip" "$PACKAGE_NAME")

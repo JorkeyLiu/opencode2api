@@ -1,0 +1,1552 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type LogEvent struct {
+	Sequence  uint64         `json:"sequence"`
+	Time      time.Time      `json:"time"`
+	Level     string         `json:"level"`
+	Message   string         `json:"message"`
+	Component string         `json:"component,omitempty"`
+	Fields    map[string]any `json:"fields,omitempty"`
+}
+
+type logSubscriber struct {
+	ch chan LogEvent
+}
+
+type LogHub struct {
+	mu          sync.RWMutex
+	buffer      []LogEvent
+	start       int
+	count       int
+	next        uint64
+	subscribers map[uint64]*logSubscriber
+	nextSub     uint64
+}
+
+func NewLogHub(capacity int) *LogHub {
+	if capacity < 100 {
+		capacity = 100
+	}
+	return &LogHub{buffer: make([]LogEvent, capacity), subscribers: make(map[uint64]*logSubscriber)}
+}
+
+func (h *LogHub) Resize(capacity int) {
+	if capacity < 100 {
+		capacity = 100
+	}
+	h.mu.Lock()
+	if capacity == len(h.buffer) {
+		h.mu.Unlock()
+		return
+	}
+	keep := min(h.count, capacity)
+	next := make([]LogEvent, capacity)
+	for i := 0; i < keep; i++ {
+		source := (h.start + h.count - keep + i) % len(h.buffer)
+		next[i] = h.buffer[source]
+	}
+	h.buffer, h.start, h.count = next, 0, keep
+	h.mu.Unlock()
+}
+
+func (h *LogHub) Publish(event LogEvent) {
+	h.mu.Lock()
+	h.next++
+	event.Sequence = h.next
+	if h.count < len(h.buffer) {
+		index := (h.start + h.count) % len(h.buffer)
+		h.buffer[index] = event
+		h.count++
+	} else {
+		h.buffer[h.start] = event
+		h.start = (h.start + 1) % len(h.buffer)
+	}
+	for _, sub := range h.subscribers {
+		select {
+		case sub.ch <- event:
+		default:
+			// A slow browser must never block request processing. Its reconnect
+			// cursor will make the gap visible on the next subscription.
+		}
+	}
+	h.mu.Unlock()
+}
+
+func (h *LogHub) Recent(after uint64, limit int) ([]LogEvent, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if limit < 1 || limit > len(h.buffer) {
+		limit = len(h.buffer)
+	}
+	oldest := uint64(0)
+	if h.count > 0 {
+		oldest = h.buffer[h.start].Sequence
+	}
+	gap := after > 0 && oldest > 0 && after+1 < oldest
+	out := make([]LogEvent, 0, min(limit, h.count))
+	for i := 0; i < h.count; i++ {
+		event := h.buffer[(h.start+i)%len(h.buffer)]
+		if event.Sequence > after {
+			out = append(out, event)
+		}
+	}
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, gap
+}
+
+func (h *LogHub) Subscribe() (<-chan LogEvent, func()) {
+	h.mu.Lock()
+	h.nextSub++
+	id := h.nextSub
+	sub := &logSubscriber{ch: make(chan LogEvent, 128)}
+	h.subscribers[id] = sub
+	h.mu.Unlock()
+	return sub.ch, func() {
+		h.mu.Lock()
+		delete(h.subscribers, id)
+		h.mu.Unlock()
+	}
+}
+
+type SecretRedactor struct {
+	values atomic.Value
+}
+
+func NewSecretRedactor() *SecretRedactor {
+	r := &SecretRedactor{}
+	r.values.Store([]string(nil))
+	return r
+}
+
+func (r *SecretRedactor) Replace(cfg Config) {
+	values := make([]string, 0, len(cfg.ServerKeys)+len(cfg.Keys)+len(cfg.ZenKeys)+len(cfg.GoKeys)+2)
+	values = append(values, cfg.ServerKeys...)
+	values = append(values, cfg.Keys...)
+	values = append(values, cfg.ZenKeys...)
+	values = append(values, cfg.GoKeys...)
+	if cfg.WebUI.Password != "" {
+		values = append(values, cfg.WebUI.Password)
+	}
+	for _, value := range []string{cfg.Upstream.Zen} {
+		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
+			values = append(values, value, parsed.User.Username())
+			if password, ok := parsed.User.Password(); ok {
+				values = append(values, password)
+			}
+		}
+	}
+	appendProxySecrets := func(value string) {
+		if value == "" || value == "direct" {
+			return
+		}
+		values = append(values, value)
+		if parsed, err := url.Parse(value); err == nil && parsed.User != nil {
+			values = append(values, parsed.User.Username())
+			if password, ok := parsed.User.Password(); ok {
+				values = append(values, password)
+			}
+		}
+	}
+	for _, pool := range cfg.ProxyPools {
+		for _, value := range pool.Proxies {
+			appendProxySecrets(strings.TrimSpace(value))
+		}
+		for _, value := range pool.effective {
+			appendProxySecrets(value)
+		}
+	}
+	for _, ch := range cfg.Fallback.Channels {
+		if key := strings.TrimSpace(ch.APIKey); key != "" {
+			values = append(values, key)
+		}
+	}
+	for _, value := range cfg.effectivePools {
+		for _, item := range value {
+			appendProxySecrets(item)
+		}
+	}
+	for _, value := range cfg.Proxies {
+		appendProxySecrets(strings.TrimSpace(value))
+	}
+	sort.Slice(values, func(i, j int) bool { return len(values[i]) > len(values[j]) })
+	r.values.Store(values)
+}
+
+func (r *SecretRedactor) String(value string) string {
+	for _, secret := range r.values.Load().([]string) {
+		if len(secret) >= 4 {
+			value = strings.ReplaceAll(value, secret, "***")
+		}
+	}
+	return value
+}
+
+type hubHandler struct {
+	base     slog.Handler
+	hub      *LogHub
+	redactor *SecretRedactor
+	attrs    []slog.Attr
+	groups   []string
+}
+
+func NewStructuredLogger(level *slog.LevelVar, hub *LogHub, redactor *SecretRedactor) *slog.Logger {
+	return newStructuredLogger(os.Stdout, level, hub, redactor)
+}
+
+func newStructuredLogger(output io.Writer, level *slog.LevelVar, hub *LogHub, redactor *SecretRedactor) *slog.Logger {
+	base := slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level, ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+		return sanitizeLogAttr(redactor, attr)
+	}})
+	return slog.New(&hubHandler{base: base, hub: hub, redactor: redactor})
+}
+
+func sanitizeLogAttr(redactor *SecretRedactor, attr slog.Attr) slog.Attr {
+	attr.Value = attr.Value.Resolve()
+	lower := strings.ToLower(attr.Key)
+	if strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "secret") {
+		return slog.String(attr.Key, "***")
+	}
+	switch attr.Value.Kind() {
+	case slog.KindString:
+		attr.Value = slog.StringValue(redactor.String(attr.Value.String()))
+	case slog.KindAny:
+		if err, ok := attr.Value.Any().(error); ok {
+			attr.Value = slog.StringValue(redactor.String(err.Error()))
+		}
+	}
+	return attr
+}
+
+func (h *hubHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.base.Enabled(ctx, level)
+}
+
+func (h *hubHandler) Handle(ctx context.Context, record slog.Record) error {
+	if err := h.base.Handle(ctx, record); err != nil {
+		return err
+	}
+	fields := make(map[string]any, record.NumAttrs()+len(h.attrs))
+	for _, attr := range h.attrs {
+		h.addAttr(fields, attr)
+	}
+	record.Attrs(func(attr slog.Attr) bool {
+		h.addAttr(fields, attr)
+		return true
+	})
+	component, _ := fields["component"].(string)
+	delete(fields, "component")
+	h.hub.Publish(LogEvent{
+		Time:      record.Time.UTC(),
+		Level:     strings.ToLower(record.Level.String()),
+		Message:   h.redactor.String(record.Message),
+		Component: component,
+		Fields:    fields,
+	})
+	return nil
+}
+
+func (h *hubHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	clone := *h
+	clone.base = h.base.WithAttrs(attrs)
+	clone.attrs = append(append([]slog.Attr(nil), h.attrs...), attrs...)
+	return &clone
+}
+
+func (h *hubHandler) WithGroup(name string) slog.Handler {
+	clone := *h
+	clone.base = h.base.WithGroup(name)
+	clone.groups = append(append([]string(nil), h.groups...), name)
+	return &clone
+}
+
+func (h *hubHandler) addAttr(fields map[string]any, attr slog.Attr) {
+	attr.Value = attr.Value.Resolve()
+	key := attr.Key
+	if len(h.groups) > 0 {
+		key = strings.Join(append(append([]string(nil), h.groups...), key), ".")
+	}
+	lower := strings.ToLower(key)
+	if strings.Contains(lower, "password") || strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "secret") {
+		fields[key] = "***"
+		return
+	}
+	var value any
+	switch attr.Value.Kind() {
+	case slog.KindString:
+		value = h.redactor.String(attr.Value.String())
+	case slog.KindInt64:
+		value = attr.Value.Int64()
+	case slog.KindUint64:
+		value = attr.Value.Uint64()
+	case slog.KindFloat64:
+		value = attr.Value.Float64()
+	case slog.KindBool:
+		value = attr.Value.Bool()
+	case slog.KindDuration:
+		value = attr.Value.Duration().String()
+	case slog.KindTime:
+		value = attr.Value.Time().UTC()
+	default:
+		value = h.redactor.String(fmt.Sprint(attr.Value.Any()))
+	}
+	fields[key] = value
+}
+
+type requestMeta struct {
+	Model             string
+	Tier              string
+	Protocol          string
+	ClientSessionHash string
+	Request           string
+	KeyID             string
+	Channel           string
+	Anonymous         bool
+	Proxy             string
+	ProxyPool         string
+	Attempts          int
+	Stream            bool
+	Usage             bridgeUsage
+	UsageReported     bool
+}
+
+type requestMetaKey struct{}
+
+func metaFromRequest(r *http.Request) *requestMeta {
+	meta, _ := r.Context().Value(requestMetaKey{}).(*requestMeta)
+	return meta
+}
+
+type metricBucket struct {
+	minute        int64
+	total         uint64
+	success       uint64
+	errors        uint64
+	duration      uint64
+	histogram     [11]uint64
+	endpoints     map[string]uint64
+	models        map[string]uint64
+	tiers         map[string]uint64
+	channels      map[string]uint64
+	statuses      map[string]uint64
+	usageRequests uint64
+	usageReported uint64
+	tokens        TokenCounts
+	usageModels   map[string]TokenCounts
+	usageTiers    map[string]TokenCounts
+	usageChannels map[string]TokenCounts
+}
+
+func (b *metricBucket) reset(minute int64) {
+	*b = metricBucket{
+		minute: minute, endpoints: make(map[string]uint64), models: make(map[string]uint64),
+		tiers: make(map[string]uint64), channels: make(map[string]uint64), statuses: make(map[string]uint64),
+		usageModels: make(map[string]TokenCounts), usageTiers: make(map[string]TokenCounts),
+		usageChannels: make(map[string]TokenCounts),
+	}
+}
+
+type TokenCounts struct {
+	Input     uint64 `json:"input_tokens"`
+	Output    uint64 `json:"output_tokens"`
+	Cached    uint64 `json:"cached_tokens"`
+	Reasoning uint64 `json:"reasoning_tokens"`
+	Total     uint64 `json:"total_tokens"`
+}
+
+type UsagePeriod struct {
+	Requests uint64                 `json:"requests"`
+	Reported uint64                 `json:"reported"`
+	Coverage float64                `json:"coverage"`
+	Tokens   TokenCounts            `json:"tokens"`
+	Models   map[string]TokenCounts `json:"models"`
+	Tiers    map[string]TokenCounts `json:"tiers"`
+	// Channels is the additive channel-qualified usage map. For custom
+	// fallback traffic the key is "custom:<channelID>" (old "custom"
+	// records keep that key); zen/go traffic uses its observability
+	// channel ("anonymous"/"key"). Tiers stays aggregated for
+	// compatibility (tiers.custom remains the total).
+	Channels map[string]TokenCounts `json:"channels,omitempty"`
+}
+
+type UsageSnapshot struct {
+	Lifetime UsagePeriod `json:"lifetime"`
+	Window   UsagePeriod `json:"last_hour"`
+}
+
+type AttemptCounts struct {
+	Total   uint64 `json:"total"`
+	Success uint64 `json:"success"`
+	Failed  uint64 `json:"failed"`
+}
+
+type AttemptAggregate struct {
+	AttemptCounts
+	SuccessRate float64                  `json:"success_rate"`
+	Tiers       map[string]AttemptCounts `json:"tiers"`
+	Channels    map[string]AttemptCounts `json:"channels"`
+	Keys        map[string]AttemptCounts `json:"keys"`
+}
+
+type UpstreamAttempt struct {
+	Time              time.Time `json:"time"`
+	RequestID         string    `json:"request_id"`
+	Model             string    `json:"model"`
+	Tier              string    `json:"tier"`
+	Protocol          string    `json:"protocol,omitempty"`
+	ClientSessionHash string    `json:"client_session_hash,omitempty"`
+	Attempt           int       `json:"attempt"`
+	KeyID             string    `json:"key_id"`
+	Channel           string    `json:"channel"`
+	Anonymous         bool      `json:"anonymous"`
+	Proxy             string    `json:"proxy_node"`
+	ProxyPool         string    `json:"proxy_pool,omitempty"`
+	Status            int       `json:"status,omitempty"`
+	DurationMS        int64     `json:"duration_ms"`
+	Success           bool      `json:"success"`
+	Outcome           string    `json:"outcome"`
+	// FailureClass is the shared upstream attempt classification
+	// (see classifyUpstreamAttempt). It is additive for WebUI consumers;
+	// Outcome is retained for backward compatibility.
+	FailureClass string `json:"failure_class"`
+	Retryable    bool   `json:"retryable"`
+	CoolsDown    bool   `json:"cools_down"`
+	// RouteSessionReplay marks the exact-400 same-target replay attempt.
+	// Dropped flags are true only when the replay actually removed that
+	// category of stale Responses refs; all three are omitted (false) on
+	// first/non-replay attempts.
+	RouteSessionReplay        bool `json:"route_session_replay,omitempty"`
+	DroppedPreviousResponseID bool `json:"dropped_previous_response_id,omitempty"`
+	DroppedReasoningRefs      bool `json:"dropped_reasoning_refs,omitempty"`
+	// Bounded 400 diagnostic (exact 400 only, additive schema v1).
+	// error_hint is the fixed enum, error_type/code are sanitized short
+	// allowlist values (omitted when unsafe), error_fingerprint is the
+	// short domain-separated grouping hash. Raw message/body/param/IDs are
+	// never stored. Non-400 attempts omit all four.
+	ErrorHint        string `json:"error_hint,omitempty"`
+	ErrorType        string `json:"error_type,omitempty"`
+	ErrorCode        string `json:"error_code,omitempty"`
+	ErrorFingerprint string `json:"error_fingerprint,omitempty"`
+}
+
+// Shared upstream attempt failure classes. The set is intentionally small
+// and stable: the scheduler treats anonymous and authenticated channels
+// as credential types and routes on (tier, credential, proxy, model) for
+// 403/5xx, on (pool, proxy) globally for 429, and on credential globally
+// for 401, while proxy health continues to mean transport connectivity
+// only. The rate_limited/retryable/cools_down shape is frozen for
+// compatibility; history schema is unchanged.
+const (
+	AttemptClassSuccess          = "success"
+	AttemptClassTransportFailure = "transport_failure"
+	AttemptClassAuthFailure      = "auth_failure"
+	AttemptClassRateLimited      = "rate_limited"
+	AttemptClassUpstreamFailure  = "upstream_failure"
+	AttemptClassTransientClient  = "transient_client"
+	AttemptClassClientRejected   = "client_rejected"
+	AttemptClassOtherResponse    = "other_response"
+)
+
+// anonymousCredentialID is the stable literal used for the shared public
+// credential in all observability output. Full keys must never appear here.
+const anonymousCredentialID = "anonymous"
+
+// attemptClassification carries the current routing semantics for one
+// upstream attempt without changing control flow. Retryable mirrors the
+// fallback action (transport failures, 408/425, 401/403/429, 5xx, and other
+// responses advance the frozen candidate list; route-terminal 400 and
+// ordinary 4xx do not); CoolsDown mirrors whether the attempt class can cool
+// scheduler state (credential for 401, pool-qualified proxy for 429, target
+// for 403/5xx). 408/425 are transient client responses: retryable and
+// state-neutral, never ordinary client rejections. Transport attempts never
+// cool scheduler state; they only trigger the async neutral proxy health
+// verification. The scheduler itself branches on status codes for ownership;
+// callers only read these flags for observability.
+type attemptClassification struct {
+	Class     string
+	Retryable bool
+	CoolsDown bool
+}
+
+// classifyAttempt is pure: it branches only on status code and transport
+// error presence, never on error text, so secrets in error strings cannot
+// leak into classification output.
+func classifyAttempt(status int, transportError bool) attemptClassification {
+	if !transportError && status >= 200 && status < 300 {
+		return attemptClassification{Class: AttemptClassSuccess}
+	}
+	if transportError {
+		return attemptClassification{Class: AttemptClassTransportFailure, Retryable: true}
+	}
+	switch {
+	case status == 401 || status == 403:
+		return attemptClassification{Class: AttemptClassAuthFailure, Retryable: true, CoolsDown: true}
+	case status == 429:
+		return attemptClassification{Class: AttemptClassRateLimited, Retryable: true, CoolsDown: true}
+	case status == 408 || status == 425:
+		return attemptClassification{Class: AttemptClassTransientClient, Retryable: true}
+	case status >= 500:
+		return attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
+	case status >= 400 && status < 500:
+		return attemptClassification{Class: AttemptClassClientRejected}
+	default:
+		return attemptClassification{Class: AttemptClassOtherResponse, Retryable: true}
+	}
+}
+
+// classifyUpstreamAttempt is the single shared entry point for anonymous and
+// authenticated attempts. Do not copy its branching elsewhere.
+func classifyUpstreamAttempt(resp *http.Response, err error) attemptClassification {
+	status := 0
+	if resp != nil {
+		status = resp.StatusCode
+	}
+	return classifyAttempt(status, err != nil)
+}
+
+// outcomeFromClass preserves the historical Outcome vocabulary for existing
+// WebUI consumers while new readers use FailureClass directly.
+func outcomeFromClass(class string, success bool) string {
+	if success || class == AttemptClassSuccess {
+		return "success"
+	}
+	switch class {
+	case AttemptClassTransportFailure:
+		return "transport_error"
+	case AttemptClassClientRejected:
+		return "rejected"
+	default:
+		return "retryable_failure"
+	}
+}
+
+// UpstreamRequest is the credential route that was actually used for one
+// client inference request. It is kept separately from UpstreamAttempt,
+// because a single request can try several keys before it succeeds.
+// Per-request cache tokens are populated only after upstream reports usage:
+// UsageReported false means unknown (WebUI shows —), never zero-as-known.
+// Cache hit is bridgeUsage.Cached; cache miss is
+// max(bridgeUsage.Input-bridgeUsage.Cached, 0) and therefore includes cache
+// creation/write plus ordinary uncached prompt tokens (not an exact
+// uncached-vs-creation split). Reasoning/total ride the same reported gate:
+// old persisted lines lack them (zero, legacy_incomplete) and are never
+// estimated. Attempts never receive request-final usage.
+type UpstreamRequest struct {
+	Time              time.Time `json:"time"`
+	RequestID         string    `json:"request_id"`
+	Model             string    `json:"model"`
+	Tier              string    `json:"tier,omitempty"`
+	Protocol          string    `json:"protocol,omitempty"`
+	ClientSessionHash string    `json:"client_session_hash,omitempty"`
+	KeyID             string    `json:"key_id,omitempty"`
+	Channel           string    `json:"channel"`
+	Anonymous         bool      `json:"anonymous"`
+	Proxy             string    `json:"proxy_node,omitempty"`
+	ProxyPool         string    `json:"proxy_pool,omitempty"`
+	Attempts          int       `json:"attempts"`
+	Status            int       `json:"status"`
+	DurationMS        int64     `json:"duration_ms"`
+	Success           bool      `json:"success"`
+	Outcome           string    `json:"outcome"`
+	UsageReported     bool      `json:"usage_reported"`
+	InputTokens       int       `json:"input_tokens,omitempty"`
+	OutputTokens      int       `json:"output_tokens,omitempty"`
+	CacheHitTokens    int       `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens   int       `json:"cache_miss_tokens,omitempty"`
+	ReasoningTokens   int       `json:"reasoning_tokens,omitempty"`
+	TotalTokens       int       `json:"total_tokens,omitempty"`
+}
+
+// cacheHitMiss derives the per-request cache display pair from reported
+// bridge usage. Hit is the reported cached read volume; miss is the residual
+// max(Input-Cached, 0) and therefore bundles cache creation/write with
+// ordinary uncached prompt tokens. Negative inputs clamp to zero; a
+// cached-greater-than-input anomaly clamps miss to zero while preserving hit.
+func cacheHitMiss(usage bridgeUsage) (hit, miss int) {
+	hit = max(usage.Cached, 0)
+	miss = max(usage.Input-usage.Cached, 0)
+	return hit, miss
+}
+
+type attemptBucket struct {
+	minute    int64
+	aggregate AttemptAggregate
+}
+
+// ResourceCounts is one bounded, process-local aggregation cell for the
+// last-hour window. Proxy health is transport connectivity only; business
+// failures (429/4xx/5xx) are counted here without marking proxies unhealthy.
+type ResourceCounts struct {
+	Attempts          uint64  `json:"attempts"`
+	Success           uint64  `json:"success"`
+	Failed            uint64  `json:"failed"`
+	RateLimited       uint64  `json:"rate_limited"`
+	AuthFailures      uint64  `json:"auth_failures"`
+	ClientRejected    uint64  `json:"client_rejected"`
+	ServerFailures    uint64  `json:"server_failures"`
+	TransportFailures uint64  `json:"transport_failures"`
+	AverageMS         float64 `json:"average_ms"`
+	totalDurationMS   int64
+}
+
+// AttemptResources exposes existing attempt data along the future scheduling
+// dimensions (tier, credential, proxy, model). This unit ships the proxy,
+// credential, and credential+proxy views; tier/model remain on each attempt.
+type AttemptResources struct {
+	Proxies     map[string]ResourceCounts `json:"proxies"`
+	Credentials map[string]ResourceCounts `json:"credentials"`
+	Pairs       map[string]ResourceCounts `json:"pairs"`
+}
+
+type resourceBucket struct {
+	minute  int64
+	proxies map[string]*ResourceCounts
+	creds   map[string]*ResourceCounts
+	pairs   map[string]*ResourceCounts
+}
+
+const (
+	resourceMaxProxies     = 256
+	resourceMaxCredentials = 256
+	resourceMaxPairs       = 1024
+	resourceOtherKey       = "_other"
+)
+
+type UpstreamSnapshot struct {
+	Lifetime AttemptAggregate  `json:"lifetime"`
+	Window   AttemptAggregate  `json:"last_hour"`
+	Requests []UpstreamRequest `json:"requests"`
+	Recent   []UpstreamAttempt `json:"recent"`
+}
+
+const (
+	monitorRecentRequestCapacity = 10000
+	monitorRecentAttemptCapacity = 20000
+	monitorRecentOutputLimit     = 500
+)
+
+type upstreamRequestRing struct {
+	items []UpstreamRequest
+	start int
+	count int
+}
+
+func newUpstreamRequestRing() upstreamRequestRing {
+	return upstreamRequestRing{items: make([]UpstreamRequest, monitorRecentRequestCapacity)}
+}
+
+func (ring *upstreamRequestRing) Add(value UpstreamRequest) {
+	if len(ring.items) == 0 {
+		ring.items = make([]UpstreamRequest, monitorRecentRequestCapacity)
+	}
+	index := (ring.start + ring.count) % len(ring.items)
+	if ring.count == len(ring.items) {
+		ring.items[index] = value
+		ring.start = (ring.start + 1) % len(ring.items)
+		return
+	}
+	ring.items[index] = value
+	ring.count++
+}
+
+func (ring *upstreamRequestRing) PruneBefore(cutoff time.Time) {
+	for ring.count > 0 && ring.items[ring.start].Time.Before(cutoff) {
+		ring.items[ring.start] = UpstreamRequest{}
+		ring.start = (ring.start + 1) % len(ring.items)
+		ring.count--
+	}
+}
+
+func (ring *upstreamRequestRing) Snapshot(cutoff time.Time, limit int) []UpstreamRequest {
+	if limit < 1 || ring.count == 0 {
+		return nil
+	}
+	result := make([]UpstreamRequest, 0, min(ring.count, limit))
+	for offset := 0; offset < ring.count; offset++ {
+		value := ring.items[(ring.start+offset)%len(ring.items)]
+		if !value.Time.Before(cutoff) {
+			result = append(result, value)
+		}
+	}
+	if len(result) > limit {
+		result = result[len(result)-limit:]
+	}
+	return result
+}
+
+type upstreamAttemptRing struct {
+	items []UpstreamAttempt
+	start int
+	count int
+}
+
+func newUpstreamAttemptRing() upstreamAttemptRing {
+	return upstreamAttemptRing{items: make([]UpstreamAttempt, monitorRecentAttemptCapacity)}
+}
+
+func (ring *upstreamAttemptRing) Add(value UpstreamAttempt) {
+	if len(ring.items) == 0 {
+		ring.items = make([]UpstreamAttempt, monitorRecentAttemptCapacity)
+	}
+	index := (ring.start + ring.count) % len(ring.items)
+	if ring.count == len(ring.items) {
+		ring.items[index] = value
+		ring.start = (ring.start + 1) % len(ring.items)
+		return
+	}
+	ring.items[index] = value
+	ring.count++
+}
+
+func (ring *upstreamAttemptRing) PruneBefore(cutoff time.Time) {
+	for ring.count > 0 && ring.items[ring.start].Time.Before(cutoff) {
+		ring.items[ring.start] = UpstreamAttempt{}
+		ring.start = (ring.start + 1) % len(ring.items)
+		ring.count--
+	}
+}
+
+func (ring *upstreamAttemptRing) Snapshot(cutoff time.Time, limit int) []UpstreamAttempt {
+	if limit < 1 || ring.count == 0 {
+		return nil
+	}
+	result := make([]UpstreamAttempt, 0, min(ring.count, limit))
+	for offset := 0; offset < ring.count; offset++ {
+		value := ring.items[(ring.start+offset)%len(ring.items)]
+		if !value.Time.Before(cutoff) {
+			result = append(result, value)
+		}
+	}
+	if len(result) > limit {
+		result = result[len(result)-limit:]
+	}
+	return result
+}
+
+type Monitor struct {
+	started         time.Time
+	active          atomic.Int64
+	activeStreams   atomic.Int64
+	total           atomic.Uint64
+	success         atomic.Uint64
+	errors          atomic.Uint64
+	mu              sync.Mutex
+	buckets         [60]metricBucket
+	lifetimeUsage   UsagePeriod
+	attemptLifetime AttemptAggregate
+	attemptBuckets  [60]attemptBucket
+	resourceBuckets [60]resourceBucket
+	recentRequests  upstreamRequestRing
+	recentAttempts  upstreamAttemptRing
+	history         atomic.Pointer[HistoryStore]
+}
+
+func NewMonitor() *Monitor {
+	return &Monitor{
+		started:         time.Now().UTC(),
+		lifetimeUsage:   newUsagePeriod(),
+		attemptLifetime: newAttemptAggregate(),
+		recentRequests:  newUpstreamRequestRing(),
+		recentAttempts:  newUpstreamAttemptRing(),
+	}
+}
+
+var latencyBounds = [...]uint64{50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000}
+
+func (m *Monitor) Record(endpoint string, status int, duration time.Duration, meta *requestMeta) {
+	m.total.Add(1)
+	if status >= 200 && status < 400 {
+		m.success.Add(1)
+	} else {
+		m.errors.Add(1)
+	}
+	minute := time.Now().Unix() / 60
+	m.mu.Lock()
+	bucket := &m.buckets[minute%60]
+	if bucket.minute != minute {
+		bucket.reset(minute)
+	}
+	bucket.total++
+	if status >= 200 && status < 400 {
+		bucket.success++
+	} else {
+		bucket.errors++
+	}
+	milliseconds := uint64(max(duration.Milliseconds(), 0))
+	bucket.duration += milliseconds
+	index := len(latencyBounds)
+	for i, bound := range latencyBounds {
+		if milliseconds <= bound {
+			index = i
+			break
+		}
+	}
+	bucket.histogram[index]++
+	bucket.endpoints[endpoint]++
+	bucket.statuses[fmt.Sprint(status)]++
+	var historyReq *UpstreamRequest
+	if meta != nil {
+		if meta.Model != "" {
+			bucket.models[meta.Model]++
+		}
+		if meta.Tier != "" {
+			bucket.tiers[meta.Tier]++
+			if meta.Channel != "" {
+				if bucket.channels == nil {
+					bucket.channels = make(map[string]uint64)
+				}
+				bucket.channels[meta.Channel]++
+			}
+			bucket.usageRequests++
+			m.lifetimeUsage.Requests++
+			if meta.UsageReported {
+				bucket.usageReported++
+				m.lifetimeUsage.Reported++
+			}
+			tokens := tokenCounts(meta.Usage)
+			addTokenCounts(&bucket.tokens, tokens)
+			addTokenCounts(&m.lifetimeUsage.Tokens, tokens)
+			addTokenMap(bucket.usageModels, meta.Model, tokens)
+			addTokenMap(bucket.usageTiers, meta.Tier, tokens)
+			addTokenMap(m.lifetimeUsage.Models, meta.Model, tokens)
+			addTokenMap(m.lifetimeUsage.Tiers, meta.Tier, tokens)
+			if meta.Channel != "" {
+				if bucket.usageChannels == nil {
+					bucket.usageChannels = make(map[string]TokenCounts)
+				}
+				addTokenMap(bucket.usageChannels, meta.Channel, tokens)
+				if m.lifetimeUsage.Channels == nil {
+					m.lifetimeUsage.Channels = make(map[string]TokenCounts)
+				}
+				addTokenMap(m.lifetimeUsage.Channels, meta.Channel, tokens)
+			}
+		}
+		if meta.Request != "" && meta.Model != "" {
+			request := UpstreamRequest{
+				Time: time.Now().UTC(), RequestID: meta.Request, Model: meta.Model, Tier: meta.Tier,
+				Protocol: meta.Protocol, ClientSessionHash: meta.ClientSessionHash,
+				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy, ProxyPool: meta.ProxyPool,
+				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
+				Success: status >= 200 && status < 400,
+			}
+			if meta.UsageReported {
+				hit, miss := cacheHitMiss(meta.Usage)
+				request.UsageReported = true
+				request.InputTokens = max(meta.Usage.Input, 0)
+				request.OutputTokens = max(meta.Usage.Output, 0)
+				request.CacheHitTokens = hit
+				request.CacheMissTokens = miss
+				request.ReasoningTokens = max(meta.Usage.Reasoning, 0)
+				request.TotalTokens = max(meta.Usage.Total, 0)
+			}
+			if request.Channel == "" {
+				request.Channel = "not_routed"
+			}
+			if request.Anonymous {
+				request.KeyID = "anonymous"
+			}
+			request.Outcome = requestOutcome(status, request.Channel)
+			m.recentRequests.PruneBefore(request.Time.Add(-time.Hour))
+			m.recentRequests.Add(request)
+			historyReq = &request
+		}
+	}
+	m.mu.Unlock()
+	if historyReq != nil {
+		m.enqueueHistoryRequest(*historyReq)
+	}
+}
+
+func requestOutcome(status int, channel string) string {
+	if channel == "" || channel == "not_routed" {
+		return "not_routed"
+	}
+	if status >= 200 && status < 400 {
+		return "success"
+	}
+	if status >= 400 && status < 500 {
+		return "client_error"
+	}
+	if status >= 500 {
+		return "server_error"
+	}
+	return "unknown"
+}
+
+func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
+	if attempt.Time.IsZero() {
+		attempt.Time = time.Now().UTC()
+	} else {
+		attempt.Time = attempt.Time.UTC()
+	}
+	// Normalize observability identities at the single ingestion point so
+	// no caller can leak a full key, secret, or raw proxy URL. Anonymous
+	// always uses the stable literal; proxy labels stay redacted.
+	if attempt.Anonymous || attempt.Channel == anonymousCredentialID || attempt.KeyID == anonymousCredentialID {
+		attempt.Anonymous = true
+		attempt.KeyID = anonymousCredentialID
+	}
+	attempt.Proxy = normalizeProxyLabel(attempt.Proxy)
+	// Bounded 400 diagnostic hygiene at the single ingestion point: only
+	// exact 400 retains hint/type/code/fingerprint, type/code are
+	// re-sanitized, hint is restricted to the fixed enum, and fingerprint
+	// must look like the short e400_ domain hash. Anything else is omitted
+	// so non-400 attempts never carry fields and unsafe values never persist.
+	if attempt.Status != http.StatusBadRequest {
+		attempt.ErrorHint, attempt.ErrorType, attempt.ErrorCode, attempt.ErrorFingerprint = "", "", "", ""
+	} else {
+		if !validErrorHint(attempt.ErrorHint) {
+			attempt.ErrorHint = ""
+			// Exact 400 without a valid hint still groups as unknown when a
+			// fingerprint exists; a bare attempt without either stays omitted.
+			if attempt.ErrorFingerprint != "" {
+				attempt.ErrorHint = ErrorHintUnknown
+			}
+		}
+		attempt.ErrorType = sanitizeErrorAttr(attempt.ErrorType)
+		attempt.ErrorCode = sanitizeErrorAttr(attempt.ErrorCode)
+		if attempt.ErrorFingerprint != "" && !isErrorFingerprint(attempt.ErrorFingerprint) {
+			attempt.ErrorFingerprint = ""
+		}
+		if attempt.ErrorHint == "" && attempt.ErrorType == "" && attempt.ErrorCode == "" && attempt.ErrorFingerprint == "" {
+			// keep omitted
+		} else if attempt.ErrorHint == "" {
+			attempt.ErrorHint = ErrorHintUnknown
+		}
+	}
+	if attempt.FailureClass == "" {
+		class := classifyAttempt(attempt.Status, false)
+		if !attempt.Success && attempt.Status == 0 {
+			// Status 0 with a recorded failure and no explicit class comes
+			// from a transport error path; keep the shared mapping central.
+			class = classifyAttempt(0, true)
+		}
+		attempt.FailureClass, attempt.Retryable, attempt.CoolsDown = class.Class, class.Retryable, class.CoolsDown
+	}
+	if attempt.Outcome == "" {
+		attempt.Outcome = outcomeFromClass(attempt.FailureClass, attempt.Success)
+	}
+	minute := attempt.Time.Unix() / 60
+	m.mu.Lock()
+	recordAttemptAggregate(&m.attemptLifetime, attempt)
+	bucket := &m.attemptBuckets[minute%60]
+	if bucket.minute != minute {
+		*bucket = attemptBucket{minute: minute, aggregate: newAttemptAggregate()}
+	}
+	recordAttemptAggregate(&bucket.aggregate, attempt)
+	rbucket := &m.resourceBuckets[minute%60]
+	if rbucket.minute != minute {
+		*rbucket = resourceBucket{minute: minute}
+	}
+	recordResourceBucket(rbucket, attempt)
+	m.recentAttempts.PruneBefore(attempt.Time.Add(-time.Hour))
+	m.recentAttempts.Add(attempt)
+	m.mu.Unlock()
+	m.enqueueHistoryAttempt(attempt)
+}
+
+// normalizeProxyLabel keeps proxy observability labels bounded and secret
+// free. Empty becomes "unavailable"; URL credentials are stripped.
+func normalizeProxyLabel(value string) string {
+	if value == "" {
+		return "unavailable"
+	}
+	return redactURL(value)
+}
+
+// resourceCredentialID maps one attempt to its credential view key. Both
+// future credential types collapse here: the shared public credential uses
+// the stable literal, authenticated keys use their (already suffix-only)
+// display ID qualified by channel. Custom channels never double-prefix:
+// KeyID already carries "custom:<id>" (old and new records), so it is
+// returned directly instead of "custom:custom:<id>".
+func resourceCredentialID(attempt UpstreamAttempt) string {
+	if attempt.Anonymous || attempt.KeyID == anonymousCredentialID || attempt.Channel == anonymousCredentialID {
+		return anonymousCredentialID
+	}
+	if attempt.KeyID == "" {
+		return "not_routed"
+	}
+	if strings.HasPrefix(attempt.KeyID, string(TierCustom)+":") {
+		return attempt.KeyID
+	}
+	if attempt.Channel == "" {
+		return attempt.KeyID
+	}
+	if strings.HasPrefix(attempt.Channel, string(TierCustom)+":") || attempt.Channel == string(TierCustom) {
+		if strings.HasPrefix(attempt.Channel, string(TierCustom)+":") {
+			return attempt.Channel
+		}
+		return attempt.KeyID
+	}
+	return attempt.Channel + ":" + attempt.KeyID
+}
+
+func poolQualifiedProxyID(pool, proxy string) string {
+	if pool == "" {
+		return proxy
+	}
+	return pool + " @ " + proxy
+}
+
+func poolQualifiedPairID(cred, pool, proxy string) string {
+	if pool == "" {
+		return cred + " @ " + proxy
+	}
+	return cred + " @ " + pool + " @ " + proxy
+}
+
+func recordResourceBucket(bucket *resourceBucket, attempt UpstreamAttempt) {
+	durationMS := max(attempt.DurationMS, 0)
+	proxy := attempt.Proxy
+	if proxy == "" {
+		proxy = "unavailable"
+	}
+	cred := resourceCredentialID(attempt)
+	if bucket.proxies == nil {
+		bucket.proxies = make(map[string]*ResourceCounts)
+	}
+	if bucket.creds == nil {
+		bucket.creds = make(map[string]*ResourceCounts)
+	}
+	if bucket.pairs == nil {
+		bucket.pairs = make(map[string]*ResourceCounts)
+	}
+	addResourceSample(bucket.proxies, resourceMaxProxies, poolQualifiedProxyID(attempt.ProxyPool, proxy), attempt, durationMS)
+	addResourceSample(bucket.creds, resourceMaxCredentials, cred, attempt, durationMS)
+	addResourceSample(bucket.pairs, resourceMaxPairs, poolQualifiedPairID(cred, attempt.ProxyPool, proxy), attempt, durationMS)
+}
+
+// addResourceSample updates one bounded dimension map. New keys beyond the
+// cap fold into "_other" to keep memory bounded under config churn.
+func addResourceSample(dst map[string]*ResourceCounts, cap int, key string, attempt UpstreamAttempt, durationMS int64) {
+	cell, ok := dst[key]
+	if !ok {
+		if len(dst) >= cap {
+			key = resourceOtherKey
+			cell, ok = dst[key]
+			if !ok {
+				cell = &ResourceCounts{}
+				dst[key] = cell
+			}
+		} else {
+			cell = &ResourceCounts{}
+			dst[key] = cell
+		}
+	}
+	cell.Attempts++
+	if attempt.Success {
+		cell.Success++
+	} else {
+		cell.Failed++
+	}
+	switch attempt.FailureClass {
+	case AttemptClassRateLimited:
+		cell.RateLimited++
+	case AttemptClassAuthFailure:
+		cell.AuthFailures++
+	case AttemptClassClientRejected:
+		cell.ClientRejected++
+	case AttemptClassUpstreamFailure:
+		cell.ServerFailures++
+	case AttemptClassTransportFailure:
+		cell.TransportFailures++
+	}
+	cell.totalDurationMS += durationMS
+}
+
+func mergeResourceMaps(target map[string]ResourceCounts, source map[string]*ResourceCounts, cap int) {
+	for key, cell := range source {
+		if cell == nil {
+			continue
+		}
+		outKey := key
+		if _, ok := target[outKey]; !ok && len(target) >= cap {
+			outKey = resourceOtherKey
+		}
+		merged := target[outKey]
+		merged.Attempts += cell.Attempts
+		merged.Success += cell.Success
+		merged.Failed += cell.Failed
+		merged.RateLimited += cell.RateLimited
+		merged.AuthFailures += cell.AuthFailures
+		merged.ClientRejected += cell.ClientRejected
+		merged.ServerFailures += cell.ServerFailures
+		merged.TransportFailures += cell.TransportFailures
+		merged.totalDurationMS += cell.totalDurationMS
+		target[outKey] = merged
+	}
+}
+
+func finalizeResourceMap(target map[string]ResourceCounts) {
+	for key, cell := range target {
+		if cell.Attempts > 0 {
+			cell.AverageMS = float64(cell.totalDurationMS) / float64(cell.Attempts)
+		}
+		cell.totalDurationMS = 0
+		target[key] = cell
+	}
+}
+
+type MonitorSnapshot struct {
+	StartedAt        time.Time         `json:"started_at"`
+	UptimeSeconds    int64             `json:"uptime_seconds"`
+	Active           int64             `json:"active_requests"`
+	ActiveStreams    int64             `json:"active_streams"`
+	Lifetime         MetricSummary     `json:"lifetime"`
+	Window           MetricSummary     `json:"last_hour"`
+	Series           []MetricSeries    `json:"series"`
+	Endpoints        map[string]uint64 `json:"endpoints"`
+	Models           map[string]uint64 `json:"models"`
+	Tiers            map[string]uint64 `json:"tiers"`
+	Channels         map[string]uint64 `json:"channels,omitempty"`
+	Statuses         map[string]uint64 `json:"statuses"`
+	Usage            UsageSnapshot     `json:"usage"`
+	Upstream         UpstreamSnapshot  `json:"upstream"`
+	AttemptResources AttemptResources  `json:"attempt_resources"`
+}
+
+type MetricSummary struct {
+	Total       uint64  `json:"total"`
+	Success     uint64  `json:"success"`
+	Errors      uint64  `json:"errors"`
+	SuccessRate float64 `json:"success_rate"`
+	AverageMS   float64 `json:"average_ms,omitempty"`
+	P50MS       uint64  `json:"p50_ms,omitempty"`
+	P95MS       uint64  `json:"p95_ms,omitempty"`
+	P99MS       uint64  `json:"p99_ms,omitempty"`
+}
+
+type MetricSeries struct {
+	Minute          time.Time `json:"minute"`
+	Total           uint64    `json:"total"`
+	Success         uint64    `json:"success"`
+	Errors          uint64    `json:"errors"`
+	InputTokens     uint64    `json:"input_tokens"`
+	OutputTokens    uint64    `json:"output_tokens"`
+	CachedTokens    uint64    `json:"cached_tokens"`
+	ReasoningTokens uint64    `json:"reasoning_tokens"`
+	TotalTokens     uint64    `json:"total_tokens"`
+	UsageReported   uint64    `json:"usage_reported"`
+}
+
+func (m *Monitor) Snapshot() MonitorSnapshot {
+	nowMinute := time.Now().Unix() / 60
+	window := MetricSummary{}
+	var histogram [11]uint64
+	endpoints, models, tiers, channels, statuses := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
+	series := make([]MetricSeries, 0, 60)
+	usageWindow := newUsagePeriod()
+	upstreamWindow := newAttemptAggregate()
+	windowResources := AttemptResources{
+		Proxies:     make(map[string]ResourceCounts),
+		Credentials: make(map[string]ResourceCounts),
+		Pairs:       make(map[string]ResourceCounts),
+	}
+	var recentRequests []UpstreamRequest
+	var recentAttempts []UpstreamAttempt
+	m.mu.Lock()
+	for offset := int64(59); offset >= 0; offset-- {
+		minute := nowMinute - offset
+		bucket := &m.buckets[minute%60]
+		entry := MetricSeries{Minute: time.Unix(minute*60, 0).UTC()}
+		if bucket.minute == minute {
+			entry.Total, entry.Success, entry.Errors = bucket.total, bucket.success, bucket.errors
+			entry.InputTokens, entry.OutputTokens = bucket.tokens.Input, bucket.tokens.Output
+			entry.CachedTokens, entry.ReasoningTokens, entry.TotalTokens = bucket.tokens.Cached, bucket.tokens.Reasoning, bucket.tokens.Total
+			entry.UsageReported = bucket.usageReported
+			window.Total += bucket.total
+			window.Success += bucket.success
+			window.Errors += bucket.errors
+			window.AverageMS += float64(bucket.duration)
+			for i := range histogram {
+				histogram[i] += bucket.histogram[i]
+			}
+			mergeCounts(endpoints, bucket.endpoints)
+			mergeCounts(models, bucket.models)
+			mergeCounts(tiers, bucket.tiers)
+			mergeCounts(channels, bucket.channels)
+			mergeCounts(statuses, bucket.statuses)
+			usageWindow.Requests += bucket.usageRequests
+			usageWindow.Reported += bucket.usageReported
+			addTokenCounts(&usageWindow.Tokens, bucket.tokens)
+			mergeTokenMaps(usageWindow.Models, bucket.usageModels)
+			mergeTokenMaps(usageWindow.Tiers, bucket.usageTiers)
+			mergeTokenMaps(usageWindow.Channels, bucket.usageChannels)
+		}
+		attemptBucket := &m.attemptBuckets[minute%60]
+		if attemptBucket.minute == minute {
+			mergeAttemptAggregate(&upstreamWindow, attemptBucket.aggregate)
+		}
+		rbucket := &m.resourceBuckets[minute%60]
+		if rbucket.minute == minute {
+			mergeResourceMaps(windowResources.Proxies, rbucket.proxies, resourceMaxProxies)
+			mergeResourceMaps(windowResources.Credentials, rbucket.creds, resourceMaxCredentials)
+			mergeResourceMaps(windowResources.Pairs, rbucket.pairs, resourceMaxPairs)
+		}
+		series = append(series, entry)
+	}
+	usageLifetime := cloneUsagePeriod(m.lifetimeUsage)
+	upstreamLifetime := cloneAttemptAggregate(m.attemptLifetime)
+	cutoff := time.Now().Add(-time.Hour)
+	m.recentRequests.PruneBefore(cutoff)
+	m.recentAttempts.PruneBefore(cutoff)
+	recentRequests = m.recentRequests.Snapshot(cutoff, monitorRecentOutputLimit)
+	recentAttempts = m.recentAttempts.Snapshot(cutoff, monitorRecentOutputLimit)
+	m.mu.Unlock()
+	finalizeUsagePeriod(&usageLifetime)
+	finalizeUsagePeriod(&usageWindow)
+	finalizeAttemptAggregate(&upstreamLifetime)
+	finalizeAttemptAggregate(&upstreamWindow)
+	finalizeResourceMap(windowResources.Proxies)
+	finalizeResourceMap(windowResources.Credentials)
+	finalizeResourceMap(windowResources.Pairs)
+	if window.Total > 0 {
+		window.SuccessRate = float64(window.Success) / float64(window.Total)
+		window.AverageMS /= float64(window.Total)
+		window.P50MS = histogramPercentile(histogram, window.Total, 0.50)
+		window.P95MS = histogramPercentile(histogram, window.Total, 0.95)
+		window.P99MS = histogramPercentile(histogram, window.Total, 0.99)
+	}
+	lifetime := MetricSummary{Total: m.total.Load(), Success: m.success.Load(), Errors: m.errors.Load()}
+	if lifetime.Total > 0 {
+		lifetime.SuccessRate = float64(lifetime.Success) / float64(lifetime.Total)
+	}
+	return MonitorSnapshot{
+		StartedAt: m.started, UptimeSeconds: int64(time.Since(m.started).Seconds()), Active: m.active.Load(),
+		ActiveStreams: m.activeStreams.Load(), Lifetime: lifetime, Window: window, Series: series,
+		Endpoints: endpoints, Models: models, Tiers: tiers, Channels: channels, Statuses: statuses,
+		Usage:            UsageSnapshot{Lifetime: usageLifetime, Window: usageWindow},
+		Upstream:         UpstreamSnapshot{Lifetime: upstreamLifetime, Window: upstreamWindow, Requests: recentRequests, Recent: recentAttempts},
+		AttemptResources: windowResources,
+	}
+}
+
+func mergeCounts(target, source map[string]uint64) {
+	for key, value := range source {
+		target[key] += value
+	}
+}
+
+func newUsagePeriod() UsagePeriod {
+	return UsagePeriod{Models: make(map[string]TokenCounts), Tiers: make(map[string]TokenCounts), Channels: make(map[string]TokenCounts)}
+}
+
+func tokenCounts(usage bridgeUsage) TokenCounts {
+	return TokenCounts{
+		Input: uint64(max(usage.Input, 0)), Output: uint64(max(usage.Output, 0)),
+		Cached: uint64(max(usage.Cached, 0)), Reasoning: uint64(max(usage.Reasoning, 0)), Total: uint64(max(usage.Total, 0)),
+	}
+}
+
+func addTokenCounts(target *TokenCounts, source TokenCounts) {
+	target.Input += source.Input
+	target.Output += source.Output
+	target.Cached += source.Cached
+	target.Reasoning += source.Reasoning
+	target.Total += source.Total
+}
+
+func addTokenMap(target map[string]TokenCounts, key string, value TokenCounts) {
+	if key == "" {
+		return
+	}
+	current := target[key]
+	addTokenCounts(&current, value)
+	target[key] = current
+}
+
+func mergeTokenMaps(target, source map[string]TokenCounts) {
+	for key, value := range source {
+		addTokenMap(target, key, value)
+	}
+}
+
+func cloneUsagePeriod(source UsagePeriod) UsagePeriod {
+	result := newUsagePeriod()
+	result.Requests, result.Reported, result.Tokens = source.Requests, source.Reported, source.Tokens
+	mergeTokenMaps(result.Models, source.Models)
+	mergeTokenMaps(result.Tiers, source.Tiers)
+	mergeTokenMaps(result.Channels, source.Channels)
+	return result
+}
+
+func finalizeUsagePeriod(period *UsagePeriod) {
+	if period.Requests > 0 {
+		period.Coverage = float64(period.Reported) / float64(period.Requests)
+	}
+}
+
+func newAttemptAggregate() AttemptAggregate {
+	return AttemptAggregate{
+		Tiers: make(map[string]AttemptCounts), Channels: make(map[string]AttemptCounts), Keys: make(map[string]AttemptCounts),
+	}
+}
+
+func recordAttemptAggregate(target *AttemptAggregate, attempt UpstreamAttempt) {
+	recordAttemptCounts(&target.AttemptCounts, attempt.Success)
+	addAttemptMap(target.Tiers, attempt.Tier, attempt.Success)
+	addAttemptMap(target.Channels, attempt.Channel, attempt.Success)
+	addAttemptMap(target.Keys, attempt.KeyID, attempt.Success)
+}
+
+func recordAttemptCounts(target *AttemptCounts, success bool) {
+	target.Total++
+	if success {
+		target.Success++
+	} else {
+		target.Failed++
+	}
+}
+
+func addAttemptMap(target map[string]AttemptCounts, key string, success bool) {
+	if key == "" {
+		return
+	}
+	current := target[key]
+	recordAttemptCounts(&current, success)
+	target[key] = current
+}
+
+func mergeAttemptAggregate(target *AttemptAggregate, source AttemptAggregate) {
+	target.Total += source.Total
+	target.Success += source.Success
+	target.Failed += source.Failed
+	mergeAttemptMaps(target.Tiers, source.Tiers)
+	mergeAttemptMaps(target.Channels, source.Channels)
+	mergeAttemptMaps(target.Keys, source.Keys)
+}
+
+func mergeAttemptMaps(target, source map[string]AttemptCounts) {
+	for key, value := range source {
+		current := target[key]
+		current.Total += value.Total
+		current.Success += value.Success
+		current.Failed += value.Failed
+		target[key] = current
+	}
+}
+
+func cloneAttemptAggregate(source AttemptAggregate) AttemptAggregate {
+	result := newAttemptAggregate()
+	mergeAttemptAggregate(&result, source)
+	return result
+}
+
+func finalizeAttemptAggregate(aggregate *AttemptAggregate) {
+	if aggregate.Total > 0 {
+		aggregate.SuccessRate = float64(aggregate.Success) / float64(aggregate.Total)
+	}
+}
+
+func histogramPercentile(histogram [11]uint64, total uint64, percentile float64) uint64 {
+	target := uint64(float64(total)*percentile + 0.999)
+	var count uint64
+	for i, value := range histogram {
+		count += value
+		if count >= target {
+			if i < len(latencyBounds) {
+				return latencyBounds[i]
+			}
+			return latencyBounds[len(latencyBounds)-1] + 1
+		}
+	}
+	return 0
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(data)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		started := time.Now()
+		meta := &requestMeta{}
+		r = r.WithContext(context.WithValue(r.Context(), requestMetaKey{}, meta))
+		writer := &statusWriter{ResponseWriter: w}
+		monitor.active.Add(1)
+		defer func() {
+			monitor.active.Add(-1)
+			status := writer.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			duration := time.Since(started)
+			monitor.Record(r.URL.Path, status, duration, meta)
+			// Reported token fields ride only on upstream-reported usage.
+			// Unknown usage omits token counts; usage_reported marks the gap.
+			usageArgs := []any{"usage_reported", meta.UsageReported}
+			if meta.UsageReported {
+				hit, miss := cacheHitMiss(meta.Usage)
+				usageArgs = append(usageArgs,
+					"input_tokens", max(meta.Usage.Input, 0),
+					"output_tokens", max(meta.Usage.Output, 0),
+					"cache_hit_tokens", hit,
+					"cache_miss_tokens", miss,
+				)
+			}
+			if meta.Channel != "" {
+				args := []any{"component", "http", "event", "request_routed", "method", r.Method,
+					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
+					"model", meta.Model, "tier", meta.Tier, "protocol", meta.Protocol, "client_session_hash", meta.ClientSessionHash,
+					"key_id", meta.KeyID, "channel", meta.Channel,
+					"anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream}
+				args = append(args, usageArgs...)
+				logger.Info("request routed", args...)
+			}
+			args := []any{"component", "http", "event", "request_complete", "method", r.Method,
+				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
+				"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "protocol", meta.Protocol, "client_session_hash", meta.ClientSessionHash,
+				"key_id", meta.KeyID,
+				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream}
+			args = append(args, usageArgs...)
+			logger.Debug("request completed", args...)
+		}()
+		next.ServeHTTP(writer, r)
+	})
+}
+
+func setLogLevel(level *slog.LevelVar, value string) {
+	switch value {
+	case "debug":
+		level.Set(slog.LevelDebug)
+	case "warn":
+		level.Set(slog.LevelWarn)
+	case "error":
+		level.Set(slog.LevelError)
+	default:
+		level.Set(slog.LevelInfo)
+	}
+}
+
+// SetHistorySink atomically switches the durable history sink. Disk IO
+// never happens under Monitor.mu or on the request path; enqueue is
+// non-blocking and drops newest when the fixed queue is full.
+// The sink pointer is atomic so the enqueue hot path never blocks on a
+// lock held by Apply/rotation/retention.
+func (m *Monitor) SetHistorySink(s *HistoryStore) {
+	if m == nil {
+		return
+	}
+	m.history.Store(s)
+	if s != nil {
+		s.SetMinuteProvider(m.minuteSeriesFor)
+	}
+}
+
+func (m *Monitor) historySink() *HistoryStore {
+	if m == nil {
+		return nil
+	}
+	return m.history.Load()
+}
+
+func (m *Monitor) enqueueHistoryRequest(r UpstreamRequest) {
+	if sink := m.historySink(); sink != nil {
+		sink.EnqueueRequest(r)
+	}
+}
+
+func (m *Monitor) enqueueHistoryAttempt(a UpstreamAttempt) {
+	if sink := m.historySink(); sink != nil {
+		sink.EnqueueAttempt(a)
+	}
+}
+
+// HistoryStatus exposes the durable history runtime state for /api/monitor.
+func (m *Monitor) HistoryStatus() HistoryStatus {
+	if sink := m.historySink(); sink != nil {
+		return sink.Status()
+	}
+	return HistoryStatus{}
+}
+
+// minuteSeriesFor returns the completed per-minute MetricSeries for one
+// minute. It returns false when the minute is not covered by the in-memory
+// window so the store can skip it without writing duplicates.
+func (m *Monitor) minuteSeriesFor(minute time.Time) (MetricSeries, bool) {
+	if m == nil {
+		return MetricSeries{}, false
+	}
+	target := minute.UTC().Truncate(time.Minute).Unix() / 60
+	nowMinute := time.Now().Unix() / 60
+	if target >= nowMinute || nowMinute-target > 60 {
+		return MetricSeries{}, false
+	}
+	m.mu.Lock()
+	bucket := &m.buckets[target%60]
+	if bucket.minute != target {
+		m.mu.Unlock()
+		return MetricSeries{Minute: minute.UTC().Truncate(time.Minute)}, true
+	}
+	entry := MetricSeries{
+		Minute: time.Unix(target*60, 0).UTC(),
+		Total:  bucket.total, Success: bucket.success, Errors: bucket.errors,
+		InputTokens: bucket.tokens.Input, OutputTokens: bucket.tokens.Output,
+		CachedTokens: bucket.tokens.Cached, ReasoningTokens: bucket.tokens.Reasoning,
+		TotalTokens: bucket.tokens.Total, UsageReported: bucket.usageReported,
+	}
+	m.mu.Unlock()
+	return entry, true
+}
+
+func encodeSSE(w http.ResponseWriter, event string, id uint64, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if id > 0 {
+		_, _ = fmt.Fprintf(w, "id: %d\n", id)
+	}
+	if event != "" {
+		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
+}
