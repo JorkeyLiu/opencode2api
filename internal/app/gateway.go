@@ -3000,43 +3000,23 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		// about to be sent. Only the redacted key suffix is retained.
 		attempts++
 		syncAttemptMeta(ctx, route.Tier, route.Protocol, attemptOffset, attempts)
-		resp, err, duration, _, firstDiag, firstStarted, buildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
-		if buildErr != nil {
-			return nil, buildErr, attempts, false, false
+		out := g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+		if out.BuildErr != nil {
+			return nil, out.BuildErr, attempts, false, false
 		}
+		resp := out.Resp
+		err = out.Err
+		firstDiag := out.Diag
+		firstStarted := out.Started
 		ordinarySends++
-		_ = duration
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
-			if !isStreamContext(ctx) {
-				g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
-				g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
-				return resp, nil, attempts, false, false
-			}
-			gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, route.Protocol)
-			if verifyErr != nil && isContextCancelled(ctx) {
-				drainAndClose(resp.Body)
-				return nil, ctx.Err(), attempts, false, false
-			}
-			if gate.ShouldCommit() {
-				g.applyStreamSuccess(cand, firstStarted)
-				class := attemptClassification{Class: AttemptClassSuccess}
-				g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attemptOffset+attempts, cand.CredDisplay, credentialChannel(cand), cand.CredID == anonymousSchedulerCredentialID, cand.Proxy, resp, nil, streamedAttemptDuration(firstStarted), class, false, false, false, badRequestDiag{})
+			if isStreamContext(ctx) {
 				g.logger.Debug("upstream stream committed", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
-				g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
-				resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
-				return resp, nil, attempts, false, false
-			}
-			if gate.HasStartupFailure() {
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				err = errors.New("upstream stream startup failure")
-				resp = nil
 			} else {
-				g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, firstStarted)
-				drainAndClose(resp.Body)
-				err = errors.New("upstream stream startup failure")
-				resp = nil
+				g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			}
+			g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
+			return resp, nil, attempts, false, false
 		}
 		// Unbound exhaustion evidence: same credential live 429s accumulate;
 		// credential429 is written only when the credential's full frozen
@@ -3101,45 +3081,26 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				}
 				attempts++
 				syncAttemptMeta(ctx, route.Tier, route.Protocol, attemptOffset, attempts)
-				retryResp, retryErr, _, _, retryDiag, retryStarted, retryBuildErr := g.sendUpstreamOnce(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
-				if retryBuildErr != nil {
-					return nil, retryBuildErr, attempts, false, false
+				outRetry := g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
+				if outRetry.BuildErr != nil {
+					return nil, outRetry.BuildErr, attempts, false, false
 				}
+				retryResp := outRetry.Resp
+				retryErr := outRetry.Err
+				retryDiag := outRetry.Diag
+				retryStarted := outRetry.Started
 				ordinarySends++
 				if retryErr == nil && retryResp != nil && retryResp.StatusCode == http.StatusTooManyRequests {
 					ordinarySends--
 				}
 				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if !isStreamContext(ctx) {
-						g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-						g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
-						return retryResp, nil, attempts, false, false
-					}
-					gate2, pending2, parser2, verifyErr2 := g.verifyStreamGate(ctx, retryResp.Body, route.Protocol)
-					if verifyErr2 != nil && isContextCancelled(ctx) {
-						drainAndClose(retryResp.Body)
-						return nil, ctx.Err(), attempts, false, false
-					}
-					if gate2.ShouldCommit() {
-						g.applyStreamSuccess(cand, retryStarted)
-						class2 := attemptClassification{Class: AttemptClassSuccess}
-						g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attemptOffset+attempts, cand.CredDisplay, credentialChannel(cand), cand.CredID == anonymousSchedulerCredentialID, cand.Proxy, retryResp, nil, streamedAttemptDuration(retryStarted), class2, false, false, false, badRequestDiag{})
+					if isStreamContext(ctx) {
 						g.logger.Debug("upstream transient retry stream committed", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-						g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
-						retryResp.Body = newGatedStreamBody(gate2, pending2, retryResp.Body, parser2)
-						return retryResp, nil, attempts, false, false
-					}
-					if gate2.HasStartupFailure() {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
 					} else {
-						g.noteStreamStartupFailure(ctx, cand, route, ids, attemptOffset+attempts, retryStarted)
-						drainAndClose(retryResp.Body)
-						retryErr = errors.New("upstream stream startup failure")
-						retryResp = nil
+						g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
 					}
+					g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
+					return retryResp, nil, attempts, false, false
 				}
 				if isContextCancelled(ctx) {
 					return retryResp, retryErr, attempts, false, false

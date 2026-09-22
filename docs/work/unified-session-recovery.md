@@ -52,29 +52,31 @@
 - 首个有界重构缺口已闭合（Bounded Increment 1）：`internal/app/gateway.go` 已建立结构化单次发送执行器 `executeAttempt` 并已将 `doPinnedAnonymous` 迁移至该边界（行为等价、无恢复语义变更），为后续统一恢复提供了单一收敛边界。
 - 第二个有界重构缺口已闭合（Bounded Increment 2）：`internal/app/gateway.go` 内 `attemptOutcome` 已新增 `Started int64`，`executeAttempt` 已对普通与重试发送均返回该 `Started` 并以同一值完成流式成功/启动失败的调度与监控记录，`doPinnedAuth` 两处直连 `sendUpstreamOnce` 块已迁移至该边界（行为等价、无恢复语义变更）；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 - 第三个有界重构缺口已闭合（Bounded Increment 3）：`internal/app/gateway.go` 内 `doAnonymousUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`TierZen`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel=anonymous`/`credDisplay=anonymous`/`anonymous=true`/`attemptOffset+attempts`），行为等价、无恢复语义变更；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
+- 第四个有界重构缺口已闭合（Bounded Increment 4）：`internal/app/gateway.go` 内 `doKeyUpstream` 两处直连 `sendUpstreamOnce` + 内联流式门控块已迁移至既有 `executeAttempt` 边界（`route.Tier`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession` + `channel="key"`/`credDisplay=cand.CredDisplay`/`anonymous=false`/`attemptOffset+attempts`，`firstStarted`/`retryStarted` 取 `out.Started` 并向 `cred429Evidence`/`noteCredential429Failure` 传播以保留 `lastStartedNanos` stale fencing），行为等价、无恢复语义变更；聚焦 `Started` 回归已补齐（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径，双 429 `Retry-After 9`/`future cooldown`/`lastStartedNanos>1`/`nanos=1` fencing），门槛待重跑；更广义的统一会话恢复仍未落地，当前仍以同目标单次 400 重放为基线。
 
-## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 3）
+## 7. 当前自然工作单元（Current Work Unit · Bounded Increment 4）
 
-> 已明确为本增量的唯一执行范围；不存在“下一单元未指定”的开放状态。
+> 已明确为本增量的唯一执行范围；不存在“下一单元未指定”的开放状态。以内容定位待迁移点，不依赖陈旧行号（Increment 3 已位移）。
 
-- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doAnonymousUpstream`** 两处直连发送/门控块至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`/依赖/配置 schema。
+- 目标：在现有 `internal/app/gateway.go` 内**仅迁移 `doKeyUpstream`** 两处直连发送/门控块至已建立的 `executeAttempt` 边界，行为等价、无恢复语义变更；保持代码仅在 `gateway.go`，不新增 `internal/app/recovery.go`、不拆包、不改 `README/AGENTS/ADR`/依赖/配置 schema。
 - 设计边界：
-  - 精确替换两处：首发 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 与 transient 重试 `sendUpstreamOnce` + 同样门控块，改为 `executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)`；`executeAttempt` 已完整拥有流式门控与记录，外层不再重复。
-  - Preserving exact anonymous metadata：`TierZen`、`g.cfg.Upstream.Zen`、路由 `route.Protocol`、同一 `candBody`/`ids`/`cand`/`routeSession`，通道与凭证展示值 `channel=anonymous`/`credDisplay=anonymous`/`anonymous=true`，监控序号 `attemptOffset+attempts`；不在此增量引入 `Started` 新事实或其它状态扩展。
-  - `executeAttempt` 仍为单次发送执行器，不拥有：冻结匿名候选顺序（`buildAnonymousCandidates`/`orderCandidates`）、pinHit 检测、单 transient token/delay（`maxTransient`/`transientDelay`/`sleepWithContext`）、exact 400 同目标重放（`replayCandidate400` 与 `recovered=true` 终态）、ordinary 拒绝判定、lastResponse/lastErr 保持、`bindSessionPin`、匿名 429 耗尽与外层已认证 tier 迁移。以上仍由 `doAnonymousUpstream` 及其相邻所有者负责，`doKeyUpstream` 保持不迁移。
-  - 精确保留：build 错误直接返回、`Resp/Err/Diag` 映射、取消（`isContextCancelled`/`ctx.Err()`）与流启动 sentinel（`upstream stream startup failure` 同目标 transient 重试）行为、attempt 编号（`attempts`/`syncAttemptMeta`/`attemptOffset+attempts`）、discard/drain 语义、与语义相关的日志与所有协议 envelope；不改变当前 exact-400 终态语义。
+  - 精确替换两处（按内容定位，不按行号）：首发 `sendUpstreamOnce` + 内联 `verifyStreamGate`/`applyStreamSuccess`/`noteStreamStartupFailure`/`record` 与 transient 重试 `sendUpstreamOnce` + 同样门控块，改为 `executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)`；其中 `route.Tier`/`baseURL=g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`channel="key"`/`credDisplay=cand.CredDisplay`/`anonymous=false`/`monitorAttempt=attemptOffset+attempts` 与现有 `sendUpstreamOnce` 实参精确一致；`executeAttempt` 已完整拥有流式门控与记录，外层不再重复。`firstStarted`/`retryStarted` 均取 `out.Started` 赋值，保留 `Started` 向 `cred429Evidence` 与 `noteCredential429Failure` 的传播与 stale fencing。
+  - `executeAttempt` 仍为单次发送执行器，不拥有：冻结已认证候选顺序（`buildAuthCandidates`/`orderCandidates`）、`ordinarySends` 预算与 429 `ordinarySends--` 退款（429 budget-neutral）、`cred429Evidence` 累积与 `noteCredential429Failure` 的全量 eligible 计数门控（以 last `Retry-After` 与 `Started` 的 stale fencing 为准）、单 transient token/delay（`maxTransient`/`transientDelay`/`sleepWithContext`）、pinHit 早退、`exact-400` 同目标单次重放终态（`replayCandidate400` 与 `recovered=true` 超预算最终性）、`isOrdinaryClientRejection` 判定、`lastResponse`/`lastErr` 保持、`bindSessionPin`、上下文取消（`isContextCancelled`/`ctx.Err()`）与 `upstream stream startup failure` sentinel 的同目标 transient 重试语义、attempt 编号（`attempts`/`syncAttemptMeta`/`attemptOffset+attempts`）、drain 语义、日志与协议 envelope。以上仍由 `doKeyUpstream` 及其外层 `doUpstreamTiersUnbound`/custom fallback 负责。
+  - 自定义 fallback 与 tier 迁移仍在外层调用方，不在本增量执行器内。
+  - 精确保留：build 错误直接返回、`Resp/Err/Diag/Started` 映射、取消与流启动 sentinel 行为、429 `Retry-After` 末值与 `credential429` 写入的 `future cooldown`、attempt 连续性、discard/drain 语义、与语义相关的日志与所有协议 envelope；不改变当前 exact-400 终态语义。
+  - 不触及 `doAnonymousUpstream`/`doPinnedAnonymous`/`doPinnedAuth` 及其测试。
 - 保持不变：
-  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doAnonymousUpstream` 的冻结顺序、pinHit、transient 预算、400 重放、外层 429/回退、attempts 编号与监控均保持不变。
-  - 流式语义：`executeAttempt` 内部仍以 `started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层不再重复门控；匿名非流式成功仍由外层完成 `bindSessionPin` 与对应日志。
+  - `executeAttempt` 仍为单次发送边界，不引入恢复策略；`doKeyUpstream` 的冻结顺序、`ordinarySends` 预算与 429 退款、`cred429Evidence` 全量门控与 `Started` 传播、transient 预算、400 重放、pinHit、`lastResponse`/`drain`/`bind` 均保持不变。
+  - 流式语义：`executeAttempt` 内部仍以 `Started` 完成 `applyStreamSuccess`/`noteStreamStartupFailure` 与 `recordUpstreamAttemptWithClass`，外层仅保留成功日志与 `bindSessionPin`；启动失败以 `upstream stream startup failure` 同目标重试，不推进候选。
+  - 统一会话恢复仍未实现：本增量仅为结构化收敛，不引入跨候选/跨通道统一恢复策略。
 
-## 8. 验收证据（Acceptance Evidence · Increment 3）
+## 8. 验收证据（Acceptance Evidence · Increment 4）
 
-- 文档：本文件已更新，当前自然工作单元与设计边界明确为本增量，阐明仅迁移 `doAnonymousUpstream` 两处直连块至 `executeAttempt`（匿名元数据精确一致），且 `frozen ordering/pinHit/transient/400 replay/lastResponse/bind/fallback` 仍在执行器外，统一恢复仍未实现。
-- 代码：`internal/app/gateway.go` 内 `doAnonymousUpstream` 仅两处直连发送块已替换为 `executeAttempt`（`TierZen`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`"anonymous"/"anonymous"/true`/`attemptOffset+attempts`），保留 `buildErr`/`Diag`/`isContextCancelled`/`startup failure` sentinel、`attempts`/`lastResponse/lastErr`/`bindSessionPin`/日志 envelope 语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
+- 文档：本文件已更新，当前自然工作单元与设计边界明确为 Bounded Increment 4 已闭合，阐明仅迁移 `doKeyUpstream` 两处直连块至 `executeAttempt`（已认证元数据 `route.Tier`/`g.cfg.Upstream.Zen`/`route.Protocol`/`candBody`/`ids`/`cand`/`routeSession`/`"key"/cand.CredDisplay/false`/`attemptOffset+attempts` 精确一致，`firstStarted`/`retryStarted` 取 `out.Started`），且 `frozen ordering/ordinarySends+429 refund/cred429Evidence+Started fencing/transient/400 replay/pinHit/lastResponse/bind/fallback` 仍在执行器外；未声称更广义的统一恢复已实现。
+- 代码：`internal/app/gateway.go` 内 `doKeyUpstream` 仅两处直连发送块已替换为 `executeAttempt`，保留 `buildErr`/`Diag`/`Started`/`isContextCancelled`/`startup failure` sentinel、`ordinarySends`/`cred429Evidence`/`attempts`/`lastResponse/lastErr`/`bindSessionPin`/日志 envelope 语义；未新增 `internal/app/recovery.go`；`gofmt` 干净。
 - 验证：
-  - 新增最小聚焦回归：`internal/app` 内新增匿名流启动失败同目标重试用例，验证首发空 SSE 启动失败被同目标 transient 重试吸收（不推进候选/不跨 tier），成功门控重试正常绑定且 `attempts==2`、首代理发送 `2` 次、次代理与已认证通道零发送；现有匿名流/400 语义保持权威回归。
-  - 既有 pinned anonymous/auth 429、stale429、stream、400 重放与匿名 transport/429 用例保持权威回归；执行最聚焦的相关包/用例并报告命令与结果。
-  - `go test ./...` / `go build -o opencode2api ./cmd/opencode2api` 按需通过。
+  - 新增聚焦回归（对标 `TestPinnedAuthStartedCredentialEvidence` 覆盖 unbound 路径，`internal/app/unbound_auth_started_test.go:TestUnboundAuthStartedCredentialEvidence`）：`doKeyUpstream` 双 eligible 代理各 live 429（`Retry-After` 如 `4` 与 `9`，冻结全量）→ 断言 `credential429` 以末个 `Retry-After=9` 写入、`future cooldown` 生效、`lastStartedNanos` 为真实传播值（`non-zero` 且 `>1` 且 `<` 末次 429 到达时 `time.Now().UnixNano()`，非 `0` 回退）且 `nanos=1` 陈旧成功不能清除。
+  - 既有 key/auth/429/stream/400/pinned 429、stale429 与匿名 transport/429 用例保持权威回归；已执行 `gofmt`、聚焦 `go test ./internal/app -run TestUnboundAuthStartedCredentialEvidence` 与全量 `go test ./...`，门槛待重跑（执行结果见本次报告）；`go build -o opencode2api ./cmd/opencode2api` 按需通过。
 
 ## 9. 未决问题（Unresolved Questions）
 
