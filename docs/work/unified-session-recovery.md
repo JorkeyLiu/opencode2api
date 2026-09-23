@@ -58,10 +58,11 @@
 - 第六个有界重构缺口已闭合（Bounded Increment 6 · L2 custom 429-only 资格集中化 + cancel/no-state-change 边界修正）：`internal/app/gateway.go` 内新增唯一小助手 `customTakeoverEligible(customTakeoverQualification{ObservedLive429/Eligible/TerminalStatus/Recovered400/Cancelled/Committed})`（归属既有 `gateway.go`，未新增 `recovery.go`），集中既有严格 429-only 接管资格——仅当冻结 eligible 全集在本请求/路由内均提供去重 live 429 证据（预冷跳过不计入）、终态为 429、非 400 修正终态、非取消/deadline/已提交时为真；`doPinnedAuth` 两处 in-loop 与终态、`doPinnedAnonymous` 终态（新增 `live429` 计数）、`doKeyUpstream` 两处 per-credential 证据、`doUpstreamTiersUnbound` 外层终态共七处散落门已迁移至该助手（预冷本地 429 快路径、身份/`Started` 围栏/last Retry-After/容量 fail-closed/custom 错误原样/pin/调度写入均保留调用方所有）；边界修正：pinned in-loop `credential429` 写入与 custom 接管均受 cancel-gate 抑制，pinned anonymous/auth 预冷本地 429 快路径在取消时保持原生 429 本地终态（不绑定 custom、不写新状态），非取消路径行为不变；`doUpstreamTiersUnbound` 外层当时为 terminal-only recheck（1/1 简并计数），真实 eligible 耗尽证明仍在冻结 inner walks（`doAnonymousUpstream`/`doKeyUpstream`/pinned bindings），不以谓词夸大证明；广义 L2 fallback（恢复域可用对象耗尽的一般对象选择）仍未实现。
 - 第七个有界增量已闭合（Bounded Increment 7 · 非绑定恢复域耗尽证据端到端有界接线）：`internal/app/gateway.go` 内新增 `unboundDomainEvidence{Domain/Entered/Frozen/Live429/Terminal/Recovered400}`（归属既有 `gateway.go`，未新增 `recovery.go`，无全局状态），仅由 `doAnonymousUpstream`（单域）与 `doKeyUpstream`（每凭证一域，永不加总）携带至 `doUpstreamTiersUnbound`；各域在真实游走边界填充（空/预冷为 `Entered=false/Frozen=0` 永不合格、去重 live 429 map、非 429 终态失效、400 重放终态 `Recovered400` 且重放 429 不计入证据、取消/deadline、流提交前返回）；唯一非绑定外层 custom 决策以 `unboundDomainsAllowCustom` 聚合既有 `customTakeoverEligible`（非第二资格权威）：仅当全部收集域均实际进入且各自独立满足 429-only 门、最终路由终态为 429、会话可绑定、非 `recovered400`/取消/已提交时接管，否则保持原生；无 active、容量/tombstone、`Retry-After`、`Started` 围栏、custom 错误原样、匿名→认证顺序、400 终态路由语义、pinned 路径/pin 身份均不变；`TestUnifiedAnonUnboundToAuthAndCustom` 第二阶段改用新鲜网关以保证本请求内真实 live 发送（复用旧网关将因前一请求预冷导致匿名空域而 truthfully 保持原生 429）；广义 fallback 与 pinned 行为未声称。
 - 并发边界（custom session takeover，以 session 级 first-wins 收敛）：当前 HEAD 已在请求入口（`doUpstreamTiers`）、未绑定建立环路起点（`doUnboundEstablishment` loop-start）和 pin claim 后首次 native 发送前做有限重查（fallback takeover 为 session-keyed first-wins，fallback store 与 pin store 无跨 store 原子性）；已经发出的 native POST 不撤销，后绑定只影响尚未发送或后续请求；`claim.done` waiter 唤醒后回到入口重查。此为并发边界，不是广义统一恢复完成，也不改变现有 pin 的 claim/waiter 语义；避免把发送前有限窗口误判为缺陷，不声称全局线性化。
+- 截至 HEAD `1a5904f` 的已提交证据（生产 invariant 未变）：`977790a` committed-stream 路由层回归已闭合（真实 Gateway handler / `forwardSSE`，deliverable 后 `UnexpectedEOF` 保留内容、输出 Chat structured error、不走 native/custom；同期修复 `fallback_pending` 并发测试在单代理预冷竞态下的 flaky 假设）与 `1a5904f` pinned L2 consumption 401 证据已闭合（auth/anonymous `429→401` 接管 custom，单代理 `401` 忠实无接管，断言 `credential401` 与 `credential429`/`proxy`/`channel`/`target` 隔离）；工作区 `internal/app/custom_takeover_eligible_test.go` 新增两个 auth `408`/`425` L1-final 正向用例仅为待验证测试证据（尚未重新验证/审查/提交），不代表生产语义扩展；广义三层逐状态矩阵与广义 fallback 仍未实现/未冻结，下一自然工作单元拟将 `408`/`425` 与跨协议/stream-startup 边界整合成较完整覆盖单元，当前不宣称已完成。
 
-## 7. 下一自然工作单元（Bounded Increment 6 · 统一三层语义的最小代码单元待选择）
+## 7. 下一自然工作单元（Bounded Increment 6+ · 统一三层语义的最小代码单元待选择 — 当前聚焦 pinned L2 consumption 覆盖整合）
 
-> 统一三层语义已固化，实现待选取最小行为单元；Increment 5（结构 L1 观察循环收敛）已闭合。下述仅为候选行为域与裁决前提，不构成执行指令，不声称统一恢复已完成。
+> 统一三层语义已固化，实现待选取最小行为单元；Increment 5（结构 L1 观察循环收敛）已闭合，`977790a` committed-stream/L3 回归与 `1a5904f` 401 证据已闭合（生产 invariant 未变）。工作区 `408`/`425` 两个用例仅为待验证证据；下一自然工作单元拟将 `408`/`425` 与跨协议/stream-startup 边界整合成较完整覆盖单元，避免零碎单点节奏，当前不宣称已完成。下述仅为候选行为域与裁决前提，不构成执行指令，不声称统一恢复已完成。
 
 - 现状：最高原则已于 2026-09-22 固化为统一语义三层/闭环投影 `observe stability -> resolve stable cause -> continue session or faithfully return`（L1 观察稳定性含 retry、L2 解决稳定原因含 400 修正与所有对象粒度 fallback、L3 继续或返回；代理/池/凭证/备用渠道/恢复域均为对象/候选，非固定 L2/L3；已关闭对象队列解读），文档已对齐 `AGENTS.md` / ADR；代码层面 Increment 1-5 结构收敛已闭合（Increment 5 为 `observeSameTargetTransient` 同目标观察循环收敛，四调用方已迁移，行为等价），400 同目标修正后终态（L2 按 L3 终止）、503 受约束观察（L2 内受 deadline/cancel/committed bytes/观察策略约束非无限）、取消/deadline/已提交字节后停止（L3 边界）已有基线，custom fallback 仍为 429 耗尽限定的 L2 保底，广义统一语义三层逐状态码映射仍未落地（单一 L1 计数已于最终迁移收敛）；现有代码/测试仅为候选对象序列与特定 429 fallback 基线，不应反推为三层已实现；`internal/app/gateway.go` 已无内层 transient `for` 直连迁移点，下一行为增量无可直接迁移的技术点。
 - 候选行为域（待后续工作、未立项）：
@@ -74,9 +75,9 @@
   - 由 Nexus 裁决选定唯一最小行为增量后，方可形成新的“当前自然工作单元”并进入执行；本轮不自行设计或实现上述任一行为。
 - 约束重申：不新增 `internal/app/recovery.go`，不拆包，不改 `README`/`AGENTS`/`ADR`/`config.example.json` 以外文件、依赖或配置 schema；未声称统一恢复已完成；已裁决的最高原则不再作为待裁决项；未裁决前不产生新的代码行为变更；不把 503 写成无限 retry，不冻结逐状态码矩阵/预算/退避。
 
-## 8. 验收状态（Acceptance Status · 截至最终 L1 迁移已闭合）
+## 8. 验收状态（Acceptance Status · 截至 `1a5904f` 已提交证据 + 工作区待验证）
 
-> Increment 1-5 为已闭合的结构化收敛增量，最终 L1 迁移为完整行为闭合（非局部 503 过渡）；本节为历史验收摘要。
+> Increment 1-5 为已闭合的结构化收敛增量，最终 L1 迁移为完整行为闭合（非局部 503 过渡）；`977790a` 与 `1a5904f` 为已闭合的测试证据增量（生产 invariant 未变）；`408`/`425` 两个新增用例仅在工作区待验证。本节为历史验收摘要，不把测试覆盖写成生产语义扩展，不写未执行的验证结果。
 
 - 文档：本文件已同步 Increment 1-5 闭合事实与最终 L1 迁移（`retry.transient_max_attempts` 删除、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、认证普通发送预算删除、候选遍历由冻结切片自然有界、`observeSameTargetTransient` 唯一停止为 stable/context/observation-limit、模型刷新独立全遍历）；400 语义已对齐（L2 修正按 L3 终态）；本次仅完成单一 L1 计数收敛，逐状态矩阵、广义 fallback 与退避数值仍未冻结，不声称三层已完全落地。
 - 代码：`internal/app/config.go`、`admin.go`、`gateway.go` 已收敛；未新增 `internal/app/recovery.go`；`gofmt` 干净。
