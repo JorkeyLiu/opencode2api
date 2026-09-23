@@ -481,21 +481,94 @@ func TestFallbackPendingConcurrentFirstWinsAndCapacity(t *testing.T) {
 		_, _ = w.Write([]byte(fallbackResponsesOK("cm-conc")))
 	}))
 	defer custom.Close()
-	gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{ID: "c-conc", Name: "c-conc", BaseURL: custom.URL, APIKey: "k", Model: "cm-conc", Protocol: ProtocolResponses}}, "c-conc")
+	// Provide at least workers distinct sendable proxy identities so
+	// concurrent workers can each perform live 429 sends. A single-proxy pool
+	// would let the first live 429's shared proxy429 cooldown make later
+	// workers hit the eligible==0 pre-cooled fast path (native 429, never
+	// custom) — an intended invariant, not a production bug — which would
+	// randomly fail the "route left custom" assertion. Expanding the eligible
+	// set keeps the invariant intact while stabilizing the crossing assertion.
+	anonProxies := []string{
+		"direct",
+		"http://127.0.0.1:8081",
+		"http://127.0.0.1:8082",
+		"http://127.0.0.1:8083",
+		"http://127.0.0.1:8084",
+		"http://127.0.0.1:8085",
+		"http://127.0.0.1:8086",
+		"http://127.0.0.1:8087",
+	}
+	cfg := testBaseConfig()
+	cfg.Anonymous = true
+	cfg.ProxyPools = map[string]ProxyPoolConfig{
+		"a": {Proxies: anonProxies},
+		"z": {Proxies: []string{"direct"}},
+		"g": {Proxies: []string{"direct"}},
+	}
+	cfg.ProxyRouting = ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"}
+	cfg.proxyPoolsPresent = true
+	cfg.proxyRoutingPresent = true
+	cfg.Fallback = FallbackConfig{Active: "c-conc", Channels: []FallbackChannelConfig{{ID: "c-conc", Name: "c-conc", BaseURL: custom.URL, APIKey: "k", Model: "cm-conc", Protocol: ProtocolResponses}}}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ses := "ses_pending_conc_1"
 	bindResponsesAnonPin(t, gw, ses)
-	postStub(t, gw, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(429, `{"error":{"message":"slow"}}`), nil
-	})
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	pool := gw.pools["a"]
+	pinnedIdx := 0
+	for i, p := range pool.items {
+		if p.name == pin.ProxyRaw {
+			pinnedIdx = i
+			break
+		}
+	}
 	route := pendingResponsesRoute()
 	const workers = 8
+	// Rendezvous on the first live native send (the pinned proxy) so every
+	// worker snapshots a full eligible set before any proxy429 is written.
+	// A start barrier alone still lets the first worker cool the shared pool
+	// before later workers compute eligible, hitting the intended
+	// eligible==0 pre-cooled fast path (native 429, never custom). The
+	// pinned-proxy barrier keeps the invariant intact while stabilizing the
+	// crossing assertion; other proxies need no barrier because eligible is
+	// already frozen for all workers.
+	var firstArrival atomic.Int32
+	firstBarrier := make(chan struct{})
+	for i := range anonProxies {
+		idx := i
+		if idx == pinnedIdx {
+			postStub(t, gw, "a", idx, nil, nil, func(*http.Request) (*http.Response, error) {
+				if firstArrival.Add(1) == workers {
+					close(firstBarrier)
+				}
+				<-firstBarrier
+				return responseWithBody(429, `{"error":{"message":"slow"}}`), nil
+			})
+		} else {
+			postStub(t, gw, "a", idx, nil, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(429, `{"error":{"message":"slow"}}`), nil
+			})
+		}
+	}
 	var wg sync.WaitGroup
 	errs := make([]error, workers)
 	codes := make([]int, workers)
+	// Launch barrier so all workers contend at the pinned proxy at once.
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(workers)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			ready.Done()
+			<-start
 			resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-conc"), 0, pendingNativePayload())
 			errs[idx] = err
 			if err == nil && resp != nil {
@@ -507,6 +580,8 @@ func TestFallbackPendingConcurrentFirstWinsAndCapacity(t *testing.T) {
 			}
 		}(i)
 	}
+	ready.Wait()
+	close(start)
 	wg.Wait()
 	for i := 0; i < workers; i++ {
 		if errs[i] != nil {
