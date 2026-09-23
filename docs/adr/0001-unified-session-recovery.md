@@ -109,6 +109,7 @@
 - 取消 / deadline / 已提交字节的停止语义（L3 边界）需在网关入口与流式网关处一致执行，不产生新的后台重试；503 等场景的持续观察亦受上述边界与观察策略约束（L2 内非无限，无法解决则按 L3 忠实返回，不写成无限 retry）。
 - 配置变更保持严格未知字段拒绝与原子切换语义；新增恢复相关配置需显式说明是否热生效或需重启（参考 `AGENTS.md` §3）。
 - 不引入新依赖（`golang.org/x/crypto` 以外需显式理由），保持 `gofmt` 清洁与容器姿态。
+- custom session takeover 并发边界：以 session 级 first-wins 收敛；在请求入口（`doUpstreamTiers`）、未绑定建立环路起点（`doUnboundEstablishment` loop-start）和 pin claim 后首次 native 发送前做有限重查；不提供 fallback/pin store 跨 store 原子线性化；已经发出的 native POST 不撤销，后绑定只影响尚未发送或后续请求；`claim.done` waiter 唤醒后回到入口重查。此为并发边界，不是广义统一恢复完成，也不改变现有 pin 的 claim/waiter 语义。
 
 ## 8. 验证要求（Validation Required）
 
