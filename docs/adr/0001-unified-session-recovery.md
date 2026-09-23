@@ -113,7 +113,7 @@
 
 ## 8. 验证要求（Validation Required）
 
-以下为验证要求分项现状（HEAD `488f3c9` 已提交，工作区干净）。其中当前已实现切片——单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝——对应的验证已执行且通过（见各项“已执行”标注）；广义 cause→action 矩阵/退避/广义 fallback 仍未决定，对应验证保持 pending，不宣称完整统一三层完成：
+以下为验证要求分项现状（锚点说明：下述“已执行”覆盖截至 HEAD `488f3c9`（当时工作区干净）的已实现切片验证，以及 `488f3c9..HEAD 4958720`（`419d5ac` native pin+stream cancel、`4958720` custom cancel）生产增量 + 未提交 gateway 一行取消门的静态输出审查与本轮 `go test ./... -count=1`/gofmt/build/diff --check 验证；广义矩阵外不假称为已整体审查）。其中锚点内已实现切片——单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝——对应的验证已执行且通过（见各项“已执行”标注）；广义 cause→action 矩阵/退避/广义 fallback 仍未决定，对应验证保持 pending，不宣称完整统一三层完成：
 
 - `go test ./... -count=1` 通过（CI 门禁）——已执行（现有验证，全量回归通过；见工作文档 §8）。
 - `go build -o opencode2api ./cmd/opencode2api` 构建通过——已执行（现有验证）。
@@ -122,7 +122,7 @@
 - 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry；`TestAnonymous400ReplaysSameTarget` / `TestAuthZen400ReplaySuccess` / `TestAuth400RecoveryRouteTerminal` / `TestCustomTakeover400ReplayFinalNoCustom` / `TestMaybeReplayCandidate400Entry` / `TestClassifyStableCause`）——已执行。
 - 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界；`TestCancelStopsRetryFallback` / `CommittedStream_*` 路由层回归 / `TestPinnedConsumptionAuthDeadlineNoCustom` / `TestPinnedConsumptionAuthCancelDuringSecondProxyNoCustom`）——已执行。
 - 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移；`TestTransientMaxAttemptsStrictlyRejected` / `TestObserveSameTargetTransientStops` 计数语义）——已执行。
-- 未引入新的未脱敏日志/指标输出的人工审查（`b2c4798..488f3c9` 生产 Go 变更仅 `internal/app/gateway.go`，无新增 logger/metrics/admin/history 输出，未见新的未脱敏路径）——已执行。
+- 未引入新的未脱敏日志/指标输出的人工审查（历史区间 `b2c4798..488f3c9` 内生产 Go 变更仅 `internal/app/gateway.go`，无新增 logger/metrics/admin/history 输出，未见新的未脱敏路径；该结论仅适用于该旧区间，不得扩张到之后变更）——已执行（区间内）。`488f3c9..HEAD 4958720`（`419d5ac` 的 `scheduler.go`+`gateway.go` 取消边界、`4958720` 的 `fallback.go`+`gateway.go` custom 绑定）生产增量 + 未提交 gateway 一行（`doKeyUpstream` credential429 写入改走 `Cancelled: isContextCancelled(ctx)`）的全部生产 Go diff（`fallback.go`/`gateway.go`/`scheduler.go`）静态人工审查已执行：新增 logger/metrics/admin/history/body/key/session/proxy 输出 sink 0 个，流式 `logTargetCooldownSet` 为旧调用移入 cancel guard 内，monitor record 口径不变；限此范围未见新增未脱敏输出，不声称全库安全审计。本轮 `go test ./... -count=1`/gofmt/build/diff --check 已执行且通过。
 - 广义 cause→action 矩阵 / 退避 / 广义 fallback 与对象策略的验证——pending（对应行为仍未决定，不宣称完成）。
 
 > 历史记录：本文档创建时（2026-09-22）上述验证尚未执行；现行状态见上——当前已实现切片的对应验证已执行且通过，广义矩阵/对象策略验证仍 pending。
@@ -138,6 +138,11 @@
 **附注：** 本 ADR 仅记录已稳定的方向性决策，所有逐状态码行为矩阵、阈值、退避与计数器等实现细节均显式标记为待定，不得视为已接受决策；不擅自冻结所有状态码矩阵。
 
 ### 修订历史（Revision History）
+
+- **2026-09-24 — §8 验证锚点收束到区间覆盖（文档事实更新，无原则变更）：**
+  - §8“已执行”明确仅覆盖截至 `488f3c9` 的已实现切片验证；当前 HEAD `4958720`（`419d5ac`/`4958720` 生产增量）与工作树未提交改动不在该锚点覆盖内，不假称为已整体审查。
+  - “生产 Go 变更仅 `gateway.go`”限定为历史区间 `b2c4798..488f3c9`，不得扩张；之后增量与未提交改动的新增输出路径核验保持 pending。
+  - 最高原则、503 关闭口径、400 终态与已锁定 pins 不变；广义逐状态矩阵、广义 fallback 与退避仍未冻结。
 
 - **2026-09-23 — §8 验证要求分项现状收束（文档事实更新，无原则变更）：**
   - §8 改为分项现状：当前已实现切片（单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝）对应的 `go test ./... -count=1`、构建、L1/L2 双门与 503/400/L3/预算直接测试覆盖、人工审查（`b2c4798..488f3c9` 生产 Go 仅 `gateway.go`、无新 logger/metrics/admin/history 输出）已执行且通过；广义 cause→action 矩阵/退避/广义 fallback 验证保持 pending。

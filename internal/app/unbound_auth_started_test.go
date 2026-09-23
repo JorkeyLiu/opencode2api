@@ -1,7 +1,9 @@
 package app
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -251,6 +253,159 @@ func TestUnboundAuthL1Final429StartedFencing(t *testing.T) {
 	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
 		t.Fatalf("credential429 must be cleared after equal Started")
+	}
+}
+
+// Unbound auth first-send live 429 with in-flight cancel: the cancelled 429
+// must keep its faithful native envelope with no credential429 write, no
+// proxy429/target/channel state, no fallback pin/custom send, and no second
+// send. Single eligible proxy so exhaustion would otherwise write
+// credential429; the active custom proves no takeover happens.
+func TestUnboundAuthFirst429CancelNoCredential429(t *testing.T) {
+	var customHits atomic.Int32
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackChatOK("cm-cancel-429")))
+	}))
+	t.Cleanup(custom.Close)
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 3
+	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm-cancel-429"}}}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := gw.credentials()[0]
+	ses := "ses_unbound_auth_first429_cancel_1"
+	ids := clientSessionIDs(ses)
+	now := time.Now().UnixNano()
+	cands := gw.scheduler.orderCandidates(gw.scheduler.buildAuthCandidates(TierZen, gw.credentials(), gw.pools["z"], "m", now), ses)
+	if len(cands) != 1 {
+		t.Fatalf("cands=%d want 1", len(cands))
+	}
+	identity, proxyRaw, poolName := cands[0].Identity, cands[0].ProxyRaw, cands[0].PoolName
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{}))
+	var z0 atomic.Int32
+	postStub(t, gw, "z", 0, &z0, nil, func(*http.Request) (*http.Response, error) {
+		cancel()
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "9")
+		return r, nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(ctx, authOnlyRoute(), routeBodies(), ids, 0)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("cancelled first 429 must keep faithful 429, err=%v resp=%v", err, resp)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "9" {
+		drainResp(resp)
+		t.Fatalf("cancelled Retry-After=%q want 9 (faithful envelope)", got)
+	}
+	drainResp(resp)
+	if eff.Tier != TierZen {
+		t.Fatalf("cancelled 429 must stay native, eff=%+v", eff)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1 (no follow-up send after cancel)", attempts)
+	}
+	if postCount(&z0) != 1 {
+		t.Fatalf("sends=%d want 1 (cancel ends the walk)", postCount(&z0))
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
+		t.Fatalf("cancelled in-flight 429 must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, poolName, proxyRaw); ok {
+		t.Fatalf("cancelled in-flight 429 must not write proxy429")
+	}
+	if _, _, ok := gw.scheduler.targetCooldownStatus(identity); ok {
+		t.Fatalf("cancelled in-flight 429 must not write target cooldown")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, poolName, proxyRaw); ok {
+		t.Fatalf("cancelled in-flight 429 must not write channel cooldown")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("cancelled 429 must not pin session+model")
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("cancelled 429 must not bind custom fallback")
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("cancelled 429 must not hit custom (hits=%d)", customHits.Load())
+	}
+}
+
+// Control without cancel: the same single-eligible live 429 exhausts and
+// writes credential429 with the last Retry-After and a real Started that
+// fences stale success. Custom stays inactive so the terminal envelope stays
+// the faithful native 429.
+func TestUnboundAuthFirst429NoCancelWritesCredential429(t *testing.T) {
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 3
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := gw.credentials()[0]
+	ses := "ses_unbound_auth_first429_nocancel_1"
+	ids := clientSessionIDs(ses)
+	var z0 atomic.Int32
+	postStub(t, gw, "z", 0, &z0, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "9")
+		return r, nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
+	if err != nil || resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("single live 429 must keep faithful 429, err=%v resp=%v", err, resp)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "9" {
+		drainResp(resp)
+		t.Fatalf("Retry-After=%q want 9 (last live 429)", got)
+	}
+	drainResp(resp)
+	if eff.Tier != TierZen {
+		t.Fatalf("custom inactive must stay native, eff=%+v", eff)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1", attempts)
+	}
+	until, status, ok := gw.scheduler.credential429CooldownStatus(cred.id)
+	if !ok || status != http.StatusTooManyRequests {
+		t.Fatalf("single-eligible live 429 must write credential429")
+	}
+	if until <= time.Now().UnixNano() {
+		t.Fatalf("credential429 until=%d must be future deadline (Retry-After 9)", until)
+	}
+	entry := gw.scheduler.cred429State[cred.id]
+	if entry == nil {
+		t.Fatalf("credential429 entry missing")
+	}
+	if entry.lastStartedNanos <= 0 {
+		t.Fatalf("credential429 lastStartedNanos=%d must be >0 (real Started)", entry.lastStartedNanos)
+	}
+	if ch := gw.scheduler.noteCredential429Success(cred.id, 1); ch.Changed {
+		t.Fatalf("stale Started=1 must not clear credential429 (fencing)")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); !ok {
+		t.Fatalf("credential429 must remain after stale success")
 	}
 }
 

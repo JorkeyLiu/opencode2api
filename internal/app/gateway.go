@@ -3562,7 +3562,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				// Same strict proof as the L2 custom gate (frozen eligible
 				// set fully live-429ed, pre-cooled excluded); route state
 				// stays false here so the scheduler write is unchanged.
-				if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
+				// Cancelled in-flight 429 never writes credential429: the
+				// gate carries the live ctx so the write is skipped exactly
+				// like the pinned 429 path, while the faithful native
+				// response/context boundary below is unchanged.
+				if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: resp.StatusCode, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
 					_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, resp.StatusCode, retryAfter, firstStarted)
 				}
 			} else {
