@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -611,5 +612,137 @@ func TestUnboundExhaustionStreamStartupCancelledNoCustom(t *testing.T) {
 	}
 	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
 		t.Fatalf("cancelled startup must not bind fallback")
+	}
+}
+
+// Historically pre-cooled partial freeze still allows custom: one auth proxy
+// is filtered before send (historic proxy429), the single remaining frozen
+// candidate returns live 403 in this request (Frozen=1/Unavailable=1), so the
+// single auth-only domain exhausts and the custom backstop takes over. The
+// pre-cooled node must see zero POST. Real doUpstreamTiers unbound path.
+func TestUnboundExhaustionPrecooledPartialFrozenAllowsCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-precool-partial-1"}, &customHits, true)
+	if len(gw.pools["z"].items) != 2 {
+		t.Fatalf("auth pool items=%d want 2", len(gw.pools["z"].items))
+	}
+	coldRaw := gw.pools["z"].items[0].name
+	// Historic pre-cool: excluded from the frozen set, never counts as live
+	// evidence in this request.
+	gw.scheduler.noteProxy429Failure(TierZen, "z", coldRaw, AttemptClassRateLimited, 429, time.Minute, time.Now().UnixNano())
+	var coldPosts, livePosts atomic.Int32
+	postStub(t, gw, "z", 0, &coldPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"slow"}`), nil
+	})
+	postStub(t, gw, "z", 1, &livePosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	ses := "ses_unbound_precool_partial_403_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("pre-cooled partial freeze with live 403 must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("custom takeover must not establish a session pin")
+	}
+	if got := postCount(&coldPosts); got != 0 {
+		t.Fatalf("coldPosts=%d want 0 (pre-cooled node never sent)", got)
+	}
+	if got := postCount(&livePosts); got != 1 {
+		t.Fatalf("livePosts=%d want 1 (only the sendable frozen candidate sent)", got)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2 (1 native 403 + 1 custom)", attempts)
+	}
+}
+
+// Shared pool identity isolation: anonymous and authenticated point at the
+// same pool. The anonymous live 429 in this request writes the shared
+// TierZen+pool+proxyRaw proxy429, so the authenticated phase freezes empty.
+// The anonymous live 429 must never be borrowed as the authenticated domain's
+// own evidence: custom stays untouched, no fallback binds, and the auth lane
+// sends zero POST. Real doUpstreamTiers unbound path with anon->auth entry.
+func TestUnboundExhaustionSharedPoolAnon429NotBorrowed(t *testing.T) {
+	var customHits atomic.Int32
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackChatOK("cm-exhaust")))
+	}))
+	t.Cleanup(custom.Close)
+	cfg := testGatewayConfig(
+		map[string][]string{"shared": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
+	)
+	cfg.Anonymous = true
+	cfg.Keys = []string{"zen-key-exhaust-shared-1"}
+	cfg.Retry.MaxAttempts = 1
+	cfg.Retry.TransientRetryIntervalSeconds = 0
+	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm-exhaust"}}}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gw.pools["shared"] == nil || len(gw.pools["shared"].items) != 1 {
+		t.Fatalf("shared pool must hold exactly one proxy")
+	}
+	raw := gw.pools["shared"].items[0].name
+	var anonPosts, authPosts atomic.Int32
+	postStub(t, gw, "shared", 0, nil, nil, func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") == "Bearer public" {
+			anonPosts.Add(1)
+			resp := responseWithBody(429, `{"error":"slow"}`)
+			resp.Header.Set("Retry-After", "9")
+			return resp, nil
+		}
+		authPosts.Add(1)
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	ses := "ses_unbound_shared_pool_429_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 429 {
+		t.Fatalf("shared-pool anon429 with empty auth freeze must keep native 429, got %d", resp.StatusCode)
+	}
+	if eff.Tier == TierCustom || eff.Tier != TierZen {
+		t.Fatalf("must keep native zen tier, got %+v", eff)
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("borrowed anon 429 must not hit custom (hits=%d)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("borrowed anon 429 must not bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("native 429 isolation must not establish a session pin")
+	}
+	if got := int(anonPosts.Load()); got != 1 {
+		t.Fatalf("anonPosts=%d want 1 (anonymous domain entered with live 429)", got)
+	}
+	if got := int(authPosts.Load()); got != 0 {
+		t.Fatalf("authPosts=%d want 0 (authenticated freeze is empty, never sent)", got)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts=%d want 1 (1 anon + 0 auth + 0 custom)", attempts)
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "shared", raw); !ok {
+		t.Fatalf("anonymous live 429 must write shared TierZen+pool+proxyRaw proxy429")
 	}
 }
