@@ -19,14 +19,14 @@ import (
 // Predicate unit coverage: state-agnostic, no terminal requirement.
 func TestUnboundDomainsExhaustedAllowCustom(t *testing.T) {
 	mk := func(entered bool, frozen, unavailable int, recovered bool) unboundDomainEvidence {
-		return unboundDomainEvidence{Domain: "d", Entered: entered, Frozen: frozen, Live429: 0, Unavailable: unavailable, Terminal: 500, Recovered400: recovered}
+		return unboundDomainEvidence{Domain: "d", Entered: entered, Frozen: frozen, Unavailable: unavailable, Recovered400: recovered}
 	}
 	if !unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, false, false) {
 		t.Fatalf("single exhausted domain with non-429 terminal must allow")
 	}
 	if !unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{
-		{Domain: "anonymous", Entered: true, Frozen: 2, Live429: 1, Unavailable: 2, Terminal: 403},
-		{Domain: "cred", Entered: true, Frozen: 1, Live429: 0, Unavailable: 1, Terminal: 500},
+		{Domain: "anonymous", Entered: true, Frozen: 2, Unavailable: 2},
+		{Domain: "cred", Entered: true, Frozen: 1, Unavailable: 1},
 	}, false, false, false) {
 		t.Fatalf("mixed 429/non-429 full exhaustion must allow")
 	}
