@@ -1,13 +1,39 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// waiterWaitSelectCtx is a test-only context wrapper that signals the first
+// ctx.Done() access. On the doUnboundEstablishment follower path before the
+// wait select, no ctx.Done() is touched: the loop-start cancellation check
+// uses isContextCancelled (ctx.Err() only), and pinClaim/pinGet/fallback
+// lookup take no context. The first Done() access therefore proves the
+// follower evaluated the post-pinClaim waiter select
+// (select(ctx.Done(), claim.done)) and is about to block. It returns the
+// parent Done() channel unchanged, so select semantics (nil parent Done()
+// blocks on that branch) are preserved. No production hook is added.
+type waiterWaitSelectCtx struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (w *waiterWaitSelectCtx) Done() <-chan struct{} {
+	w.once.Do(func() { close(w.entered) })
+	if w == nil || w.Context == nil {
+		return nil
+	}
+	return w.Context.Done()
+}
 
 // fallbackUnboundAuthGateway builds an auth-only gateway with two proxies in
 // pool "z" and one custom fallback channel active. Retry is minimal to keep
@@ -458,5 +484,152 @@ func TestFallbackUnboundDifferentModelAdoptsSessionBinding(t *testing.T) {
 	}
 	if n := gw.scheduler.pins.reservedCount(); n != 0 {
 		t.Fatalf("reserved leak=%d", n)
+	}
+}
+
+// TestFallbackUnboundWaiterAdoptsCustom verifies the concurrent waiter queue
+// window: B blocks on claim.done while owner A holds the establishment claim,
+// A exhausts native, binds the session-level custom takeover, and releases;
+// B wakes, returns to loop-start, observes fallback before pin/native send,
+// and serves via the same stored binding with zero native POST.
+//
+// Determinism: A's first native POST signals firstStarted and stalls until
+// releaseOwner, guaranteeing A owns the claim before B starts. B uses a
+// test-only context wrapper whose first ctx.Done() access proves B reached
+// the post-pinClaim waiter select (earlier loop-start checks use ctx.Err()
+// only, so they cannot fire the signal). The test waits for that signal with
+// a bounded timeout instead of sleeping, then releases A. No production
+// hooks are used.
+func TestFallbackUnboundWaiterAdoptsCustom(t *testing.T) {
+	var customHits atomic.Int32
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackChatOK("cm-unbound")))
+	}))
+	defer custom.Close()
+
+	gw := fallbackUnboundAuthGateway(t, custom.URL, "c-unbound")
+	ses := "ses_unbound_waiter_queue_1"
+	route := authOnlyRoute()
+	route.KeyTiers = []Tier{TierZen}
+
+	var nativeCalls atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	var once sync.Once
+	barrier := func(*http.Request) (*http.Response, error) {
+		if nativeCalls.Load() == 1 {
+			once.Do(func() { close(firstStarted) })
+			select {
+			case <-releaseOwner:
+			case <-time.After(5 * time.Second):
+				return responseWithBody(500, `{"error":"barrier timeout"}`), nil
+			}
+		}
+		resp := responseWithBody(429, `{"error":"slow"}`)
+		resp.Header.Set("Retry-After", "1")
+		return resp, nil
+	}
+	postStub(t, gw, "z", 0, &nativeCalls, nil, barrier)
+	postStub(t, gw, "z", 1, &nativeCalls, nil, barrier)
+
+	chatExtra := func() upstreamExtra {
+		return upstreamExtra{
+			External: ProtocolChat,
+			Payload: map[string]any{
+				"model": "m",
+				"messages": []any{
+					map[string]any{"role": "user", "content": "hi"},
+				},
+			},
+		}
+	}
+
+	type outcome struct {
+		resp     *http.Response
+		eff      modelRoute
+		attempts int
+		err      error
+	}
+	ownerCh := make(chan outcome, 1)
+	followerCh := make(chan outcome, 1)
+	go func() {
+		resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "req-owner"), 0, chatExtra())
+		ownerCh <- outcome{resp, eff, attempts, err}
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("owner first native send never started")
+	}
+	waiterEntered := make(chan struct{})
+	followerCtx := &waiterWaitSelectCtx{Context: pinTestCtx(), entered: waiterEntered}
+	go func() {
+		resp, eff, attempts, err := gw.doUpstreamTiers(followerCtx, route, routeBodies(), pinIDs(ses, "req-follower"), 0, chatExtra())
+		followerCh <- outcome{resp, eff, attempts, err}
+	}()
+	select {
+	case <-waiterEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("follower never reached claim.done wait select")
+	}
+	select {
+	case got := <-followerCh:
+		drainResp(got.resp)
+		t.Fatalf("follower finished before owner release: must stay blocked on claim.done")
+	default:
+	}
+	if got := nativeCalls.Load(); got != 1 {
+		t.Fatalf("follower sent before owner release: nativeCalls=%d want 1 (owner first only)", got)
+	}
+	close(releaseOwner)
+
+	var ownerRes outcome
+	select {
+	case ownerRes = <-ownerCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("owner deadlocked")
+	}
+	var followerRes outcome
+	select {
+	case followerRes = <-followerCh:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("waiter deadlocked after owner custom takeover")
+	}
+	if ownerRes.err != nil || ownerRes.resp == nil || ownerRes.resp.StatusCode != 200 || ownerRes.eff.Tier != TierCustom {
+		t.Fatalf("owner must succeed via custom: err=%v resp=%v eff=%+v", ownerRes.err, ownerRes.resp, ownerRes.eff)
+	}
+	drainResp(ownerRes.resp)
+	if followerRes.err != nil || followerRes.resp == nil || followerRes.resp.StatusCode != 200 || followerRes.eff.Tier != TierCustom {
+		t.Fatalf("waiter must adopt custom after wakeup: err=%v resp=%v eff=%+v", followerRes.err, followerRes.resp, followerRes.eff)
+	}
+	drainResp(followerRes.resp)
+
+	if got := nativeCalls.Load(); got != 2 {
+		t.Fatalf("waiter must make zero native POST: nativeCalls=%d want 2 (owner exhaustion only)", got)
+	}
+	if got := customHits.Load(); got != 2 {
+		t.Fatalf("customHits=%d want 2 (owner takeover + waiter adoption of same binding)", got)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("session must stay bound to custom (first-wins)")
+	}
+	if binding.ID != "c-unbound" || binding.Model != "cm-unbound" {
+		t.Fatalf("binding identity changed: %+v", binding)
+	}
+	if !binding.Established {
+		t.Fatalf("binding must be established after custom 2xx")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("waiter adoption must not create a pin")
+	}
+	if n := gw.scheduler.pins.inflightCount(); n != 0 {
+		t.Fatalf("claim leak inflight=%d", n)
+	}
+	if n := gw.scheduler.pins.reservedCount(); n != 0 {
+		t.Fatalf("reservation leak reserved=%d", n)
 	}
 }

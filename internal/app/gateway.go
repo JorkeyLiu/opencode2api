@@ -1343,11 +1343,22 @@ func pinRetryAfterSeconds(untilUnixNano int64, now time.Time) int64 {
 	return secs
 }
 
+// lookupCustomFallbackBinding centralizes the repeated nil-safe session
+// fallback lookup shared by the three ADR-required recheck windows. It
+// performs lookup only and never serves, owns, or releases pin claims, so the
+// post-claim window can release before network I/O. Callers keep the exact
+// window placement and order: fallback lookup before pin lookup, serving via
+// doCustomFallbackPinned on hit.
+func (g *Gateway) lookupCustomFallbackBinding(ids requestIDs) (fallbackBinding, bool) {
+	if g == nil || g.scheduler == nil || g.scheduler.fallbacks == nil || ids.Session == "" {
+		return fallbackBinding{}, false
+	}
+	return g.scheduler.fallbacks.get(ids.Session)
+}
+
 func (g *Gateway) doUpstreamTiers(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
-	if g != nil && g.scheduler != nil && g.scheduler.fallbacks != nil && ids.Session != "" {
-		if binding, ok := g.scheduler.fallbacks.get(ids.Session); ok {
-			return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
-		}
+	if binding, ok := g.lookupCustomFallbackBinding(ids); ok {
+		return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
 	}
 	if ids.Session != "" && route.ID != "" && g != nil && g.scheduler != nil {
 		if pin, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
@@ -1666,10 +1677,8 @@ func (g *Gateway) doUnboundEstablishment(ctx context.Context, route modelRoute, 
 		// deterministic missed-entry path exercised by tests via
 		// doUnboundEstablishment. No pinClaim is held, so prepared
 		// route/crossing/metadata are preserved via doCustomFallbackPinned.
-		if g.scheduler != nil && g.scheduler.fallbacks != nil && ids.Session != "" {
-			if binding, ok := g.scheduler.fallbacks.get(ids.Session); ok {
-				return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
-			}
+		if binding, ok := g.lookupCustomFallbackBinding(ids); ok {
+			return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
 		}
 		if pin, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
 			return g.doPinnedUpstream(ctx, route, bodies, ids, pin, attemptOffset, extra...)
@@ -1697,13 +1706,11 @@ func (g *Gateway) doUnboundEstablishment(ctx context.Context, route modelRoute, 
 		// recheck and acquiring ownership (e.g. different-model owner for the
 		// same session), avoid a stray native send by rechecking fallback now.
 		// No cross-store atomicity is promised; on hit release the reservation
-		// and serve custom exclusively. Kept as defense; no deterministic
+		// before serving custom exclusively. Kept as defense; no deterministic
 		// repro is added for this racy window.
-		if g.scheduler != nil && g.scheduler.fallbacks != nil && ids.Session != "" {
-			if binding, ok := g.scheduler.fallbacks.get(ids.Session); ok {
-				g.scheduler.pinRelease(ids.Session, route.ID, claim)
-				return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
-			}
+		if binding, ok := g.lookupCustomFallbackBinding(ids); ok {
+			g.scheduler.pinRelease(ids.Session, route.ID, claim)
+			return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
 		}
 		if pin, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
 			g.scheduler.pinRelease(ids.Session, route.ID, claim)
