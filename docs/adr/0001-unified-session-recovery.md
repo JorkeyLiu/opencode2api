@@ -25,7 +25,7 @@
 - **目的：** 一切恢复都是为了让会话继续；网关是会话恢复系统，不是 HTTP 状态码驱动的重试器。
 - **语义三层/闭环投影（非固定线性对象队列）：** 单次请求的恢复按语义分层投影，非按 proxy/pool/channel/domain 的固定对象层级升级。代理、代理池、凭证、备用渠道、恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；`fallback` 只是 L2 对象选择而非固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级：
   - **L1 / Observe stability — 观察稳定性：** 先判断当前状态；本身已稳定则不重试；未稳定则用受约束的多次请求观察至稳定或停止。`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限。
-  - **L2 / Resolve stable cause — 解决已确认的稳定原因：** 按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes，完成后按 L3 终止/忠实返回，不是 L1 retry）；代理节点不可用时换节点；对象耗尽时选择下一个可用对象；503 执行受 deadline/cancel/committed bytes/观察策略约束的持续观察策略（非无限）；无法解决则进入忠实返回。备用渠道等不同粒度对象均属此层候选决策。
+  - **L2 / Resolve stable cause — 解决已确认的稳定原因：** 按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes，完成后按 L3 终止/忠实返回，不是 L1 retry）；代理节点不可用时换节点；对象耗尽时选择下一个可用对象；503 不设独立的 L2 持续观察/重试循环（稳定性观察仅属 L1 并受其既有边界约束）；L1-final 503 后 L2 仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回。备用渠道等不同粒度对象均属此层候选决策。
   - **L3 / Continue session or faithfully return — 继续会话或忠实返回：** 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回。
 - **恢复域定义（上下文而非层级）：** 已绑定会话为该 session+model 绑定的 credential+pool 可用代理集；未绑定会话为本次冻结的 eligible targets；耗尽是健康/冷却过滤后没有可发送对象。恢复域是对象/候选组织与可用性过滤的上下文，不产生比对象更高的恢复层级。
 - **无单状态码自动资格：** 任何单个状态码都不自动等同于 fallback 资格；逐状态码在 L1/L2/L3 语义投影下的映射、预算数值、退避细节仍由后续实现决定，本 ADR 不将其完整矩阵写成已完成，MUST NOT 冻结逐状态码矩阵、预算或退避。
@@ -43,7 +43,7 @@
 
 4. **精确 400 重放的终态定位（Corrective replay, not retry — L2 动作按 L3 终态）：** HTTP 400 属于非法请求、非波动态。精确 HTTP 400 的一次同目标重放（exact 400 replay）是对 `reasoning`/`previous_response_id` 等策略引用清理后的“解除策略/请求修正动作”，属于 L2 的稳定非法请求解决动作，不是 L1 retry；必须保持同目标、同 route session、同请求身份（same target / same route session / same request ID）约束，始终在向客户端提交任何字节之前执行。重放结果无论成功、二次 400 或其他结果，都是整条路由的最后恢复动作（route-terminal），按 L3 终止/忠实返回，不再继续候选、通道或 fallback 恢复，不进入进一步评估。当前代码与 `AGENTS.md` §4 的 400 终态基线是正确的，以此为准。
 
-5. **停止条件与忠实返回（Stop conditions & Faithful return — L3 边界）：** 客户端取消（cancellation）、请求 deadline 超时、已向客户端提交字节（committed bytes / streaming started）后，立即停止恢复（L3 停止边界），不再切换上游或重新生成；503 等场景的持续稳定性观察亦受上述边界与当前观察策略约束（L2 内受 deadline/cancel/committed bytes/观察策略约束的持续观察，非无限），无法解决时按 L3 忠实返回。
+5. **停止条件与忠实返回（Stop conditions & Faithful return — L3 边界）：** 客户端取消（cancellation）、请求 deadline 超时、已向客户端提交字节（committed bytes / streaming started）后，立即停止恢复（L3 停止边界），不再切换上游或重新生成；稳定性观察仅属 L1（受单一 `retry.max_attempts` 计数、interval/Retry-After、deadline/cancel、提交前边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决时按 L3 忠实返回。
 
 6. **最大重试语义（稳定性观察计数 — L1 观察层）：** `max retry` / `retry.max_attempts` 的规范语义是 L1 观察层判定稳定性所需的“最小请求次数/观察次数”（minimum observation/request count to judge stability），不是对所有错误统一发放的重试额度或对象队列配额（not a uniform error-count quota）；具体状态在统一语义三层下的映射与是否计入该观察预算，仍由既有/后续实现定义，本 ADR 不将其完整矩阵写成已决定。该语义已**规范化迁移至单一权威定义（canonical migration，已落地单一 L1 计数）**：`retry.transient_max_attempts` 已删除（严格 unknown-field 拒绝，无值迁移），`retry.max_attempts` 为唯一 L1 同目标观察上限（含首次发送），认证普通发送预算已删除（不再截断 L1 与候选遍历，遍历由冻结切片自然有界），模型刷新改用独立全遍历；避免被误读为并行预算或按错误数额度的配额；现有分散预算已收敛到 L1 稳定性观察，但不预先冻结数值与逐状态退避，不写成 L1/L2/L3 固定队列。本次仅完成单一 L1 计数收敛，逐状态矩阵、广义 fallback 与退避数值仍未冻结。
 
@@ -106,7 +106,7 @@
 - `max retry` 已收敛至 L1 观察层“最小观察次数/稳定性观察计数”的单一权威语义（not a uniform error-count quota / 对象队列配额）：`retry.max_attempts` 为唯一 L1 同目标观察上限（含首次发送），已删除的 `retry.transient_max_attempts` 严格 unknown-field 拒绝、无值迁移；不保留多预算并行解释，也不将逐状态数值预算与退避写成已决定或冻结矩阵。
 - 实现必须保持 `scheduler` / `pin` / `route-session` 的领域归属，不将冷却、绑定、会话生成职责外移或合并；流式提交后不切换上游/不重新生成的不变式保持不变；代理/池/凭证/备用渠道/恢复域仅为对象/候选上下文，不映射为固定 L2/L3。
 - 400 重放的实现需保证同目标、同路由会话、同一请求身份的约束，属于 L2 稳定非法请求解决动作，且其结果为整条路由的最后恢复动作（route-terminal，按 L3 终止/忠实返回），不再继续候选/通道/fallback 评估；不得将重放结果回流至正常恢复或视为 L1 retry，不得把 400 写成 L1 行为。
-- 取消 / deadline / 已提交字节的停止语义（L3 边界）需在网关入口与流式网关处一致执行，不产生新的后台重试；503 等场景的持续观察亦受上述边界与观察策略约束（L2 内非无限，无法解决则按 L3 忠实返回，不写成无限 retry）。
+- 取消 / deadline / 已提交字节的停止语义（L3 边界）需在网关入口与流式网关处一致执行，不产生新的后台重试；503 不设 L2 持续观察（稳定性观察仅属 L1），L1-final 503 后仅按既有对象选择/耗尽规则解决、否则按 L3 忠实返回，不写成无限 retry。
 - 配置变更保持严格未知字段拒绝与原子切换语义；新增恢复相关配置需显式说明是否热生效或需重启（参考 `AGENTS.md` §3）。
 - 不引入新依赖（`golang.org/x/crypto` 以外需显式理由），保持 `gofmt` 清洁与容器姿态。
 - custom session takeover 并发边界：以 session 级 first-wins 收敛；在请求入口（`doUpstreamTiers`）、未绑定建立环路起点（`doUnboundEstablishment` loop-start）和 pin claim 后首次 native 发送前做有限重查；不提供 fallback/pin store 跨 store 原子线性化；已经发出的 native POST 不撤销，后绑定只影响尚未发送或后续请求；`claim.done` waiter 唤醒后回到入口重查。此为并发边界，不是广义统一恢复完成，也不改变现有 pin 的 claim/waiter 语义。
@@ -116,7 +116,7 @@
 在实现被视为完成前，必须完成以下验证（均为待执行项，本 ADR 仅作要求声明）：
 
 - `go test ./...` 通过（CI 门禁）；
-- 针对统一语义三层（L1 观察稳定性 / L2 解决稳定原因（含所有对象粒度与 fallback 作为 L2 动作）/ L3 继续或返回）的单测与集成测试，覆盖：L1 受约束观察至稳定、L2 对象耗尽判定（代理/池/凭证/备用渠道均为候选，恢复域为上下文）、耗尽后 L2 选择下一可用对象、未耗尽时不选择 fallback；503 受 deadline/cancel/committed bytes/观察策略约束的持续观察非无限；
+- 针对统一语义三层（L1 观察稳定性 / L2 解决稳定原因（含所有对象粒度与 fallback 作为 L2 动作）/ L3 继续或返回）的单测与集成测试，覆盖：L1 受约束观察至稳定、L2 对象耗尽判定（代理/池/凭证/备用渠道均为候选，恢复域为上下文）、耗尽后 L2 选择下一可用对象、未耗尽时不选择 fallback；503 仅有 L1 同目标有界观察（无 L2 持续观察循环），L1-final 503 按既有对象选择/耗尽规则解决或按 L3 忠实返回；
 - 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry）；
 - 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界）；
 - 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移）；
@@ -135,6 +135,11 @@
 **附注：** 本 ADR 仅记录已稳定的方向性决策，所有逐状态码行为矩阵、阈值、退避与计数器等实现细节均显式标记为待定，不得视为已接受决策；不擅自冻结所有状态码矩阵。
 
 ### 修订历史（Revision History）
+
+- **2026-09-23 — 关闭 503 观察策略问题（Nexus 裁决：无 L2 持续观察）：**
+  - 无独立的 HTTP-503 L2 持续观察/重试循环：稳定性观察仅属 L1，受单一规范 `retry.max_attempts` 计数（含首次发送）、既有 interval/Retry-After 延迟、请求 deadline、取消与提交前边界约束；新增 post-L1 503 观察循环将重复 L1、形成并行/隐藏观察预算，与已接受的单一 L1 权威矛盾，故不设。
+  - L1-final 503 后，L2 仅按既有对象选择/耗尽规则解决稳定原因：未绑定建立沿用当前冻结目标遍历与分域耗尽规则；已绑定会话保持 5xx 不移动不变式，仅已满足条件的既有有界 consumption/custom 规则可适用，否则按 L3 忠实返回目标协议 503；单个 503 不直接构成 fallback 资格。
+  - 本次仅关闭 503 观察策略问题；广义逐状态码矩阵与统一三层完整实现仍待定，不冻结无关退避/预算细节；正文 §2/§5/§7/§8 中的 L2 503 持续观察表述已同步修正为上述关闭口径（历史修订条保留原样，以下条目为准）；§8 验证要求保持待执行，不标记完成。
 
 - **2026-09-23 — 当前 fallback 事实状态澄清（无规范变更，仅消除现状误读）：**
   - §6“候选序列与特定 429 fallback 基线”与 2026-09-22 修订条“当前代码仍为历史候选/429 fallback 基线”均为当时快照，现已由 `b2c4798`（未绑定按域状态无关耗尽：每域独立 `Entered && Frozen>0 && Unavailable>=Frozen`，允许集 live 429 / 401 / 403 / L1-final 408-425-5xx-transport 含 L1-final stream startup，400 / ordinary 4xx / cancel-deadline / committed / build 不计，状态无关）与 `1e4536c`（已绑定保留全量 live 429 并新增有界 consumption 门：已实际切换到下一冻结 eligible、全部冻结 eligible 真实尝试、末位对象不可用；预冷零发送保持原生；单代理首发非 429 / 400 重放 / ordinary 4xx / cancel-deadline / committed 不接管）取代；`977790a` / `1a5904f` / `8a43803` 为纯测试提交，无生产语义变更。

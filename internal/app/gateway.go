@@ -1436,6 +1436,43 @@ func customTakeoverEligible(q customTakeoverQualification) bool {
 	return q.ObservedLive429 >= q.Eligible
 }
 
+// finalNon429ObjectUnavailable is the single leaf authority for the
+// overlapping non-429 final-unavailable classification shared by the unbound
+// and pinned exhaustion wrappers. It reports whether one live final outcome
+// proves its object unavailable excluding 429: 401/403, L1-final 408/425/5xx
+// (including 503), true transport failure, and stream-startup failure. Any
+// non-nil err counts as unavailable here; the L1-final, cancel/deadline,
+// BuildErr/no-send, and committed-stream gating stays with the callers, which
+// only pass the L1-final outcome of a real send via the frozen-walk paths.
+// Exact 400 (same-target corrective replay, route-terminal), ordinary client
+// 4xx, 2xx and other statuses, nil/nil, and 429 never count here; 429
+// ownership stays with the wrappers (unbound counts live 429, pinned excludes
+// it via the separate full-live-429 gate). No scheduler writes, attempts
+// accounting, Started fencing, response draining, proxy moves, or
+// route-session behavior lives here.
+func finalNon429ObjectUnavailable(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	status := resp.StatusCode
+	if status == http.StatusTooManyRequests {
+		return false
+	}
+	if status == http.StatusBadRequest {
+		return false
+	}
+	if isOrdinaryClientRejection(resp, nil) {
+		return false
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusRequestTimeout || status == 425 {
+		return true
+	}
+	return status >= 500 && status <= 599
+}
+
 // pinnedConsumptionAllowCustom is the bounded pinned L2 consumption
 // exhaustion gate (pinned native only). It never replaces the 429-only
 // compat gate above: 429 finals return false here and stay owned by
@@ -1461,29 +1498,10 @@ func pinnedConsumptionAllowCustom(eligible, attempted int, consumed, cancelled b
 	if !consumed {
 		return false
 	}
-	if err != nil {
-		return true
-	}
-	if resp == nil {
+	if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		return false
 	}
-	status := resp.StatusCode
-	if status == http.StatusTooManyRequests {
-		return false
-	}
-	if status == http.StatusBadRequest {
-		return false
-	}
-	if isOrdinaryClientRejection(resp, nil) {
-		return false
-	}
-	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusRequestTimeout || status == 425 {
-		return true
-	}
-	if status >= 500 && status <= 599 {
-		return true
-	}
-	return false
+	return finalNon429ObjectUnavailable(resp, err)
 }
 
 // unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
@@ -1519,20 +1537,10 @@ type unboundDomainEvidence struct {
 // outcome of a real send; BuildErr/unsent, cancel/deadline, committed, and
 // 400/ordinary-4xx finals never reach it via the frozen-walk early returns.
 func unboundObjectUnavailable(resp *http.Response, err error) bool {
-	if err != nil {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 		return true
 	}
-	if resp == nil {
-		return false
-	}
-	status := resp.StatusCode
-	if status == http.StatusTooManyRequests || status == http.StatusUnauthorized || status == http.StatusForbidden {
-		return true
-	}
-	if status == http.StatusRequestTimeout || status == 425 {
-		return true
-	}
-	return status >= 500 && status <= 599
+	return finalNon429ObjectUnavailable(resp, err)
 }
 
 // unboundDomainExhausted reports state-agnostic object exhaustion for one
