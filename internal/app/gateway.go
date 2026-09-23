@@ -2168,11 +2168,11 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			return resp, effectiveRoute, attemptOffset + attempts, sendErr
 		}
-		if isRouteTerminalBadRequest(resp, sendErr) {
+		if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, resp, sendErr, firstDiag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, func() {
 			if last429 != nil {
 				drainAndClose(last429.Body)
 			}
-			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
+		}); handled {
 			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
 				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 			}
@@ -2217,11 +2217,11 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			if isRouteTerminalBadRequest(final.Resp, final.Err) {
+			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, func() {
 				if last429 != nil {
 					drainAndClose(last429.Body)
 				}
-				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+			}); handled {
 				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
 					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 				}
@@ -2495,9 +2495,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			discardLast429()
 			return resp, effectiveRoute, attemptOffset + attempts, sendErr
 		}
-		if isRouteTerminalBadRequest(resp, sendErr) {
-			discardLast429()
-			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
+		if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, resp, sendErr, firstDiag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
 			attempts = replayed
 			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
 				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
@@ -2575,9 +2573,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				discardLast429()
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			if isRouteTerminalBadRequest(final.Resp, final.Err) {
-				discardLast429()
-				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
 				attempts = replayed
 				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
 					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
@@ -3035,8 +3031,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false, anonEvidence(anonEntered, anonFrozen, len(anonLive429), anonTerminalOf(resp, err), false)
 		}
-		if isRouteTerminalBadRequest(resp, err) {
-			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
+		if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, resp, err, firstDiag, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 			attempts = replayed
 			if replayResp != nil || replayErr != nil {
 				replayTerminal := 0
@@ -3071,8 +3066,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			if stop == transientStopContext || isContextCancelled(ctx) {
 				return final.Resp, final.Err, attempts, false, false, anonEvidence(anonEntered, anonFrozen, len(anonLive429), anonTerminalOf(final.Resp, final.Err), false)
 			}
-			if isRouteTerminalBadRequest(final.Resp, final.Err) {
-				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 				attempts = replayed
 				if replayResp != nil || replayErr != nil {
 					replayTerminal := 0
@@ -3131,6 +3125,32 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		lastErr = errors.New("no healthy anonymous proxies available")
 	}
 	return nil, lastErr, attempts, false, false, anonEvidence(anonEntered, anonFrozen, len(anonLive429), 0, false)
+}
+
+// maybeReplayCandidate400 centralizes the repeated mechanical exact-400 entry
+// condition and call without absorbing caller-owned recovery policy. It takes
+// the observed attempt outcome (response/error/diag) plus the existing
+// replayCandidate400 arguments, determines exact HTTP 400 via
+// isRouteTerminalBadRequest, runs the caller-owned preReplay action (if any),
+// and only then calls replayCandidate400. preReplay exists so pinned callers
+// can execute their last429/discardLast429 draining before the replay send
+// performs replay I/O, exactly as HEAD a733a20 ordered drain-before-replay.
+// It returns handled plus the replay response/error/updated attempt count;
+// when not an exact 400 it returns handled=false with the input attempt count
+// and never runs preReplay. All other caller-owned policy stays outside:
+// pinMoveCurrent after replay 2xx on a pinned alternate proxy, unbound
+// Recovered400/Terminal evidence, credRecovered/credTerminal mutations,
+// suppressed nil/nil preservation of the original 400, route-terminal returns,
+// and attemptOffset return shapes.
+func (g *Gateway) maybeReplayCandidate400(ctx context.Context, resp *http.Response, err error, diag badRequestDiag, route modelRoute, tier Tier, baseURL string, protocol Protocol, canonical []byte, ids requestIDs, cand targetCandidate, scope routeSessionScope, routeSession string, attemptOffset, attempts int, preReplay func()) (handled bool, replayResp *http.Response, replayErr error, replayed int) {
+	if !isRouteTerminalBadRequest(resp, err) {
+		return false, nil, nil, attempts
+	}
+	if preReplay != nil {
+		preReplay()
+	}
+	replayResp, replayErr, replayed = g.replayCandidate400(ctx, route, tier, baseURL, protocol, canonical, ids, cand, scope, routeSession, resp, diag, attemptOffset, attempts)
+	return true, replayResp, replayErr, replayed
 }
 
 // replayCandidate400 performs the single same-target 400 recovery replay: it
@@ -3462,8 +3482,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false, buildKeyDomains()
 		}
-		if isRouteTerminalBadRequest(resp, err) {
-			replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, resp, firstDiag, attemptOffset, attempts)
+		if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, resp, err, firstDiag, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 			attempts = replayed
 			if replayResp != nil || replayErr != nil {
 				credRecovered[cand.CredID] = true
@@ -3503,8 +3522,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				credTerminal[cand.CredID] = keyTerminalOf(final.Resp, final.Err)
 				return final.Resp, final.Err, attempts, false, false, buildKeyDomains()
 			}
-			if isRouteTerminalBadRequest(final.Resp, final.Err) {
-				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 				attempts = replayed
 				if replayResp != nil || replayErr != nil {
 					credRecovered[cand.CredID] = true
