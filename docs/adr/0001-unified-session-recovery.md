@@ -136,6 +136,10 @@
 
 ### 修订历史（Revision History）
 
+- **2026-09-23 — L1 后稳定原因分类接缝收敛（实现事实，无原则变更）：**
+  - `gateway.go` 内 L1 观察之后收敛为单一分类权威 `classifyStableCause`（仅七种：context / build / 2xx / exact400 / live429 / ordinary4xx / 其余 L1-final；late-cancel 不折入原因，`doPinnedAuth` 保留旧门原样）；四条 native walker 消费分类，各路径 L2 对象决策与 scheduler / pin / route-session / custom 门保留，行为等价。
+  - 本次为行为保持的结构收敛，不更改已接受的统一语义三层原则，不冻结新的逐状态码矩阵、预算或退避；广义 cause→L2 action / object selection 映射仍待定。
+
 - **2026-09-23 — 关闭 503 观察策略问题（Nexus 裁决：无 L2 持续观察）：**
   - 无独立的 HTTP-503 L2 持续观察/重试循环：稳定性观察仅属 L1，受单一规范 `retry.max_attempts` 计数（含首次发送）、既有 interval/Retry-After 延迟、请求 deadline、取消与提交前边界约束；新增 post-L1 503 观察循环将重复 L1、形成并行/隐藏观察预算，与已接受的单一 L1 权威矛盾，故不设。
   - L1-final 503 后，L2 仅按既有对象选择/耗尽规则解决稳定原因：未绑定建立沿用当前冻结目标遍历与分域耗尽规则；已绑定会话保持 5xx 不移动不变式，仅已满足条件的既有有界 consumption/custom 规则可适用，否则按 L3 忠实返回目标协议 503；单个 503 不直接构成 fallback 资格。
@@ -157,7 +161,7 @@
   - 明确最高原则闭环为 `observe stability -> resolve stable cause -> continue session or faithfully return`；网关是会话恢复系统而非 HTTP 状态码驱动的重试器，一切恢复为让会话继续；先判断稳定性（稳态不重试、未稳态受约束多次观察），稳态后按错误原因/当前对象/恢复域取最小针对性解决动作（非法请求同目标修正、节点不可用域内换节点、域耗尽进下一对象/备用渠道、503 受 deadline/取消/已提交字节/观察策略约束的持续稳定性观察，非无限请求）。
   - 补充对象/恢复域定义：已绑定 = 同 session+model 绑定的 credential+pool 可用代理集，未绑定 = 本次冻结 eligible targets，耗尽 = 健康/冷却过滤后无可发送对象；单状态码不自动获得 fallback 资格，备用路由仅在当前恢复域可用目标耗尽后作为下一可用目标。
   - 明确无法解决时按目标协议忠实返回；保留 400 同目标修正重放 route-terminal 定位与既有代码/`AGENTS.md` §4 基线；逐状态码 L1/L2/L3 矩阵、预算数值、退避细节仍显式待定，不视为已完成。
-  - 状态由“已接受方向 / 实现待验证”调整为“原则已接受 / 分层实现待验证”。
+   - 状态由“已接受方向 / 实现待验证”调整为“原则已接受 / 分层实现待验证”。
 - **2026-09-22 — 将三层从对象队列投影修正为 observe/resolve/continue-or-return 语义投影（维护者裁决）：**
   - 将 §2 的“有序分层（Ordered Layers）：L1 同目标→ L2 域内代理→ L3 备用路由”对象队列描述修正为统一语义三层/闭环投影：L1 / Observe stability（观察稳定性，先判断已稳定则不重试，未稳定受约束多次请求观察，retry 属此层）、L2 / Resolve stable cause（按 cause+current object+上下文选最小针对性动作：非法请求同目标修正、节点不可用换节点、对象耗尽选下一可用对象、503 受 deadline/cancel/committed bytes/观察策略约束持续观察，无法解决则忠实返回）、L3 / Continue session or faithfully return（成功继续会话保持 pin/route-session 约束，失败或止边界按目标协议忠实返回）；代理/代理池/凭证/备用渠道/恢复域均为不同粒度的对象/候选，不是 L2/L3 的固定层级；fallback 为 L2 对象选择/解决动作，不是固定 L3；恢复域为对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3；400 重放属 L2 完成后按 L3 终止，不是 L1 retry。
   - 同步修正 §2 备用路由资格、§3 范围、§5 拒绝项、§6 后果、§7 迁移约束、§8 验证要求中的 L1/L2/L3 引用与 400/503/停止条件/max retry 表述，避免把 fallback 定为 L3、避免冻结逐状态码矩阵/预算/退避、不把 503 写成无限 retry、不改变当前 400 终态与 scheduler/pin/route-session/流式提交后停止等实现不变式。

@@ -1242,6 +1242,97 @@ func (r transientLoopResult) sawStreamSentinel() bool {
 	return isStreamStartupFailureErr(r.InitialErr) || isStreamStartupFailureErr(r.Final.Err)
 }
 
+// stableCause names the single post-L1 stable reason observed after
+// observeSameTargetTransient stops. It only describes why the observation
+// stopped and what the final outcome is; it never selects candidates,
+// proxy moves, scheduler writes, custom fallback, or return envelopes.
+// L1Final covers every remaining live final (L1-final transient 408/425/5xx
+// including 503, true transport errors, stream-startup sentinels, and stable
+// 401/403); callers keep their existing fine-grained policy inside that
+// bucket (sentinel poisoning, stale-initial returns, transport walks,
+// 5xx no-move, exhaustion evidence).
+type stableCause int
+
+const (
+	stableCauseContext stableCause = iota
+	stableCauseBuildFailure
+	stableCauseSuccess
+	stableCauseExact400
+	stableCauseLive429
+	stableCauseOrdinaryRejection
+	stableCauseL1Final
+)
+
+// stableCauseResult is the structured post-L1 classification: the cause plus
+// the raw L1 outcome passthrough that existing caller policy still needs.
+// Final/Stop/InitialResp/InitialErr are loopRes unchanged. StreamSentinel is
+// loopRes.sawStreamSentinel(), StillTransient is
+// isSameTargetTransient(Final), Cancelled is isContextCancelled(ctx).
+type stableCauseResult struct {
+	Cause          stableCause
+	Final          attemptOutcome
+	Stop           transientStopReason
+	InitialResp    *http.Response
+	InitialErr     error
+	StreamSentinel bool
+	StillTransient bool
+	Cancelled      bool
+}
+
+// classifyStableCause is the single post-L1 classification authority shared
+// by the four native recovery walkers. Cause describes the observed final
+// outcome plus the L1 stop fact only: build failure and 2xx success precede
+// everything (a BuildErr/2xx final is returned as-is even under
+// cancellation), then the L1 stop-context (Stop == transientStopContext),
+// exact 400, live 429, ordinary rejection, and finally the L1-final bucket.
+// Late cancellation after observation (Stop == stable/observation-limit with
+// a cancelled ctx) is NOT folded into Cause; it is carried in Cancelled for
+// each caller's own preserved gate, so an observationLimit+cancelled final
+// still classifies as its outcome (e.g. live 429, exact 400, L1-final)
+// exactly as the old per-path predicates did. All status predicates reuse
+// the existing authorities; no status-code matrix is copied here.
+func classifyStableCause(ctx context.Context, loopRes transientLoopResult) stableCauseResult {
+	final := loopRes.Final
+	cancelled := isContextCancelled(ctx)
+	res := stableCauseResult{
+		Final:          final,
+		Stop:           loopRes.Stop,
+		InitialResp:    loopRes.InitialResp,
+		InitialErr:     loopRes.InitialErr,
+		StreamSentinel: loopRes.sawStreamSentinel(),
+		StillTransient: isSameTargetTransient(final.Resp, final.Err),
+		Cancelled:      cancelled,
+	}
+	switch {
+	case final.BuildErr != nil:
+		res.Cause = stableCauseBuildFailure
+	case final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2:
+		res.Cause = stableCauseSuccess
+	case loopRes.Stop == transientStopContext:
+		res.Cause = stableCauseContext
+	case isRouteTerminalBadRequest(final.Resp, final.Err):
+		res.Cause = stableCauseExact400
+	case final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests:
+		res.Cause = stableCauseLive429
+	case isOrdinaryClientRejection(final.Resp, final.Err):
+		res.Cause = stableCauseOrdinaryRejection
+	default:
+		res.Cause = stableCauseL1Final
+	}
+	return res
+}
+
+// pinnedAuthContextEarlyReturn is the exact HEAD doPinnedAuth context
+// early-return gate kept verbatim: only an L1 stop-context or a stable final
+// with a cancelled ctx returns early. An observationLimit final with a ctx
+// cancelled after observation stays on the old L1-final path (sentinel,
+// stale-initial, transport-walk, 5xx no-move policy); it must not be folded
+// into the broad stop==context-or-cancelled gates the unbound and
+// pinned-anonymous paths keep.
+func pinnedAuthContextEarlyReturn(r stableCauseResult) bool {
+	return r.Stop == transientStopContext || (r.Stop == transientStopStable && r.Cancelled)
+}
+
 // observeSameTargetTransient owns only the L1 same-target observation mechanism
 // starting from an initial transient attemptOutcome: while it remains
 // isSameTargetTransient it drains the retried outcome, sleeps with
@@ -2156,14 +2247,17 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag}, pin.Tier, protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
 			})
-			final, stop := loopRes.Final, loopRes.Stop
-			if final.BuildErr != nil {
+			classified := classifyStableCause(ctx, loopRes)
+			final := classified.Final
+			stop := classified.Stop
+			_ = stop
+			if classified.Cause == stableCauseBuildFailure {
 				if last429 != nil {
 					drainAndClose(last429.Body)
 				}
 				return nil, effectiveRoute, attemptOffset + attempts, final.BuildErr
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+			if classified.Cause == stableCauseSuccess {
 				if last429 != nil {
 					drainAndClose(last429.Body)
 				}
@@ -2172,36 +2266,38 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 			}
-			if stop == transientStopContext {
+			if classified.Cause == stableCauseContext || classified.Cancelled {
+				if stop == transientStopContext {
+					if last429 != nil {
+						drainAndClose(last429.Body)
+					}
+					// Exact HEAD pre-retry-cancel ownership: an intermediate cur
+					// (cur != initial) was drained before return; the initial
+					// itself was returned undrained. Sleep interruption returns
+					// nil + ctx err with no body.
+					if final.Resp != nil && final.Resp != classified.InitialResp {
+						drainAndClose(final.Resp.Body)
+					}
+					return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+				}
 				if last429 != nil {
 					drainAndClose(last429.Body)
-				}
-				// Exact HEAD pre-retry-cancel ownership: an intermediate cur
-				// (cur != initial) was drained before return; the initial
-				// itself was returned undrained. Sleep interruption returns
-				// nil + ctx err with no body.
-				if final.Resp != nil && final.Resp != loopRes.InitialResp {
-					drainAndClose(final.Resp.Body)
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			if isContextCancelled(ctx) {
-				if last429 != nil {
-					drainAndClose(last429.Body)
+			if classified.Cause == stableCauseExact400 {
+				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, func() {
+					if last429 != nil {
+						drainAndClose(last429.Body)
+					}
+				}); handled {
+					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					}
+					return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 				}
-				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, func() {
-				if last429 != nil {
-					drainAndClose(last429.Body)
-				}
-			}); handled {
-				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-				}
-				return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
-			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+			if classified.Cause == stableCauseLive429 {
 				if last429 != nil {
 					drainAndClose(last429.Body)
 				}
@@ -2258,7 +2354,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			// (final == initial, e.g. maxObservation==1) was returned undrained.
 			// Stable finals are never drained here; the caller returns them
 			// for the envelope.
-			if final.Err != nil && final.Resp != nil && final.Resp != loopRes.InitialResp {
+			if final.Err != nil && final.Resp != nil && final.Resp != classified.InitialResp {
 				drainAndClose(final.Resp.Body)
 			}
 			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
@@ -2527,34 +2623,35 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag, Started: firstStarted}, pin.Tier, protocol, &attempts, attemptOffset, g.observationAttempts(), g.transientInterval(), func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, monitorAttempt)
 			})
-			final, stop := loopRes.Final, loopRes.Stop
-			if final.BuildErr != nil {
+			classified := classifyStableCause(ctx, loopRes)
+			final := classified.Final
+			stop := classified.Stop
+			_ = stop
+			if classified.Cause == stableCauseBuildFailure {
 				discardLast429()
 				return nil, effectiveRoute, attemptOffset + attempts, final.BuildErr
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+			if classified.Cause == stableCauseSuccess {
 				discardLast429()
 				if ep.raw != pin.ProxyRaw {
 					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 			}
-			if stop == transientStopContext {
+			if pinnedAuthContextEarlyReturn(classified) {
 				discardLast429()
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			if stop == transientStopStable && isContextCancelled(ctx) {
-				discardLast429()
-				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
-			}
-			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
-				attempts = replayed
-				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			if classified.Cause == stableCauseExact400 {
+				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
+					attempts = replayed
+					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					}
+					return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
 				}
-				return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+			if classified.Cause == stableCauseLive429 {
 				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
 				if _, seen := observed429[ep.raw]; !seen {
 					observed429[ep.raw] = retryAfter
@@ -2588,7 +2685,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				// intermediate-only sentinels never poison. Preserve the
 				// observed429 write, drain both final and prior last429, and
 				// return pin-local 502 with no next-proxy/custom/credential429.
-				if loopRes.sawStreamSentinel() {
+				if classified.StreamSentinel {
 					drainAndClose(final.Resp.Body)
 					discardLast429()
 					return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
@@ -2605,7 +2702,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// old isStreamStartupFailureErr(curErr)||isStreamStartupFailureErr(sendErr).
 			// Intermediate-only sentinels never poison. No last-wins, no
 			// de-poisoning.
-			if loopRes.sawStreamSentinel() {
+			if classified.StreamSentinel {
 				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, final.Err) {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 						discardLast429()
@@ -2624,11 +2721,11 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// Exact HEAD mixed 503->transport-nil at the observation limit:
 			// old returned the stale initial response (initial 503, nil err)
 			// where the final is a nil-body transport error, not nil+transport.
-			if stop == transientStopObservationLimit && final.Err != nil && final.Resp == nil && loopRes.InitialErr == nil && loopRes.InitialResp != nil {
-				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), loopRes.InitialResp, loopRes.InitialErr) {
+			if stop == transientStopObservationLimit && final.Err != nil && final.Resp == nil && classified.InitialErr == nil && classified.InitialResp != nil {
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), classified.InitialResp, classified.InitialErr) {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 						discardLast429()
-						drainAndClose(loopRes.InitialResp.Body)
+						drainAndClose(classified.InitialResp.Body)
 						if takeErr != nil {
 							return nil, eff, next, takeErr
 						}
@@ -2639,9 +2736,9 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					}
 				}
 				discardLast429()
-				return loopRes.InitialResp, effectiveRoute, attemptOffset + attempts, loopRes.InitialErr
+				return classified.InitialResp, effectiveRoute, attemptOffset + attempts, classified.InitialErr
 			}
-			if final.Resp != nil && isSameTargetTransient(final.Resp, final.Err) {
+			if final.Resp != nil && classified.StillTransient {
 				if final.Err != nil {
 					if idx != len(eligible)-1 {
 						if final.Resp != nil {
@@ -3012,11 +3109,14 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag}, TierZen, route.Protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
 			})
-			final, stop := loopRes.Final, loopRes.Stop
-			if final.BuildErr != nil {
+			classified := classifyStableCause(ctx, loopRes)
+			final := classified.Final
+			stop := classified.Stop
+			_ = stop
+			if classified.Cause == stableCauseBuildFailure {
 				return nil, final.BuildErr, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+			if classified.Cause == stableCauseSuccess {
 				if isStreamContext(ctx) {
 					g.logger.Debug("anonymous transient retry stream committed", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
@@ -3025,21 +3125,23 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
-			if stop == transientStopContext || isContextCancelled(ctx) {
+			if classified.Cause == stableCauseContext || classified.Cancelled {
 				return final.Resp, final.Err, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
-			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
-				attempts = replayed
-				if replayResp != nil || replayErr != nil {
-					return replayResp, replayErr, attempts, true, false, anonEvidence(anonEntered, anonFrozen, true)
+			if classified.Cause == stableCauseExact400 {
+				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
+					attempts = replayed
+					if replayResp != nil || replayErr != nil {
+						return replayResp, replayErr, attempts, true, false, anonEvidence(anonEntered, anonFrozen, true)
+					}
+					return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 				}
-				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
-			if isOrdinaryClientRejection(final.Resp, final.Err) {
+			if classified.Cause == stableCauseOrdinaryRejection {
 				g.logger.Debug("anonymous transient retry hit ordinary rejection; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+			if classified.Cause == stableCauseLive429 {
 				markAnonUnavailable(cand.ProxyRaw, final.Resp, nil)
 			} else if stop == transientStopObservationLimit || stop == transientStopStable {
 				// L1-final transport/408/425/5xx, stable 401/403, or L1-final
@@ -3444,12 +3546,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag, Started: firstStarted}, route.Tier, route.Protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
 			})
-			final := loopRes.Final
-			_ = loopRes.Stop
-			if final.BuildErr != nil {
+			classified := classifyStableCause(ctx, loopRes)
+			final := classified.Final
+			stop := classified.Stop
+			_ = stop
+			if classified.Cause == stableCauseBuildFailure {
 				return nil, final.BuildErr, attempts, false, false, buildKeyDomains()
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+			if classified.Cause == stableCauseSuccess {
 				if isStreamContext(ctx) {
 					g.logger.Debug("upstream transient retry stream committed", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
@@ -3458,22 +3562,24 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
 				return final.Resp, nil, attempts, false, false, buildKeyDomains()
 			}
-			if isContextCancelled(ctx) {
+			if classified.Cancelled {
 				return final.Resp, final.Err, attempts, false, false, buildKeyDomains()
 			}
-			if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
-				attempts = replayed
-				if replayResp != nil || replayErr != nil {
-					credRecovered[cand.CredID] = true
-					return replayResp, replayErr, attempts, true, false, buildKeyDomains()
+			if classified.Cause == stableCauseExact400 {
+				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
+					attempts = replayed
+					if replayResp != nil || replayErr != nil {
+						credRecovered[cand.CredID] = true
+						return replayResp, replayErr, attempts, true, false, buildKeyDomains()
+					}
+					return final.Resp, nil, attempts, false, false, buildKeyDomains()
 				}
-				return final.Resp, nil, attempts, false, false, buildKeyDomains()
 			}
-			if isOrdinaryClientRejection(final.Resp, final.Err) {
+			if classified.Cause == stableCauseOrdinaryRejection {
 				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
 				return final.Resp, nil, attempts, false, false, buildKeyDomains()
 			}
-			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+			if classified.Cause == stableCauseLive429 {
 				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, nil)
 				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
 				ev, ok := cred429Evidence[cand.CredID]
@@ -3498,7 +3604,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			// unavailable (each frozen candidate once; ordinary 4xx/400
 			// already returned, cancel already returned, BuildErr/committed
 			// never reach here).
-			if loopRes.Stop == transientStopObservationLimit || loopRes.Stop == transientStopStable {
+			if stop == transientStopObservationLimit || stop == transientStopStable {
 				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
 			}
 			lastResponse = final.Resp

@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+// nextTickArrivalNanos returns a strictly post-entry arrival timestamp from
+// the real monotonic clock for test observation only. Production send-start
+// (Started) happens-before the stub entry on the same goroutine, so
+// entry >= Started; busy-spinning until the clock passes entry yields
+// arrival > entry >= Started, which proves Started < arrival even when both
+// fall on one coarse tick. Only real time.Now().UnixNano() values are
+// recorded; a clock that never advances within the bound fails the test
+// explicitly instead of synthesizing an arrival.
+func nextTickArrivalNanos(t *testing.T, entry int64) int64 {
+	t.Helper()
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		if n := time.Now().UnixNano(); n > entry {
+			return n
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("monotonic clock did not advance past entry=%d within 100ms; refusing synthetic arrival", entry)
+		}
+	}
+}
+
 func TestUnboundAuthStartedCredentialEvidence(t *testing.T) {
 	monitor := NewMonitor()
 	cfg := testGatewayConfig(
@@ -49,7 +70,7 @@ func TestUnboundAuthStartedCredentialEvidence(t *testing.T) {
 		return r, nil
 	})
 	postStub(t, gw, "z", secondIdx, nil, nil, func(*http.Request) (*http.Response, error) {
-		secondArrivalNanos.Store(time.Now().UnixNano())
+		secondArrivalNanos.Store(nextTickArrivalNanos(t, time.Now().UnixNano()))
 		r := responseWithBody(429, `{"error":"t"}`)
 		r.Header.Set("Retry-After", "9")
 		return r, nil
@@ -160,7 +181,7 @@ func TestUnboundAuthL1Final429StartedFencing(t *testing.T) {
 		return r, nil
 	})
 	postStub(t, gw, "z", secondIdx, &bCalls, nil, func(*http.Request) (*http.Response, error) {
-		bArrival.Store(time.Now().UnixNano())
+		bArrival.Store(nextTickArrivalNanos(t, time.Now().UnixNano()))
 		r := responseWithBody(429, `{"error":"t"}`)
 		r.Header.Set("Retry-After", "9")
 		return r, nil
