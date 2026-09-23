@@ -20,9 +20,8 @@ func transientGateway(t *testing.T, monitor *Monitor, transientMax int, interval
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.TransientMaxAttempts = transientMax
+	cfg.Retry.MaxAttempts = transientMax
 	cfg.Retry.TransientRetryIntervalSeconds = intervalSec
-	cfg.Retry.MaxAttempts = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
 	if err != nil {
 		t.Fatal(err)
@@ -109,8 +108,7 @@ func TestUnboundAuthenticated503RetrySuccess(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = false
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
 	if err != nil {
@@ -212,9 +210,8 @@ func TestExhausted503Returns503NoCustomFallback(t *testing.T) {
 	)
 	cfgUnbound.Anonymous = true
 	cfgUnbound.Keys = []string{"single-key-12345"}
-	cfgUnbound.Retry.TransientMaxAttempts = 3
+	cfgUnbound.Retry.MaxAttempts = 3
 	cfgUnbound.Retry.TransientRetryIntervalSeconds = 0
-	cfgUnbound.Retry.MaxAttempts = 5
 	cfgUnbound.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	normUnbound, _ := NormalizeConfig("config.json", cfgUnbound)
 	gwUnbound, _ := NewGateway(normUnbound, discardGatewayLogger(), NewMonitor())
@@ -246,9 +243,8 @@ func TestExhausted503Returns503NoCustomFallback(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
-	cfg.Retry.MaxAttempts = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	norm, _ := NormalizeConfig("config.json", cfg)
 	gw, _ := NewGateway(norm, discardGatewayLogger(), monitor)
@@ -333,9 +329,8 @@ func TestRetryAfterLowerBound(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
-	cfg.Retry.MaxAttempts = 5
 	gw, _ := NewGateway(cfg, discardGatewayLogger(), monitor)
 	var calls atomic.Int32
 	var seq atomic.Int32
@@ -376,8 +371,7 @@ func TestMixed429Then503DoesNotReturn429(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"single-key-12345"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 2
+	cfg.Retry.MaxAttempts = 2
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	var customHits atomic.Int32
 	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

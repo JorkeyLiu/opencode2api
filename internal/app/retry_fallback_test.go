@@ -153,9 +153,11 @@ func TestAnonymousTransportRetryThenFallback(t *testing.T) {
 	}
 }
 
-// 3. Auth real-send budget: max=1 blocks retry and next candidate; max=2 A,A; max=3 A,A,B.
-func TestAuthRealSendBudget(t *testing.T) {
-	t.Run("max1", func(t *testing.T) {
+// 3. Auth L1 observation limit plus frozen candidate traversal (no
+// ordinary-send budget): L1 bounds only same-target observation, traversal is
+// bounded by the frozen slice.
+func TestAuthL1ObservationAndTraversal(t *testing.T) {
+	t.Run("limit1StillWalks", func(t *testing.T) {
 		monitor := NewMonitor()
 		gateway := authTwoProxyGateway(t, monitor, 1)
 		var z0calls, z1calls atomic.Int32
@@ -168,44 +170,24 @@ func TestAuthRealSendBudget(t *testing.T) {
 		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
 		route := authOnlyRoute()
 		route.KeyTiers = []Tier{TierZen}
-		_, _, attempts, _ := gateway.doUpstreamTiers(ctx, route, routeBodies(), emptySessionIDs(), 0)
-		if postCount(&z0calls) != 1 || postCount(&z1calls) != 0 {
-			t.Fatalf("max=1 must send once only: %d/%d", postCount(&z0calls), postCount(&z1calls))
+		resp, _, attempts, err := gateway.doUpstreamTiers(ctx, route, routeBodies(), emptySessionIDs(), 0)
+		if err != nil || resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("limit=1 transport must still walk to 200, err=%v resp=%v", err, resp)
 		}
-		if attempts != 1 {
-			t.Fatalf("attempts=%d want 1", attempts)
-		}
-		if got := len(monitor.Snapshot().Upstream.Recent); got != 1 {
-			t.Fatalf("recorded=%d want 1", got)
-		}
-	})
-	t.Run("max2", func(t *testing.T) {
-		monitor := NewMonitor()
-		gateway := authTwoProxyGateway(t, monitor, 2)
-		var z0calls, z1calls atomic.Int32
-		postStub(t, gateway, "z", 0, &z0calls, nil, func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("dial timeout")
-		})
-		postStub(t, gateway, "z", 1, &z1calls, nil, func(*http.Request) (*http.Response, error) {
-			return responseWithBody(200, `{"ok":true}`), nil
-		})
-		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
-		route := authOnlyRoute()
-		route.KeyTiers = []Tier{TierZen}
-		_, _, attempts, _ := gateway.doUpstreamTiers(ctx, route, routeBodies(), emptySessionIDs(), 0)
-		if postCount(&z0calls)+postCount(&z1calls) != 2 {
-			t.Fatalf("max=2 total sends=%d/%d want 2", postCount(&z0calls), postCount(&z1calls))
-		}
-		if postCount(&z0calls) != 2 {
-			t.Fatalf("max=2 must be A,A: %d/%d", postCount(&z0calls), postCount(&z1calls))
+		drainAndClose(resp.Body)
+		if postCount(&z0calls) != 1 || postCount(&z1calls) != 1 {
+			t.Fatalf("limit=1 must walk the frozen slice: %d/%d want 1/1", postCount(&z0calls), postCount(&z1calls))
 		}
 		if attempts != 2 {
 			t.Fatalf("attempts=%d want 2", attempts)
 		}
+		if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
+			t.Fatalf("recorded=%d want 2", got)
+		}
 	})
-	t.Run("max3", func(t *testing.T) {
+	t.Run("limit2RetriesThenWalks", func(t *testing.T) {
 		monitor := NewMonitor()
-		gateway := authTwoProxyGateway(t, monitor, 3)
+		gateway := authTwoProxyGateway(t, monitor, 2)
 		var z0calls, z1calls atomic.Int32
 		postStub(t, gateway, "z", 0, &z0calls, nil, func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("dial timeout")
@@ -222,7 +204,7 @@ func TestAuthRealSendBudget(t *testing.T) {
 		}
 		drainAndClose(resp.Body)
 		if postCount(&z0calls) != 2 || postCount(&z1calls) != 1 {
-			t.Fatalf("max=3 total=%d/%d want 2/1 (A,A,B)", postCount(&z0calls), postCount(&z1calls))
+			t.Fatalf("limit=2 total=%d/%d want 2/1 (A,A,B)", postCount(&z0calls), postCount(&z1calls))
 		}
 		if attempts != 3 {
 			t.Fatalf("attempts=%d want 3", attempts)
@@ -447,10 +429,10 @@ func TestCancelStopsRetryFallback(t *testing.T) {
 	}
 }
 
-// 8. 400 recovery ignores auth max_attempts=1 and never falls back.
-func TestAuth400RecoveryIgnoresBudget(t *testing.T) {
+// 8. 400 recovery is route-terminal on the same target and never walks.
+func TestAuth400RecoveryRouteTerminal(t *testing.T) {
 	monitor := NewMonitor()
-	gateway := authTwoProxyGateway(t, monitor, 1)
+	gateway := authTwoProxyGateway(t, monitor, 2)
 	cap := &capturedUpstream{}
 	var z0calls, z1calls atomic.Int32
 	var calls atomic.Int32

@@ -54,7 +54,7 @@ func routing400Gateway(t *testing.T, monitor *Monitor) *Gateway {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
+	cfg.Retry.MaxAttempts = 2
 	gateway, err := NewGateway(cfg, discardGatewayLogger(), monitor)
 	if err != nil {
 		t.Fatal(err)

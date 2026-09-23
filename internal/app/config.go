@@ -65,7 +65,6 @@ type Config struct {
 	proxyRoutingPresent           bool
 	retryMaxAttemptsPresent       bool
 	retryAttemptTimeoutPresent    bool
-	retryTransientMaxPresent      bool
 	retryTransientIntervalPresent bool
 	performanceSuspectPresent     bool
 }
@@ -80,7 +79,6 @@ type RetryConfig struct {
 	MaxAttempts                   int `json:"max_attempts"`
 	TimeoutSeconds                int `json:"timeout_seconds"`
 	AttemptTimeoutSeconds         int `json:"attempt_timeout_seconds"`
-	TransientMaxAttempts          int `json:"transient_max_attempts"`
 	TransientRetryIntervalSeconds int `json:"transient_retry_interval_seconds"`
 }
 
@@ -130,7 +128,7 @@ func defaultConfig() Config {
 	return Config{
 		Listen:      "127.0.0.1:8080",
 		Upstream:    UpstreamConfig{Zen: "https://opencode.ai/zen"},
-		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, AttemptTimeoutSeconds: 5, TransientMaxAttempts: 3, TransientRetryIntervalSeconds: 3},
+		Retry:       RetryConfig{MaxAttempts: 3, TimeoutSeconds: 300, AttemptTimeoutSeconds: 5, TransientRetryIntervalSeconds: 3},
 		Models:      ModelsConfig{RefreshSeconds: 300, Protocols: map[string]string{}},
 		Performance: PerformanceConfig{MaxIdleConns: 2048, MaxIdleConnsPerHost: 256, MaxConnsPerHost: 0, IdleConnTimeoutSeconds: 120, ConnectTimeoutSeconds: 5, FailureCooldownSeconds: 15, RateLimitCooldownSeconds: 300, TransportSuspectCooldownSeconds: 15},
 		Logging:     LoggingConfig{Level: "info", RingSize: 2000},
@@ -163,8 +161,9 @@ func LoadConfig(path string) (Config, error) {
 // MarshalJSON emits only the canonical shape: keys, anonymous+authenticated
 // routing, Zen upstream only, and the single 429 base. Legacy inputs
 // (zen_keys/go_keys, prefer, proxy_routing.zen/go, upstream.go,
-// performance.rate_limit_cooldown_max_seconds, top-level proxies/proxyfile,
-// retry.transient_max_attempts) are load-time compat and never persist.
+// performance.rate_limit_cooldown_max_seconds, top-level proxies/proxyfile)
+// are load-time compat and never persist. retry.transient_max_attempts was
+// removed: strict unknown-field rejection applies, no value migration.
 func (cfg Config) MarshalJSON() ([]byte, error) {
 	type diskRouting struct {
 		Anonymous     string `json:"anonymous"`
@@ -254,18 +253,16 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 	}
 	def := defaultConfig()
 	*cfg = def
-	// Attempt, max, transient and suspect have presence semantics: missing must be
+	// Attempt, max and suspect have presence semantics: missing must be
 	// distinguishable from explicit zero so NormalizeConfig can preserve
 	// deployed behavior while explicit values are validated strictly.
-	// Transient_max is legacy-only and omitted on save; interval 0 is explicit valid.
+	// Interval 0 is explicit valid.
 	cfg.Retry.MaxAttempts = 0
 	cfg.Retry.AttemptTimeoutSeconds = 0
-	cfg.Retry.TransientMaxAttempts = 0
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Performance.TransportSuspectCooldownSeconds = 0
 	cfg.retryMaxAttemptsPresent = false
 	cfg.retryAttemptTimeoutPresent = false
-	cfg.retryTransientMaxPresent = false
 	cfg.retryTransientIntervalPresent = false
 	cfg.performanceSuspectPresent = false
 	if rawRetry, ok := raw["retry"]; ok {
@@ -276,9 +273,6 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 			}
 			if _, has := retryMap["attempt_timeout_seconds"]; has {
 				cfg.retryAttemptTimeoutPresent = true
-			}
-			if _, has := retryMap["transient_max_attempts"]; has {
-				cfg.retryTransientMaxPresent = true
 			}
 			if _, has := retryMap["transient_retry_interval_seconds"]; has {
 				cfg.retryTransientIntervalPresent = true
@@ -466,7 +460,9 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if !cfg.Anonymous && len(cfg.Keys) == 0 {
 		return Config{}, errors.New("keys must contain at least one upstream key unless anonymous is enabled")
 	}
-	// retry.max_attempts: missing defaults to 3, explicit 0 fails strictly.
+	// retry.max_attempts is the unique L1 same-target stability observation
+	// limit, including the first send. Missing defaults to 3, explicit 0
+	// fails strictly.
 	if !cfg.retryMaxAttemptsPresent && cfg.Retry.MaxAttempts == 0 {
 		cfg.Retry.MaxAttempts = 3
 		cfg.retryMaxAttemptsPresent = true
@@ -490,19 +486,6 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	}
 	if cfg.Retry.AttemptTimeoutSeconds < 1 || cfg.Retry.AttemptTimeoutSeconds > cfg.Retry.TimeoutSeconds {
 		return Config{}, errors.New("retry.attempt_timeout_seconds must be between 1 and retry.timeout_seconds")
-	}
-	// transient_max_attempts legacy handling: when absent and zero, default to 3 for runtime
-	// (preserves HEAD gateway behavior); explicit values are strictly validated 1..10.
-	// It is legacy-only for persistence (Marshal omits it) but retained in memory
-	// for the existing transient retry loop.
-	if !cfg.retryTransientMaxPresent && cfg.Retry.TransientMaxAttempts == 0 {
-		cfg.Retry.TransientMaxAttempts = 3
-		cfg.retryTransientMaxPresent = true
-	}
-	if cfg.retryTransientMaxPresent {
-		if cfg.Retry.TransientMaxAttempts < 1 || cfg.Retry.TransientMaxAttempts > 10 {
-			return Config{}, errors.New("retry.transient_max_attempts must be between 1 and 10")
-		}
 	}
 	// transient_retry_interval_seconds: absent defaults to 3; explicit 0 is valid (0..30) and must not be defaulted.
 	if !cfg.retryTransientIntervalPresent && cfg.Retry.TransientRetryIntervalSeconds == 0 {

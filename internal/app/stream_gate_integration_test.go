@@ -22,8 +22,7 @@ func streamTestGateway(t *testing.T, monitor *Monitor) *Gateway {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -43,8 +42,7 @@ func streamSingleProxyGateway(t *testing.T, monitor *Monitor) *Gateway {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -64,8 +62,7 @@ func streamKeyGateway(t *testing.T, monitor *Monitor) *Gateway {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"test-key-1", "test-key-2"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -325,8 +322,7 @@ func TestStreamGate_UnboundCandidateAdvanceAfterRetries(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "a"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -374,8 +370,7 @@ func TestStreamGate_PinnedTargetOnlyThen502(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "a"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -576,8 +571,7 @@ func TestStreamGate_HTTPHandler_NoEarlyWriteHeader(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "a"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
@@ -620,8 +614,7 @@ func TestStreamGate_HTTPHandler_Pinned502BeforeBytes(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "a"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)

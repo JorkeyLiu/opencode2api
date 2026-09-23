@@ -330,7 +330,6 @@ type ConfigUpdate struct {
 
 	retryMaxAttemptsPresent       bool
 	retryAttemptTimeoutPresent    bool
-	retryTransientMaxPresent      bool
 	retryTransientIntervalPresent bool
 	performanceSuspectPresent     bool
 }
@@ -371,9 +370,6 @@ func (cu *ConfigUpdate) UnmarshalJSON(data []byte) error {
 			}
 			if _, has := retryMap["attempt_timeout_seconds"]; has {
 				cu.retryAttemptTimeoutPresent = true
-			}
-			if _, has := retryMap["transient_max_attempts"]; has {
-				cu.retryTransientMaxPresent = true
 			}
 			if _, has := retryMap["transient_retry_interval_seconds"]; has {
 				cu.retryTransientIntervalPresent = true
@@ -443,7 +439,7 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	candidate.proxyPoolsPresent = true
 	candidate.proxyRoutingPresent = true
 	// Presence propagation: explicit values keep strict validation, omitted
-	// WebUI fields preserve current effective values (attempt, interval, suspect, transient).
+	// WebUI fields preserve current effective values (attempt, interval, suspect).
 	candidate.retryMaxAttemptsPresent = update.retryMaxAttemptsPresent
 	if !update.retryMaxAttemptsPresent {
 		candidate.Retry.MaxAttempts = current.Retry.MaxAttempts
@@ -453,14 +449,6 @@ func (a *AdminServer) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 	if !update.retryAttemptTimeoutPresent {
 		candidate.Retry.AttemptTimeoutSeconds = current.Retry.AttemptTimeoutSeconds
 		candidate.retryAttemptTimeoutPresent = true
-	}
-	candidate.retryTransientMaxPresent = update.retryTransientMaxPresent
-	if !update.retryTransientMaxPresent {
-		candidate.Retry.TransientMaxAttempts = current.Retry.TransientMaxAttempts
-		candidate.retryTransientMaxPresent = true
-		if candidate.Retry.TransientMaxAttempts == 0 {
-			candidate.Retry.TransientMaxAttempts = 3
-		}
 	}
 	candidate.retryTransientIntervalPresent = update.retryTransientIntervalPresent
 	if !update.retryTransientIntervalPresent {

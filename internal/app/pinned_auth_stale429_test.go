@@ -45,7 +45,7 @@ func pinnedAuthCustomGateway(t *testing.T, customHits *atomic.Int32) *Gateway {
 	)
 	cfg.Anonymous = true
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
+	cfg.Retry.MaxAttempts = 2
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	normalized, err := NormalizeConfig("config.json", cfg)
 	if err != nil {

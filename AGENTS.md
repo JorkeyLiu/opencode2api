@@ -139,12 +139,11 @@
   proxy429 cooldowns skipped without new evidence, never truncated by
   `retry.max_attempts`) while
   400/401/403/408/425, ordinary 4xx, and 5xx never move to another proxy; a
-  transport error keeps the existing same-target transient retry only on the
+  transport error keeps the existing same-target L1 observation only on the
   anonymous binding, while the authenticated binding may additionally try the
-  next eligible proxy after its same-target transient retry within the ordinary
-  send budget. A removed/unhealthy/unresolvable target fails
+  next eligible proxy after its same-target L1 observation. A removed/unhealthy/unresolvable target fails
   locally with 502; full 429 exhaustion of the binding tries the custom final
-  fallback per §4 and otherwise keeps the native 429 envelope. Same-target transient retry and exact-400 replay remain per
+  fallback per §4 and otherwise keeps the native 429 envelope. Same-target L1 observation and exact-400 replay remain per
   §4. An established session moves within the same
   pool, credential, channel, model, protocol, and authority only after an HTTP
   429 on the current proxy walk (local 429 skip or live 429), before any client bytes
@@ -152,9 +151,9 @@
   updates only the
   current proxy under generation fencing (concurrent moves converge to one winner).
   No move occurs on 400/401/403/408/425, ordinary 4xx, or 5xx; transport errors
-  beyond the same-target transient retry never move the anonymous binding (the
-  authenticated binding keeps its existing same-target transient retry plus a
-  budget-limited next-proxy try).
+  beyond the same-target L1 observation never move the anonymous binding (the
+  authenticated binding keeps its existing same-target L1 observation plus a
+  next-proxy try).
   Both channels share these pin/move semantics. Pins are process-lifetime and never expire/evict; the store is
   fixed-bounded (see `sessionPinStoreCap` in `scheduler.go`) and a new
   session+model at capacity fails closed locally with 502 before any send
@@ -195,7 +194,7 @@
 
 ## 4. Invariants (MUST Preserve)
 
-> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码仍是历史的按候选/429 fallback 等实现（400 同目标 corrective replay 终态、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、custom 仅 429 耗尽保底），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；广义逐状态码语义映射、预算归一与退避仍待定，MUST NOT be read as completed — see ADR 0001.
+> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码为候选/429 fallback 基线加已收敛的单一 L1 计数（400 同目标 corrective replay 终态、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、候选遍历由冻结切片自然有界、模型刷新独立全遍历、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、custom 仅 429 耗尽保底），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；本次仅完成单一 L1 计数收敛，广义逐状态码语义映射、广义 fallback 与退避数值仍待定，MUST NOT be read as completed — see ADR 0001.
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
@@ -207,12 +206,13 @@
   channel; once pinned, the binding walks the same credential+pool per the
   Session affinity spine (not a single target).
   Dispersion and fallback belong to
-  the frozen order only (HRW/round-robin); same-target retry never disperses.
-  Each available proxy gets at most one fallback send and the 429 chain is NEVER
-  truncated
-  by `retry.max_attempts`; the whole channel additionally owns one shared
-  transient token for the first transport error, 408/425, or 5xx (same target,
-  same route session, same body). Ordinary 4xx MUST end the anonymous channel
+  the frozen order only (HRW/round-robin); same-target L1 observation never
+  disperses. Each same-target transient (transport error, 408/425, 500-599,
+  stream startup failure) is observed up to the unique L1 limit (normalized
+  `retry.max_attempts`, including the first send); 400/429/ordinary 4xx are
+  stable and never enter L1, and candidate traversal is bounded by the frozen
+  slice. The 429 chain walks all sendable proxies (no candidate-send budget).
+  Ordinary 4xx MUST end the anonymous channel
   without scanning remaining proxies, then may enter the authenticated channel;
   only proxy exhaustion without a 400 enters it otherwise. Client cancel or
   the shared request deadline ends the route immediately with no further
@@ -221,30 +221,31 @@
   exactly once on the same target with the same route session (same request
   ID, same credential/proxy/protocol, same wire session bytes, always before any
   client bytes; Responses replays also drop stale previous_response_id/
-  reasoning refs; never consumes the transient token; no override is stored).
+   reasoning refs; no override is stored).
    The replay result is
   final for the whole route: success returns normally, a second 400 returns
   that 400, and any other replay outcome returns as-is without scanning
   remaining proxies or entering the authenticated channel. A replay 2xx pins the
   session+model when still unbound.
-- Authenticated channel: the channel owns a `retry.max_attempts`
-  real-send budget for ordinary (non-429) sends only (each first send plus each
-  same-target transient retry consumes it); 429 sends are budget-neutral and walk
-  all currently sendable credential×proxy candidates to exhaustion. `retry.max_attempts`
+- Authenticated channel: `retry.max_attempts` is the unique L1 same-target
+  stability observation limit, including the first send. It never truncates
+  candidate traversal, which is bounded by the frozen eligible/candidate slice;
+  the 429 chain walks all currently sendable credential×proxy candidates to
+  exhaustion. `retry.max_attempts`
   is the minimum observation/request count to judge stability, not a uniform
   error-count quota; per-status mapping is still governed by the state matrix.
-  The channel owns its own transient token. Inside the channel, while still
+  Inside the channel, while still
   unpinned, only transport errors, 408/425, 401/403, 429, 5xx, and other
-  retryable responses advance the frozen list; 401/403/429 never retry
-  same-target; transport/408/425/5xx retry same-target at most once; any other
+  retryable responses advance the frozen list; 401/403/429 never observe
+  same-target; transport/408/425/5xx observe same-target up to the unique L1
+  limit; any other
   4xx MUST end the route. Exhaustion of one credential's frozen eligible set
   writes that credential's 429 (last Retry-After) without stopping other
   credential/channel candidates; partial 429 and pre-cooled skips never do.
    The first exact HTTP 400 on any candidate is a corrective / policy-removal
   action, not a retry, and follows the same same-target one-replay rule as
   anonymous (same route/wire session, Responses stale-ref cleanup, replay is the
-  route's last recovery action, always allowed once extra beyond the ordinary
-  budget; no override is stored);
+  route's last recovery action; no override is stored);
   a second 400
   terminates the whole route. Cancel/deadline ends the route. A
   replay 2xx pins the session+model when still unbound; once pinned, the
@@ -277,8 +278,8 @@
   clears a newer cooldown; newer failures stay authoritative). 429 config is
   one base/cooldown seconds value default 300, validated 300..3600; fixed
   internal exponential backoff cap 3600; no second configurable max.
-  `retry.max_attempts` canonical migration is toward a single definition of
-  minimum stability-observation count, not a uniform per-status error-count quota.
+  `retry.max_attempts` is the unique L1 same-target observation limit (including
+  the first send), not a uniform per-status error-count quota.
   Proxy429/channel use deterministic exponential backoff with Retry-After
   max/cap, no same-target retry, bounded maps with stale prune/eviction
   proportional to proxy resources, and still-future migration by

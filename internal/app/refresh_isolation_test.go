@@ -319,3 +319,64 @@ func TestRefreshDoesNotCreateCredentialState(t *testing.T) {
 		t.Fatalf("failed probe must still mark proxy unhealthy")
 	}
 }
+
+// Refresh traversal is independent of the inference L1 retry.max_attempts:
+// with MaxAttempts=1 the frozen keys x healthy-proxies slice is still fully
+// walked (2 keys x 1 proxy = 2 attempts; first fails, second succeeds).
+func TestRefreshTraversesAllCandidatesIndependentOfL1(t *testing.T) {
+	cfg := testGatewayConfig(
+		map[string][]string{"shared": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"},
+	)
+	cfg.Keys = []string{"zen-key-aaaaa", "zen-key-bbbbb"}
+	cfg.Anonymous = false
+	cfg.Retry.MaxAttempts = 1
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gateway.observationAttempts(); got != 1 {
+		t.Fatalf("L1=%d want 1", got)
+	}
+	pool := gateway.pools["shared"]
+	if pool == nil || len(pool.items) != 1 {
+		t.Fatalf("shared pool must have 1 proxy")
+	}
+	// First key fails, second succeeds: proves both keys are tried despite L1=1.
+	fail := modelsServer(500, "", 0)
+	defer fail.Close()
+	ok := modelsServer(200, `{"data":[{"id":"model-ok-1"}]}`, 0)
+	defer ok.Close()
+	// Point key0 at failing server, key1 at succeeding server by swapping
+	// per-attempt clients: refresh order is keys outer, proxies inner, so
+	// attempt 0 uses keys[0] and attempt 1 uses keys[1] on the same proxy.
+	// Stub the single proxy transport to route by Authorization key.
+	proxy := pool.items[0]
+	orig := proxy.client
+	proxy.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") == "Bearer zen-key-aaaaa" {
+			req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, fail.URL+"/v1/models", nil)
+			return orig.Transport.RoundTrip(req)
+		}
+		req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, ok.URL+"/v1/models", nil)
+		return orig.Transport.RoundTrip(req)
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	models := gateway.refreshTier(ctx, "", TierZen)
+	// refreshTier joins base with /v1/models via fetchModels; empty base with
+	// stubbed transport still exercises the key traversal above through the
+	// per-key servers. Fall back to direct base coverage when empty base
+	// yields nil: try the succeeding server base with L1=1 (single attempt
+	// would fail if truncated, but full traversal succeeds).
+	if len(models) == 0 {
+		models = gateway.refreshTier(ctx, ok.URL, TierZen)
+	}
+	if len(models) != 1 || models[0] != "model-ok-1" {
+		t.Fatalf("refresh must traverse all keys despite L1=1, got %v", models)
+	}
+}

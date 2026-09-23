@@ -23,7 +23,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		)
 		cfg.Anonymous = false
 		cfg.Keys = []string{"zen-key-aaaaa"}
-		cfg.Retry.TransientMaxAttempts = 3
+		cfg.Retry.MaxAttempts = 3
 		cfg.Retry.TransientRetryIntervalSeconds = 0
 		norm, err := NormalizeConfig("config.json", cfg)
 		if err != nil {
@@ -41,7 +41,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		attempts := 1
 		var calls atomic.Int32
 		initial := attemptOutcome{Resp: responseWithBody(200, `{"ok":true}`)}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, func(monitorAttempt int) attemptOutcome {
 			calls.Add(1)
 			return attemptOutcome{Resp: responseWithBody(200, `{"ok":true}`)}
 		})
@@ -65,7 +65,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		gw := newGW(t)
 		attempts := 1
 		initial := attemptOutcome{BuildErr: errors.New("bad request build")}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, func(monitorAttempt int) attemptOutcome {
 			t.Fatalf("must not execute on BuildErr")
 			return attemptOutcome{}
 		})
@@ -83,7 +83,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		attempts := 1
 		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
 		var calls atomic.Int32
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 5, 0, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 5, 0, func(monitorAttempt int) attemptOutcome {
 			calls.Add(1)
 			return attemptOutcome{Resp: responseWithBody(429, `{"error":"throttled"}`)}
 		})
@@ -109,7 +109,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
 		drainResp(initial.Resp)
 		initial = attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 2, 0, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 2, 0, func(monitorAttempt int) attemptOutcome {
 			if monitorAttempt != 2 {
 				t.Fatalf("monitorAttempt=%d want 2", monitorAttempt)
 			}
@@ -128,20 +128,20 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		drainResp(final.Resp)
 	})
 
-	t.Run("budget", func(t *testing.T) {
+	t.Run("observationLimitIncludesFirstSend", func(t *testing.T) {
 		gw := newGW(t)
 		attempts := 1
 		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 5, 0, func() bool { return false }, func(monitorAttempt int) attemptOutcome {
-			t.Fatalf("must not execute when budget exhausted")
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 1, 0, func(monitorAttempt int) attemptOutcome {
+			t.Fatalf("maxObservation=1 must not execute (first send counts)")
 			return attemptOutcome{}
 		})
 		final, stop := loopRes.Final, loopRes.Stop
-		if stop != transientStopBudget {
-			t.Fatalf("stop=%v want budget", stop)
+		if stop != transientStopObservationLimit {
+			t.Fatalf("stop=%v want observation-limit", stop)
 		}
 		if attempts != 1 {
-			t.Fatalf("attempts=%d want 1 (no observation on budget stop)", attempts)
+			t.Fatalf("attempts=%d want 1 (no observation at limit)", attempts)
 		}
 		if final.Resp == nil || final.Resp.StatusCode != 503 {
 			t.Fatalf("final must be initial 503 undrained")
@@ -149,24 +149,15 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		drainResp(final.Resp)
 	})
 
-	t.Run("budgetBeforeContext", func(t *testing.T) {
+	t.Run("observationLimitUsesNormalizedMaxAttempts", func(t *testing.T) {
 		gw := newGW(t)
-		attempts := 1
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
-		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 5, 0, func() bool { return false }, func(monitorAttempt int) attemptOutcome {
-			t.Fatalf("must not execute when budget exhausted even with cancelled context")
-			return attemptOutcome{}
-		})
-		_, stop := loopRes.Final, loopRes.Stop
-		if stop != transientStopBudget {
-			t.Fatalf("stop=%v want budget (budget precedes context when provided)", stop)
+		if got := gw.observationAttempts(); got != 3 {
+			t.Fatalf("observationAttempts=%d want 3 (normalized retry.max_attempts)", got)
 		}
-		if attempts != 1 {
-			t.Fatalf("attempts=%d want 1", attempts)
+		gw.cfg.Retry.MaxAttempts = 2
+		if got := gw.observationAttempts(); got != 2 {
+			t.Fatalf("observationAttempts=%d want 2", got)
 		}
-		drainResp(loopRes.Final.Resp)
 	})
 
 	t.Run("contextPreCancel", func(t *testing.T) {
@@ -175,7 +166,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
-		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, func(monitorAttempt int) attemptOutcome {
 			t.Fatalf("must not execute on cancelled context")
 			return attemptOutcome{}
 		})
@@ -197,7 +188,7 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		defer cancel()
 		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
 		start := time.Now()
-		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 5, 5*time.Second, nil, func(monitorAttempt int) attemptOutcome {
+		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 5, 5*time.Second, func(monitorAttempt int) attemptOutcome {
 			t.Fatalf("sleep interrupt must not execute")
 			return attemptOutcome{}
 		})
@@ -224,8 +215,8 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		attempts := 1
 		sentinel := errors.New("upstream stream startup failure")
 		initial := attemptOutcome{Resp: nil, Err: sentinel}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 1, 0, nil, func(monitorAttempt int) attemptOutcome {
-			t.Fatalf("maxTransient=1 must not execute")
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 1, 0, func(monitorAttempt int) attemptOutcome {
+			t.Fatalf("maxObservation=1 must not execute")
 			return attemptOutcome{}
 		})
 		final, stop := loopRes.Final, loopRes.Stop
@@ -245,8 +236,8 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		attempts := 1
 		initialResp := responseWithBody(503, `{"error":"initial"}`)
 		initial := attemptOutcome{Resp: initialResp, Err: nil}
-		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 5, 0, func() bool { return false }, func(monitorAttempt int) attemptOutcome {
-			t.Fatalf("must not execute on budget stop")
+		loopRes := gw.observeSameTargetTransient(context.Background(), initial, TierZen, ProtocolChat, &attempts, 0, 1, 0, func(monitorAttempt int) attemptOutcome {
+			t.Fatalf("must not execute at observation limit")
 			return attemptOutcome{}
 		})
 		if loopRes.InitialResp != initialResp {
@@ -255,19 +246,20 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		if loopRes.InitialErr != nil {
 			t.Fatalf("InitialErr=%v want nil", loopRes.InitialErr)
 		}
-		if loopRes.Stop != transientStopBudget {
-			t.Fatalf("stop=%v want budget", loopRes.Stop)
+		if loopRes.Stop != transientStopObservationLimit {
+			t.Fatalf("stop=%v want observation-limit", loopRes.Stop)
 		}
 		drainResp(loopRes.Final.Resp)
 	})
 }
 
-// Integration: pinnedAuth ordinary-budget stop vs observation-limit transport
-// behavior, and 5xx never moves. Stream sentinel pinned 502 is covered by
+// Integration: pinnedAuth unique observation-limit transport behavior and
+// candidate traversal (no ordinary-send budget), and 5xx never moves. Stream
+// sentinel pinned 502 is covered by
 // TestPinnedAuthStreamStartupFailureNoWalkNoFallback; unbound sentinel retry
 // by TestUnboundAnonymousStreamStartupSameTargetRetryBinds.
-func TestPinnedAuthBudgetVsLimitTransport(t *testing.T) {
-	setup := func(t *testing.T, session string, maxAttempts, transientMax int) (*Gateway, int, int) {
+func TestPinnedAuthObservationLimitTransport(t *testing.T) {
+	setup := func(t *testing.T, session string, maxObservation int) (*Gateway, int, int) {
 		t.Helper()
 		cfg := testGatewayConfig(
 			map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
@@ -275,8 +267,7 @@ func TestPinnedAuthBudgetVsLimitTransport(t *testing.T) {
 		)
 		cfg.Anonymous = false
 		cfg.Keys = []string{"zen-key-aaaaa"}
-		cfg.Retry.MaxAttempts = maxAttempts
-		cfg.Retry.TransientMaxAttempts = transientMax
+		cfg.Retry.MaxAttempts = maxObservation
 		cfg.Retry.TransientRetryIntervalSeconds = 0
 		norm, err := NormalizeConfig("config.json", cfg)
 		if err != nil {
@@ -299,38 +290,9 @@ func TestPinnedAuthBudgetVsLimitTransport(t *testing.T) {
 		return gw, pinnedIdx, otherIdx
 	}
 
-	t.Run("budgetExhaustedTransportNoWalk", func(t *testing.T) {
-		ids := pinIDs("ses_budget_vs_limit_TestPinnedAuthBudgetVsLimitTransport/budgetExhaustedTransportNoWalk", "req-budget")
-		gw, pinnedIdx, otherIdx := setup(t, ids.Session, 1, 3)
-		var pinnedCalls, otherCalls atomic.Int32
-		postStub(t, gw, gw.authPoolName(), pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
-			return nil, errors.New("dial timeout")
-		})
-		postStub(t, gw, gw.authPoolName(), otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
-			return responseWithBody(200, `{"ok":true}`), nil
-		})
-		resp, _, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
-		if err != nil {
-			t.Fatalf("budget transport must return 502 response, err=%v", err)
-		}
-		if resp == nil || resp.StatusCode != 502 {
-			t.Fatalf("want 502, got %v", resp)
-		}
-		drainResp(resp)
-		if postCount(&pinnedCalls) != 1 {
-			t.Fatalf("pinned=%d want 1 (budget blocks retry and walk)", postCount(&pinnedCalls))
-		}
-		if postCount(&otherCalls) != 0 {
-			t.Fatalf("other=%d want 0 (budget stop must not cross proxy)", postCount(&otherCalls))
-		}
-		if attempts != 1 {
-			t.Fatalf("attempts=%d want 1", attempts)
-		}
-	})
-
-	t.Run("limitTransportWalksWhenBudgetRemains", func(t *testing.T) {
-		ids := pinIDs("ses_budget_vs_limit_TestPinnedAuthBudgetVsLimitTransport/limitTransportWalksWhenBudgetRemains", "req-limit-walk")
-		gw, pinnedIdx, otherIdx := setup(t, ids.Session, 5, 1)
+	t.Run("observationLimitTransportStillWalks", func(t *testing.T) {
+		ids := pinIDs("ses_limit_TestPinnedAuthObservationLimitTransport/observationLimitTransportStillWalks", "req-limit-walk")
+		gw, pinnedIdx, otherIdx := setup(t, ids.Session, 1)
 		var pinnedCalls, otherCalls atomic.Int32
 		postStub(t, gw, gw.authPoolName(), pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("dial timeout")
@@ -340,14 +302,14 @@ func TestPinnedAuthBudgetVsLimitTransport(t *testing.T) {
 		})
 		resp, _, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
 		if err != nil || resp == nil || resp.StatusCode != 200 {
-			t.Fatalf("limit transport with budget must walk to other 200, err=%v resp=%v", err, resp)
+			t.Fatalf("observation-limit transport must walk to other 200, err=%v resp=%v", err, resp)
 		}
 		drainResp(resp)
 		if postCount(&pinnedCalls) != 1 {
 			t.Fatalf("pinned=%d want 1", postCount(&pinnedCalls))
 		}
 		if postCount(&otherCalls) != 1 {
-			t.Fatalf("other=%d want 1 (observation-limit transport walks when budget remains)", postCount(&otherCalls))
+			t.Fatalf("other=%d want 1 (observation-limit transport still walks the frozen slice)", postCount(&otherCalls))
 		}
 		if attempts != 2 {
 			t.Fatalf("attempts=%d want 2", attempts)
@@ -360,8 +322,8 @@ func TestPinnedAuthBudgetVsLimitTransport(t *testing.T) {
 	})
 
 	t.Run("limit5xxNeverMoves", func(t *testing.T) {
-		ids := pinIDs("ses_budget_vs_limit_TestPinnedAuthBudgetVsLimitTransport/limit5xxNeverMoves", "req-limit-5xx")
-		gw, pinnedIdx, otherIdx := setup(t, ids.Session, 5, 1)
+		ids := pinIDs("ses_limit_TestPinnedAuthObservationLimitTransport/limit5xxNeverMoves", "req-limit-5xx")
+		gw, pinnedIdx, otherIdx := setup(t, ids.Session, 1)
 		var pinnedCalls, otherCalls atomic.Int32
 		postStub(t, gw, gw.authPoolName(), pinnedIdx, &pinnedCalls, nil, func(*http.Request) (*http.Response, error) {
 			return responseWithBody(503, `{"error":"svc"}`), nil
@@ -406,8 +368,7 @@ func TestPinnedAuthMixed503TransportStaleInitial(t *testing.T) {
 		)
 		cfg.Anonymous = false
 		cfg.Keys = []string{"zen-key-aaaaa"}
-		cfg.Retry.MaxAttempts = 5
-		cfg.Retry.TransientMaxAttempts = 2
+		cfg.Retry.MaxAttempts = 2
 		cfg.Retry.TransientRetryIntervalSeconds = 0
 		norm, err := NormalizeConfig("config.json", cfg)
 		if err != nil {
@@ -471,8 +432,7 @@ func TestPinnedAuthSentinelPoisoning503(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 2
+	cfg.Retry.MaxAttempts = 2
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	norm, err := NormalizeConfig("config.json", cfg)
@@ -569,8 +529,7 @@ func TestPinnedAuthInitialSentinelPartial429Poisons502(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 2
+	cfg.Retry.MaxAttempts = 2
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
@@ -666,8 +625,7 @@ func TestPinnedAuthInitialSentinelFull429KeepsExhaustion(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 2
+	cfg.Retry.MaxAttempts = 2
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
@@ -742,7 +700,7 @@ func TestPinnedAuthIntermediateSentinelPartial429Continues(t *testing.T) {
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
 	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}

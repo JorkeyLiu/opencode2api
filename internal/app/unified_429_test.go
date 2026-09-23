@@ -117,8 +117,8 @@ func TestUnifiedAnonPinnedLocal429StableResponses(t *testing.T) {
 	}
 }
 
-// Anonymous pinned 3-proxy live429 chain at budget 1 reaches third 200.
-func TestUnifiedAnonPinnedThreeProxyBudget1(t *testing.T) {
+// Anonymous pinned 3-proxy live429 chain at L1=1 reaches third 200 (429 traversal never truncated).
+func TestUnifiedAnonPinnedThreeProxyL1One(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := unifiedThreeProxyAnonGateway(t, monitor, 1)
 	route := anonAuthRoute()
@@ -155,7 +155,7 @@ func TestUnifiedAnonPinnedThreeProxyBudget1(t *testing.T) {
 	})
 	r2, _, attempts, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r2"), 0)
 	if err != nil || r2.StatusCode != 200 {
-		t.Fatalf("3-proxy budget-1 must reach third 200, err=%v resp=%v", err, r2)
+		t.Fatalf("3-proxy L1=1 must reach third 200, err=%v resp=%v", err, r2)
 	}
 	drainResp(r2)
 	if postCount(&c0) != 1 || postCount(&c1) != 1 || postCount(&c2) != 1 {

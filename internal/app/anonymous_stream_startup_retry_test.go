@@ -20,8 +20,7 @@ func TestUnboundAnonymousStreamStartupSameTargetRetryBinds(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Keys = []string{"test-key-anon-retry-1"}

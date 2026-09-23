@@ -26,10 +26,10 @@ func pinnedAuthForRefactor(t *testing.T, gw *Gateway, session string) sessionPin
 // pin stability, and correct cooldown isolation (no proxy429/credential429 mis-write).
 func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 	cases := []struct {
-		name         string
-		transientMax int
-		firstIs503   bool
-		retryTo200   bool // if true, retry succeeds; else exhaustion
+		name           string
+		maxObservation int
+		firstIs503     bool
+		retryTo200     bool // if true, retry succeeds; else exhaustion
 	}{
 		{"retrySuccess", 3, true, true},
 		{"exhaustion503", 3, true, false},
@@ -50,9 +50,8 @@ func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 			)
 			cfg.Anonymous = false
 			cfg.Keys = []string{"zen-key-aaaaa"}
-			cfg.Retry.TransientMaxAttempts = tc.transientMax
+			cfg.Retry.MaxAttempts = tc.maxObservation
 			cfg.Retry.TransientRetryIntervalSeconds = 0
-			cfg.Retry.MaxAttempts = 5
 			cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 			norm, _ := NormalizeConfig("config.json", cfg)
 			gw, _ := NewGateway(norm, discardGatewayLogger(), NewMonitor())
@@ -136,8 +135,8 @@ func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 				if eff.Tier == TierCustom {
 					t.Fatalf("must not fallback to custom on exhausted 503")
 				}
-				if postCount(&pinnedCalls) != tc.transientMax {
-					t.Fatalf("pinned calls=%d want %d (maxTransient)", postCount(&pinnedCalls), tc.transientMax)
+				if postCount(&pinnedCalls) != tc.maxObservation {
+					t.Fatalf("pinned calls=%d want %d (maxObservation)", postCount(&pinnedCalls), tc.maxObservation)
 				}
 				if postCount(&otherCalls) != 0 {
 					t.Fatalf("other calls=%d want 0 (pinned exhaustion must not walk)", postCount(&otherCalls))
@@ -145,8 +144,8 @@ func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 				if customHits.Load() != 0 {
 					t.Fatalf("custom hits=%d want 0 on 503 exhaustion", customHits.Load())
 				}
-				if attempts != tc.transientMax {
-					t.Fatalf("attempts=%d want %d", attempts, tc.transientMax)
+				if attempts != tc.maxObservation {
+					t.Fatalf("attempts=%d want %d", attempts, tc.maxObservation)
 				}
 				pinAfter, _ := gw.scheduler.pinGet(ses, "m")
 				if pinAfter != pin {
@@ -182,9 +181,8 @@ func TestTransientMid400_PinnedAnonAndAuth(t *testing.T) {
 			)
 			cfg.Anonymous = true
 			cfg.Keys = []string{"zen-key-aaaaa"}
-			cfg.Retry.TransientMaxAttempts = 3
+			cfg.Retry.MaxAttempts = 3
 			cfg.Retry.TransientRetryIntervalSeconds = 0
-			cfg.Retry.MaxAttempts = 5
 			norm, _ := NormalizeConfig("config.json", cfg)
 			monitor := NewMonitor()
 			gw, _ := NewGateway(norm, discardGatewayLogger(), monitor)
@@ -368,9 +366,8 @@ func TestPinnedAuth503Then429_Refactor(t *testing.T) {
 			)
 			cfg.Anonymous = false
 			cfg.Keys = []string{"zen-key-aaaaa"}
-			cfg.Retry.TransientMaxAttempts = 3
+			cfg.Retry.MaxAttempts = 3
 			cfg.Retry.TransientRetryIntervalSeconds = 0
-			cfg.Retry.MaxAttempts = 5
 			cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 			norm, _ := NormalizeConfig("config.json", cfg)
 			monitor := NewMonitor()
@@ -434,7 +431,7 @@ func TestPinnedAuth503Then429_Refactor(t *testing.T) {
 					t.Fatalf("attempts=%d want 4 (503+429 + other429 + custom)", attempts)
 				}
 			} else {
-				// Partial: pinned 429 after 503, other 200 success => refund logic must have kept budget, early 503 not as 429
+				// Partial: pinned 429 after 503, other 200 success => candidate walk must continue without an ordinary-send budget, early 503 not as 429
 				if err != nil || resp == nil || resp.StatusCode != 200 {
 					t.Fatalf("partial 429->success want 200, err=%v resp=%v", err, resp)
 				}
@@ -452,7 +449,7 @@ func TestPinnedAuth503Then429_Refactor(t *testing.T) {
 					t.Fatalf("custom hits=%d want 0 (partial not exhaustion)", customHits.Load())
 				}
 				if attempts != 3 {
-					t.Fatalf("attempts=%d want 3 (503+429 refund + 200)", attempts)
+					t.Fatalf("attempts=%d want 3 (503+429 + 200)", attempts)
 				}
 				// Partial 429 must NOT write credential429 (needs full eligible set)
 				if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {

@@ -29,9 +29,8 @@ func Test503TransientObservationRespectsDeadline(t *testing.T) {
 	)
 	cfg.Anonymous = true
 	cfg.Keys = []string{"single-key-12345"}
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 1
-	cfg.Retry.MaxAttempts = 5
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	norm, err := NormalizeConfig("config.json", cfg)
@@ -104,9 +103,8 @@ func TestPinnedAnonymous503DeadlineStopsTransientObservation(t *testing.T) {
 	)
 	cfg.Anonymous = true
 	cfg.Keys = []string{"single-key-12345"}
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 1
-	cfg.Retry.MaxAttempts = 5
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	norm, err := NormalizeConfig("config.json", cfg)

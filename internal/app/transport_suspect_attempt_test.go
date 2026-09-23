@@ -95,7 +95,7 @@ func TestPerformanceUnknownFieldStrict(t *testing.T) {
 
 func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
 	// legacy JSON without attempt_timeout_seconds must normalize to 5 (clamped to timeout)
-	rawMissing := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"transient_max_attempts":3,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
+	rawMissing := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
 	var cfg Config
 	if err := json.Unmarshal([]byte(rawMissing), &cfg); err != nil {
 		t.Fatalf("unmarshal missing attempt: %v", err)
@@ -111,7 +111,7 @@ func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
 		t.Fatalf("timeout should stay 300 got %d", norm.Retry.TimeoutSeconds)
 	}
 	// explicit 5 must stay 5
-	rawExplicit := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_max_attempts":3,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
+	rawExplicit := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
 	var cfgE Config
 	if err := json.Unmarshal([]byte(rawExplicit), &cfgE); err != nil {
 		t.Fatalf("unmarshal explicit: %v", err)
@@ -124,7 +124,7 @@ func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
 		t.Fatalf("explicit 5 must stay 5 got %d", normE.Retry.AttemptTimeoutSeconds)
 	}
 	// missing with small timeout 2 -> attempt 2 (not 5)
-	rawSmall := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":2,"transient_max_attempts":3,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
+	rawSmall := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":2,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
 	var cfg2 Config
 	if err := json.Unmarshal([]byte(rawSmall), &cfg2); err != nil {
 		t.Fatalf("unmarshal small: %v", err)
@@ -137,7 +137,7 @@ func TestAttemptTimeoutLegacyMissingNormalization(t *testing.T) {
 		t.Fatalf("small timeout normalize want 2 got %d", norm2.Retry.AttemptTimeoutSeconds)
 	}
 	// explicit zero must be rejected (distinguish absent vs explicit zero)
-	rawZero := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":0,"transient_max_attempts":3,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
+	rawZero := `{"listen":"127.0.0.1:8080","server_keys":["k1"],"keys":["k2"],"proxy_pools":{"shared":{"proxies":["direct"]}},"proxy_routing":{"anonymous":"shared","authenticated":"shared"},"upstream":{"zen":"https://opencode.ai/zen"},"retry":{"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":0,"transient_retry_interval_seconds":3},"models":{"refresh_seconds":300,"protocols":{}},"performance":{"max_idle_conns":2048,"max_idle_conns_per_host":256,"max_conns_per_host":0,"idle_conn_timeout_seconds":120,"connect_timeout_seconds":5,"failure_cooldown_seconds":15,"rate_limit_cooldown_seconds":300},"logging":{"level":"info","ring_size":2000},"webui":{"enabled":false,"listen":"127.0.0.1:1","username":"u","session_ttl_minutes":5},"history":{"enabled":true,"directory":"","retention_days":7,"max_bytes_mb":128}}`
 	var cfgZ Config
 	if err := json.Unmarshal([]byte(rawZero), &cfgZ); err != nil {
 		t.Fatalf("unmarshal zero: %v", err)
@@ -336,9 +336,8 @@ func TestAnonymousUnboundTransportMovesToNextProxy(t *testing.T) {
 	monitor := NewMonitor()
 	cfg := testGatewayConfig(map[string][]string{"a": {"direct", "http://127.0.0.1:8081"}, "z": {"direct"}}, ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"})
 	cfg.Anonymous = true
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
-	cfg.Retry.MaxAttempts = 5
 	norm, _ := NormalizeConfig("config.json", cfg)
 	gw, _ := NewGateway(norm, discardGatewayLogger(), monitor)
 	var a0calls, a1calls atomic.Int32
@@ -379,7 +378,7 @@ func TestPinnedAnonymousTransportDoesNotMove(t *testing.T) {
 	monitor := NewMonitor()
 	cfg := testGatewayConfig(map[string][]string{"a": {"direct", "http://127.0.0.1:8081"}, "z": {"direct"}}, ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"})
 	cfg.Anonymous = true
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	norm, _ := NormalizeConfig("config.json", cfg)
 	gw, _ := NewGateway(norm, discardGatewayLogger(), monitor)
@@ -480,7 +479,7 @@ func TestAllSuspectGives502NoCustom(t *testing.T) {
 	cfg.Anonymous = true
 	cfg.Keys = []string{"single-key-12345"}
 	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	norm, _ := NormalizeConfig("config.json", cfg)
@@ -515,7 +514,7 @@ func TestAnonymousUnboundEmptyProxy429Returns429(t *testing.T) {
 	cfg := testGatewayConfig(map[string][]string{"a": {"direct", "http://127.0.0.1:8081"}, "z": {"direct"}}, ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"})
 	cfg.Anonymous = true
 	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}
 	norm, _ := NormalizeConfig("config.json", cfg)

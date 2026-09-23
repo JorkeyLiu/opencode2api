@@ -170,8 +170,10 @@ func TestCandidateFanoutKxP(t *testing.T) {
 	}
 }
 
-// 2b. Auth tiers are capped by max_attempts; anonymous walks every proxy once.
-func TestTierBudgets(t *testing.T) {
+// 2b. Candidate traversal is bounded by the frozen slice; anonymous walks
+// every proxy once and authenticated walks every credential x proxy. The L1
+// retry.max_attempts never truncates traversal.
+func TestTierTraversalBounds(t *testing.T) {
 	cfg := testGatewayConfig(
 		map[string][]string{"shared": {"direct", "http://127.0.0.1:8081", "http://127.0.0.1:8082", "http://127.0.0.1:8083"}},
 		ProxyRoutingConfig{Anonymous: "shared", Authenticated: "shared"})
@@ -191,8 +193,8 @@ func TestTierBudgets(t *testing.T) {
 	if len(auth) != 8 {
 		t.Fatalf("auth candidates=%d want 8", len(auth))
 	}
-	if limit := min(len(auth), normalized.Retry.MaxAttempts); limit != 3 {
-		t.Fatalf("auth budget=%d want 3", limit)
+	if len(auth) != 8 {
+		t.Fatalf("auth traversal bound=%d want 8 (frozen slice, never truncated by L1)", len(auth))
 	}
 	anon := gateway.scheduler.buildAnonymousCandidates(gateway.pools["shared"], "m", now)
 	if len(anon) != 4 {

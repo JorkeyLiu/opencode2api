@@ -304,7 +304,7 @@ func TestAuthEstablishedMoveMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			monitor := NewMonitor()
-			gateway := authTwoProxyGateway(t, monitor, 5)
+			gateway := authTwoProxyGateway(t, monitor, 2)
 			route := authOnlyRoute()
 			route.KeyTiers = []Tier{TierZen}
 			postStub(t, gateway, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {
@@ -805,7 +805,7 @@ func TestAuthEstablishedThreeProxyTwo429Stops(t *testing.T) {
 
 // Small budget established auth with all transport failures: total real sends
 // capped at retry.max_attempts including same-target retry accounting.
-func TestAuthEstablishedSmallBudgetTransportCap(t *testing.T) {
+func TestAuthEstablishedTransportExhaustionWalks(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := authTwoProxyGateway(t, monitor, 2)
 	route := authOnlyRoute()
@@ -843,21 +843,21 @@ func TestAuthEstablishedSmallBudgetTransportCap(t *testing.T) {
 	_ = r2
 	drainResp(r2)
 	if r2.StatusCode != 502 {
-		t.Fatalf("budget-exhausted transport must 502, got %d", r2.StatusCode)
+		t.Fatalf("transport exhaustion must 502, got %d", r2.StatusCode)
 	}
-	// Budget 2: first proxy first send + same-target retry = 2, next proxy
-	// never sent because budget exhausted before it.
+	// No ordinary-send budget: L1=2 per target, frozen slice of 2 proxies is
+	// fully walked (2+2 sends) before 502.
 	if postCount(&curCalls) != 2 {
-		t.Fatalf("cur=%d want 2 (first+retry)", postCount(&curCalls))
+		t.Fatalf("cur=%d want 2 (first+L1 retry)", postCount(&curCalls))
 	}
-	if postCount(&otherCalls) != 0 {
-		t.Fatalf("other=%d want 0 (budget stops move)", postCount(&otherCalls))
+	if postCount(&otherCalls) != 2 {
+		t.Fatalf("other=%d want 2 (walk continues without budget cap)", postCount(&otherCalls))
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d want 2 (exact budget)", attempts)
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (2+2)", attempts)
 	}
-	if got := len(monitor.Snapshot().Upstream.Recent) - before; got != 2 {
-		t.Fatalf("recorded=%d want 2", got)
+	if got := len(monitor.Snapshot().Upstream.Recent) - before; got != 4 {
+		t.Fatalf("recorded=%d want 4", got)
 	}
 }
 
@@ -914,12 +914,11 @@ func TestAuthEstablished429RespectsBudget1(t *testing.T) {
 	}
 }
 
-// Pinned anonymous at max_attempts=1 keeps its independent same-target
-// transient retry (prior contract), unlike authenticated budget truncation.
-func TestPinnedAnonymousMaxAttempts1KeepsRetry(t *testing.T) {
+// Pinned anonymous at max_attempts=2 keeps its L1 same-target observation.
+func TestPinnedAnonymousL1ObservationKeepsRetry(t *testing.T) {
 	monitor := NewMonitor()
 	gateway := routing400Gateway(t, monitor)
-	gateway.cfg.Retry.MaxAttempts = 1
+	gateway.cfg.Retry.MaxAttempts = 2
 	postStub(t, gateway, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
@@ -1042,7 +1041,7 @@ func TestAuthEstablishedPrecooledSkippedNotCounted(t *testing.T) {
 // yields one current proxy without stale move-back or split; attempts recorded.
 func TestAuthEstablishedConcurrentMovesSingleWinner(t *testing.T) {
 	monitor := NewMonitor()
-	gateway := authTwoProxyGateway(t, monitor, 5)
+	gateway := authTwoProxyGateway(t, monitor, 2)
 	route := authOnlyRoute()
 	route.KeyTiers = []Tier{TierZen}
 	postStub(t, gateway, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {

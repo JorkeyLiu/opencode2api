@@ -826,16 +826,13 @@ func isContextCancelled(ctx context.Context) bool {
 	return ctx != nil && ctx.Err() != nil
 }
 
-func (g *Gateway) transientAttempts() int {
+func (g *Gateway) observationAttempts() int {
 	if g == nil {
 		return 3
 	}
-	n := g.cfg.Retry.TransientMaxAttempts
+	n := g.cfg.Retry.MaxAttempts
 	if n < 1 {
-		n = 3
-	}
-	if n > 10 {
-		n = 10
+		n = 1
 	}
 	return n
 }
@@ -1137,7 +1134,7 @@ func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandi
 // attemptOutcome is the structured single-send result owned by executeAttempt.
 // It carries the upstream response/error, request-build error, diagnostic,
 // and send-start time sufficient for the outer loop to decide candidate
-// advance, proxy fallback, budgets, 400 replay, pin moves, and custom fallback
+// advance, proxy fallback, 400 replay, pin moves, and custom fallback
 // without re-implementing send/classification/stream gating. Started is the
 // true send-start nanos from sendUpstreamOnce and is required by doPinnedAuth
 // for credential429 stale fencing (lastStartedNanos comparison).
@@ -1154,7 +1151,7 @@ type attemptOutcome struct {
 // streaming startup gate before client commitment, stream-success
 // scheduler/monitor recording, startup-failure classification/recording, and
 // returning a structured outcome. It does NOT select/advance candidates, decide
-// proxy fallback, own ordinary-send budgets, accumulate credential429 evidence,
+// proxy fallback, accumulate credential429 evidence,
 // invoke custom fallback, replay exact 400, bind/move pins, or change
 // route-session/body construction.
 func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) attemptOutcome {
@@ -1213,23 +1210,22 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 // same-target observation loop stopped. Stable means the final outcome is no
 // longer isSameTargetTransient (2xx/400/429/ordinary 4xx/BuildErr included) and
 // the caller owns all policy for it. Context covers pre-retry cancellation and
-// sleep interruption. ObservationLimit means maxTransient (including the initial
-// send) was reached while still transient. Budget means the caller-provided
-// ordinary-budget gate blocked another observation.
+// sleep interruption. ObservationLimit means maxObservation (normalized
+// retry.max_attempts, including the initial send) was reached while still
+// transient.
 type transientStopReason int
 
 const (
 	transientStopStable transientStopReason = iota
 	transientStopContext
 	transientStopObservationLimit
-	transientStopBudget
 )
 
 // transientLoopResult is the L1 observation outcome with history metadata for
 // exact HEAD equivalence. Final is the last observed outcome (stable, context,
-// budget, or limit). InitialResp/InitialErr preserve the initial send so
+// or limit). InitialResp/InitialErr preserve the initial send so
 // pinned callers can reproduce the old stale-initial return (mixed 503 ->
-// transport-nil at limit/budget) and the old stream-startup poisoning
+// transport-nil at the observation limit) and the old stream-startup poisoning
 // (initial OR final sentinel => local502, matching old
 // isStreamStartupFailureErr(curErr)||isStreamStartupFailureErr(sendErr)).
 // Intermediate sentinel-only states never poison: only initial or final counts.
@@ -1253,23 +1249,21 @@ func (r transientLoopResult) sawStreamSentinel() bool {
 // and executes the next attempt via exec. It never drains the returned stable
 // or limit final response; the caller drains or returns it per policy. The
 // caller owns every policy/action: BuildErr return, 2xx bind/move, exact-400
-// replay, 429 refund/evidence/Started/custom/candidate walk, ordinary 4xx,
+// replay, 429 evidence/Started/custom/candidate walk, ordinary 4xx,
 // transport cross-proxy rules, stream startup local502, and scheduler/pin
-// state. Budget accounting stays in exec/budgetOK to preserve the existing
-// differences (pinnedAuth increments before execute, doKey increments only
-// after BuildErr==nil with 429 refund, anonymous has no budget). The stream
-// startup sentinel is returned unchanged so pinned callers produce local502
-// while unbound callers retain candidate behavior. When budgetOK is provided
-// (pinnedAuth/doKey) the caller budget gate precedes the context check at the
-// inner loop top, matching old HEAD order; anonymous paths (nil budgetOK)
-// remain context-only. Sleep interruption keeps context behavior.
-func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemptOutcome, tier Tier, protocol Protocol, attempts *int, attemptOffset int, maxTransient int, interval time.Duration, budgetOK func() bool, exec func(monitorAttempt int) attemptOutcome) transientLoopResult {
+// state. The loop has no candidate-send budget: maxObservation (normalized
+// retry.max_attempts, including the initial send) is the unique L1 stop, and
+// candidate traversal is bounded only by the frozen eligible/candidate slice.
+// The stream startup sentinel is returned unchanged so pinned callers produce
+// local502 while unbound callers retain candidate behavior. Sleep interruption
+// keeps context behavior.
+func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemptOutcome, tier Tier, protocol Protocol, attempts *int, attemptOffset int, maxObservation int, interval time.Duration, exec func(monitorAttempt int) attemptOutcome) transientLoopResult {
 	cur := initial
 	initResp := initial.Resp
 	initErr := initial.Err
 	sends := 1
-	if maxTransient < 1 {
-		maxTransient = 1
+	if maxObservation < 1 {
+		maxObservation = 1
 	}
 	mk := func(final attemptOutcome, stop transientStopReason) transientLoopResult {
 		return transientLoopResult{Final: final, Stop: stop, InitialResp: initResp, InitialErr: initErr}
@@ -1281,17 +1275,10 @@ func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemp
 		if !isSameTargetTransient(cur.Resp, cur.Err) {
 			return mk(cur, transientStopStable)
 		}
-		if budgetOK != nil {
-			if !budgetOK() {
-				return mk(cur, transientStopBudget)
-			}
-			if isContextCancelled(ctx) {
-				return mk(cur, transientStopContext)
-			}
-		} else if isContextCancelled(ctx) {
+		if isContextCancelled(ctx) {
 			return mk(cur, transientStopContext)
 		}
-		if sends >= maxTransient {
+		if sends >= maxObservation {
 			return mk(cur, transientStopObservationLimit)
 		}
 		d := transientDelay(interval, cur.Resp)
@@ -1878,7 +1865,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		return nil, effectiveRoute, attemptOffset, err
 	}
 	attempts := 0
-	maxTransient := g.transientAttempts()
+	maxObservation := g.observationAttempts()
 	interval := g.transientInterval()
 	var last429 *http.Response
 	for _, ep := range eligible {
@@ -1932,7 +1919,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 		}
 		if isSameTargetTransient(resp, sendErr) {
-			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag}, pin.Tier, protocol, &attempts, attemptOffset, maxTransient, interval, nil, func(monitorAttempt int) attemptOutcome {
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag}, pin.Tier, protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
 			})
 			final, stop := loopRes.Final, loopRes.Stop
@@ -2001,7 +1988,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			// Exact HEAD transport ownership: a retry transport error carrying a
 			// non-nil response was drained before return (old drained retryResp
 			// before setting cur/return). An initial transport with no retry
-			// (final == initial, e.g. maxTransient==1) was returned undrained.
+			// (final == initial, e.g. maxObservation==1) was returned undrained.
 			// Stable finals are never drained here; the caller returns them
 			// for the envelope.
 			if final.Err != nil && final.Resp != nil && final.Resp != loopRes.InitialResp {
@@ -2047,12 +2034,13 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 // authority; ProxyRaw is the current/preferred selection with generation
 // fencing. The route session is proxy-independent so moves preserve the same
 // upstream session value and body bytes. Within one request, only transport
-// failure (after same-target transient retry) or HTTP 429 may try the next
+// failure (after same-target L1 observation) or HTTP 429 may try the next
 // eligible healthy proxy in the same pool/tier/credential/model/protocol/
-// authority before client bytes. The authenticated tier real-send budget
-// governs only non-429 ordinary sends/transient retries: 429 sends never
-// consume it and the 429 chain walks all currently sendable proxies until
-// exhaustion. Credential429 is written only after every eligible proxy has
+// authority before client bytes. The L1 observation limit (normalized
+// retry.max_attempts, including the first send) bounds only same-target
+// stability observation; candidate traversal is bounded by the frozen eligible
+// slice. 429 walks all currently sendable proxies until exhaustion.
+// Credential429 is written only after every eligible proxy has
 // returned live 429 in this request (last Retry-After); partial 429 never
 // writes it and pre-cooled skips never count. Full 429 exhaustion tries the
 // custom final fallback. Pre-existing cooling proxies are skipped before any
@@ -2148,12 +2136,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
-	budget := g.cfg.Retry.MaxAttempts
-	if budget < 1 {
-		budget = 1
-	}
 	attempts := 0
-	ordinarySends := 0
 	observed429 := make(map[string]time.Duration)
 	var last429 *http.Response
 	discardLast429 := func() {
@@ -2163,12 +2146,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		}
 	}
 	for idx, ep := range eligible {
-		// Non-429 budget: only ordinary (non-429) sends consume
-		// retry.max_attempts. 429 sends are refunded below so the 429 chain
-		// walks all currently sendable proxies until exhaustion.
-		if ordinarySends >= budget {
-			break
-		}
 		if isContextCancelled(ctx) {
 			discardLast429()
 			return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
@@ -2180,7 +2157,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			ProxyRaw: ep.raw, Model: pin.Model, Identity: identity,
 		}
 		attempts++
-		ordinarySends++
 		syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
 		out := g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, attemptOffset+attempts)
 		if out.BuildErr != nil {
@@ -2216,10 +2192,9 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			status = resp.StatusCode
 		}
 		if status == http.StatusTooManyRequests && sendErr == nil {
-			// 429 never consumes the ordinary budget: refund so the chain
-			// continues across all eligible proxies regardless of
-			// retry.max_attempts.
-			ordinarySends--
+			// 429 never consumes the L1 observation limit: the chain walks
+			// all currently sendable proxies of this binding until
+			// exhaustion.
 			var retryAfter time.Duration
 			if resp != nil {
 				retryAfter = parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -2257,8 +2232,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			continue
 		}
 		if sendErr != nil || status == http.StatusRequestTimeout || status == 425 || (status >= 500 && status <= 599) {
-			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag, Started: firstStarted}, pin.Tier, protocol, &attempts, attemptOffset, g.transientAttempts(), g.transientInterval(), func() bool { return ordinarySends < budget }, func(monitorAttempt int) attemptOutcome {
-				ordinarySends++
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag, Started: firstStarted}, pin.Tier, protocol, &attempts, attemptOffset, g.observationAttempts(), g.transientInterval(), func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, monitorAttempt)
 			})
 			final, stop := loopRes.Final, loopRes.Stop
@@ -2291,7 +2265,6 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
 			}
 			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
-				ordinarySends--
 				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
 				if _, seen := observed429[ep.raw]; !seen {
 					observed429[ep.raw] = retryAfter
@@ -2341,27 +2314,16 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				discardLast429()
 				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
 			}
-			// Exact HEAD mixed 503->transport-nil at observation/budget limit:
+			// Exact HEAD mixed 503->transport-nil at the observation limit:
 			// old returned the stale initial response (initial 503, nil err)
 			// where the final is a nil-body transport error, not nil+transport.
-			if (stop == transientStopBudget || stop == transientStopObservationLimit) && final.Err != nil && final.Resp == nil && loopRes.InitialErr == nil && loopRes.InitialResp != nil {
+			if stop == transientStopObservationLimit && final.Err != nil && final.Resp == nil && loopRes.InitialErr == nil && loopRes.InitialResp != nil {
 				discardLast429()
 				return loopRes.InitialResp, effectiveRoute, attemptOffset + attempts, loopRes.InitialErr
 			}
-			if stop == transientStopBudget {
-				if final.Resp != nil && isSameTargetTransient(final.Resp, final.Err) && final.Err == nil {
-					discardLast429()
-					return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
-				}
-				if final.Resp != nil {
-					drainAndClose(final.Resp.Body)
-				}
-				discardLast429()
-				break
-			}
 			if final.Resp != nil && isSameTargetTransient(final.Resp, final.Err) {
 				if final.Err != nil {
-					if ordinarySends < budget && idx != len(eligible)-1 {
+					if idx != len(eligible)-1 {
 						if final.Resp != nil {
 							drainAndClose(final.Resp.Body)
 						}
@@ -2374,6 +2336,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					discardLast429()
 					break
 				}
+				// 5xx/408/425 never move to another proxy: return as-is.
 				discardLast429()
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
@@ -2382,7 +2345,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
 			if sendErr != nil && !isStreamStartupFailureErr(sendErr) {
-				if ordinarySends >= budget || idx == len(eligible)-1 {
+				if idx == len(eligible)-1 {
 					if resp != nil {
 						drainAndClose(resp.Body)
 					}
@@ -2426,15 +2389,14 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		return last429, effectiveRoute, attemptOffset + attempts, nil
 	}
 	if last429 != nil {
-		// Stale partial 429 after a non-429 transport/terminal event or a
-		// budget stop: never a 429 exhaustion, never custom. Drop the stale
-		// envelope and report a transport-neutral 502 with the exact
-		// consumed attempt count instead of forging a 429.
+		// Stale partial 429 after a non-429 transport/terminal event: never a
+		// 429 exhaustion, never custom. Drop the stale envelope and report a
+		// transport-neutral 502 with the exact consumed attempt count instead
+		// of forging a 429.
 		drainAndClose(last429.Body)
 		last429 = nil
 	}
-	// Exhausted eligible proxies or real-send budget after transport moves, or
-	// budget stopped the walk before the next proxy. No 429 envelope is owed
+	// Exhausted eligible proxies after transport moves. No 429 envelope is owed
 	// here (429 exhaustion returned above); report 502 with the exact
 	// consumed attempt count.
 	return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
@@ -2493,17 +2455,18 @@ func syncAttemptMeta(ctx context.Context, tier Tier, protocol Protocol, attemptO
 // anonymous credential x every currently available proxy. HRW ordering uses
 // only the client session; the route session is proxy-independent and shared
 // across candidates, stamped into the already-present body session fields.
-// The canonical tier body is never mutated. The whole channel owns one shared
-// transient retry token: the first transport error, 408/425, or 5xx re-sends
-// once on the same target with the same route session and body. The first
+// The canonical tier body is never mutated. Each same-target transient
+// (transport error, 408/425, 500-599, stream startup failure) is observed up
+// to the unique L1 limit (normalized retry.max_attempts, including the first
+// send) on the same target with the same route session and body. The first
 // exact HTTP 400 on any candidate instead replays exactly once on the same
 // candidate with the same route session (same request ID, attempt +1, same
 // target/protocol/proxy, always before any client bytes); the replay result
-// is final for the whole route and never consumes the transient token.
-// Ordinary 4xx ends the anonymous channel (authenticated tiers may still
-// run); other retryable outcomes advance to the next proxy. Cancel ends the
-// channel immediately without further sends or state changes. The list is
-// never truncated by retry.max_attempts.
+// is final for the whole route. Ordinary 4xx ends the anonymous channel
+// (authenticated tiers may still run); other retryable outcomes advance to
+// the next proxy. Cancel ends the channel immediately without further sends
+// or state changes. The list is never truncated by a candidate-send budget;
+// traversal is bounded by the frozen candidate slice.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int, extra ...upstreamExtra) (*http.Response, error, int, bool, bool) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -2542,7 +2505,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), nil, 0, false, false
 	}
 	attempts := 0
-	maxTransient := g.transientAttempts()
+	maxObservation := g.observationAttempts()
 	interval := g.transientInterval()
 	for idx, cand := range cands {
 		if isContextCancelled(ctx) {
@@ -2556,7 +2519,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		// Defense in depth: before a later fallback candidate sends another
 		// target, stop when a pin appeared and let the outer route through
-		// the pinned target. Same-target transient retry/replay below stays
+		// the pinned target. Same-target L1 observation/replay below stays
 		// on the same candidate and never checks here.
 		if idx > 0 && ids.Session != "" && route.ID != "" {
 			if _, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
@@ -2615,7 +2578,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			return resp, nil, attempts, false, false
 		}
 		if isSameTargetTransient(resp, err) {
-			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag}, TierZen, route.Protocol, &attempts, attemptOffset, maxTransient, interval, nil, func(monitorAttempt int) attemptOutcome {
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag}, TierZen, route.Protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
 				return g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
 			})
 			final, stop := loopRes.Final, loopRes.Stop
@@ -2800,18 +2763,17 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		return nil, fmt.Errorf("no prepared %s request body", route.Tier), 0, false, false
 	}
 	// Freeze the candidate order at request start; failover walks the frozen
-	// list without dynamic re-sorting. The tier budget counts only non-429
-	// ordinary upstream sends (each candidate first send plus at most one
-	// same-target transient retry) against retry.max_attempts; 429 sends are
-	// budget-neutral and walk all currently sendable credential x proxy
-	// candidates until exhaustion. Credential429 is written only after every
+	// list without dynamic re-sorting. The L1 observation limit (normalized
+	// retry.max_attempts, including the first send) bounds only same-target
+	// stability observation; candidate traversal is bounded by the frozen
+	// credential x proxy slice. 429 walks all currently sendable candidates
+	// until exhaustion. Credential429 is written only after every
 	// eligible proxy for one credential has returned live 429 (last
 	// Retry-After); partial 429 never writes it and pre-cooled skips never
-	// count. The 400 recovery is always allowed once extra and never consumes
-	// the transient token or the ordinary budget. Auth ordering is
-	// credential-soft-affinity: credential groups by session HRW, proxies
-	// within each credential by deterministic affinity (session/model
-	// independent). The route session is proxy-independent.
+	// count. The 400 recovery is always allowed once extra on the same target.
+	// Auth ordering is credential-soft-affinity: credential groups by session
+	// HRW, proxies within each credential by deterministic affinity
+	// (session/model independent). The route session is proxy-independent.
 	now := time.Now().UnixNano()
 	// Credential429 fast-fail before any send: when every credential for this
 	// tier is cooling and at least one is credential-429 cooling, fail locally
@@ -2871,13 +2833,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	for _, cand := range cands {
 		credEligibleCount[cand.CredID]++
 	}
-	budget := g.cfg.Retry.MaxAttempts
-	if budget < 1 {
-		budget = 1
-	}
 	attempts := 0
-	ordinarySends := 0
-	maxTransient := g.transientAttempts()
+	maxObservation := g.observationAttempts()
 	interval := g.transientInterval()
 	for idx, cand := range cands {
 		if isContextCancelled(ctx) {
@@ -2889,12 +2846,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			}
 			return nil, ctx.Err(), attempts, false, false
 		}
-		if ordinarySends >= budget {
-			break
-		}
 		// Defense in depth: before a later fallback candidate sends another
 		// target, stop when a pin appeared and let the outer route through
-		// the pinned target. Same-target transient retry/replay below stays
+		// the pinned target. Same-target L1 observation/replay below stays
 		// on the same candidate and never checks here.
 		if idx > 0 && ids.Session != "" && route.ID != "" {
 			if _, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
@@ -2925,7 +2879,6 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		err = out.Err
 		firstDiag := out.Diag
 		firstStarted := out.Started
-		ordinarySends++
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			if isStreamContext(ctx) {
 				g.logger.Debug("upstream stream committed", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
@@ -2938,10 +2891,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		// Unbound exhaustion evidence: same credential live 429s accumulate;
 		// credential429 is written only when the credential's full frozen
 		// eligible set has 429ed (last Retry-After). Single/progress 429
-		// never sets it. 429 sends are budget-neutral so the chain is never
-		// truncated by retry.max_attempts.
+		// never sets it. Candidate traversal is bounded only by the frozen slice.
 		if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
-			ordinarySends--
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			ev, ok := cred429Evidence[cand.CredID]
 			if !ok {
@@ -2975,15 +2926,8 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			return resp, nil, attempts, false, false
 		}
 		if isSameTargetTransient(resp, err) {
-			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag, Started: firstStarted}, route.Tier, route.Protocol, &attempts, attemptOffset, maxTransient, interval, func() bool { return ordinarySends < budget }, func(monitorAttempt int) attemptOutcome {
-				out := g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
-				if out.BuildErr == nil {
-					ordinarySends++
-					if out.Err == nil && out.Resp != nil && out.Resp.StatusCode == http.StatusTooManyRequests {
-						ordinarySends--
-					}
-				}
-				return out
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag, Started: firstStarted}, route.Tier, route.Protocol, &attempts, attemptOffset, maxObservation, interval, func(monitorAttempt int) attemptOutcome {
+				return g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
 			})
 			final := loopRes.Final
 			_ = loopRes.Stop
@@ -3765,13 +3709,15 @@ func (g *Gateway) refreshAnonymousTier(ctx context.Context, base string) []strin
 }
 
 // refreshTier fetches the model list with a stateless key x healthy-proxy
-// traversal bounded by retry.max_attempts. Foreground scheduler
-// credential/target state is never read or written here, and proxy
-// healthy/checking is never changed via syncProxyResult/verifyProxyAfterError.
-// Healthy proxies are observed read-only; success/failure only decides the
-// catalog snapshot in the caller, and a context deadline/cancel is only a
-// refresh failure, never a proxy signal. Only the Zen lane exists; the tier
-// argument is retained for compat and ignored beyond pool selection.
+// traversal over all frozen candidates: the slice length itself is the
+// independent, naturally finite upper bound and never reuses the inference L1
+// retry.max_attempts. Foreground scheduler credential/target state is never
+// read or written here, and proxy healthy/checking is never changed via
+// syncProxyResult/verifyProxyAfterError. Healthy proxies are observed
+// read-only; success/failure only decides the catalog snapshot in the caller,
+// and a context deadline/cancel is only a refresh failure, never a proxy
+// signal. Only the Zen lane exists; the tier argument is retained for compat
+// and ignored beyond pool selection.
 func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []string {
 	keys := g.cfg.Keys
 	poolName := g.authPoolName()
@@ -3787,15 +3733,19 @@ func (g *Gateway) refreshTier(ctx context.Context, base string, tier Tier) []str
 	if len(healthy) == 0 {
 		return nil
 	}
-	budget := min(g.cfg.Retry.MaxAttempts, len(keys)*len(healthy))
-	if budget < 1 {
-		budget = 1
+	type refreshCandidate struct {
+		key   string
+		proxy *proxyTransport
 	}
-	for attempt := 0; attempt < budget; attempt++ {
-		key := keys[attempt%len(keys)]
-		proxy := healthy[attempt%len(healthy)]
+	candidates := make([]refreshCandidate, 0, len(keys)*len(healthy))
+	for _, key := range keys {
+		for _, proxy := range healthy {
+			candidates = append(candidates, refreshCandidate{key: key, proxy: proxy})
+		}
+	}
+	for attempt, cand := range candidates {
 		refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models, _, err := fetchModels(refreshCtx, proxy.client, base, key)
+		models, _, err := fetchModels(refreshCtx, cand.proxy.client, base, cand.key)
 		cancel()
 		if err == nil {
 			return models

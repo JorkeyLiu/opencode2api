@@ -26,8 +26,7 @@ func TestPinnedAuthStreamStartupFailureNoWalkNoFallback(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	cfg.Retry.TimeoutSeconds = 5
 	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{ch}}

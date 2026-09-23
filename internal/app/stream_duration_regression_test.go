@@ -148,8 +148,7 @@ func TestStreamDuration_SuccessNotZero_PinnedAuth(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 3
+	cfg.Retry.MaxAttempts = 3
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
 	if err != nil {
@@ -262,8 +261,7 @@ func TestStreamDuration_FailureNotZero(t *testing.T) {
 	)
 	cfg.Anonymous = false
 	cfg.Keys = []string{"zen-key-aaaaa"}
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	monitor2 := NewMonitor()
 	gw2, err := NewGateway(cfg, discardGatewayLogger(), monitor2)
 	if err != nil {
@@ -299,8 +297,7 @@ func TestStreamDuration_FailureNotZero_UnboundAnonymous(t *testing.T) {
 		ProxyRoutingConfig{Anonymous: "a", Authenticated: "a"},
 	)
 	cfg.Anonymous = true
-	cfg.Retry.MaxAttempts = 5
-	cfg.Retry.TransientMaxAttempts = 1
+	cfg.Retry.MaxAttempts = 1
 	cfg.Retry.TransientRetryIntervalSeconds = 0
 	gw, err := NewGateway(cfg, discardGatewayLogger(), monitor)
 	if err != nil {
