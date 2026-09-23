@@ -193,7 +193,15 @@ func TestPinned503RemainsSameTarget(t *testing.T) {
 	}
 }
 
-func TestExhausted503Returns503NoCustomFallback(t *testing.T) {
+// Empty-session 503 faithful return (not a general "503 never takes over"
+// rule): emptySessionIDs() carries Session=="" so doUpstreamTiersUnbound can
+// never enter the custom gate (ids.Session!="" required). With a non-empty
+// bindable session + active custom, L1-final 503 exhaustion on every entered
+// domain does take over custom; see
+// TestUnboundExhaustion503BothDomainsAllowCustom and
+// TestUnboundExhaustionAuth429And503AllowCustom. This test keeps the L1
+// same-target observation (3 sends) and the native 503 envelope verification.
+func TestExhausted503EmptySessionReturns503NoCustomFallback(t *testing.T) {
 	monitor := NewMonitor()
 	var customHits atomic.Int32
 	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -222,17 +230,20 @@ func TestExhausted503Returns503NoCustomFallback(t *testing.T) {
 		return responseWithBody(503, `{"error":"svc"}`), nil
 	})
 	ids := emptySessionIDs()
+	if ids.Session != "" {
+		t.Fatalf("test premise broken: want empty session, got %q", ids.Session)
+	}
 	route := anonAuthRoute()
 	resp, eff, _, err := gwUnbound.doUpstreamTiers(context.Background(), route, routeBodies(), ids, 0)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
 	if resp == nil || resp.StatusCode != 503 {
-		t.Fatalf("exhausted 503 want 503, got %v", resp)
+		t.Fatalf("empty-session exhausted 503 want faithful 503, got %v", resp)
 	}
 	drainResp(resp)
 	if eff.Tier == TierCustom {
-		t.Fatalf("must not fallback to custom on 503")
+		t.Fatalf("empty session must not fallback to custom on 503 (custom gate needs a bindable session)")
 	}
 	if customHits.Load() != 0 {
 		t.Fatalf("custom hits %d want 0", customHits.Load())
@@ -279,7 +290,7 @@ func TestExhausted503Returns503NoCustomFallback(t *testing.T) {
 	}
 	drainResp(resp2)
 	if eff2.Tier == TierCustom {
-		t.Fatalf("pinned must not fallback on 503")
+		t.Fatalf("pinned 503 must not fallback (5xx never moves, no consumption gate)")
 	}
 	if postCount(&pinnedCalls) != 3 {
 		t.Fatalf("pinned calls %d want 3", postCount(&pinnedCalls))
@@ -363,7 +374,14 @@ func TestRetryAfterLowerBound(t *testing.T) {
 	}
 }
 
-func TestMixed429Then503DoesNotReturn429(t *testing.T) {
+// Empty-session mixed 429/503 faithful return (not a general "503 never
+// takes over" rule): emptySessionIDs() carries Session=="" so the unbound
+// custom gate is closed even though the single credential domain would
+// otherwise exhaust (live 429 + L1-final 503). With a non-empty bindable
+// session + active custom the same evidence does take over; see
+// TestUnboundExhaustionAuth429And503AllowCustom. This test keeps the L1
+// same-target 503 observation and the native 503 envelope verification.
+func TestMixed429Then503EmptySessionKeeps503NoCustomFallback(t *testing.T) {
 	monitor := NewMonitor()
 	cfg := testGatewayConfig(
 		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
@@ -394,7 +412,11 @@ func TestMixed429Then503DoesNotReturn429(t *testing.T) {
 		return responseWithBody(503, `{"error":"svc"}`), nil
 	})
 	route := authOnlyRoute()
-	resp, eff, _, err := gw.doUpstreamTiers(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	ids := emptySessionIDs()
+	if ids.Session != "" {
+		t.Fatalf("test premise broken: want empty session, got %q", ids.Session)
+	}
+	resp, eff, _, err := gw.doUpstreamTiers(context.Background(), route, routeBodies(), ids, 0)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -403,17 +425,17 @@ func TestMixed429Then503DoesNotReturn429(t *testing.T) {
 	}
 	defer drainResp(resp)
 	if resp.StatusCode != 503 {
-		t.Fatalf("mixed 429 then 503 must return 503, got %d", resp.StatusCode)
+		t.Fatalf("empty-session mixed 429 then 503 must keep faithful 503, got %d", resp.StatusCode)
 	}
 	if eff.Tier == TierCustom {
-		t.Fatalf("must not fallback to custom on 503 after 429")
+		t.Fatalf("empty session must not fallback to custom on 503 after 429 (custom gate needs a bindable session)")
 	}
 	if customHits.Load() != 0 {
 		t.Fatalf("custom hits %d want 0", customHits.Load())
 	}
-	// z1 should have been retried at least once (503 is transient)
-	if postCount(&z1calls) < 1 {
-		t.Fatalf("z1 calls %d want >=1", postCount(&z1calls))
+	// z1 carries the L1 same-target 503 observation (MaxAttempts=2).
+	if postCount(&z1calls) != 2 {
+		t.Fatalf("z1 calls %d want 2 (initial 503 + 1 same-target L1 retry)", postCount(&z1calls))
 	}
 	cred := gw.authCreds[0]
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {

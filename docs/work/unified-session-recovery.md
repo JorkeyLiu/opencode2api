@@ -7,8 +7,8 @@
 
 - 文件：`docs/work/unified-session-recovery.md`
 - 目标：统一会话恢复（unified session recovery）
-- 基准：当前代码即基线（HEAD `b5a0d08`（`test(recovery): cover L1-final credential fencing`；`internal/app/unbound_auth_started_test.go` +201 行两用例已提交，不再是未提交追加）之上未提交的本轮 `stableCause` 结构收敛（`internal/app/gateway.go` 的 `stableCause`/`classifyStableCause` 四路径收敛、`pinnedAuthContextEarlyReturn` 旧门保留）、新文件 `internal/app/stable_cause_test.go` 与 `unbound_auth_started_test.go` 时钟采样修复；历史已提交证据截至 `b5a0d08`，其中 `b5a0d08` / `977790a` / `1a5904f` / `8a43803` / `0d4c34b` 为纯测试提交、无生产语义变更，`5357c16` 为文档同步，`a733a20` / `abb3d56` / `3ef7710` / `ac8a1f7` 为行为保持的生产重构/清理）。【历史快照：2026-09-23 早前版本曾以 HEAD `0d4c34b` + 未提交 `unbound_auth_started_test.go` 为检验基线，该快照已 superseded，`unbound_auth_started_test.go` 现已随 `b5a0d08` 提交；快照前的中间态描述保留于本文件历史行文中，不再作为现行基线。】统一语义三层为已接受原则，未完全落地：未绑定已实现按域状态无关耗尽、已绑定已实现全量 live 429 加有界 consumption，广义三层逐状态矩阵仍待定
-- 检验时间：2026-09-23 现场检查（HEAD `b5a0d08` + 未提交本轮 `stableCause` 代码/测试与时钟精度修复；`b5a0d08` 及之前均为历史已提交基线）
+- 基准：当前代码即基线（HEAD `f6d7974` 已提交 `stableCause` 结构收敛；工作区仅未提交纯测试变更：`internal/app/transient_retry_test.go` 两旧用例更名澄清 + `internal/app/unbound_exhaustion_stateagnostic_test.go` 四个有会话 503 端到端新用例，无生产代码变化；历史已提交证据截至 `f6d7974`，其中 `f6d7974` 为行为保持的 `stableCause` 七分类收敛提交，`b5a0d08` / `977790a` / `1a5904f` / `8a43803` / `0d4c34b` 为纯测试提交、无生产语义变更，`5357c16` 为文档同步，`a733a20` / `abb3d56` / `3ef7710` / `ac8a1f7` 为行为保持的生产重构/清理）。【历史快照：2026-09-23 早前版本曾以 HEAD `b5a0d08` + 未提交 `stableCause` 为检验基线，该快照已 superseded，`stableCause` 现已随 `f6d7974` 提交；更早的 HEAD `0d4c34b` + 未提交 `unbound_auth_started_test.go` 快照亦已 superseded；快照前的中间态描述保留于本文件历史行文中，不再作为现行基线。】统一语义三层为已接受原则，未完全落地：未绑定已实现按域状态无关耗尽、已绑定已实现全量 live 429 加有界 consumption，广义三层逐状态矩阵仍待定
+- 检验时间：2026-09-23 现场检查（HEAD `f6d7974` + 未提交纯测试 503 证据；`f6d7974` 及之前均为历史已提交基线）
 
 ## 1. 结论（Outcome）
 
@@ -80,7 +80,7 @@
   - 下一自然工作须从剩余的广义逐状态/L2 缺口（见 §6 / §9）中由 Nexus 先裁决未定行为、选定能闭合当前语义缺口的自然工作单元后，方可形成新的“当前自然工作单元”并进入执行；本轮不预设逐状态矩阵、不自行设计任一后续行为。
 - 约束重申：不新增 `internal/app/recovery.go`，不拆包，不改 `README`/`AGENTS`/`ADR`/`config.example.json` 以外文件、依赖或配置 schema；未声称统一恢复已完成；已裁决的最高原则与 503 关闭决策不再作为待裁决项；不把 503 写成无限 retry，不冻结逐状态码矩阵/预算/退避。
 
-## 8. 验收状态（Acceptance Status · HEAD `b5a0d08` + 未提交本轮 `stableCause` 收敛与时钟修复；历史已提交证据截至 `b5a0d08`）
+## 8. 验收状态（Acceptance Status · HEAD `f6d7974` + 未提交纯测试 503 证据；历史已提交证据截至 `f6d7974`）
 
 > Increment 1-5 为已闭合的结构化收敛增量，最终 L1 迁移为完整行为闭合（非局部 503 过渡）；`b5a0d08` / `977790a` / `1a5904f` / `8a43803` / `0d4c34b` 为历史已闭合的纯测试证据增量（无生产语义变更；其中 `b5a0d08` 的 `unbound_auth_started_test.go` 在早前快照中曾记为未提交，现已提交），`5357c16` 为文档同步，`a733a20` / `abb3d56` / `3ef7710` / `ac8a1f7` 为已提交的行为保持生产重构/清理/复用。本节为验收摘要，不把测试覆盖写成生产语义扩展，不写未执行的验证结果。
 
@@ -89,15 +89,18 @@
 - 验证（已执行且通过）：
   - 新增/改写聚焦 `TestObserveSameTargetTransientStops`（`stable`/`context`/`observation-limit`/`BuildErr`/`429-stable`/流哨兵原样，含 `observationLimitIncludesFirstSend` 与 `observationLimitUsesNormalizedMaxAttempts`）与 `TestPinnedAuthObservationLimitTransport`（观察上限 transport 仍走冻结切片、`5xx` 永不移动）及审计回归 `TestPinnedAuthMixed503TransportStaleInitial` 与 `TestPinnedAuthSentinelPoisoning503`；`TestAuthL1ObservationAndTraversal`（L1=1 仍走全切片、L1=2 先重试后走）、`TestAuthEstablishedTransportExhaustionWalks`、`TestRefreshTraversesAllCandidatesIndependentOfL1`、`TestTransientMaxAttemptsStrictlyRejected` 已通过；`pinnedAnon` 中体取消/`transport+non-nil` 仍为防御性保留；既有 400/429/pin/stream/cancel 证据保留。
   - 全量回归 `go test ./... -count=1` 已通过，`gofmt` 干净；`go build -o opencode2api ./cmd/opencode2api` 已通过。
-- 当前状态说明：单一 L1 计数已收敛；`b5a0d08` 为已提交基线（L1-final credential fencing 纯测试，无生产语义变更；早前快照中的“HEAD `0d4c34b` + 未提交 `unbound_auth_started_test.go`”已由本次提交取代）；当前检查基线为 HEAD `b5a0d08` 之上未提交的本轮 `stableCause` 结构收敛（`gateway.go` 四路径消费单一分类、各路径 L2 对象决策与 scheduler/pin/route-session/custom 双门保留、行为等价）加新 `stable_cause_test.go` 与 `unbound_auth_started_test.go` 时钟采样修复（两处同 tick 改严格真实时钟，不描述为已提交）；生产行为无变更，无完成声称；统一恢复仍未完全落地。
-- 当前纯测试验证（已执行且通过，未提交）：`gofmt` 干净；全量 `go test ./...` 通过；race count 10 通过；`go build` 临时二进制通过且已清理删除；有界审计零生产差异（零 findings）。
-- 当前重构验证（已执行且通过，未提交）：聚焦 fallback/pin 套件通过，新增确定性 `TestFallbackUnboundWaiterAdoptsCustom`（事件证明、无 sleep、race count 10 通过）且 follower 零 native POST；`gofmt` 干净；全量 `go test ./... -count=1` 通过；race count 10 通过；`go build` 临时二进制通过且已清理删除；有界审计零生产差异（其测试强度发现项已纠正）。
+- 【历史快照：以下三行截至 HEAD `b5a0d08` + 未提交 `stableCause`，已 superseded；`stableCause` 现已随 `f6d7974` 提交，原文保留】当前状态说明：单一 L1 计数已收敛；`b5a0d08` 为已提交基线（L1-final credential fencing 纯测试，无生产语义变更；早前快照中的“HEAD `0d4c34b` + 未提交 `unbound_auth_started_test.go`”已由本次提交取代）；当时检查基线为 HEAD `b5a0d08` 之上未提交的本轮 `stableCause` 结构收敛（`gateway.go` 四路径消费单一分类、各路径 L2 对象决策与 scheduler/pin/route-session/custom 双门保留、行为等价）加新 `stable_cause_test.go` 与 `unbound_auth_started_test.go` 时钟采样修复（两处同 tick 改严格真实时钟，不描述为已提交）；生产行为无变更，无完成声称；统一恢复仍未完全落地。
+- 【历史快照：同上基线已 superseded】当前纯测试验证（已执行且通过，未提交）：`gofmt` 干净；全量 `go test ./...` 通过；race count 10 通过；`go build` 临时二进制通过且已清理删除；有界审计零生产差异（零 findings）。
+- 【历史快照：同上基线已 superseded】当前重构验证（已执行且通过，未提交）：聚焦 fallback/pin 套件通过，新增确定性 `TestFallbackUnboundWaiterAdoptsCustom`（事件证明、无 sleep、race count 10 通过）且 follower 零 native POST；`gofmt` 干净；全量 `go test ./... -count=1` 通过；race count 10 通过；`go build` 临时二进制通过且已清理删除；有界审计零生产差异（其测试强度发现项已纠正）。
+- 现行状态（HEAD `f6d7974` + 未提交纯测试 503 证据，2026-09-23）：`f6d7974` 为已提交基线（`stableCause` 七分类收敛，无恢复语义变更）；工作区仅两测试文件未提交，无生产代码变化。本轮 503 证据为纯测试变更，不称为新 L2 503 持续观察（§7 关闭口径不变：503 仅 L1 同目标有界观察，无独立 L2 持续观察循环）。有会话未绑定端到端（`unbound_exhaustion_stateagnostic_test.go` 新增四用例，均用非空可绑定 session + 真实 `doUpstreamTiers` 未绑定路径）：`TestUnboundExhaustion503BothDomainsAllowCustom`（anon/auth 两域各单候选 L1-final 503、`MaxAttempts=3` 各 3 次同目标观察后各自耗尽→active custom 接管一次并绑定 session，不建 pin）、`TestUnboundExhaustionAuth429And503AllowCustom`（auth 单凭证双候选：live 429 单发 + L1-final 503 三发→耗尽→custom 接管，不写 `credential429`）、`TestUnboundExhaustion503PartialOrdinaryNoCustom`（anon L1-final 503 + auth ordinary 422：auth 域未耗尽→保持忠实 422、不接管 custom）、`TestUnboundExhaustion503NoActivePreserves503`（两域 L1-final 503 但无 active→忠实 503、无 custom 接触/绑定）。空 session 旧用例更名澄清（`transient_retry_test.go`，行为不变）：`TestExhausted503Returns503NoCustomFallback`→`TestExhausted503EmptySessionReturns503NoCustomFallback`、`TestMixed429Then503DoesNotReturn429`→`TestMixed429Then503EmptySessionKeeps503NoCustomFallback`，二者原来仅证明 session gate（`Session==""` 使 custom 门永不进入），更名后注释明确“非一般 503 不接管规则”，有会话同证据接管见上三新用例。
+- 现行验证事实（按委托验证记录，本轮文档编辑未重跑测试）：聚焦通过；随后 `go test ./... -count=1` 连续至少 5 次通过（Manifestor 后三次 + Inspector 两次）；另有一次早期包级 FAIL 但无原始输出、无法定位，不定性为 flaky；`go build` 成功、`gofmt` 清洁。ADR §8 仍为要求声明，不标记全部 ADR §8 验证已完成，不声称三层全面完成或矩阵冻结。
 
 ## 9. 未决问题（Unresolved Questions）
 
-- 统一恢复是否允许跨代理或跨凭证迁移，抑或仍限定同目标同会话？（注：L2/L3 对象层级疑问已于 2026-09-22 裁决关闭——代理/池/凭证/备用渠道/恢复域均为对象/候选或上下文，不映射为固定 L2/L3；fallback 为 L2 对象选择非固定末级）
-- 与 Responses `previous_response_id` 清理及自定义 fallback 接管的交互边界？（400 为 L2 修正按 L3 终态，不回流正常恢复）
-- 是否需要新增可观测事件/指标，或复用现有 `route_session_recovery_*` 事件？
+- 【历史快照：以下三问为早前措辞，已 settled，原文保留，不再待裁决】统一恢复是否允许跨代理或跨凭证迁移，抑或仍限定同目标同会话？（注：L2/L3 对象层级疑问已于 2026-09-22 裁决关闭——代理/池/凭证/备用渠道/恢复域均为对象/候选或上下文，不映射为固定 L2/L3；fallback 为 L2 对象选择非固定末级）/ 与 Responses `previous_response_id` 清理及自定义 fallback 接管的交互边界？（400 为 L2 修正按 L3 终态，不回流正常恢复）/ 是否需要新增可观测事件/指标，或复用现有 `route_session_recovery_*` 事件？
+- 现行状态（2026-09-23，依据 `AGENTS.md` §3/§4 与现有 work 事实）：已绑定 session+model pin 固定 channel/credential/pool/model/protocol/authority，不跨凭证/池/通道；proxy 移动仅按既定规则——429 前提下移动，authenticated transport 在既有同目标 L1 观察后可尝试下一代理，anonymous transport 不移动；未绑定按冻结顺序走候选。本轮不新增移动规则。
+- 现行状态（同上）：400 Responses 清理 provider-bound `previous_response_id`/reasoning 后同目标 replay 即终态；首次 native→custom strip provider-bound refs，bound custom follow-up 保留 custom-issued refs；均已定，不再作为空白问题重裁。
+- 现行状态（同上）：可观测性本轮不新增事件/指标，不引入 raw secrets；仅具体可观测需求出现再评估，不将可观测性开放问题当作恢复行为阻塞。
 
 ## 10. 已否决路径（Rejected Approach）
 
@@ -116,8 +119,10 @@
 - **恢复行为保持不变：** 该结构重构不改变任何路由/重试/冷却/会话亲和语义，不触及 `AGENTS.md` §4 不变式；本文件 §1–§11 所锁定的“同目标单次 400 重放为终态、不创建覆盖、六层冷却与绑定语义不变”等结论继续有效。
 - **文档边界：** 后续布局实现验证（`go test ./...` / `go build ./cmd/opencode2api` / `gofmt` / Docker）归 ADR 0002 追踪，不在本文件验收证据内重复判定。
 
-## 13. 下一工作边界（2026-09-23）
+## 13. 下一工作边界（2026-09-23 · HEAD `f6d7974` + 未提交纯测试 503 证据）
 
-- 当前结构性 L1→stable cause 接缝已完成：`observeSameTargetTransient` 之后仅以 `classifyStableCause` 七分类描述稳定原因，四条 native walker 消费分类但 L2 对象决策仍在各路径自有门内；该接缝为行为保持的结构收敛，不改变恢复语义。
+- 现行接缝：`f6d7974` 已提交 `stableCause` 七分类收敛（L1→stable cause 描述层，四条 native walker 消费分类但 L2 对象决策仍在各路径自有门内；行为保持）；工作区未提交部分仅为上述四个有会话 503 端到端纯测试 + 两旧空 session 用例更名，无生产语义待合入。
 - 剩余的广义 cause→L2 action / object selection 映射（逐状态在 L2 的对象选择与耗尽资格的一般规则）仍需真实行为裁决：哪些 cause 在何种恢复域上下文中触发何种对象动作，属于待定的产品语义决定，不能靠进一步机械重构或零散测试自动完成。
 - 本文件不承诺统一恢复已全部完成；后续是否立项、裁决何种映射，均不在本文档内预设。
+- 现行状态：当前无 `AGENTS.md` 明确已定但代码尚未兑现的用户可观察恢复行为；503 纯测试证据已闭合一个核验缺口（见 §7/§8），不声称新行为。
+- 约束：剩余广义逐状态策略/对象移动若要改变已绑定基线，必须先由具体需求及规范修订定界，不可从抽象原则直接推导新矩阵，也不因追求形式上的 L2 中心化而新增代码；保留“三层统一未全面落地”诚实表述，不宣称全完成。

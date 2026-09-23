@@ -746,3 +746,204 @@ func TestUnboundExhaustionSharedPoolAnon429NotBorrowed(t *testing.T) {
 		t.Fatalf("anonymous live 429 must write shared TierZen+pool+proxyRaw proxy429")
 	}
 }
+
+// 503 closed loop, both domains L1-final: anonymous and authenticated each
+// hold one frozen candidate returning live 503. With MaxAttempts=3 each
+// candidate is observed exactly 3 times on the same target (unique L1 bound,
+// same route session/body), then counts once as unavailable (Frozen=1/
+// Unavailable=1 per domain). Both entered domains exhaust independently, so
+// the active custom takes over exactly once and binds the session; the
+// native 503 never returns. Real doUpstreamTiers unbound path.
+func TestUnboundExhaustion503BothDomainsAllowCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-503-both-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 3
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var anonPosts, authPosts atomic.Int32
+	postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	ses := "ses_unbound_503_both_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("both-domain L1-final 503 exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if eff.ID != "cm-exhaust" {
+		t.Fatalf("custom response tier model=%q want cm-exhaust", eff.ID)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind session-keyed fallback")
+	}
+	if binding.ID == "" && binding.Name == "" {
+		t.Fatalf("fallback binding must carry channel identity: %+v", binding)
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("custom takeover must not establish a session pin")
+	}
+	if got := postCount(&anonPosts); got != 3 {
+		t.Fatalf("anonPosts=%d want 3 (initial + 2 same-target L1 retries)", got)
+	}
+	if got := postCount(&authPosts); got != 3 {
+		t.Fatalf("authPosts=%d want 3 (initial + 2 same-target L1 retries)", got)
+	}
+	if attempts != 7 {
+		t.Fatalf("attempts=%d want 7 (3 anon + 3 auth + 1 custom)", attempts)
+	}
+}
+
+// No-active 503 keeps the native envelope: same two-domain L1-final 503
+// evidence as above but without an active channel. The route must return the
+// faithful protocol 503 with zero custom contact and no fallback binding.
+func TestUnboundExhaustion503NoActivePreserves503(t *testing.T) {
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-503-noactive-1"}, nil, false)
+	gw.cfg.Retry.MaxAttempts = 3
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var anonPosts, authPosts atomic.Int32
+	postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	ses := "ses_unbound_503_noactive_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 503 {
+		t.Fatalf("no-active 503 exhaustion must keep faithful 503, got %d", resp.StatusCode)
+	}
+	if eff.Tier == TierCustom {
+		t.Fatalf("no-active must not enter custom tier: %+v", eff)
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("no-active must not bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("no-active 503 must not establish a session pin")
+	}
+	if got := postCount(&anonPosts); got != 3 {
+		t.Fatalf("anonPosts=%d want 3 (L1 observation preserved without active)", got)
+	}
+	if got := postCount(&authPosts); got != 3 {
+		t.Fatalf("authPosts=%d want 3 (L1 observation preserved without active)", got)
+	}
+	if attempts != 6 {
+		t.Fatalf("attempts=%d want 6 (3 anon + 3 auth, no custom)", attempts)
+	}
+}
+
+// Auth single-domain mixed 429 + L1-final 503: one credential with two frozen
+// proxies, one live 429 (stable, single send) and one L1-final 503 (3 sends
+// under MaxAttempts=3). Each frozen candidate counts once, so the lone
+// credential domain exhausts (Frozen=2/Unavailable=2) and the active custom
+// takes over. The non-429 takeover must not write credential429.
+func TestUnboundExhaustionAuth429And503AllowCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-503-auth-mix-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 3
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var z429Posts, z503Posts atomic.Int32
+	postStub(t, gw, "z", 0, &z429Posts, nil, func(*http.Request) (*http.Response, error) {
+		resp := responseWithBody(429, `{"error":"slow"}`)
+		resp.Header.Set("Retry-After", "9")
+		return resp, nil
+	})
+	postStub(t, gw, "z", 1, &z503Posts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	ses := "ses_unbound_503_auth_mix_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth 429+L1-final-503 exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind session-keyed fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("custom takeover must not establish a session pin")
+	}
+	// Proxy behavior is pinned to the pool index, so counts hold regardless
+	// of the frozen walk order: 429 is stable (1 send), 503 observes L1 (3).
+	if got := postCount(&z429Posts); got != 1 {
+		t.Fatalf("z429Posts=%d want 1 (live 429 never observes same-target)", got)
+	}
+	if got := postCount(&z503Posts); got != 3 {
+		t.Fatalf("z503Posts=%d want 3 (initial + 2 same-target L1 retries)", got)
+	}
+	if attempts != 5 {
+		t.Fatalf("attempts=%d want 5 (1x429 + 3x503 + 1 custom)", attempts)
+	}
+	cred := gw.authCreds[0]
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
+		t.Fatalf("mixed 429+503 custom takeover must not write credential429 (partial live-429 only)")
+	}
+}
+
+// Partial 503 is not enough: anonymous reaches L1-final 503 (3 sends) but the
+// authenticated lane ends with an ordinary 422 that never counts as
+// unavailable. The auth domain stays partial (Frozen=1/Unavailable=0), so the
+// single observed 503 must never trigger custom directly; the route keeps the
+// faithful 422 with no fallback binding. Real doUpstreamTiers unbound path.
+func TestUnboundExhaustion503PartialOrdinaryNoCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-503-partial-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 3
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var anonPosts, authPosts atomic.Int32
+	postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(503, `{"error":"svc"}`), nil
+	})
+	postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(422, `{"error":"unprocessable"}`), nil
+	})
+	ses := "ses_unbound_503_partial_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 422 {
+		t.Fatalf("partial 503 + ordinary terminal must keep faithful 422, got %d", resp.StatusCode)
+	}
+	if eff.Tier == TierCustom || eff.Tier != TierZen {
+		t.Fatalf("must keep native zen tier, got %+v", eff)
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("partial exhaustion must not hit custom (hits=%d)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("partial exhaustion must not bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("non-2xx partial must not establish a session pin")
+	}
+	if got := postCount(&anonPosts); got != 3 {
+		t.Fatalf("anonPosts=%d want 3 (L1-final 503 still observed once per candidate)", got)
+	}
+	if got := postCount(&authPosts); got != 1 {
+		t.Fatalf("authPosts=%d want 1 (ordinary 422 single send)", got)
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (3 anon + 1 auth, no custom)", attempts)
+	}
+}
