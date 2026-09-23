@@ -1209,6 +1209,31 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// transientNextAttempt executes the shared same-target transient observation mechanism
+// for one retry iteration: it computes the delay from prevResp, drains prevResp,
+// sleeps with context, increments attempts, syncs attempt meta, and executes
+// the next attempt via execFn. It returns the attemptOutcome and true when the
+// retry was executed; false means the sleep was interrupted (or context already
+// cancelled) and no attempt was made. Ordinary budget (ordinarySends) is owned
+// by the caller: doPinnedAuth increments before executeAttempt (inside the
+// closure), doKeyUpstream increments after executeAttempt returns with
+// BuildErr==nil and refunds on 429, anonymous paths do not use it. The caller
+// retains all policy: whether to retry, budget/maxTransient checks, 400 replay,
+// 429 refund/evidence, candidate advance, stream startup handling, custom
+// fallback, and pin move/bind decisions.
+func (g *Gateway) transientNextAttempt(ctx context.Context, prevResp *http.Response, interval time.Duration, attempts *int, attemptOffset int, tier Tier, protocol Protocol, execFn func(monitorAttempt int) attemptOutcome) (attemptOutcome, bool) {
+	d := transientDelay(interval, prevResp)
+	if prevResp != nil {
+		drainAndClose(prevResp.Body)
+	}
+	if !sleepWithContext(ctx, d) {
+		return attemptOutcome{}, false
+	}
+	*attempts++
+	syncAttemptMeta(ctx, tier, protocol, attemptOffset, *attempts)
+	return execFn(attemptOffset + *attempts), true
+}
+
 // bindSessionPin records the successful target for derived session + model.
 // The key uses only the derived client session and model ID; the value is the
 // full target identity plus resolvable protocol/authority. Raw client signals
@@ -1844,19 +1869,15 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 					}
 					return curResp, effectiveRoute, attemptOffset + attempts, curErr
 				}
-				d := transientDelay(interval, curResp)
-				if curResp != nil {
-					drainAndClose(curResp.Body)
-				}
-				if !sleepWithContext(ctx, d) {
+				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, pin.Tier, protocol, func(monitorAttempt int) attemptOutcome {
+					return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
+				})
+				if !ok {
 					if last429 != nil {
 						drainAndClose(last429.Body)
 					}
 					return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
 				}
-				attempts++
-				syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-				outRetry := g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 				if outRetry.BuildErr != nil {
 					if last429 != nil {
 						drainAndClose(last429.Body)
@@ -1874,9 +1895,6 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
 					}
 					return retryResp, effectiveRoute, attemptOffset + attempts, nil
-				}
-				if isStreamStartupFailureErr(retryErr) && retryIdx+1 == maxTransient {
-					retryExhausted = true
 				}
 				if isContextCancelled(ctx) {
 					if last429 != nil {
@@ -2232,18 +2250,14 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					discardLast429()
 					return curResp, effectiveRoute, attemptOffset + attempts, curErr
 				}
-				d := transientDelay(interval, curResp)
-				if curResp != nil {
-					drainAndClose(curResp.Body)
-				}
-				if !sleepWithContext(ctx, d) {
+				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, pin.Tier, protocol, func(monitorAttempt int) attemptOutcome {
+					ordinarySends++
+					return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, monitorAttempt)
+				})
+				if !ok {
 					discardLast429()
 					return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
 				}
-				attempts++
-				ordinarySends++
-				syncAttemptMeta(ctx, pin.Tier, protocol, attemptOffset, attempts)
-				outRetry := g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, attemptOffset+attempts)
 				if outRetry.BuildErr != nil {
 					discardLast429()
 					return nil, effectiveRoute, attemptOffset + attempts, outRetry.BuildErr
@@ -2623,16 +2637,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				if isContextCancelled(ctx) {
 					return curResp, curErr, attempts, false, false
 				}
-				d := transientDelay(interval, curResp)
-				if curResp != nil {
-					drainAndClose(curResp.Body)
-				}
-				if !sleepWithContext(ctx, d) {
+				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, TierZen, route.Protocol, func(monitorAttempt int) attemptOutcome {
+					return g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
+				})
+				if !ok {
 					return nil, ctx.Err(), attempts, false, false
 				}
-				attempts++
-				syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-				outRetry := g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, attemptOffset+attempts)
 				if outRetry.BuildErr != nil {
 					return nil, outRetry.BuildErr, attempts, false, false
 				}
@@ -3037,24 +3047,20 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				if isContextCancelled(ctx) {
 					return curResp, curErr, attempts, false, false
 				}
-				d := transientDelay(interval, curResp)
-				if curResp != nil {
-					drainAndClose(curResp.Body)
-				}
-				if !sleepWithContext(ctx, d) {
+				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, route.Tier, route.Protocol, func(monitorAttempt int) attemptOutcome {
+					return g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
+				})
+				if !ok {
 					return nil, ctx.Err(), attempts, false, false
 				}
-				attempts++
-				syncAttemptMeta(ctx, route.Tier, route.Protocol, attemptOffset, attempts)
-				outRetry := g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, attemptOffset+attempts)
 				if outRetry.BuildErr != nil {
 					return nil, outRetry.BuildErr, attempts, false, false
 				}
+				ordinarySends++
 				retryResp := outRetry.Resp
 				retryErr := outRetry.Err
 				retryDiag := outRetry.Diag
 				retryStarted := outRetry.Started
-				ordinarySends++
 				if retryErr == nil && retryResp != nil && retryResp.StatusCode == http.StatusTooManyRequests {
 					ordinarySends--
 				}
