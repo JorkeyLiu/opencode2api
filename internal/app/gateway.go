@@ -1209,29 +1209,107 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// transientNextAttempt executes the shared same-target transient observation mechanism
-// for one retry iteration: it computes the delay from prevResp, drains prevResp,
-// sleeps with context, increments attempts, syncs attempt meta, and executes
-// the next attempt via execFn. It returns the attemptOutcome and true when the
-// retry was executed; false means the sleep was interrupted (or context already
-// cancelled) and no attempt was made. Ordinary budget (ordinarySends) is owned
-// by the caller: doPinnedAuth increments before executeAttempt (inside the
-// closure), doKeyUpstream increments after executeAttempt returns with
-// BuildErr==nil and refunds on 429, anonymous paths do not use it. The caller
-// retains all policy: whether to retry, budget/maxTransient checks, 400 replay,
-// 429 refund/evidence, candidate advance, stream startup handling, custom
-// fallback, and pin move/bind decisions.
-func (g *Gateway) transientNextAttempt(ctx context.Context, prevResp *http.Response, interval time.Duration, attempts *int, attemptOffset int, tier Tier, protocol Protocol, execFn func(monitorAttempt int) attemptOutcome) (attemptOutcome, bool) {
-	d := transientDelay(interval, prevResp)
-	if prevResp != nil {
-		drainAndClose(prevResp.Body)
+// transientStopReason is the structured L1 observation stop: why the
+// same-target observation loop stopped. Stable means the final outcome is no
+// longer isSameTargetTransient (2xx/400/429/ordinary 4xx/BuildErr included) and
+// the caller owns all policy for it. Context covers pre-retry cancellation and
+// sleep interruption. ObservationLimit means maxTransient (including the initial
+// send) was reached while still transient. Budget means the caller-provided
+// ordinary-budget gate blocked another observation.
+type transientStopReason int
+
+const (
+	transientStopStable transientStopReason = iota
+	transientStopContext
+	transientStopObservationLimit
+	transientStopBudget
+)
+
+// transientLoopResult is the L1 observation outcome with history metadata for
+// exact HEAD equivalence. Final is the last observed outcome (stable, context,
+// budget, or limit). InitialResp/InitialErr preserve the initial send so
+// pinned callers can reproduce the old stale-initial return (mixed 503 ->
+// transport-nil at limit/budget) and the old stream-startup poisoning
+// (initial OR final sentinel => local502, matching old
+// isStreamStartupFailureErr(curErr)||isStreamStartupFailureErr(sendErr)).
+// Intermediate sentinel-only states never poison: only initial or final counts.
+type transientLoopResult struct {
+	Final       attemptOutcome
+	Stop        transientStopReason
+	InitialResp *http.Response
+	InitialErr  error
+}
+
+// sawStreamSentinel reports the old pinned poisoning condition: either the
+// initial send or the final outcome is the stream-startup sentinel.
+func (r transientLoopResult) sawStreamSentinel() bool {
+	return isStreamStartupFailureErr(r.InitialErr) || isStreamStartupFailureErr(r.Final.Err)
+}
+
+// observeSameTargetTransient owns only the L1 same-target observation mechanism
+// starting from an initial transient attemptOutcome: while it remains
+// isSameTargetTransient it drains the retried outcome, sleeps with
+// Retry-After/interval and context, increments attempts, syncs attempt meta,
+// and executes the next attempt via exec. It never drains the returned stable
+// or limit final response; the caller drains or returns it per policy. The
+// caller owns every policy/action: BuildErr return, 2xx bind/move, exact-400
+// replay, 429 refund/evidence/Started/custom/candidate walk, ordinary 4xx,
+// transport cross-proxy rules, stream startup local502, and scheduler/pin
+// state. Budget accounting stays in exec/budgetOK to preserve the existing
+// differences (pinnedAuth increments before execute, doKey increments only
+// after BuildErr==nil with 429 refund, anonymous has no budget). The stream
+// startup sentinel is returned unchanged so pinned callers produce local502
+// while unbound callers retain candidate behavior. When budgetOK is provided
+// (pinnedAuth/doKey) the caller budget gate precedes the context check at the
+// inner loop top, matching old HEAD order; anonymous paths (nil budgetOK)
+// remain context-only. Sleep interruption keeps context behavior.
+func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemptOutcome, tier Tier, protocol Protocol, attempts *int, attemptOffset int, maxTransient int, interval time.Duration, budgetOK func() bool, exec func(monitorAttempt int) attemptOutcome) transientLoopResult {
+	cur := initial
+	initResp := initial.Resp
+	initErr := initial.Err
+	sends := 1
+	if maxTransient < 1 {
+		maxTransient = 1
 	}
-	if !sleepWithContext(ctx, d) {
-		return attemptOutcome{}, false
+	mk := func(final attemptOutcome, stop transientStopReason) transientLoopResult {
+		return transientLoopResult{Final: final, Stop: stop, InitialResp: initResp, InitialErr: initErr}
 	}
-	*attempts++
-	syncAttemptMeta(ctx, tier, protocol, attemptOffset, *attempts)
-	return execFn(attemptOffset + *attempts), true
+	for {
+		if cur.BuildErr != nil {
+			return mk(cur, transientStopStable)
+		}
+		if !isSameTargetTransient(cur.Resp, cur.Err) {
+			return mk(cur, transientStopStable)
+		}
+		if budgetOK != nil {
+			if !budgetOK() {
+				return mk(cur, transientStopBudget)
+			}
+			if isContextCancelled(ctx) {
+				return mk(cur, transientStopContext)
+			}
+		} else if isContextCancelled(ctx) {
+			return mk(cur, transientStopContext)
+		}
+		if sends >= maxTransient {
+			return mk(cur, transientStopObservationLimit)
+		}
+		d := transientDelay(interval, cur.Resp)
+		if cur.Resp != nil {
+			drainAndClose(cur.Resp.Body)
+		}
+		if !sleepWithContext(ctx, d) {
+			ctxErr := context.Canceled
+			if ctx != nil && ctx.Err() != nil {
+				ctxErr = ctx.Err()
+			}
+			return mk(attemptOutcome{Err: ctxErr}, transientStopContext)
+		}
+		*attempts++
+		syncAttemptMeta(ctx, tier, protocol, attemptOffset, *attempts)
+		cur = exec(attemptOffset + *attempts)
+		sends++
+	}
 }
 
 // bindSessionPin records the successful target for derived session + model.
@@ -1854,140 +1932,82 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 		}
 		if isSameTargetTransient(resp, sendErr) {
-			curResp := resp
-			curErr := sendErr
-			retryExhausted := false
-			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
-				if isContextCancelled(ctx) {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					if curResp != nil && curResp != resp {
-						drainAndClose(curResp.Body)
-					} else if curResp == resp && curResp != nil {
-						// curResp is original resp not yet drained
-					}
-					return curResp, effectiveRoute, attemptOffset + attempts, curErr
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag}, pin.Tier, protocol, &attempts, attemptOffset, maxTransient, interval, nil, func(monitorAttempt int) attemptOutcome {
+				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
+			})
+			final, stop := loopRes.Final, loopRes.Stop
+			if final.BuildErr != nil {
+				if last429 != nil {
+					drainAndClose(last429.Body)
 				}
-				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, pin.Tier, protocol, func(monitorAttempt int) attemptOutcome {
-					return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
-				})
-				if !ok {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
-				}
-				if outRetry.BuildErr != nil {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					return nil, effectiveRoute, attemptOffset + attempts, outRetry.BuildErr
-				}
-				retryResp := outRetry.Resp
-				retryErr := outRetry.Err
-				retryDiag := outRetry.Diag
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					if ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-					}
-					return retryResp, effectiveRoute, attemptOffset + attempts, nil
-				}
-				if isContextCancelled(ctx) {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
-				}
-				if isRouteTerminalBadRequest(retryResp, retryErr) {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, retryResp, retryDiag, attemptOffset, attempts)
-					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-					}
-					return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
-				}
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode == http.StatusTooManyRequests {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					last429 = retryResp
-					retryExhausted = false
-					curResp = nil
-					break
-				}
-				if retryErr != nil {
-					if isStreamStartupFailureErr(retryErr) {
-						// Stream startup failure is same-target retry for pinned, not immediate error
-						if retryIdx+1 < maxTransient {
-							curResp = retryResp
-							curErr = retryErr
-							continue
-						}
-						// Exhausted, return 502 for pinned
-						if last429 != nil {
-							drainAndClose(last429.Body)
-							last429 = nil
-						}
-						return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
-					}
-					if retryResp != nil {
-						drainAndClose(retryResp.Body)
-					}
-					if last429 != nil {
-						drainAndClose(last429.Body)
-						last429 = nil
-					}
-					// transport still transient: if more attempts remain, continue loop, else return
-					if retryIdx+1 < maxTransient && isSameTargetTransient(retryResp, retryErr) {
-						curResp = retryResp
-						curErr = retryErr
-						continue
-					}
-					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
-				}
-				if !isSameTargetTransient(retryResp, retryErr) {
-					if last429 != nil {
-						drainAndClose(last429.Body)
-						last429 = nil
-					}
-					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
-				}
-				// still transient, keep for next iteration or final return
-				curResp = retryResp
-				curErr = retryErr
-				if retryIdx+1 == maxTransient {
-					retryExhausted = true
-				}
+				return nil, effectiveRoute, attemptOffset + attempts, final.BuildErr
 			}
-			if curResp == nil && curErr == nil {
-				// 429 during retry path: continue to next proxy
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				if ep.raw != pin.ProxyRaw {
+					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				}
+				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
+			}
+			if stop == transientStopContext {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				// Exact HEAD pre-retry-cancel ownership: an intermediate cur
+				// (cur != initial) was drained before return; the initial
+				// itself was returned undrained. Sleep interruption returns
+				// nil + ctx err with no body.
+				if final.Resp != nil && final.Resp != loopRes.InitialResp {
+					drainAndClose(final.Resp.Body)
+				}
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+			}
+			if isContextCancelled(ctx) {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+			}
+			if isRouteTerminalBadRequest(final.Resp, final.Err) {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				}
+				return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
+			}
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				last429 = final.Resp
 				continue
 			}
-			if retryExhausted || (curResp != nil && isSameTargetTransient(curResp, curErr)) {
+			if isStreamStartupFailureErr(final.Err) {
 				if last429 != nil {
 					drainAndClose(last429.Body)
 					last429 = nil
 				}
-				if isStreamStartupFailureErr(curErr) {
-					return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
-				}
-				return curResp, effectiveRoute, attemptOffset + attempts, curErr
+				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
 			}
-			// loop ended via break due to 429 already handled
-			// transient still? handle as pinned non-429 final
-			if curResp != nil {
-				if last429 != nil {
-					drainAndClose(last429.Body)
-					last429 = nil
-				}
-				return curResp, effectiveRoute, attemptOffset + attempts, curErr
+			if last429 != nil {
+				drainAndClose(last429.Body)
+				last429 = nil
 			}
+			// Exact HEAD transport ownership: a retry transport error carrying a
+			// non-nil response was drained before return (old drained retryResp
+			// before setting cur/return). An initial transport with no retry
+			// (final == initial, e.g. maxTransient==1) was returned undrained.
+			// Stable finals are never drained here; the caller returns them
+			// for the envelope.
+			if final.Err != nil && final.Resp != nil && final.Resp != loopRes.InitialResp {
+				drainAndClose(final.Resp.Body)
+			}
+			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		}
 		if sendErr == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 			if last429 != nil {
@@ -2237,166 +2257,130 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			continue
 		}
 		if sendErr != nil || status == http.StatusRequestTimeout || status == 425 || (status >= 500 && status <= 599) {
-			maxTransient := g.transientAttempts()
-			interval := g.transientInterval()
-			curResp := resp
-			curErr := sendErr
-			// curResp/curErr is first transient failure; retry same target up to maxTransient-1 more times
-			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
-				if ordinarySends >= budget {
-					break
-				}
-				if isContextCancelled(ctx) {
-					discardLast429()
-					return curResp, effectiveRoute, attemptOffset + attempts, curErr
-				}
-				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, pin.Tier, protocol, func(monitorAttempt int) attemptOutcome {
-					ordinarySends++
-					return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, monitorAttempt)
-				})
-				if !ok {
-					discardLast429()
-					return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
-				}
-				if outRetry.BuildErr != nil {
-					discardLast429()
-					return nil, effectiveRoute, attemptOffset + attempts, outRetry.BuildErr
-				}
-				retryResp := outRetry.Resp
-				retryErr := outRetry.Err
-				retryDiag := outRetry.Diag
-				retryStarted := outRetry.Started
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					discardLast429()
-					if ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-					}
-					return retryResp, effectiveRoute, attemptOffset + attempts, nil
-				}
-				if isContextCancelled(ctx) {
-					discardLast429()
-					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
-				}
-				if isRouteTerminalBadRequest(retryResp, retryErr) {
-					discardLast429()
-					replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, retryResp, retryDiag, attemptOffset, attempts)
-					attempts = replayed
-					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
-					}
-					return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
-				}
-				retryStatus := 0
-				if retryResp != nil {
-					retryStatus = retryResp.StatusCode
-				}
-				if retryErr == nil && retryStatus == http.StatusTooManyRequests {
-					ordinarySends--
-					var retryAfter time.Duration
-					if retryResp != nil {
-						retryAfter = parseRetryAfter(retryResp.Header.Get("Retry-After"))
-					}
-					if _, seen := observed429[ep.raw]; !seen {
-						observed429[ep.raw] = retryAfter
-					}
-					if len(observed429) >= len(eligible) {
-						_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, retryStatus, retryAfter, retryStarted)
-						if ids.Session != "" {
-							if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
-								drainAndClose(retryResp.Body)
-								if last429 != nil {
-									drainAndClose(last429.Body)
-								}
-								if takeErr != nil {
-									return nil, eff, next, takeErr
-								}
-								if resp2 == nil {
-									return nil, eff, next, contextError("custom fallback transport failed")
-								}
-								return resp2, eff, next, nil
-							}
-						}
-						if last429 != nil {
-							drainAndClose(last429.Body)
-						}
-						return retryResp, effectiveRoute, attemptOffset + attempts, nil
-					}
-					if last429 != nil {
-						drainAndClose(last429.Body)
-					}
-					last429 = retryResp
-					curResp = nil
-					curErr = nil
-					break
-				}
-				if retryErr != nil {
-					if isStreamStartupFailureErr(retryErr) {
-						if retryIdx+1 < maxTransient && ordinarySends < budget {
-							curResp = retryResp
-							curErr = retryErr
-							continue
-						}
-						discardLast429()
-						return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
-					}
-					if retryResp != nil {
-						drainAndClose(retryResp.Body)
-					}
-					// transport still transient: if more attempts remain, continue loop
-					if retryIdx+1 < maxTransient && ordinarySends < budget && isSameTargetTransient(retryResp, retryErr) {
-						curResp = retryResp
-						curErr = retryErr
-						continue
-					}
-					discardLast429()
-					curResp = retryResp
-					curErr = retryErr
-					break
-				}
-				if !isSameTargetTransient(retryResp, retryErr) {
-					discardLast429()
-					return retryResp, effectiveRoute, attemptOffset + attempts, retryErr
-				}
-				// still transient 5xx/408/425: continue loop if more attempts
-				curResp = retryResp
-				curErr = retryErr
-				if retryIdx+1 == maxTransient {
-					// exhausted, return final transient for pinned (no walk)
-					discardLast429()
-					if isStreamStartupFailureErr(curErr) {
-						return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
-					}
-					return curResp, effectiveRoute, attemptOffset + attempts, curErr
-				}
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: sendErr, Diag: firstDiag, Started: firstStarted}, pin.Tier, protocol, &attempts, attemptOffset, g.transientAttempts(), g.transientInterval(), func() bool { return ordinarySends < budget }, func(monitorAttempt int) attemptOutcome {
+				ordinarySends++
+				return g.executeAttempt(ctx, route, pin.Tier, baseURL, protocol, candBody, ids, cand, routeSession, "key", credDisplay, false, monitorAttempt)
+			})
+			final, stop := loopRes.Final, loopRes.Stop
+			if final.BuildErr != nil {
+				discardLast429()
+				return nil, effectiveRoute, attemptOffset + attempts, final.BuildErr
 			}
-			if isStreamStartupFailureErr(curErr) || isStreamStartupFailureErr(sendErr) {
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+				discardLast429()
+				if ep.raw != pin.ProxyRaw {
+					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				}
+				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
+			}
+			if stop == transientStopContext {
+				discardLast429()
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+			}
+			if stop == transientStopStable && isContextCancelled(ctx) {
+				discardLast429()
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+			}
+			if isRouteTerminalBadRequest(final.Resp, final.Err) {
+				discardLast429()
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+				attempts = replayed
+				if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
+					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				}
+				return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
+			}
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+				ordinarySends--
+				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
+				if _, seen := observed429[ep.raw]; !seen {
+					observed429[ep.raw] = retryAfter
+				}
+				if len(observed429) >= len(eligible) {
+					_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
+					if ids.Session != "" {
+						if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+							drainAndClose(final.Resp.Body)
+							discardLast429()
+							if takeErr != nil {
+								return nil, eff, next, takeErr
+							}
+							if resp2 == nil {
+								return nil, eff, next, contextError("custom fallback transport failed")
+							}
+							return resp2, eff, next, nil
+						}
+					}
+					discardLast429()
+					return final.Resp, effectiveRoute, attemptOffset + attempts, nil
+				}
+				// Exact HEAD order (HEAD gateway.go:2372 before cur==nil continue):
+				// full exhaustion above precedes poisoning; only the partial path
+				// with an initial stream-startup sentinel poisons. Final is 429
+				// here, so sawStreamSentinel() reduces to initial-sentinel only;
+				// intermediate-only sentinels never poison. Preserve the
+				// observed429 write, drain both final and prior last429, and
+				// return pin-local 502 with no next-proxy/custom/credential429.
+				if loopRes.sawStreamSentinel() {
+					drainAndClose(final.Resp.Body)
+					discardLast429()
+					return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
+				}
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				last429 = final.Resp
+				continue
+			}
+			// Exact HEAD stream-startup poisoning: either the initial send or
+			// the final outcome being the sentinel yields local502, matching
+			// old isStreamStartupFailureErr(curErr)||isStreamStartupFailureErr(sendErr).
+			// Intermediate-only sentinels never poison. No last-wins, no
+			// de-poisoning.
+			if loopRes.sawStreamSentinel() {
 				discardLast429()
 				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
 			}
-			if curResp == nil && curErr == nil {
-				// 429 during retry path handled, continue to next proxy
-				continue
-			}
-			if curResp != nil && isSameTargetTransient(curResp, curErr) {
+			// Exact HEAD mixed 503->transport-nil at observation/budget limit:
+			// old returned the stale initial response (initial 503, nil err)
+			// where the final is a nil-body transport error, not nil+transport.
+			if (stop == transientStopBudget || stop == transientStopObservationLimit) && final.Err != nil && final.Resp == nil && loopRes.InitialErr == nil && loopRes.InitialResp != nil {
 				discardLast429()
-				if curErr != nil {
-					// transport exhaustion on pinned: not returned as transport error, walk or 502
+				return loopRes.InitialResp, effectiveRoute, attemptOffset + attempts, loopRes.InitialErr
+			}
+			if stop == transientStopBudget {
+				if final.Resp != nil && isSameTargetTransient(final.Resp, final.Err) && final.Err == nil {
+					discardLast429()
+					return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+				}
+				if final.Resp != nil {
+					drainAndClose(final.Resp.Body)
+				}
+				discardLast429()
+				break
+			}
+			if final.Resp != nil && isSameTargetTransient(final.Resp, final.Err) {
+				if final.Err != nil {
 					if ordinarySends < budget && idx != len(eligible)-1 {
-						if curResp != nil {
-							drainAndClose(curResp.Body)
+						if final.Resp != nil {
+							drainAndClose(final.Resp.Body)
 						}
+						discardLast429()
 						continue
 					}
+					if final.Resp != nil {
+						drainAndClose(final.Resp.Body)
+					}
+					discardLast429()
 					break
 				}
-				return curResp, effectiveRoute, attemptOffset + attempts, curErr
-			}
-			if curResp != nil {
 				discardLast429()
-				return curResp, effectiveRoute, attemptOffset + attempts, curErr
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
-			// No retry token: transport failure moves directly only while
-			// budget remains; otherwise stop without another send.
+			if final.Resp != nil {
+				discardLast429()
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+			}
 			if sendErr != nil && !isStreamStartupFailureErr(sendErr) {
 				if ordinarySends >= budget || idx == len(eligible)-1 {
 					if resp != nil {
@@ -2412,7 +2396,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				continue
 			}
 			discardLast429()
-			return resp, effectiveRoute, attemptOffset + attempts, sendErr
+			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		}
 		// 401/403/408/425/ordinary 4xx/5xx: no cross-proxy moves.
 		if last429 != nil {
@@ -2631,91 +2615,45 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			return resp, nil, attempts, false, false
 		}
 		if isSameTargetTransient(resp, err) {
-			curResp := resp
-			curErr := err
-			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
-				if isContextCancelled(ctx) {
-					return curResp, curErr, attempts, false, false
-				}
-				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, TierZen, route.Protocol, func(monitorAttempt int) attemptOutcome {
-					return g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
-				})
-				if !ok {
-					return nil, ctx.Err(), attempts, false, false
-				}
-				if outRetry.BuildErr != nil {
-					return nil, outRetry.BuildErr, attempts, false, false
-				}
-				retryResp := outRetry.Resp
-				retryErr := outRetry.Err
-				retryDiag := outRetry.Diag
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if isStreamContext(ctx) {
-						g.logger.Debug("anonymous transient retry stream committed", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-					} else {
-						g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-					}
-					g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
-					return retryResp, nil, attempts, false, false
-				}
-				if isContextCancelled(ctx) {
-					return retryResp, retryErr, attempts, false, false
-				}
-				if isRouteTerminalBadRequest(retryResp, retryErr) {
-					replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, retryResp, retryDiag, attemptOffset, attempts)
-					attempts = replayed
-					if replayResp != nil || replayErr != nil {
-						return replayResp, replayErr, attempts, true, false
-					}
-					return retryResp, nil, attempts, false, false
-				}
-				if isOrdinaryClientRejection(retryResp, retryErr) {
-					g.logger.Debug("anonymous transient retry hit ordinary rejection; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-					return retryResp, nil, attempts, false, false
-				}
-				if !isSameTargetTransient(retryResp, retryErr) {
-					lastResponse = retryResp
-					lastErr = retryErr
-					if retryErr != nil {
-						g.logger.Debug("anonymous transient retry still failing; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", retryErr)
-					} else {
-						g.logger.Debug("anonymous transient retry returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-					}
-					curResp = nil
-					break
-				}
-				curResp = retryResp
-				curErr = retryErr
-				if retryIdx+1 == maxTransient {
-					lastResponse = curResp
-					lastErr = curErr
-					if curErr != nil {
-						g.logger.Debug("anonymous transient retry still failing; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", curErr)
-					} else {
-						g.logger.Debug("anonymous transient retry returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", curResp.StatusCode)
-					}
-				}
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag}, TierZen, route.Protocol, &attempts, attemptOffset, maxTransient, interval, nil, func(monitorAttempt int) attemptOutcome {
+				return g.executeAttempt(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, candBody, ids, cand, routeSession, "anonymous", "anonymous", true, monitorAttempt)
+			})
+			final, stop := loopRes.Final, loopRes.Stop
+			if final.BuildErr != nil {
+				return nil, final.BuildErr, attempts, false, false
 			}
-			if lastResponse != nil {
-				continue
-			}
-			if maxTransient == 1 {
-				lastResponse = resp
-				lastErr = err
-				if err != nil {
-					g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", err)
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+				if isStreamContext(ctx) {
+					g.logger.Debug("anonymous transient retry stream committed", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
-					g.logger.Debug("anonymous upstream returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
+					g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				}
-				continue
+				g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
+				return final.Resp, nil, attempts, false, false
 			}
-			// exhausted same-target retries, continue to next proxy (lastResponse already set if needed)
-			if curResp != nil && isSameTargetTransient(curResp, curErr) {
-				if lastResponse == nil {
-					lastResponse = curResp
-					lastErr = curErr
+			if stop == transientStopContext || isContextCancelled(ctx) {
+				return final.Resp, final.Err, attempts, false, false
+			}
+			if isRouteTerminalBadRequest(final.Resp, final.Err) {
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+				attempts = replayed
+				if replayResp != nil || replayErr != nil {
+					return replayResp, replayErr, attempts, true, false
 				}
-				continue
+				return final.Resp, nil, attempts, false, false
+			}
+			if isOrdinaryClientRejection(final.Resp, final.Err) {
+				g.logger.Debug("anonymous transient retry hit ordinary rejection; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
+				return final.Resp, nil, attempts, false, false
+			}
+			lastResponse = final.Resp
+			lastErr = final.Err
+			if final.Err != nil {
+				g.logger.Debug("anonymous transient retry still failing; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
+			} else if final.Resp != nil {
+				g.logger.Debug("anonymous transient retry returned an error response; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
+			} else {
+				g.logger.Debug("anonymous transient retry still failing; trying the next proxy", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
 			}
 			continue
 		}
@@ -3037,121 +2975,72 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			return resp, nil, attempts, false, false
 		}
 		if isSameTargetTransient(resp, err) {
-			curResp := resp
-			curErr := err
-			retryLoopDone := false
-			for retryIdx := 1; retryIdx < maxTransient; retryIdx++ {
-				if ordinarySends >= budget {
-					break
-				}
-				if isContextCancelled(ctx) {
-					return curResp, curErr, attempts, false, false
-				}
-				outRetry, ok := g.transientNextAttempt(ctx, curResp, interval, &attempts, attemptOffset, route.Tier, route.Protocol, func(monitorAttempt int) attemptOutcome {
-					return g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
-				})
-				if !ok {
-					return nil, ctx.Err(), attempts, false, false
-				}
-				if outRetry.BuildErr != nil {
-					return nil, outRetry.BuildErr, attempts, false, false
-				}
-				ordinarySends++
-				retryResp := outRetry.Resp
-				retryErr := outRetry.Err
-				retryDiag := outRetry.Diag
-				retryStarted := outRetry.Started
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode == http.StatusTooManyRequests {
-					ordinarySends--
-				}
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode/100 == 2 {
-					if isStreamContext(ctx) {
-						g.logger.Debug("upstream transient retry stream committed", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
-					} else {
-						g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", retryResp.StatusCode)
+			loopRes := g.observeSameTargetTransient(ctx, attemptOutcome{Resp: resp, Err: err, Diag: firstDiag, Started: firstStarted}, route.Tier, route.Protocol, &attempts, attemptOffset, maxTransient, interval, func() bool { return ordinarySends < budget }, func(monitorAttempt int) attemptOutcome {
+				out := g.executeAttempt(ctx, route, route.Tier, baseURL, route.Protocol, candBody, ids, cand, routeSession, "key", cand.CredDisplay, false, monitorAttempt)
+				if out.BuildErr == nil {
+					ordinarySends++
+					if out.Err == nil && out.Resp != nil && out.Resp.StatusCode == http.StatusTooManyRequests {
+						ordinarySends--
 					}
-					g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
-					return retryResp, nil, attempts, false, false
 				}
-				if isContextCancelled(ctx) {
-					return retryResp, retryErr, attempts, false, false
-				}
-				if isRouteTerminalBadRequest(retryResp, retryErr) {
-					replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, retryResp, retryDiag, attemptOffset, attempts)
-					attempts = replayed
-					if replayResp != nil || replayErr != nil {
-						return replayResp, replayErr, attempts, true, false
-					}
-					return retryResp, nil, attempts, false, false
-				}
-				if isOrdinaryClientRejection(retryResp, retryErr) {
-					g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", retryResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
-					return retryResp, nil, attempts, false, false
-				}
-				if retryErr == nil && retryResp != nil && retryResp.StatusCode == http.StatusTooManyRequests {
-					retryAfter := parseRetryAfter(retryResp.Header.Get("Retry-After"))
-					ev, ok := cred429Evidence[cand.CredID]
-					if !ok {
-						ev = make(map[string]time.Duration)
-						cred429Evidence[cand.CredID] = ev
-					}
-					if _, seen := ev[cand.ProxyRaw]; !seen {
-						ev[cand.ProxyRaw] = retryAfter
-						cred429LastRetry[cand.CredID] = retryAfter
-						cred429LastStarted[cand.CredID] = retryStarted
-						if len(ev) >= credEligibleCount[cand.CredID] && credEligibleCount[cand.CredID] > 0 {
-							_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, retryResp.StatusCode, retryAfter, retryStarted)
-						}
-					}
-					lastResponse = retryResp
-					lastErr = retryErr
-					retryLoopDone = true
-					break
-				}
-				if !isSameTargetTransient(retryResp, retryErr) {
-					lastResponse = retryResp
-					lastErr = retryErr
-					if retryErr != nil {
-						g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", retryErr)
-					} else {
-						g.logger.Debug("upstream transient retry returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", retryResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
-					}
-					retryLoopDone = true
-					break
-				}
-				curResp = retryResp
-				curErr = retryErr
-				if retryIdx+1 == maxTransient {
-					lastResponse = curResp
-					lastErr = curErr
-					if curErr != nil {
-						g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", curErr)
-					} else {
-						g.logger.Debug("upstream transient retry returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", curResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
-					}
-					retryLoopDone = true
-				}
+				return out
+			})
+			final := loopRes.Final
+			_ = loopRes.Stop
+			if final.BuildErr != nil {
+				return nil, final.BuildErr, attempts, false, false
 			}
-			if retryLoopDone {
-				continue
-			}
-			if maxTransient == 1 {
-				lastResponse = resp
-				lastErr = err
-				if err != nil {
-					g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", err)
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode/100 == 2 {
+				if isStreamContext(ctx) {
+					g.logger.Debug("upstream transient retry stream committed", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
-					g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+					g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				}
+				g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
+				return final.Resp, nil, attempts, false, false
+			}
+			if isContextCancelled(ctx) {
+				return final.Resp, final.Err, attempts, false, false
+			}
+			if isRouteTerminalBadRequest(final.Resp, final.Err) {
+				replayResp, replayErr, replayed := g.replayCandidate400(ctx, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, final.Resp, final.Diag, attemptOffset, attempts)
+				attempts = replayed
+				if replayResp != nil || replayErr != nil {
+					return replayResp, replayErr, attempts, true, false
+				}
+				return final.Resp, nil, attempts, false, false
+			}
+			if isOrdinaryClientRejection(final.Resp, final.Err) {
+				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+				return final.Resp, nil, attempts, false, false
+			}
+			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
+				ev, ok := cred429Evidence[cand.CredID]
+				if !ok {
+					ev = make(map[string]time.Duration)
+					cred429Evidence[cand.CredID] = ev
+				}
+				if _, seen := ev[cand.ProxyRaw]; !seen {
+					ev[cand.ProxyRaw] = retryAfter
+					cred429LastRetry[cand.CredID] = retryAfter
+					cred429LastStarted[cand.CredID] = final.Started
+					if len(ev) >= credEligibleCount[cand.CredID] && credEligibleCount[cand.CredID] > 0 {
+						_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
+					}
+				}
+				lastResponse = final.Resp
+				lastErr = final.Err
 				continue
 			}
-			// exhausted or budget blocked, treat as last for this candidate
-			lastResponse = curResp
-			lastErr = curErr
-			if curErr != nil {
-				g.logger.Debug("upstream transport attempt failed", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", curErr)
+			lastResponse = final.Resp
+			lastErr = final.Err
+			if final.Err != nil {
+				g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
+			} else if final.Resp != nil {
+				g.logger.Debug("upstream transient retry returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
 			} else {
-				g.logger.Debug("upstream returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", curResp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+				g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
 			}
 			continue
 		}
