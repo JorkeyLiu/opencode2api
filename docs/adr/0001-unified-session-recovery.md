@@ -98,12 +98,12 @@
 ## 6. 后果（Consequences）
 
 - **正向：** 恢复路径可解释性提升；备用路由的触发条件与会话域可用性对齐，减少误触发；预算语义澄清为 L1 观察层稳定性观察计数并向单一权威定义收敛，便于审计与测试；400 终态（L2 修正后按 L3 终止）与现有代码/`AGENTS.md` 对齐，减少歧义；明确代理/池/凭证/备用渠道均为对象粒度、恢复域为上下文，避免把 proxy/pool/channel/domain 误映射为 L2/L3。
-- **负向/成本：** 需对 `retry` 与通道预算进行规范化迁移（明确为 L1 最小观察次数而非统一错误额度/对象队列配额），涉及配置与代码的兼容处理；现有测试与文档需按统一语义三层（observe/resolve/continue-or-return）与 400 终态重新对齐。
+- **负向/成本：** `retry` 与通道预算的规范化迁移已完成（明确为 L1 最小观察次数而非统一错误额度/对象队列配额；`transient_max_attempts` 删除、严格拒绝、无值迁移）；现有测试与文档需按统一语义三层（observe/resolve/continue-or-return）与 400 终态重新对齐。
 - **中性：** 逐状态码在统一语义三层下的映射、具体退避与数值预算仍待定（本 ADR 不将其写成已决定），单一 L1 计数已收敛（`transient_max_attempts` 删除、`max_attempts` 为唯一 L1 上限、无候选发送预算、刷新独立全遍历），其余保持现状行为（候选序列与特定 429 fallback 基线），仅以本 ADR 的统一三层闭环、耗尽资格与 400 终态原则作为评判后续改动的依据；调度器/pin/route-session 领域边界与流式提交后停止不变式保持不变，广义逐状态矩阵、广义 fallback 与退避数值仍未冻结。
 
 ## 7. 迁移与实现约束（Migration / Implementation Constraints）
 
-- `max retry` 迁移必须采用**规范化迁移（canonical migration）**至 L1 观察层“最小观察次数/稳定性观察计数”的单一权威语义（not a uniform error-count quota / 对象队列配额），提供旧字段到该语义的兼容与归一，不保留多预算并行解释，也不将逐状态数值预算与退避写成已决定或冻结矩阵。
+- `max retry` 已收敛至 L1 观察层“最小观察次数/稳定性观察计数”的单一权威语义（not a uniform error-count quota / 对象队列配额）：`retry.max_attempts` 为唯一 L1 同目标观察上限（含首次发送），已删除的 `retry.transient_max_attempts` 严格 unknown-field 拒绝、无值迁移；不保留多预算并行解释，也不将逐状态数值预算与退避写成已决定或冻结矩阵。
 - 实现必须保持 `scheduler` / `pin` / `route-session` 的领域归属，不将冷却、绑定、会话生成职责外移或合并；流式提交后不切换上游/不重新生成的不变式保持不变；代理/池/凭证/备用渠道/恢复域仅为对象/候选上下文，不映射为固定 L2/L3。
 - 400 重放的实现需保证同目标、同路由会话、同一请求身份的约束，属于 L2 稳定非法请求解决动作，且其结果为整条路由的最后恢复动作（route-terminal，按 L3 终止/忠实返回），不再继续候选/通道/fallback 评估；不得将重放结果回流至正常恢复或视为 L1 retry，不得把 400 写成 L1 行为。
 - 取消 / deadline / 已提交字节的停止语义（L3 边界）需在网关入口与流式网关处一致执行，不产生新的后台重试；503 等场景的持续观察亦受上述边界与观察策略约束（L2 内非无限，无法解决则按 L3 忠实返回，不写成无限 retry）。
@@ -119,7 +119,7 @@
 - 针对统一语义三层（L1 观察稳定性 / L2 解决稳定原因（含所有对象粒度与 fallback 作为 L2 动作）/ L3 继续或返回）的单测与集成测试，覆盖：L1 受约束观察至稳定、L2 对象耗尽判定（代理/池/凭证/备用渠道均为候选，恢复域为上下文）、耗尽后 L2 选择下一可用对象、未耗尽时不选择 fallback；503 受 deadline/cancel/committed bytes/观察策略约束的持续观察非无限；
 - 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry）；
 - 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界）；
-- 预算规范化迁移的兼容性测试（`retry.max_attempts` 归一为 L1 最小观察计数，非统一错误额度/对象队列额度，旧配置加载与保存归一）；
+- 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移）；
 - 未引入新的未脱敏日志/指标输出的人工审查。
 
 > 本文档创建时上述验证尚未执行，状态保持“原则已接受 / 分层实现待验证”（2026-09-22 修订后）。
@@ -135,6 +135,10 @@
 **附注：** 本 ADR 仅记录已稳定的方向性决策，所有逐状态码行为矩阵、阈值、退避与计数器等实现细节均显式标记为待定，不得视为已接受决策；不擅自冻结所有状态码矩阵。
 
 ### 修订历史（Revision History）
+
+- **2026-09-23 — 当前 fallback 事实状态澄清（无规范变更，仅消除现状误读）：**
+  - §6“候选序列与特定 429 fallback 基线”与 2026-09-22 修订条“当前代码仍为历史候选/429 fallback 基线”均为当时快照，现已由 `b2c4798`（未绑定按域状态无关耗尽：每域独立 `Entered && Frozen>0 && Unavailable>=Frozen`，允许集 live 429 / 401 / 403 / L1-final 408-425-5xx-transport 含 L1-final stream startup，400 / ordinary 4xx / cancel-deadline / committed / build 不计，状态无关）与 `1e4536c`（已绑定保留全量 live 429 并新增有界 consumption 门：已实际切换到下一冻结 eligible、全部冻结 eligible 真实尝试、末位对象不可用；预冷零发送保持原生；单代理首发非 429 / 400 重放 / ordinary 4xx / cancel-deadline / committed 不接管）取代；`977790a` / `1a5904f` / `8a43803` 为纯测试提交，无生产语义变更。
+  - 503 当前实现仅为同目标有界 L1 观察，已绑定 5xx 不移动；本 ADR 所述 L2 持续观察为已接受原则方向，未另行规定/实现，不视为已落地。§8 验证要求保持待执行，不标记完成。
 
 - **2026-09-23 — 收敛单一 L1 观察计数（最终迁移）：**
   - 删除 `retry.transient_max_attempts`（配置/管理面/运行时 helper/持久化兼容全部移除，严格 unknown-field 拒绝，无值迁移）；`retry.max_attempts` 为唯一 L1 同目标观察上限（含首次发送）；认证 `ordinarySends`/`budgetOK`/候选发送预算全部删除，候选遍历由冻结切片自然有界；`observeSameTargetTransient` 唯一停止为 stable/context/observation-limit；模型刷新改用冻结 `keys × healthy proxies` 全遍历，不再复用推理 L1 值。
