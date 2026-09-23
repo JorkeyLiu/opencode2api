@@ -113,16 +113,19 @@
 
 ## 8. 验证要求（Validation Required）
 
-在实现被视为完成前，必须完成以下验证（均为待执行项，本 ADR 仅作要求声明）：
+以下为验证要求分项现状（HEAD `488f3c9` 已提交，工作区干净）。其中当前已实现切片——单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝——对应的验证已执行且通过（见各项“已执行”标注）；广义 cause→action 矩阵/退避/广义 fallback 仍未决定，对应验证保持 pending，不宣称完整统一三层完成：
 
-- `go test ./...` 通过（CI 门禁）；
-- 针对统一语义三层（L1 观察稳定性 / L2 解决稳定原因（含所有对象粒度与 fallback 作为 L2 动作）/ L3 继续或返回）的单测与集成测试，覆盖：L1 受约束观察至稳定、L2 对象耗尽判定（代理/池/凭证/备用渠道均为候选，恢复域为上下文）、耗尽后 L2 选择下一可用对象、未耗尽时不选择 fallback；503 仅有 L1 同目标有界观察（无 L2 持续观察循环），L1-final 503 按既有对象选择/耗尽规则解决或按 L3 忠实返回；
-- 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry）；
-- 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界）；
-- 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移）；
-- 未引入新的未脱敏日志/指标输出的人工审查。
+- `go test ./... -count=1` 通过（CI 门禁）——已执行（现有验证，全量回归通过；见工作文档 §8）。
+- `go build -o opencode2api ./cmd/opencode2api` 构建通过——已执行（现有验证）。
+- L1 受约束观察至稳定的测试（`TestObserveSameTargetTransientStops` 覆盖 stable/context/observation-limit、`TestAuthL1ObservationAndTraversal`、`TestPinnedAuthObservationLimitTransport`、`TestRefreshTraversesAllCandidatesIndependentOfL1`）——已执行。
+- L2 当前双门/503 的测试：unbound 逐域状态无关耗尽（`TestUnboundExhaustion503BothDomainsAllowCustom` / `TestUnboundExhaustionAuth429And503AllowCustom` / `TestUnboundExhaustion503PartialOrdinaryNoCustom` / `TestUnboundExhaustion503NoActivePreserves503` / `TestUnboundDomainsExhaustedAllowCustom` 系列）与 pinned 429-only 加有界 consumption（`TestPinnedConsumptionAuth429ThenL1Final408Takeover` / `TestPinnedConsumptionAuth429ThenL1Final425Takeover` / `TestPinnedConsumptionAuth429ThenStartupTakeover` / `TestPinnedConsumptionResponses429Then403Takeover` / `TestPinnedAuthFull429StillCustom`）；503 仅 L1 同目标有界观察、无 L2 持续观察循环（`TestUnboundAnonymous503RetrySuccessAfterMultipleFailures` / `TestPinned503RemainsSameTarget` / `TestPinned5xxRetryOnly`）——已执行。
+- 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry；`TestAnonymous400ReplaysSameTarget` / `TestAuthZen400ReplaySuccess` / `TestAuth400RecoveryRouteTerminal` / `TestCustomTakeover400ReplayFinalNoCustom` / `TestMaybeReplayCandidate400Entry` / `TestClassifyStableCause`）——已执行。
+- 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界；`TestCancelStopsRetryFallback` / `CommittedStream_*` 路由层回归 / `TestPinnedConsumptionAuthDeadlineNoCustom` / `TestPinnedConsumptionAuthCancelDuringSecondProxyNoCustom`）——已执行。
+- 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移；`TestTransientMaxAttemptsStrictlyRejected` / `TestObserveSameTargetTransientStops` 计数语义）——已执行。
+- 未引入新的未脱敏日志/指标输出的人工审查（`b2c4798..488f3c9` 生产 Go 变更仅 `internal/app/gateway.go`，无新增 logger/metrics/admin/history 输出，未见新的未脱敏路径）——已执行。
+- 广义 cause→action 矩阵 / 退避 / 广义 fallback 与对象策略的验证——pending（对应行为仍未决定，不宣称完成）。
 
-> 本文档创建时上述验证尚未执行，状态保持“原则已接受 / 分层实现待验证”（2026-09-22 修订后）。
+> 历史记录：本文档创建时（2026-09-22）上述验证尚未执行；现行状态见上——当前已实现切片的对应验证已执行且通过，广义矩阵/对象策略验证仍 pending。
 
 ## 9. 修订与过期条件（Revision / Expiry）
 
@@ -135,6 +138,10 @@
 **附注：** 本 ADR 仅记录已稳定的方向性决策，所有逐状态码行为矩阵、阈值、退避与计数器等实现细节均显式标记为待定，不得视为已接受决策；不擅自冻结所有状态码矩阵。
 
 ### 修订历史（Revision History）
+
+- **2026-09-23 — §8 验证要求分项现状收束（文档事实更新，无原则变更）：**
+  - §8 改为分项现状：当前已实现切片（单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝）对应的 `go test ./... -count=1`、构建、L1/L2 双门与 503/400/L3/预算直接测试覆盖、人工审查（`b2c4798..488f3c9` 生产 Go 仅 `gateway.go`、无新 logger/metrics/admin/history 输出）已执行且通过；广义 cause→action 矩阵/退避/广义 fallback 验证保持 pending。
+  - 此前修订条中“§8 验证要求保持待执行，不标记完成”为当时历史快照，现已被本条覆盖，不再为现状；正文不再保留“均待执行”表述。最高原则、503 关闭口径、400 终态与已锁定 pins 不变。
 
 - **2026-09-23 — L1 后稳定原因分类接缝收敛（实现事实，无原则变更）：**
   - `gateway.go` 内 L1 观察之后收敛为单一分类权威 `classifyStableCause`（仅七种：context / build / 2xx / exact400 / live429 / ordinary4xx / 其余 L1-final；late-cancel 不折入原因，`doPinnedAuth` 保留旧门原样）；四条 native walker 消费分类，各路径 L2 对象决策与 scheduler / pin / route-session / custom 门保留，行为等价。
