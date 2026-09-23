@@ -630,3 +630,205 @@ func TestPinnedConsumptionAuthCancelDuringSecondProxyNoCustom(t *testing.T) {
 		t.Fatalf("ctx.Err=%v want context.Canceled", ctx.Err())
 	}
 }
+
+// Bounded pinned L2 consumption: 429 -> 401 on the last eligible exhausts
+// the frozen auth binding and takes over custom. Mirrors
+// TestPinnedConsumptionAuth429Then403Takeover with 401 terminal to lock the
+// pinnedConsumptionAllowCustom 401 whitelist end-to-end.
+func TestPinnedConsumptionAuth429Then401Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 1
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_429_401_auth_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(401, `{"error":"bad key"}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth 429->401 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 || postCount(&p1Calls) != 1 {
+		t.Fatalf("native sends p0=%d p1=%d want 1/1", postCount(&p0Calls), postCount(&p1Calls))
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3 (2 native + 1 custom)", attempts)
+	}
+	if eff.ID != "cm-inc6" {
+		t.Fatalf("effective model=%q want cm-inc6 rewrite", eff.ID)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if binding.Model != "cm-inc6" || binding.Name != "c1" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if until, status, ok := gw.scheduler.credentialCooldownStatus(pin.CredID); !ok || status != 401 || until <= time.Now().UnixNano() {
+		t.Fatalf("401 must write credential cooldown, ok=%v status=%v until=%d", ok, status, until)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("401 take over must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("401 must not write proxy429 for the 401 proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("401 must not write channel for the 401 proxy")
+	}
+	targetID := targetIdentity(TierZen, pin.CredID, "z", ordered[1].name, "m")
+	if _, _, ok := gw.scheduler.targetCooldownStatus(targetID); ok {
+		t.Fatalf("401 must not write target cooldown")
+	}
+}
+
+// Bounded pinned L2 consumption: anonymous 429 -> 401 takes over custom.
+// Reuses the anon two-proxy pool helper; keeps candidate order deterministic.
+func TestPinnedConsumptionAnon429Then401Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
+	ses := "ses_pinned_consume_429_401_anon_1"
+	pool := gw.pools["a"]
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(401, `{"error":"unauthorized"}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("anon 429->401 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 || postCount(&p1Calls) != 1 {
+		t.Fatalf("native sends p0=%d p1=%d want 1/1", postCount(&p0Calls), postCount(&p1Calls))
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3 (2 native + 1 custom)", attempts)
+	}
+	if eff.ID != "cm-anon-consume" {
+		t.Fatalf("effective model=%q want cm-anon-consume rewrite", eff.ID)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind anon fallback")
+	}
+	if binding.Model != "cm-anon-consume" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if until, status, ok := gw.scheduler.credentialCooldownStatus(pin.CredID); !ok || status != 401 || until <= time.Now().UnixNano() {
+		t.Fatalf("anon 401 must write credential cooldown, ok=%v status=%v until=%d", ok, status, until)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("anon 401 take over must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "a", ordered[1].name); ok {
+		t.Fatalf("anon 401 must not write proxy429 for the 401 proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "a", ordered[1].name); ok {
+		t.Fatalf("anon 401 must not write channel for the 401 proxy")
+	}
+	targetID := targetIdentity(TierZen, pin.CredID, "a", ordered[1].name, "m")
+	if _, _, ok := gw.scheduler.targetCooldownStatus(targetID); ok {
+		t.Fatalf("anon 401 must not write target cooldown")
+	}
+}
+
+// Single-proxy 401 stays faithful: consumed=false never triggers pinned L2
+// custom takeover. Mirrors the existing 403 single-proxy guard but for 401.
+func TestPinnedConsumptionAuthSingle401NoTakeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	cred := gw.authCreds[0]
+	pinTmp, _ := func() (sessionPin, bool) {
+		ses := "ses_tmp_precool_401_single"
+		gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+		return gw.scheduler.pinGet(ses, "m")
+	}()
+	orderedTmp := affinityProxyOrder(gw.pools["z"], pinTmp.CredID, pinTmp.ProxyRaw)
+	if len(orderedTmp) == 2 {
+		gw.scheduler.noteProxy429Failure(TierZen, "z", orderedTmp[1].name, AttemptClassRateLimited, 429, time.Minute, time.Now().UnixNano())
+	}
+	ses := "ses_pinned_consume_single401_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", orderedTmp[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", orderedTmp[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(401, `{"error":"unauthorized"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if err != nil || resp == nil || resp.StatusCode != 401 {
+		t.Fatalf("single 401 must stay faithful 401, err=%v resp=%v", err, resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom || customHits.Load() != 0 {
+		t.Fatalf("single 401 must not hit custom")
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("single 401 must not bind fallback")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
+		t.Fatalf("single 401 must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", orderedTmp[0].name); ok {
+		t.Fatalf("single 401 must not write proxy429")
+	}
+}
+
+func TestPinnedConsumptionAnonSingle401NoTakeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
+	pool := gw.pools["a"]
+	tmpSes := "ses_tmp_precool_401_anon_single"
+	gw.bindSessionPin(tmpSes, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	tmpPin, _ := gw.scheduler.pinGet(tmpSes, "m")
+	orderedTmp := affinityProxyOrder(pool, tmpPin.CredID, tmpPin.ProxyRaw)
+	if len(orderedTmp) == 2 {
+		gw.scheduler.noteProxy429Failure(TierZen, "a", orderedTmp[1].name, AttemptClassRateLimited, 429, time.Minute, time.Now().UnixNano())
+	}
+	ses := "ses_pinned_consume_single401_anon_1"
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", orderedTmp[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", orderedTmp[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(401, `{"error":"unauthorized"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 401 {
+		t.Fatalf("single anon 401 must stay faithful 401, err=%v resp=%v", err, resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom || customHits.Load() != 0 {
+		t.Fatalf("single anon 401 must not hit custom")
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("single anon 401 must not bind fallback")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(anonymousSchedulerCredentialID); ok {
+		t.Fatalf("single anon 401 must not write credential429")
+	}
+}
