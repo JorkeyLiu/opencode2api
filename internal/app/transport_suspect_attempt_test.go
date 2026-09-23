@@ -524,7 +524,7 @@ func TestAnonymousUnboundEmptyProxy429Returns429(t *testing.T) {
 	gw.scheduler.noteProxy429Failure(TierZen, "a", "http://127.0.0.1:8081", AttemptClassRateLimited, 429, time.Second*60, time.Now().UnixNano())
 	route := anonAuthRoute()
 	// direct unbound anonymous call should return 429 (not 502) and not be blocked by suspect logic
-	resp, err, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	resp, err, _, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
 	if err != nil {
 		t.Fatalf("err %v", err)
 	}
@@ -546,7 +546,7 @@ func TestAnonymousUnboundEmptySuspectOnlyReturns502(t *testing.T) {
 	gw.scheduler.noteTransportSuspect(TierZen, "a", "direct", AttemptClassTransportFailure, 0, time.Now().UnixNano())
 	gw.scheduler.noteTransportSuspect(TierZen, "a", "http://127.0.0.1:8081", AttemptClassTransportFailure, 0, time.Now().UnixNano())
 	route := anonAuthRoute()
-	resp, _, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	resp, _, _, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
 	if resp == nil || resp.StatusCode != 502 {
 		t.Fatalf("suspect-only anonymous empty want 502 got %v", resp)
 	}
@@ -563,7 +563,7 @@ func TestAuthUnboundEmptyProxy429Returns429(t *testing.T) {
 	gw.scheduler.noteProxy429Failure(TierZen, "z", "http://127.0.0.1:8081", AttemptClassRateLimited, 429, time.Second*60, time.Now().UnixNano())
 	route := anonAuthRoute()
 	route.Anonymous = false
-	resp, _, _, _, _ := gw.doKeyUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	resp, _, _, _, _, _ := gw.doKeyUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
 	if resp == nil || resp.StatusCode != 429 {
 		t.Fatalf("auth empty proxy429 want 429 got %v", resp)
 	}
@@ -582,7 +582,7 @@ func TestAuthUnboundEmptySuspectOnlyReturns502(t *testing.T) {
 	gw.scheduler.noteTransportSuspect(TierZen, "z", "http://127.0.0.1:8081", AttemptClassTransportFailure, 0, time.Now().UnixNano())
 	route := anonAuthRoute()
 	route.Anonymous = false
-	resp, _, _, _, _ := gw.doKeyUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	resp, _, _, _, _, _ := gw.doKeyUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
 	if resp == nil || resp.StatusCode != 502 {
 		t.Fatalf("auth suspect-only empty want 502 got %v", resp)
 	}
@@ -607,7 +607,7 @@ func TestUnboundExpiredProxy429NotOverrideSuspect(t *testing.T) {
 	gw.scheduler.noteTransportSuspect(TierZen, "a", "direct", AttemptClassTransportFailure, 0, time.Now().UnixNano())
 	gw.scheduler.noteTransportSuspect(TierZen, "a", "http://127.0.0.1:8081", AttemptClassTransportFailure, 0, time.Now().UnixNano())
 	route := anonAuthRoute()
-	resp, _, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
+	resp, _, _, _, _, _ := gw.doAnonymousUpstream(context.Background(), route, routeBodies(), emptySessionIDs(), 0)
 	if resp == nil || resp.StatusCode != 502 {
 		t.Fatalf("expired 429 must not override suspect 502, got %v", resp)
 	}

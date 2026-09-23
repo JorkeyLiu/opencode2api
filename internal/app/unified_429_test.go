@@ -362,25 +362,30 @@ func TestUnifiedAnonUnboundToAuthAndCustom(t *testing.T) {
 	if customHits.Load() != 0 {
 		t.Fatalf("partial native exhaustion must not hit custom")
 	}
-	// Full native 429 on every proxy: custom binds.
+	// Full native 429 on every proxy: custom binds. Uses a fresh gateway so
+	// both unbound domains actually enter with live sends in this request;
+	// reusing the first gateway would leave the anonymous proxies pre-cooled
+	// from the prior 429s (Entered=false/Frozen=0) which truthfully cannot
+	// prove live exhaustion and must preserve native 429.
+	gw2 := unifiedFallbackGateway(t, []string{"direct", "http://127.0.0.1:8081"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-aaaaa"}, "c1", []FallbackChannelConfig{ch})
 	var b0, b1, c0, c1 atomic.Int32
-	postStub(t, gw, "a", 0, &b0, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gw2, "a", 0, &b0, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(429, `{"error":"t"}`), nil
 	})
-	postStub(t, gw, "a", 1, &b1, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gw2, "a", 1, &b1, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(429, `{"error":"t"}`), nil
 	})
-	postStub(t, gw, "z", 0, &c0, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gw2, "z", 0, &c0, nil, func(*http.Request) (*http.Response, error) {
 		resp := responseWithBody(429, `{"error":"t"}`)
 		resp.Header.Set("Retry-After", "8")
 		return resp, nil
 	})
-	postStub(t, gw, "z", 1, &c1, nil, func(*http.Request) (*http.Response, error) {
+	postStub(t, gw2, "z", 1, &c1, nil, func(*http.Request) (*http.Response, error) {
 		resp := responseWithBody(429, `{"error":"t"}`)
 		resp.Header.Set("Retry-After", "9")
 		return resp, nil
 	})
-	resp2, eff2, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs("ses_unified_all429_1", "r2"), 0, ex)
+	resp2, eff2, _, err := gw2.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs("ses_unified_all429_1", "r2"), 0, ex)
 	if err != nil || resp2.StatusCode != 200 || eff2.Tier != TierCustom {
 		t.Fatalf("full native 429 must bind custom 200, err=%v resp=%v eff=%+v", err, resp2, eff2)
 	}
@@ -388,7 +393,7 @@ func TestUnifiedAnonUnboundToAuthAndCustom(t *testing.T) {
 	if customHits.Load() != 1 {
 		t.Fatalf("custom hits=%d want 1", customHits.Load())
 	}
-	if _, ok := gw.scheduler.fallbacks.get("ses_unified_all429_1"); !ok {
+	if _, ok := gw2.scheduler.fallbacks.get("ses_unified_all429_1"); !ok {
 		t.Fatalf("unbound full exhaustion must bind fallback")
 	}
 }
