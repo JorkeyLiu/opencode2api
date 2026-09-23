@@ -1685,6 +1685,17 @@ func (g *Gateway) doUnboundEstablishment(ctx context.Context, route modelRoute, 
 		return g.doUpstreamTiersUnbound(ctx, route, bodies, ids, attemptOffset, extra...)
 	}
 	for {
+		// Fallback recheck at loop start (defensive): a session already bound
+		// to custom must not continue to native even when this call missed the
+		// doUpstreamTiers entry fallback.get. Covers follower wakeup and the
+		// deterministic missed-entry path exercised by tests via
+		// doUnboundEstablishment. No pinClaim is held, so prepared
+		// route/crossing/metadata are preserved via doCustomFallbackPinned.
+		if g.scheduler != nil && g.scheduler.fallbacks != nil && ids.Session != "" {
+			if binding, ok := g.scheduler.fallbacks.get(ids.Session); ok {
+				return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
+			}
+		}
 		if pin, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
 			return g.doPinnedUpstream(ctx, route, bodies, ids, pin, attemptOffset, extra...)
 		}
@@ -1704,6 +1715,19 @@ func (g *Gateway) doUnboundEstablishment(ctx context.Context, route modelRoute, 
 				return nil, route, attemptOffset, ctx.Err()
 			case <-claim.done:
 				continue
+			}
+		}
+		// Owner double-check before first native send (defensive): if a
+		// concurrent session binding appeared between loop-start fallback
+		// recheck and acquiring ownership (e.g. different-model owner for the
+		// same session), avoid a stray native send by rechecking fallback now.
+		// No cross-store atomicity is promised; on hit release the reservation
+		// and serve custom exclusively. Kept as defense; no deterministic
+		// repro is added for this racy window.
+		if g.scheduler != nil && g.scheduler.fallbacks != nil && ids.Session != "" {
+			if binding, ok := g.scheduler.fallbacks.get(ids.Session); ok {
+				g.scheduler.pinRelease(ids.Session, route.ID, claim)
+				return g.doCustomFallbackPinned(ctx, route, bodies, ids, binding, attemptOffset, extra...)
 			}
 		}
 		if pin, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
