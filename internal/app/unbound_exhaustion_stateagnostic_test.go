@@ -239,3 +239,76 @@ func TestUnboundExhaustionCredentialDomainsNotMerged(t *testing.T) {
 		t.Fatalf("split domains must keep native terminal, got %d", resp.StatusCode)
 	}
 }
+
+// L1-final stream startup failure counts as unbound object-unavailable: two
+// frozen candidates both failing startup after same-target L1 observation
+// exhaust the single-credential domain and take over custom. Per-candidate
+// POST counts prove the existing same-target L1 retry is preserved.
+func TestUnboundExhaustionStreamStartupAllowsCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-startup-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var z0, z1 atomic.Int32
+	postStub(t, gw, "z", 0, &z0, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	postStub(t, gw, "z", 1, &z1, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{Stream: true})
+	ses := "ses_unbound_startup_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(ctx, authOnlyRoute(), streamBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("startup exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if got := postCount(&z0); got != 2 {
+		t.Fatalf("z0=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if got := postCount(&z1); got != 2 {
+		t.Fatalf("z1=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if attempts != 5 {
+		t.Fatalf("attempts=%d want 5 (4 native + 1 custom)", attempts)
+	}
+}
+
+// Cancelled stream startup exhaustion never takes over custom: the cancel
+// gate denies even when every frozen candidate would otherwise report
+// startup failure. Guards against over-broadening the new sentinel count.
+func TestUnboundExhaustionStreamStartupCancelledNoCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-startup-2"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	postStub(t, gw, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	postStub(t, gw, "z", 1, nil, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	base := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{Stream: true})
+	ctx, cancel := context.WithCancel(base)
+	cancel()
+	ses := "ses_unbound_startup_cancel_1"
+	resp, _, _, _ := gw.doUpstreamTiers(ctx, authOnlyRoute(), streamBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if resp != nil {
+		drainResp(resp)
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("cancelled startup must not hit custom (hits=%d)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("cancelled startup must not bind fallback")
+	}
+}

@@ -1445,9 +1445,9 @@ func customTakeoverEligible(q customTakeoverQualification) bool {
 // empty/pre-cooled domains stay Entered=false/Frozen=0 and can never prove
 // exhaustion. Frozen is the frozen candidate count; Unavailable counts the
 // distinct frozen candidates with live unavailable evidence in this request
-// (live 429, 401/403 terminal, or L1-final transport/408/425/5xx; each frozen
-// candidate counts at most once, intermediate L1 retries never count
-// separately). Live429/Terminal are retained diagnostics for the frozen walk;
+// (live 429, 401/403 terminal, L1-final transport/408/425/5xx, or L1-final
+// stream startup failure; each frozen candidate counts at most once,
+// intermediate L1 retries never count separately). Live429/Terminal are retained diagnostics for the frozen walk;
 // the unbound gate reads only Unavailable. Recovered400 marks a 400
 // corrective-replay final for that domain (never counts as unavailable).
 type unboundDomainEvidence struct {
@@ -1461,15 +1461,15 @@ type unboundDomainEvidence struct {
 }
 
 // unboundObjectUnavailable reports whether one live final outcome proves its
-// object unavailable for unbound exhaustion: live 429, 401/403, or L1-final
-// transport/408/425/5xx. 400 corrective replays (any terminal), ordinary
-// client 4xx, cancel/deadline (caller-gated), committed streams, build errors,
-// and stream-startup sentinels never count.
+// object unavailable for unbound exhaustion: live 429, 401/403, L1-final
+// transport/408/425/5xx, or L1-final stream startup failure. 400 corrective
+// replays (any terminal), ordinary client 4xx, cancel/deadline
+// (caller-gated), committed streams, and build errors never count. The
+// stream-startup sentinel counts only when the caller passes the L1-final
+// outcome of a real send; BuildErr/unsent, cancel/deadline, committed, and
+// 400/ordinary-4xx finals never reach it via the frozen-walk early returns.
 func unboundObjectUnavailable(resp *http.Response, err error) bool {
 	if err != nil {
-		if isStreamStartupFailureErr(err) {
-			return false
-		}
 		return true
 	}
 	if resp == nil {
@@ -1818,9 +1818,10 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 	if lastResponse != nil {
 		// Native final fallback: only full unbound-domain object exhaustion
 		// reaches the custom channel. Each frozen candidate must have live
-		// unavailable evidence in this request (live 429, 401/403, or L1-final
-		// transport/408/425/5xx; 400 replays, ordinary 4xx, cancel/deadline,
-		// and committed streams never count). The per-domain proof lives in
+		// unavailable evidence in this request (live 429, 401/403, L1-final
+		// transport/408/425/5xx, or L1-final stream startup failure; 400
+		// replays, ordinary 4xx, cancel/deadline, and committed streams never
+		// count). The per-domain proof lives in
 		// the frozen walks (doAnonymousUpstream/doKeyUpstream); this outer
 		// step requires every collected domain (anonymous lane plus each
 		// authenticated credential, never summed) to independently satisfy
@@ -2707,9 +2708,6 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		if isContextCancelled(ctx) {
 			return
 		}
-		if err != nil && isStreamStartupFailureErr(err) {
-			return
-		}
 		if _, ok := anonUnavailable[proxyRaw]; ok {
 			return
 		}
@@ -2883,10 +2881,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				anonLive429[cand.ProxyRaw] = struct{}{}
 				markAnonUnavailable(cand.ProxyRaw, final.Resp, nil)
 			} else if stop == transientStopObservationLimit || stop == transientStopStable {
-				// L1-final transport/408/425/5xx or stable 401/403 after
-				// observation proves the object unavailable (each frozen
-				// candidate once; ordinary 4xx/400 already returned above,
-				// cancel already returned, stream sentinel never counts).
+				// L1-final transport/408/425/5xx, stable 401/403, or L1-final
+				// stream startup failure after observation proves the object
+				// unavailable (each frozen candidate once; ordinary 4xx/400
+				// already returned above, cancel already returned,
+				// BuildErr/committed never reach here).
 				markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
 			}
 			lastResponse = final.Resp
@@ -3134,9 +3133,6 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		if isContextCancelled(ctx) {
 			return
 		}
-		if err != nil && isStreamStartupFailureErr(err) {
-			return
-		}
 		set, ok := credUnavailable[credID]
 		if !ok {
 			set = make(map[string]struct{})
@@ -3338,10 +3334,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				lastErr = final.Err
 				continue
 			}
-			// L1-final transport/408/425/5xx or stable 401/403 after
-			// observation proves the object unavailable (each frozen candidate
-			// once; ordinary 4xx/400 already returned, cancel already
-			// returned, stream sentinel never counts).
+			// L1-final transport/408/425/5xx, stable 401/403, or L1-final
+			// stream startup failure after observation proves the object
+			// unavailable (each frozen candidate once; ordinary 4xx/400
+			// already returned, cancel already returned, BuildErr/committed
+			// never reach here).
 			if loopRes.Stop == transientStopObservationLimit || loopRes.Stop == transientStopStable {
 				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
 			}
