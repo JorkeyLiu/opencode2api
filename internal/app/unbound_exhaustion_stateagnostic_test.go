@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -271,6 +273,144 @@ func TestUnboundExhaustionStreamStartupAllowsCustom(t *testing.T) {
 	}
 	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
 		t.Fatalf("must bind fallback")
+	}
+	if got := postCount(&z0); got != 2 {
+		t.Fatalf("z0=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if got := postCount(&z1); got != 2 {
+		t.Fatalf("z1=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if attempts != 5 {
+		t.Fatalf("attempts=%d want 5 (4 native + 1 custom)", attempts)
+	}
+}
+
+// Unbound Responses/Anthropic helpers: auth-only native route plus strict
+// three-protocol extras/bodies, mirroring TestFallbackConversionAllProtocols
+// payload shapes. Bodies carry stream:true; the native stubs below return
+// empty SSE so the startup gate reports EOF-before-commit startup failure
+// without depending on per-protocol parser event shapes.
+func unboundResponsesRoute() modelRoute {
+	return modelRoute{
+		ID: "m", Tier: TierZen, Protocol: ProtocolResponses,
+		Protocols: map[Tier]Protocol{TierZen: ProtocolResponses},
+		Anonymous: false, KeyTiers: []Tier{TierZen},
+	}
+}
+
+func unboundAnthropicRoute() modelRoute {
+	return modelRoute{
+		ID: "m", Tier: TierZen, Protocol: ProtocolAnthropic,
+		Protocols: map[Tier]Protocol{TierZen: ProtocolAnthropic},
+		Anonymous: false, KeyTiers: []Tier{TierZen},
+	}
+}
+
+func unboundResponsesExtra() upstreamExtra {
+	return upstreamExtra{External: ProtocolResponses, Payload: map[string]any{"model": "m", "input": "hi"}}
+}
+
+func unboundAnthropicExtra() upstreamExtra {
+	return upstreamExtra{External: ProtocolAnthropic, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}, "max_tokens": 8}}
+}
+
+func unboundResponsesStreamBodies() map[Tier][]byte {
+	return map[Tier][]byte{TierZen: []byte(`{"model":"m","input":"hi","stream":true}`)}
+}
+
+func unboundAnthropicStreamBodies() map[Tier][]byte {
+	return map[Tier][]byte{TierZen: []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true}`)}
+}
+
+func unboundStreamCtx() context.Context {
+	return context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{Stream: true})
+}
+
+// Responses streaming unbound exhaustion: two native candidates each send
+// twice (initial + 1 same-target L1 retry with MaxAttempts=2, empty SSE
+// startup failure), then one custom fallback succeeds. Real doUpstreamTiers
+// unbound path, not the predicate.
+func TestUnboundExhaustionResponsesStreamStartupAllowsCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-resp-startup-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var z0, z1 atomic.Int32
+	postStub(t, gw, "z", 0, &z0, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	postStub(t, gw, "z", 1, &z1, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	ses := "ses_unbound_resp_startup_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(unboundStreamCtx(), unboundResponsesRoute(), unboundResponsesStreamBodies(), pinIDs(ses, "r1"), 0, unboundResponsesExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("responses startup exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if len(raw) == 0 || !strings.Contains(string(raw), "hello") {
+		t.Fatalf("custom response must carry transcoded hello, got %q", raw)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("startup exhaustion must not establish a session pin")
+	}
+	if got := postCount(&z0); got != 2 {
+		t.Fatalf("z0=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if got := postCount(&z1); got != 2 {
+		t.Fatalf("z1=%d want 2 (initial + 1 same-target L1 retry)", got)
+	}
+	if attempts != 5 {
+		t.Fatalf("attempts=%d want 5 (4 native + 1 custom)", attempts)
+	}
+}
+
+// Anthropic streaming unbound exhaustion: same shape as Responses above with
+// the Anthropic route/extras/bodies. Empty SSE keeps the startup-failure
+// signal parser-independent (clean EOF before commit for every protocol).
+func TestUnboundExhaustionAnthropicStreamStartupAllowsCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, []string{"zen-key-exhaust-anth-startup-1"}, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	var z0, z1 atomic.Int32
+	postStub(t, gw, "z", 0, &z0, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	postStub(t, gw, "z", 1, &z1, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	ses := "ses_unbound_anth_startup_1"
+	resp, eff, attempts, err := gw.doUpstreamTiers(unboundStreamCtx(), unboundAnthropicRoute(), unboundAnthropicStreamBodies(), pinIDs(ses, "r1"), 0, unboundAnthropicExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	drainResp(resp)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("anthropic startup exhaustion must take over custom, got %d %+v", resp.StatusCode, eff)
+	}
+	if len(raw) == 0 || !strings.Contains(string(raw), "hello") {
+		t.Fatalf("custom response must carry transcoded hello, got %q", raw)
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("must hit custom once, got %d", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("startup exhaustion must not establish a session pin")
 	}
 	if got := postCount(&z0); got != 2 {
 		t.Fatalf("z0=%d want 2 (initial + 1 same-target L1 retry)", got)
