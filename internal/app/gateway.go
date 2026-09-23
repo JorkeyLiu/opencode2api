@@ -1117,13 +1117,17 @@ func (g *Gateway) applyStreamSuccess(cand targetCandidate, startedNanos int64) {
 
 // noteStreamStartupFailure cools the single target for a pre-commit startup failure
 // and records the observability attempt. It never touches proxy health, proxy429,
-// credential429, or channel state.
+// credential429, or channel state. A cancelled stream never cools the target:
+// cancellation is not an object-unavailable signal. The monitoring record below
+// keeps the existing recording policy unchanged (still recorded on cancel).
 func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandidate, route modelRoute, ids requestIDs, attempt int, startedNanos int64) {
 	if g == nil || g.scheduler == nil {
 		return
 	}
-	change := g.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, http.StatusBadGateway, 0)
-	g.logTargetCooldownSet(cand, change)
+	if !isContextCancelled(ctx) {
+		change := g.scheduler.noteTargetFailure(cand.Identity, AttemptClassUpstreamFailure, http.StatusBadGateway, 0)
+		g.logTargetCooldownSet(cand, change)
+	}
 	class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
 	fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
 	duration := streamedAttemptDuration(startedNanos)
@@ -1166,7 +1170,15 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 			return attemptOutcome{Resp: nil, Err: ctx.Err(), Diag: diag, Started: started}
 		}
 		if gate.ShouldCommit() {
-			g.applyStreamSuccess(cand, started)
+			// A cancelled stream keeps its already-gated committed body and
+			// envelope, but never applies scheduler success: cancellation is
+			// not a clear signal. The monitoring record below keeps the
+			// existing recording policy unchanged (still recorded on cancel),
+			// mirroring applyAttemptOutcome's cancel behavior on non-stream
+			// paths (early return without state change, record still kept).
+			if !isContextCancelled(ctx) {
+				g.applyStreamSuccess(cand, started)
+			}
 			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{})
 			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
 			return attemptOutcome{Resp: resp, Err: nil, Diag: diag, Started: started}
@@ -1399,6 +1411,24 @@ func (g *Gateway) bindSessionPin(session, model string, tier Tier, credID, pool,
 		return
 	}
 	g.scheduler.pinBind(session, model, sessionPin{
+		Tier: tier, CredID: credID, Pool: pool, ProxyRaw: proxyRaw,
+		Model: model, Protocol: protocol, Authority: authority,
+	})
+}
+
+// bindSessionPinCtx is the context-aware bind entry for post-send paths. The
+// outer pre-check is a fast path only; the store-level lock-held recheck
+// inside pinBindCtx defines the local linearization point, so a ctx that
+// cancels between send and write never binds. It never touches pin claims,
+// waiters, the fallback store, first-wins, or generation fencing.
+func (g *Gateway) bindSessionPinCtx(ctx context.Context, session, model string, tier Tier, credID, pool, proxyRaw string, protocol Protocol, authority string) {
+	if g == nil || g.scheduler == nil || session == "" || model == "" {
+		return
+	}
+	if isContextCancelled(ctx) {
+		return
+	}
+	g.scheduler.pinBindCtx(ctx, session, model, sessionPin{
 		Tier: tier, CredID: credID, Pool: pool, ProxyRaw: proxyRaw,
 		Model: model, Protocol: protocol, Authority: authority,
 	})
@@ -2222,8 +2252,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			if last429 != nil {
 				drainAndClose(last429.Body)
 			}
-			if ep.raw != pin.ProxyRaw {
-				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 			}
 			return resp, effectiveRoute, attemptOffset + attempts, nil
 		}
@@ -2238,8 +2268,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				drainAndClose(last429.Body)
 			}
 		}); handled {
-			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 			}
 			return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 		}
@@ -2261,8 +2291,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				if last429 != nil {
 					drainAndClose(last429.Body)
 				}
-				if ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+					_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 			}
@@ -2291,8 +2321,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 						drainAndClose(last429.Body)
 					}
 				}); handled {
-					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+						_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 					}
 					return replayResp, effectiveRoute, attemptOffset + replayed, replayErr
 				}
@@ -2556,8 +2586,8 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		firstStarted := out.Started
 		if sendErr == nil && resp != nil && resp.StatusCode/100 == 2 {
 			discardLast429()
-			if ep.raw != pin.ProxyRaw {
-				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 			}
 			return resp, effectiveRoute, attemptOffset + attempts, nil
 		}
@@ -2567,8 +2597,8 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		}
 		if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, resp, sendErr, firstDiag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
 			attempts = replayed
-			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-				_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+			if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 			}
 			return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
 		}
@@ -2633,8 +2663,8 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			}
 			if classified.Cause == stableCauseSuccess {
 				discardLast429()
-				if ep.raw != pin.ProxyRaw {
-					_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+				if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+					_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 				}
 				return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 			}
@@ -2645,8 +2675,8 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			if classified.Cause == stableCauseExact400 {
 				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, pin.Tier, baseURL, protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, discardLast429); handled {
 					attempts = replayed
-					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw {
-						_, _ = g.scheduler.pinMoveCurrent(ids.Session, route.ID, pin.Generation, ep.raw)
+					if replayErr == nil && replayResp != nil && replayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
+						_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
 					}
 					return replayResp, effectiveRoute, attemptOffset + attempts, replayErr
 				}
@@ -3088,7 +3118,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			} else {
 				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			}
-			g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
+			g.bindSessionPinCtx(ctx, ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
 			return resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 		}
 		if isContextCancelled(ctx) {
@@ -3122,7 +3152,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				} else {
 					g.logger.Debug("anonymous transient retry succeeded", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				}
-				g.bindSessionPin(ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
+				g.bindSessionPinCtx(ctx, ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			}
 			if classified.Cause == stableCauseContext || classified.Cancelled {
@@ -3314,7 +3344,7 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 	// never walks remaining frozen candidates or the next tier. A replay
 	// success remains bound to that same target.
 	if err == nil && resp != nil && resp.StatusCode/100 == 2 {
-		g.bindSessionPin(ids.Session, route.ID, tier, cand.CredID, cand.PoolName, cand.ProxyRaw, protocol, normalizeRouteAuthority(baseURL))
+		g.bindSessionPinCtx(ctx, ids.Session, route.ID, tier, cand.CredID, cand.PoolName, cand.ProxyRaw, protocol, normalizeRouteAuthority(baseURL))
 	}
 	return resp, err, attempts
 }
@@ -3495,7 +3525,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			} else {
 				g.logger.Debug("upstream accepted request", "component", "upstream", "event", "attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			}
-			g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
+			g.bindSessionPinCtx(ctx, ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
 			return resp, nil, attempts, false, false, buildKeyDomains()
 		}
 		// Unbound exhaustion evidence: same credential live 429s accumulate;
@@ -3559,7 +3589,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				} else {
 					g.logger.Debug("upstream transient retry succeeded", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				}
-				g.bindSessionPin(ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
+				g.bindSessionPinCtx(ctx, ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
 				return final.Resp, nil, attempts, false, false, buildKeyDomains()
 			}
 			if classified.Cancelled {

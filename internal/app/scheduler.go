@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"hash/fnv"
@@ -2649,6 +2650,50 @@ func (st *sessionPinStore) bind(session, model string, pin sessionPin) {
 	st.entries[key] = &fresh
 }
 
+// pinBindCtx is the context-aware bind entry for gateway post-send paths.
+// It re-checks ctx under the store mu immediately before the write, so the
+// lock-held recheck defines the local linearization point: a ctx that is
+// already cancelled at that point never writes. Otherwise it is identical
+// to bind (first-wins, cap-drop, no waiter/claim/fallback interaction). It
+// establishes no atomicity across ctx and the store and never touches pin
+// claims, waiters, the fallback store, first-wins, or generation fencing.
+// The non-ctx bind stays for tests and existing non-gateway callers. It
+// returns true only when this call inserted the pin.
+func (s *targetScheduler) pinBindCtx(ctx context.Context, session, model string, pin sessionPin) bool {
+	if s == nil || s.pins == nil || session == "" || model == "" {
+		return false
+	}
+	pin.Model = model
+	return s.pins.bindCtx(ctx, session, model, pin)
+}
+
+func (st *sessionPinStore) bindCtx(ctx context.Context, session, model string, pin sessionPin) bool {
+	if st == nil {
+		return false
+	}
+	key := sessionPinKey(session, model)
+	if pin.Model == "" {
+		pin.Model = model
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	if existing, ok := st.entries[key]; ok && existing != nil {
+		return false
+	}
+	if len(st.entries) >= sessionPinStoreCap {
+		return false
+	}
+	if st.entries == nil {
+		st.entries = make(map[string]*sessionPin)
+	}
+	fresh := pin
+	st.entries[key] = &fresh
+	return true
+}
+
 func (st *sessionPinStore) count() int {
 	if st == nil {
 		return 0
@@ -2775,6 +2820,47 @@ func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64
 	entry, ok := st.entries[key]
 	if !ok || entry == nil {
 		return 0, false
+	}
+	if entry.Generation != expectedGen {
+		return entry.Generation, false
+	}
+	if entry.ProxyRaw == newProxyRaw {
+		return entry.Generation, true
+	}
+	entry.ProxyRaw = newProxyRaw
+	entry.Generation++
+	return entry.Generation, true
+}
+
+// pinMoveCurrentCtx is the context-aware move entry for gateway post-send
+// paths. It re-checks ctx under the store mu immediately before the write,
+// so the lock-held recheck defines the local linearization point: a ctx that
+// is already cancelled at that point never mutates the pin (returning the
+// current generation with false). Otherwise it is identical to moveCurrent,
+// preserving generation fencing exactly. It establishes no atomicity across
+// ctx and the store and never touches pin claims, waiters, the fallback
+// store, or first-wins. The non-ctx moveCurrent stays for tests and existing
+// non-gateway callers.
+func (s *targetScheduler) pinMoveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" || newProxyRaw == "" {
+		return 0, false
+	}
+	return s.pins.moveCurrentCtx(ctx, session, model, expectedGen, newProxyRaw)
+}
+
+func (st *sessionPinStore) moveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+	if st == nil {
+		return 0, false
+	}
+	key := sessionPinKey(session, model)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	entry, ok := st.entries[key]
+	if !ok || entry == nil {
+		return 0, false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return entry.Generation, false
 	}
 	if entry.Generation != expectedGen {
 		return entry.Generation, false
