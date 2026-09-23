@@ -74,8 +74,10 @@ func stale429Extra() upstreamExtra {
 	return upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
 }
 
-// 1) p0 live 429 -> p1 transport + retry transport: active custom must not
-// take over, stale 429 must not be returned, stale body must be drained.
+// 1) Bounded pinned L2 consumption: p0 live 429 -> p1 transport + retry
+// transport exhausts the frozen binding and takes over custom. Stale 429
+// must not be returned and is drained; non-429 takeover never writes
+// credential429.
 func TestPinnedAuthStale429TransportExhaustionNoCustom(t *testing.T) {
 	var customHits atomic.Int32
 	gw := pinnedAuthCustomGateway(t, &customHits)
@@ -108,14 +110,11 @@ func TestPinnedAuthStale429TransportExhaustionNoCustom(t *testing.T) {
 	if resp.StatusCode == 429 {
 		t.Fatalf("stale 429 must not be returned after p1 transport, got 429")
 	}
-	if resp.StatusCode != 502 {
-		t.Fatalf("transport exhaustion status=%d want 502", resp.StatusCode)
+	if resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("transport exhaustion must take over custom 200, got %d %+v", resp.StatusCode, eff)
 	}
-	if eff.Tier == TierCustom {
-		t.Fatalf("must not take over custom on transport exhaustion")
-	}
-	if customHits.Load() != 0 {
-		t.Fatalf("custom hits=%d want 0", customHits.Load())
+	if customHits.Load() != 1 {
+		t.Fatalf("custom hits=%d want 1", customHits.Load())
 	}
 	if postCount(&p0Calls) != 1 {
 		t.Fatalf("p0 sends=%d want 1", postCount(&p0Calls))
@@ -126,13 +125,18 @@ func TestPinnedAuthStale429TransportExhaustionNoCustom(t *testing.T) {
 	if p0Closed.Load() != 1 {
 		t.Fatalf("stale p0 429 body closed=%d want 1 (drained)", p0Closed.Load())
 	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("transport exhaustion must bind fallback")
+	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
 		t.Fatalf("partial 429 + transport must not write credential429")
 	}
 }
 
-// 2) p0 live 429 -> p1 5xx transient retry -> 403: final non-429 wins, no
-// custom, stale 429 drained, returned 403 body intact.
+// 2) Bounded pinned L2 consumption: p0 live 429 -> p1 5xx transient retry
+// -> 403 exhausts the frozen binding and takes over custom. Stale 429 is
+// drained; non-429 takeover never writes credential429. The no-active
+// faithful 403 case is covered by the consumption no-active test.
 func TestPinnedAuthStale429RetryNon429NoCustom(t *testing.T) {
 	var customHits atomic.Int32
 	gw := pinnedAuthCustomGateway(t, &customHits)
@@ -161,37 +165,26 @@ func TestPinnedAuthStale429RetryNon429NoCustom(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry 403 must return response, err=%v", err)
 	}
-	if resp == nil || resp.StatusCode != 403 {
-		t.Fatalf("final status=%v want 403", resp)
+	if resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("429 then L1 500->403 exhaustion must take over custom 200, got %v %+v", resp, eff)
 	}
-	if eff.Tier == TierCustom {
-		drainResp(resp)
-		t.Fatalf("non-429 terminal must not take over custom")
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("custom hits=%d want 1", customHits.Load())
 	}
-	if customHits.Load() != 0 {
-		drainResp(resp)
-		t.Fatalf("custom hits=%d want 0", customHits.Load())
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("429 then 403 exhaustion must bind fallback")
 	}
 	if p0Closed.Load() != 1 {
-		drainResp(resp)
 		t.Fatalf("stale p0 429 body closed=%d want 1", p0Closed.Load())
 	}
 	if p1FirstClosed.Load() != 1 {
-		drainResp(resp)
 		t.Fatalf("p1 first 500 body closed=%d want 1 (drained before retry)", p1FirstClosed.Load())
 	}
-	if p1RetryClosed.Load() != 0 {
-		drainResp(resp)
-		t.Fatalf("returned retry 403 body must not be drained before return, closed=%d", p1RetryClosed.Load())
-	}
-	raw, _ := io.ReadAll(resp.Body)
-	drainResp(resp)
 	if p1RetryClosed.Load() != 1 {
-		t.Fatalf("returned body must close on drain, closed=%d", p1RetryClosed.Load())
+		t.Fatalf("handoff must drain final 403 body, closed=%d want 1", p1RetryClosed.Load())
 	}
-	if !strings.Contains(string(raw), "forbidden-final") {
-		t.Fatalf("returned 403 body=%q want forbidden-final", raw)
-	}
+	_ = strings.Contains
 	if postCount(&p0Calls) != 1 || postCount(&p1Calls) != 2 {
 		t.Fatalf("sends p0=%d p1=%d want 1/2", postCount(&p0Calls), postCount(&p1Calls))
 	}

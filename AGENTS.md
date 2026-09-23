@@ -142,8 +142,8 @@
   transport error keeps the existing same-target L1 observation only on the
   anonymous binding, while the authenticated binding may additionally try the
   next eligible proxy after its same-target L1 observation. A removed/unhealthy/unresolvable target fails
-  locally with 502; full 429 exhaustion of the binding tries the custom final
-  fallback per §4 and otherwise keeps the native 429 envelope. Same-target L1 observation and exact-400 replay remain per
+  locally with 502; full 429 exhaustion of the binding (including proxy429 pre-cooled 429 exhaustion) tries the custom final
+  fallback per §4, and a bounded pinned L2 consumption exhaustion — already switched to the next frozen eligible proxy in this request, every frozen eligible really tried and the final object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup, not exact-400/ordinary 4xx/cancel/deadline/committed bytes) — also may try custom; otherwise the native envelope is kept. Same-target L1 observation and exact-400 replay remain per
   §4. An established session moves within the same
   pool, credential, channel, model, protocol, and authority only after an HTTP
   429 on the current proxy walk (local 429 skip or live 429), before any client bytes
@@ -194,7 +194,7 @@
 
 ## 4. Invariants (MUST Preserve)
 
-> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码为候选/429 fallback 基线加已收敛的单一 L1 计数（400 同目标 corrective replay 终态、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、候选遍历由冻结切片自然有界、模型刷新独立全遍历、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、custom 仅 429 耗尽保底），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；本次仅完成单一 L1 计数收敛，广义逐状态码语义映射、广义 fallback 与退避数值仍待定，MUST NOT be read as completed — see ADR 0001.
+> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码为候选/429 fallback 基线加已收敛的单一 L1 计数（400 同目标 corrective replay 终态、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、候选遍历由冻结切片自然有界、模型刷新独立全遍历、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、custom：未绑定按逐域真实请求对象耗尽状态无关判断 per b2c4798（每域 Entered && Frozen>0 && Unavailable>=Frozen，Unavailable=live 429/401/403/L1-final 408/425/5xx/transport 含 L1-final stream startup，每冻结候选各计一次；400/ordinary 4xx/cancel/deadline/committed/build 不计，状态无关、不要求终态429），已绑定在原全 429 与 proxy429 预冷 429 路径之外新增受限 pinned L2 consumption 耗尽——仅已实际进入下一代理的 L2 消耗、冻结 eligible 全部真实尝试且末位对象不可用（401/403/L1-final 408/425/5xx/transport/stream-startup）时接管，单代理首发非 429、400 replay、ordinary 4xx、cancel/deadline、committed stream 不接管，非 429 不写 credential429；未绑定与已绑定均不按单一错误种类直接决策，二者独立耗尽证据不同），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；本次仅完成单一 L1 计数收敛，广义逐状态码语义映射、广义 fallback 与退避数值仍待定，MUST NOT be read as completed — see ADR 0001.
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
@@ -356,14 +356,9 @@
   with masked GET, authenticated-session reveal (POST-only non-GET behind admin
   session auth + CSRF + Origin, no-store response, and full-chain
   redaction without plaintext logging). When `active` names a channel, it is
-  the final 429 backstop for every request shape (new/unbound/established,
-  anonymous/authenticated): only a request whose allowed native route finally
-  exhausts with 429 (unbound full-route 429, or established-binding full
-  eligible-set 429 including local proxy429 exhaustion) may take over;
-  any non-429 terminal (400/401/403/408/425, ordinary 4xx, transport errors,
-  5xx) never triggers even when 429s were seen earlier on other candidates.
+  the final fallback for eligible native-route exhaustion: unbound (new) requests use per-domain real-request state-agnostic object-unavailable exhaustion per b2c4798 (each domain Entered && Frozen>0 && Unavailable>=Frozen, Unavailable=live 429/401/403/L1-final 408/425/5xx/transport incl. L1-final stream startup per frozen candidate, 400/ordinary 4xx/cancel/deadline/committed/build excluded, state-agnostic, not requiring terminal 429), while established (pinned) bindings keep the existing full-429 and proxy429 pre-cooled 429 paths and add a bounded pinned L2 consumption gate — only after a real switch/send to the next frozen eligible proxy has already happened in this request, every frozen eligible has been really tried (pre-cooled skips not counted, BuildErr/no-send not counted) and the final is object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup) may the pinned non-429 exhaust to custom; single-proxy initial non-429, exact-400 replay (and its second-400/ordinary 4xx outcome), ordinary 4xx, cancel/deadline, and committed-stream never qualify, and non-429 takeovers never write credential429; unbound and pinned do not decide by single error kind directly and their independent exhaustion proofs differ; other non-429 terminals remain faithful without custom even when 429s were seen earlier on other candidates.
   Without an
-  active channel the original 429 stands; with one, the current request retries at
+  active channel the original envelope is kept (native 429 stays 429, other statuses faithful); with one, the current request retries at
   once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
   for chat, `{root}/v1/responses` for responses via the unified API-root rule,
   Bearer key, client entry converted to the channel protocol via the strict bridge

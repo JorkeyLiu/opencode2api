@@ -1436,6 +1436,56 @@ func customTakeoverEligible(q customTakeoverQualification) bool {
 	return q.ObservedLive429 >= q.Eligible
 }
 
+// pinnedConsumptionAllowCustom is the bounded pinned L2 consumption
+// exhaustion gate (pinned native only). It never replaces the 429-only
+// compat gate above: 429 finals return false here and stay owned by
+// customTakeoverEligible (with credential429 writes). Consumption means a
+// real switch/send to the next frozen eligible proxy already happened in
+// this request (429 walk or pinned-auth transport next-proxy); the initial
+// same-target L1 observation alone never counts, so single-proxy first
+// non-429 failures (consumed=false) never qualify. Exhaustion requires
+// every frozen eligible proxy to have a real live send in this request
+// (attempted >= eligible); pre-cooled skips never enter eligible and
+// BuildErr/no-send never counts. The final must prove its object
+// unavailable: live 401/403, L1-final transport/408/425/5xx, or L1-final
+// stream startup failure (only after a consume action). Exact-400,
+// ordinary 4xx, cancel/deadline, and committed streams never qualify;
+// without an active custom the caller keeps the native faithful envelope.
+func pinnedConsumptionAllowCustom(eligible, attempted int, consumed, cancelled bool, resp *http.Response, err error) bool {
+	if cancelled {
+		return false
+	}
+	if eligible <= 0 || attempted < eligible {
+		return false
+	}
+	if !consumed {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	status := resp.StatusCode
+	if status == http.StatusTooManyRequests {
+		return false
+	}
+	if status == http.StatusBadRequest {
+		return false
+	}
+	if isOrdinaryClientRejection(resp, nil) {
+		return false
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusRequestTimeout || status == 425 {
+		return true
+	}
+	if status >= 500 && status <= 599 {
+		return true
+	}
+	return false
+}
+
 // unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
 // for one frozen unbound recovery domain: the anonymous lane or one
 // authenticated credential. Domains are never summed: the outer unbound custom
@@ -2061,7 +2111,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 	interval := g.transientInterval()
 	var last429 *http.Response
 	live429 := 0
-	for _, ep := range eligible {
+	consumed := false
+	for idx, ep := range eligible {
 		if isContextCancelled(ctx) {
 			if last429 != nil {
 				drainAndClose(last429.Body)
@@ -2166,6 +2217,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				}
 				last429 = final.Resp
 				live429++
+				consumed = true
 				continue
 			}
 			if isStreamStartupFailureErr(final.Err) {
@@ -2173,7 +2225,38 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 					drainAndClose(last429.Body)
 					last429 = nil
 				}
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, final.Err) {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
+			}
+			if pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+				if ids.Session != "" {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						if last429 != nil {
+							drainAndClose(last429.Body)
+							last429 = nil
+						}
+						if final.Resp != nil {
+							drainAndClose(final.Resp.Body)
+						}
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 			}
 			if last429 != nil {
 				drainAndClose(last429.Body)
@@ -2196,7 +2279,27 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			last429 = resp
 			live429++
+			consumed = true
 			continue
+		}
+		if pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), resp, sendErr) {
+			if ids.Session != "" {
+				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+					if last429 != nil {
+						drainAndClose(last429.Body)
+					}
+					if resp != nil {
+						drainAndClose(resp.Body)
+					}
+					if takeErr != nil {
+						return nil, eff, next, takeErr
+					}
+					if resp2 == nil {
+						return nil, eff, next, contextError("custom fallback transport failed")
+					}
+					return resp2, eff, next, nil
+				}
+			}
 		}
 		if last429 != nil {
 			drainAndClose(last429.Body)
@@ -2350,6 +2453,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	attempts := 0
 	observed429 := make(map[string]time.Duration)
 	var last429 *http.Response
+	consumed := false
 	discardLast429 := func() {
 		if last429 != nil {
 			drainAndClose(last429.Body)
@@ -2442,6 +2546,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				}
 				last429 = resp
 			}
+			consumed = true
 			continue
 		}
 		if sendErr != nil || status == http.StatusRequestTimeout || status == 425 || (status >= 500 && status <= 599) {
@@ -2520,6 +2625,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					drainAndClose(last429.Body)
 				}
 				last429 = final.Resp
+				consumed = true
 				continue
 			}
 			// Exact HEAD stream-startup poisoning: either the initial send or
@@ -2528,6 +2634,18 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// Intermediate-only sentinels never poison. No last-wins, no
 			// de-poisoning.
 			if loopRes.sawStreamSentinel() {
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, final.Err) {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						discardLast429()
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 				discardLast429()
 				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
 			}
@@ -2535,6 +2653,19 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// old returned the stale initial response (initial 503, nil err)
 			// where the final is a nil-body transport error, not nil+transport.
 			if stop == transientStopObservationLimit && final.Err != nil && final.Resp == nil && loopRes.InitialErr == nil && loopRes.InitialResp != nil {
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), loopRes.InitialResp, loopRes.InitialErr) {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						discardLast429()
+						drainAndClose(loopRes.InitialResp.Body)
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 				discardLast429()
 				return loopRes.InitialResp, effectiveRoute, attemptOffset + attempts, loopRes.InitialErr
 			}
@@ -2545,7 +2676,23 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 							drainAndClose(final.Resp.Body)
 						}
 						discardLast429()
+						consumed = true
 						continue
+					}
+					if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+						if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+							if final.Resp != nil {
+								drainAndClose(final.Resp.Body)
+							}
+							discardLast429()
+							if takeErr != nil {
+								return nil, eff, next, takeErr
+							}
+							if resp2 == nil {
+								return nil, eff, next, contextError("custom fallback transport failed")
+							}
+							return resp2, eff, next, nil
+						}
 					}
 					if final.Resp != nil {
 						drainAndClose(final.Resp.Body)
@@ -2554,15 +2701,56 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					break
 				}
 				// 5xx/408/425 never move to another proxy: return as-is.
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						discardLast429()
+						drainAndClose(final.Resp.Body)
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 				discardLast429()
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
 			if final.Resp != nil {
+				if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						discardLast429()
+						drainAndClose(final.Resp.Body)
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
 				discardLast429()
 				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
 			if sendErr != nil && !isStreamStartupFailureErr(sendErr) {
 				if idx == len(eligible)-1 {
+					if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, sendErr) {
+						if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+							if resp != nil {
+								drainAndClose(resp.Body)
+							}
+							discardLast429()
+							if takeErr != nil {
+								return nil, eff, next, takeErr
+							}
+							if resp2 == nil {
+								return nil, eff, next, contextError("custom fallback transport failed")
+							}
+							return resp2, eff, next, nil
+						}
+					}
 					if resp != nil {
 						drainAndClose(resp.Body)
 					}
@@ -2573,12 +2761,32 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 					drainAndClose(resp.Body)
 				}
 				discardLast429()
+				consumed = true
 				continue
 			}
 			discardLast429()
 			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		}
-		// 401/403/408/425/ordinary 4xx/5xx: no cross-proxy moves.
+		// 401/403/ordinary 4xx: no cross-proxy moves. Only 401/403 after a
+		// consume action on the last eligible may take over custom; ordinary
+		// 4xx and single/unconsumed finals stay faithful.
+		if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), resp, sendErr) {
+			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				if resp != nil {
+					drainAndClose(resp.Body)
+				}
+				if takeErr != nil {
+					return nil, eff, next, takeErr
+				}
+				if resp2 == nil {
+					return nil, eff, next, contextError("custom fallback transport failed")
+				}
+				return resp2, eff, next, nil
+			}
+		}
 		if last429 != nil {
 			drainAndClose(last429.Body)
 		}

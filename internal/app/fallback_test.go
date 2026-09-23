@@ -348,6 +348,157 @@ func TestFallbackNoActiveKeeps429(t *testing.T) {
 	}
 }
 
+func pinnedAnonTwoProxyGateway(t *testing.T, customHits *atomic.Int32, active bool) *Gateway {
+	t.Helper()
+	var customURL string
+	var cleanup func()
+	if customHits != nil {
+		custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			customHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(fallbackChatOK("cm-anon-consume")))
+		}))
+		customURL = custom.URL
+		cleanup = custom.Close
+		t.Cleanup(custom.Close)
+		_ = cleanup
+	}
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct", "http://127.0.0.1:8081"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = true
+	cfg.Retry.MaxAttempts = 1
+	if active {
+		cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: customURL, APIKey: "k1", Model: "cm-anon-consume"}}}
+	}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gw
+}
+
+func pinnedAnonConsumeExtra() upstreamExtra {
+	return upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
+}
+
+// Bounded pinned-anon L2 consumption: 429 -> 403 exhausts the frozen binding
+// and takes over custom.
+func TestPinnedAnonConsumption429Then403Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
+	ses := "ses_anon_consume_429_403_1"
+	pool := gw.pools["a"]
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"t"}`), nil
+	})
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[1].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("anon 429->403 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
+	}
+}
+
+// Bounded pinned-anon L2 consumption: 429 -> L1-final 500 takes over custom.
+func TestPinnedAnonConsumption429Then500Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	ses := "ses_anon_consume_429_500_1"
+	pool := gw.pools["a"]
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"t"}`), nil
+	})
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[1].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(500, `{"error":"boom"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("anon 429->500 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+}
+
+// Without active custom the anon faithful envelope wins: 429 -> 403 stays
+// 403, never forged back to stale 429.
+func TestPinnedAnonConsumptionNoActiveFaithful403(t *testing.T) {
+	gw := pinnedAnonTwoProxyGateway(t, nil, false)
+	ses := "ses_anon_consume_noactive_1"
+	pool := gw.pools["a"]
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"t"}`), nil
+	})
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[1].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 403 {
+		t.Fatalf("no-active anon 429->403 must stay 403, err=%v resp=%v", err, resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom {
+		t.Fatalf("no-active must not bind custom")
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("no-active must not bind fallback")
+	}
+}
+
+// Ordinary 4xx stays terminal for anon consumption: 429 -> 404 stays 404
+// without custom even after a consume action.
+func TestPinnedAnonConsumptionOrdinary404NoTakeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
+	ses := "ses_anon_consume_404_1"
+	pool := gw.pools["a"]
+	gw.bindSessionPin(ses, "m", TierZen, anonymousSchedulerCredentialID, "a", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"t"}`), nil
+	})
+	postStub(t, gw, "a", poolIndexByRaw(gw, "a", ordered[1].name), nil, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(404, `{"error":"nope"}`), nil
+	})
+	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
+	if err != nil || resp == nil || resp.StatusCode != 404 {
+		t.Fatalf("anon 429->404 must stay 404, err=%v resp=%v", err, resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom || customHits.Load() != 0 {
+		t.Fatalf("ordinary 4xx must not hit custom")
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("must not bind fallback")
+	}
+}
+
 func TestFallbackSessionCrossModelAndActiveSwitch(t *testing.T) {
 	c1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
