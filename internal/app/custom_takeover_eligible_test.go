@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -830,5 +832,486 @@ func TestPinnedConsumptionAnonSingle401NoTakeover(t *testing.T) {
 	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(anonymousSchedulerCredentialID); ok {
 		t.Fatalf("single anon 401 must not write credential429")
+	}
+}
+
+// Bounded pinned L2 consumption: p0 live 429 then L1-final 408/425 on the
+// last eligible exhausts the frozen auth binding and takes over custom.
+// MaxAttempts=2 with TransientInterval=0 so p1 is observed exactly twice
+// (L1 limit includes the first send): p0 1x, p1 2x, then TierCustom 200.
+// Exercises doPinnedAuth -> observeSameTargetTransient -> pinnedConsumptionAllowCustom -> maybeTakeoverCustomFallback.
+func TestPinnedConsumptionAuth429ThenL1Final408Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_429_408_l1final_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(408, `{"error":"timeout"}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth 429->L1-final 408 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 {
+		t.Fatalf("p0 sends=%d want 1", postCount(&p0Calls))
+	}
+	if postCount(&p1Calls) != 2 {
+		t.Fatalf("p1 sends=%d want 2 (L1 observation limit includes first send)", postCount(&p1Calls))
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (1 native 429 + 2 native 408 + 1 custom)", attempts)
+	}
+	if eff.ID != "cm-inc6" {
+		t.Fatalf("effective model=%q want cm-inc6 rewrite", eff.ID)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if binding.Model != "cm-inc6" || binding.Name != "c1" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("408 takeover must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("408 must not write proxy429 for the 408 proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("408 must not write channel for the 408 proxy")
+	}
+	targetID := targetIdentity(TierZen, pin.CredID, "z", ordered[1].name, "m")
+	if _, _, ok := gw.scheduler.targetCooldownStatus(targetID); ok {
+		t.Fatalf("408 must not write target cooldown")
+	}
+	if _, _, ok := gw.scheduler.credentialCooldownStatus(pin.CredID); ok {
+		t.Fatalf("408 must not write credential 401 cooldown")
+	}
+}
+
+func TestPinnedConsumptionAuth429ThenL1Final425Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_429_425_l1final_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(425, `{"error":"too early"}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth 429->L1-final 425 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 {
+		t.Fatalf("p0 sends=%d want 1", postCount(&p0Calls))
+	}
+	if postCount(&p1Calls) != 2 {
+		t.Fatalf("p1 sends=%d want 2 (L1 observation limit includes first send)", postCount(&p1Calls))
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (1 native 429 + 2 native 425 + 1 custom)", attempts)
+	}
+	if eff.ID != "cm-inc6" {
+		t.Fatalf("effective model=%q want cm-inc6 rewrite", eff.ID)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if binding.Model != "cm-inc6" || binding.Name != "c1" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("425 takeover must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("425 must not write proxy429 for the 425 proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("425 must not write channel for the 425 proxy")
+	}
+	targetID := targetIdentity(TierZen, pin.CredID, "z", ordered[1].name, "m")
+	if _, _, ok := gw.scheduler.targetCooldownStatus(targetID); ok {
+		t.Fatalf("425 must not write target cooldown")
+	}
+	if _, _, ok := gw.scheduler.credentialCooldownStatus(pin.CredID); ok {
+		t.Fatalf("425 must not write credential 401 cooldown")
+	}
+}
+
+// Bounded pinned L2 consumption: p0 live 429 then L1-final stream-startup
+// failure (distinct nil-resp + sentinel err) on the last eligible exhausts
+// the frozen auth binding and takes over custom. MaxAttempts=2 with
+// TransientInterval=0 so p1 is observed exactly twice via empty SSE
+// (EOF-before-commit startup failure): p0 1x, p1 2x, then TierCustom 200.
+// Exercises doPinnedAuth -> executeAttempt stream gate -> sentinel ->
+// observeSameTargetTransient -> pinnedConsumptionAllowCustom(err!=nil) ->
+// maybeTakeoverCustomFallback. Startup cools only its single target; it must
+// not write proxy429/channel/credential429/credential401.
+func TestPinnedConsumptionAuth429ThenStartupTakeover(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 2
+	gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_429_startup_l1final_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return sseResponse(""), nil
+	})
+	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{Stream: true})
+	resp, eff, attempts, err := gw.doUpstreamTiers(ctx, authOnlyRoute(), streamBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("auth 429->L1-final startup must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 {
+		t.Fatalf("p0 sends=%d want 1", postCount(&p0Calls))
+	}
+	if postCount(&p1Calls) != 2 {
+		t.Fatalf("p1 sends=%d want 2 (L1 observation limit includes first send)", postCount(&p1Calls))
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (1 native 429 + 2 native startup + 1 custom)", attempts)
+	}
+	if eff.ID != "cm-inc6" {
+		t.Fatalf("effective model=%q want cm-inc6 rewrite", eff.ID)
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if binding.Model != "cm-inc6" || binding.Name != "c1" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("startup takeover must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("startup must not write proxy429 for the startup proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("startup must not write channel for the startup proxy")
+	}
+	if _, _, ok := gw.scheduler.credentialCooldownStatus(pin.CredID); ok {
+		t.Fatalf("startup must not write credential 401 cooldown")
+	}
+	targetID := targetIdentity(TierZen, pin.CredID, "z", ordered[1].name, "m")
+	if until, _, ok := gw.scheduler.targetCooldownStatus(targetID); !ok || until <= time.Now().UnixNano() {
+		t.Fatalf("startup must cool its single target, ok=%v until=%d", ok, until)
+	}
+}
+
+// Bounded pinned L2 consumption across protocols: native Responses 429 ->
+// 403 on the last eligible exhausts the frozen auth binding and crosses to a
+// Responses custom channel. Locks the correct protocol envelope, model
+// rewrite, binding identity, and first-crossing stale native refs removal
+// (previous_response_id + input reasoning dropped, ordinary history kept).
+func TestPinnedConsumptionResponses429Then403Takeover(t *testing.T) {
+	var customHits atomic.Int32
+	var gotPath string
+	var gotBody map[string]any
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		customHits.Add(1)
+		gotPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackResponsesOK("cm-resp-consume")))
+	}))
+	t.Cleanup(custom.Close)
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = true
+	cfg.Keys = []string{"zen-key-inc6aaaaa"}
+	cfg.Retry.MaxAttempts = 1
+	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm-resp-consume", Protocol: ProtocolResponses}}}
+	normalized, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(normalized, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_resp_429_403_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolResponses, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	route := modelRoute{ID: "m", Tier: TierZen, Protocol: ProtocolResponses, Protocols: map[Tier]Protocol{TierZen: ProtocolResponses}, Anonymous: false, KeyTiers: []Tier{TierZen}}
+	ex := upstreamExtra{External: ProtocolResponses, Payload: map[string]any{
+		"model":                "m",
+		"previous_response_id": "resp-native-1",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "hi"},
+			map[string]any{"type": "reasoning", "id": "rs_native_1", "encrypted_content": "enc-native"},
+			map[string]any{"type": "function_call", "call_id": "c1", "name": "fn", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": "c1", "output": "ok"},
+		},
+	}}
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r1"), 0, ex)
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("responses 429->403 must take over custom 200, err=%v resp=%v eff=%+v", err, resp, eff)
+	}
+	drainResp(resp)
+	if customHits.Load() != 1 {
+		t.Fatalf("hits=%d want 1", customHits.Load())
+	}
+	if postCount(&p0Calls) != 1 || postCount(&p1Calls) != 1 {
+		t.Fatalf("native sends p0=%d p1=%d want 1/1", postCount(&p0Calls), postCount(&p1Calls))
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3 (2 native + 1 custom)", attempts)
+	}
+	if eff.Protocol != ProtocolResponses {
+		t.Fatalf("effective protocol=%q want responses", eff.Protocol)
+	}
+	if eff.ID != "cm-resp-consume" {
+		t.Fatalf("effective model=%q want cm-resp-consume rewrite", eff.ID)
+	}
+	if gotPath != "/v1/responses" {
+		t.Fatalf("custom path=%q want /v1/responses", gotPath)
+	}
+	if gotBody == nil {
+		t.Fatalf("custom did not receive a body")
+	}
+	if gotBody["model"] != "cm-resp-consume" {
+		t.Fatalf("model rewrite missing: %v", gotBody["model"])
+	}
+	if _, ok := gotBody["previous_response_id"]; ok {
+		t.Fatalf("takeover must drop native previous_response_id, got %v", gotBody["previous_response_id"])
+	}
+	rawInput, ok := gotBody["input"].([]any)
+	if !ok {
+		t.Fatalf("takeover body must carry input, got %T", gotBody["input"])
+	}
+	if len(rawInput) != 3 {
+		t.Fatalf("takeover input must keep 3 ordinary items, got %d: %v", len(rawInput), rawInput)
+	}
+	seen := map[string]bool{}
+	for _, item := range rawInput {
+		m, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("input item must be an object, got %T", item)
+		}
+		typ, _ := m["type"].(string)
+		if typ == "reasoning" {
+			t.Fatalf("takeover must drop all input reasoning items, got %v", m)
+		}
+		seen[typ] = true
+	}
+	for _, want := range []string{"message", "function_call", "function_call_output"} {
+		if !seen[want] {
+			t.Fatalf("takeover must preserve %q history, got types %v", want, seen)
+		}
+	}
+	binding, ok := gw.scheduler.fallbacks.get(ses)
+	if !ok {
+		t.Fatalf("must bind fallback")
+	}
+	if binding.Protocol != ProtocolResponses {
+		t.Fatalf("binding protocol=%q want responses", binding.Protocol)
+	}
+	if binding.Model != "cm-resp-consume" {
+		t.Fatalf("fallback binding wrong: %+v", binding)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("responses 403 takeover must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("responses 403 must not write proxy429 for the 403 proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("responses 403 must not write channel for the 403 proxy")
+	}
+}
+
+// Pinned consumption deadline stop boundary: an already-expired deadline
+// with live-429-ready proxies never enters custom and never writes
+// credential429. Mirrors TestCustomTakeoverCancelledLive429NoCustomNoCredential429
+// with DeadlineExceeded instead of cancel, using a past deadline so no timing
+// is involved and no native send occurs.
+func TestPinnedConsumptionAuthDeadlineNoCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_deadline_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	var p0Calls, p1Calls atomic.Int32
+	for i, proxy := range ordered {
+		calls := &p0Calls
+		if i == 1 {
+			calls = &p1Calls
+		}
+		postStub(t, gw, "z", poolIndexByRaw(gw, "z", proxy.name), calls, nil, func(*http.Request) (*http.Response, error) {
+			r := responseWithBody(429, `{"error":"t"}`)
+			r.Header.Set("Retry-After", "7")
+			return r, nil
+		})
+	}
+	ctx, cancel := context.WithDeadline(pinTestCtx(), time.Now().Add(-time.Second))
+	defer cancel()
+	resp, eff, _, err := gw.doUpstreamTiers(ctx, authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0)
+	if resp != nil {
+		drainResp(resp)
+	}
+	if eff.Tier == TierCustom || customHits.Load() != 0 {
+		t.Fatalf("deadline live-429 must not hit custom (hits=%d)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("deadline live-429 must not bind fallback")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("deadline live-429 must not write credential429")
+	}
+	if postCount(&p0Calls) != 0 || postCount(&p1Calls) != 0 {
+		t.Fatalf("deadline must send nothing, p0=%d p1=%d", postCount(&p0Calls), postCount(&p1Calls))
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline must preserve DeadlineExceeded, err=%v ctx=%v", err, ctx.Err())
+	}
+}
+
+// Bounded pinned L2 consumption deadline during the second-proxy blocked
+// send: p0 live 429 enters L2 consumption, p1 blocks on the request context
+// until the outer deadline expires. Must keep the faithful deadline error,
+// no custom hit/bind, and no credential429. Proxy order is the frozen
+// affinity order (no wall-clock sleep decides routing); only the deadline
+// duration ends the blocked p1 send via request-context completion.
+func TestPinnedConsumptionAuthDeadlineDuringSecondProxyNoCustom(t *testing.T) {
+	var customHits atomic.Int32
+	gw := customTakeoverTestGateway(t, &customHits, true)
+	gw.cfg.Retry.MaxAttempts = 1
+	cred := gw.authCreds[0]
+	ses := "ses_pinned_consume_deadline_mid_1"
+	gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", gw.pools["z"].items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pin, _ := gw.scheduler.pinGet(ses, "m")
+	ordered := affinityProxyOrder(gw.pools["z"], pin.CredID, pin.ProxyRaw)
+	if len(ordered) != 2 {
+		t.Fatalf("ordered=%d want 2", len(ordered))
+	}
+	var p0Calls, p1Calls atomic.Int32
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[0].name), &p0Calls, nil, func(*http.Request) (*http.Response, error) {
+		r := responseWithBody(429, `{"error":"t"}`)
+		r.Header.Set("Retry-After", "4")
+		return r, nil
+	})
+	postStub(t, gw, "z", poolIndexByRaw(gw, "z", ordered[1].name), &p1Calls, nil, func(r *http.Request) (*http.Response, error) {
+		select {
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		case <-time.After(10 * time.Second):
+			return nil, context.DeadlineExceeded
+		}
+	})
+	ctx, cancel := context.WithDeadline(pinTestCtx(), time.Now().Add(500*time.Millisecond))
+	defer cancel()
+	resp, eff, attempts, err := gw.doUpstreamTiers(ctx, authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
+	if resp != nil {
+		drainResp(resp)
+	}
+	if postCount(&p0Calls) != 1 {
+		t.Fatalf("p0 sends=%d want 1 (first 429 must be sent before deadline)", postCount(&p0Calls))
+	}
+	if postCount(&p1Calls) != 1 {
+		t.Fatalf("p1 sends=%d want 1 (second proxy must be really attempted)", postCount(&p1Calls))
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2 (p0 429 + p1 blocked send)", attempts)
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("deadline must not hit custom (hits=%d)", customHits.Load())
+	}
+	if eff.Tier == TierCustom {
+		t.Fatalf("deadline must not enter custom tier, got %+v", eff)
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("deadline must not bind fallback")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
+		t.Fatalf("deadline must not write credential429")
+	}
+	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("deadline must not write proxy429 for the deadline proxy")
+	}
+	if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", ordered[1].name); ok {
+		t.Fatalf("deadline must not write channel for the deadline proxy")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline must preserve DeadlineExceeded, err=%v resp=%v", err, resp)
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ctx.Err=%v want context.DeadlineExceeded", ctx.Err())
 	}
 }
