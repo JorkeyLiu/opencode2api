@@ -66,18 +66,21 @@ func stub429(t *testing.T, gw *Gateway, pool string, index int) {
 }
 
 // (1) Anonymous partial plus authenticated full exhaustion must not custom.
+// State-agnostic exhaustion: ordinary 4xx never counts as unavailable, so
+// anon 429 + ordinary 404 stays partial (Unavailable=1/Frozen=2) and denies
+// custom even though auth is fully exhausted.
 func TestUnboundExhaustionAnonPartialAuthFullNoCustom(t *testing.T) {
 	var customHits atomic.Int32
 	gw := unboundExhaustionGateway(t, []string{"direct", "http://127.0.0.1:8081"}, []string{"direct"}, []string{"zen-key-exhaust-11111"}, &customHits, true)
-	// Anon: one 429, one 500 (transient, walks both with L1=1). Frozen=2,
-	// live=1, terminal=429 or 500 depending on HRW order; either way partial.
+	// Anon: one 429, one ordinary 404 (ends the channel without counting).
+	// Frozen=2, Unavailable=1 either way; partial denies custom.
 	postStub(t, gw, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
 		r := responseWithBody(429, `{"error":"slow"}`)
 		r.Header.Set("Retry-After", "9")
 		return r, nil
 	})
 	postStub(t, gw, "a", 1, nil, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(500, `{"error":"boom"}`), nil
+		return responseWithBody(404, `{"error":"not found"}`), nil
 	})
 	// Auth: single credential x single proxy fully 429.
 	stub429(t, gw, "z", 0)
@@ -96,10 +99,9 @@ func TestUnboundExhaustionAnonPartialAuthFullNoCustom(t *testing.T) {
 	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
 		t.Fatalf("partial anon must not bind fallback")
 	}
-	// Native behavior preserved: anonymous 429 with usable auth would have
-	// continued to auth; here auth is exhausted so the native terminal stands
-	// without custom.
-	if resp.StatusCode != 429 && resp.StatusCode != 500 {
+	// Native behavior preserved: the ordinary 404 ends the anonymous channel
+	// and the route keeps its native terminal without custom.
+	if resp.StatusCode != 429 && resp.StatusCode != 404 {
 		t.Fatalf("partial exhaustion must keep native terminal, got %d", resp.StatusCode)
 	}
 }
@@ -152,29 +154,31 @@ func TestUnboundExhaustionPrecooledEmptyPreventsCustom(t *testing.T) {
 	}
 }
 
-// (4) Full 429 then non-429/400/cancel prevents custom.
+// (4) Ordinary 4xx/400/cancel prevents custom. L1-final 5xx/transport/401/403
+// now count as unavailable (see TestUnboundExhaustionNon429AllowsCustom), so
+// this group uses an ordinary rejection as the non-429 negative.
 func TestUnboundExhaustionTerminalInvalidationNoCustom(t *testing.T) {
-	t.Run("Non429Terminal", func(t *testing.T) {
+	t.Run("OrdinaryTerminal", func(t *testing.T) {
 		var customHits atomic.Int32
 		gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-44444"}, &customHits, true)
 		stub429(t, gw, "a", 0)
 		postStub(t, gw, "z", 0, nil, nil, func(*http.Request) (*http.Response, error) {
-			return responseWithBody(500, `{"error":"boom"}`), nil
+			return responseWithBody(422, `{"error":"unprocessable"}`), nil
 		})
-		ses := "ses_unbound_inv_500_1"
+		ses := "ses_unbound_inv_422_1"
 		resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
 		if err != nil || resp == nil {
 			t.Fatalf("err=%v resp=%v", err, resp)
 		}
 		defer drainResp(resp)
-		if resp.StatusCode != 500 {
-			t.Fatalf("non-429 terminal must stay 500, got %d", resp.StatusCode)
+		if resp.StatusCode != 422 {
+			t.Fatalf("ordinary terminal must stay 422, got %d", resp.StatusCode)
 		}
 		if eff.Tier == TierCustom || customHits.Load() != 0 {
-			t.Fatalf("non-429 terminal must not hit custom (hits=%d)", customHits.Load())
+			t.Fatalf("ordinary terminal must not hit custom (hits=%d)", customHits.Load())
 		}
 		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-			t.Fatalf("non-429 terminal must not bind fallback")
+			t.Fatalf("ordinary terminal must not bind fallback")
 		}
 	})
 	t.Run("Replay429Terminal", func(t *testing.T) {

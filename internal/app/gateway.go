@@ -1436,29 +1436,94 @@ func customTakeoverEligible(q customTakeoverQualification) bool {
 	return q.ObservedLive429 >= q.Eligible
 }
 
-// unboundDomainEvidence is the per-domain live-429 exhaustion proof for one
-// frozen unbound recovery domain: the anonymous lane or one authenticated
-// credential. Domains are never summed: the outer unbound custom decision
-// requires every collected domain to independently satisfy the existing
-// customTakeoverEligible gate. Entered reports whether the domain actually
-// sent at least one live upstream attempt in this request; empty/pre-cooled
-// domains stay Entered=false/Frozen=0 and can never prove exhaustion.
-// Terminal is the domain's own terminal HTTP status (0 for transport/none).
-// Recovered400 marks a 400 corrective-replay final for that domain.
+// unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
+// for one frozen unbound recovery domain: the anonymous lane or one
+// authenticated credential. Domains are never summed: the outer unbound custom
+// decision requires every collected domain to independently satisfy the
+// state-agnostic object-exhaustion gate. Entered reports whether the domain
+// actually sent at least one live upstream attempt in this request;
+// empty/pre-cooled domains stay Entered=false/Frozen=0 and can never prove
+// exhaustion. Frozen is the frozen candidate count; Unavailable counts the
+// distinct frozen candidates with live unavailable evidence in this request
+// (live 429, 401/403 terminal, or L1-final transport/408/425/5xx; each frozen
+// candidate counts at most once, intermediate L1 retries never count
+// separately). Live429/Terminal are retained diagnostics for the frozen walk;
+// the unbound gate reads only Unavailable. Recovered400 marks a 400
+// corrective-replay final for that domain (never counts as unavailable).
 type unboundDomainEvidence struct {
 	Domain       string
 	Entered      bool
 	Frozen       int
 	Live429      int
+	Unavailable  int
 	Terminal     int
 	Recovered400 bool
 }
 
-// unboundDomainsAllowCustom aggregates the existing 429-only gate over all
-// frozen unbound domains without creating a second qualification authority:
-// every domain must independently satisfy customTakeoverEligible, the final
-// route terminal must be 429, and the route must not be recovered/cancelled/
-// committed. Any absent/empty/partial/non-429/transport domain denies custom.
+// unboundObjectUnavailable reports whether one live final outcome proves its
+// object unavailable for unbound exhaustion: live 429, 401/403, or L1-final
+// transport/408/425/5xx. 400 corrective replays (any terminal), ordinary
+// client 4xx, cancel/deadline (caller-gated), committed streams, build errors,
+// and stream-startup sentinels never count.
+func unboundObjectUnavailable(resp *http.Response, err error) bool {
+	if err != nil {
+		if isStreamStartupFailureErr(err) {
+			return false
+		}
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	status := resp.StatusCode
+	if status == http.StatusTooManyRequests || status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return true
+	}
+	if status == http.StatusRequestTimeout || status == 425 {
+		return true
+	}
+	return status >= 500 && status <= 599
+}
+
+// unboundDomainExhausted reports state-agnostic object exhaustion for one
+// unbound domain: every frozen candidate has live unavailable evidence in this
+// request. Pre-cooled/empty domains (Entered=false/Frozen<=0) and 400-replay
+// finals never qualify. Terminal status is intentionally not consulted.
+func unboundDomainExhausted(d unboundDomainEvidence) bool {
+	if d.Recovered400 {
+		return false
+	}
+	if !d.Entered || d.Frozen <= 0 {
+		return false
+	}
+	return d.Unavailable >= d.Frozen
+}
+
+// unboundDomainsExhaustedAllowCustom is the unbound-only object-exhaustion
+// gate: every collected domain (anonymous lane plus each authenticated
+// credential, never summed) must independently satisfy unboundDomainExhausted,
+// and the route must not be recovered/cancelled/committed. It is
+// state-agnostic: no Terminal==429 or Live429==Eligible requirement. Pinned
+// paths must not use it; they keep customTakeoverEligible (429-only).
+func unboundDomainsExhaustedAllowCustom(domains []unboundDomainEvidence, recovered400, cancelled, committed bool) bool {
+	if recovered400 || cancelled || committed {
+		return false
+	}
+	if len(domains) == 0 {
+		return false
+	}
+	for _, d := range domains {
+		if !unboundDomainExhausted(d) {
+			return false
+		}
+	}
+	return true
+}
+
+// unboundDomainsAllowCustom is the legacy 429-only unbound aggregation kept
+// for pinned-compat diagnostics and existing unit coverage. The live unbound
+// route no longer reads it; doUpstreamTiersUnbound reads
+// unboundDomainsExhaustedAllowCustom.
 func unboundDomainsAllowCustom(domains []unboundDomainEvidence, terminal int, recovered400, cancelled, committed bool) bool {
 	if recovered400 || cancelled || committed {
 		return false
@@ -1751,21 +1816,17 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 		}
 	}
 	if lastResponse != nil {
-		// Native final fallback: only full unbound-domain 429 exhaustion
-		// reaches the custom channel. Replay results (recovered paths
-		// returned above), ordinary 4xx, 401/403, and transport/5xx terminals
-		// never trigger custom even when 429s were seen earlier on other
-		// candidates. The per-domain live-429 proof lives in the frozen walks
-		// (doAnonymousUpstream/doKeyUpstream); this outer step requires every
-		// collected domain (anonymous lane plus each authenticated credential,
-		// never summed) to independently satisfy the shared 429-only gate
-		// with its own frozen/live-429/terminal evidence, plus the final route
-		// terminal 429 and bound-eligible session state.
-		terminal := 0
-		if lastResponse != nil {
-			terminal = lastResponse.StatusCode
-		}
-		if ids.Session != "" && unboundDomainsAllowCustom(unboundDomains, terminal, unboundRecovered, isContextCancelled(ctx), false) {
+		// Native final fallback: only full unbound-domain object exhaustion
+		// reaches the custom channel. Each frozen candidate must have live
+		// unavailable evidence in this request (live 429, 401/403, or L1-final
+		// transport/408/425/5xx; 400 replays, ordinary 4xx, cancel/deadline,
+		// and committed streams never count). The per-domain proof lives in
+		// the frozen walks (doAnonymousUpstream/doKeyUpstream); this outer
+		// step requires every collected domain (anonymous lane plus each
+		// authenticated credential, never summed) to independently satisfy
+		// the state-agnostic object-exhaustion gate. Pinned paths keep the
+		// separate 429-only gate and never read this predicate.
+		if ids.Session != "" && unboundDomainsExhaustedAllowCustom(unboundDomains, unboundRecovered, isContextCancelled(ctx), false) {
 			if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 				drainAndClose(lastResponse.Body)
 				if takeErr != nil {
@@ -1778,6 +1839,21 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 			}
 		}
 		return lastResponse, effectiveRoute, attempts, nil
+	}
+	// Transport-only exhaustion (all frozen objects failed with no response)
+	// carries no lastResponse but the same per-domain proof still applies.
+	// 400 replays return above, ordinary 4xx returns above with a response,
+	// and cancel/deadline denies via the gate.
+	if ids.Session != "" && len(unboundDomains) > 0 && unboundDomainsExhaustedAllowCustom(unboundDomains, unboundRecovered, isContextCancelled(ctx), false) {
+		if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+			if takeErr != nil {
+				return nil, eff, next, takeErr
+			}
+			if resp == nil {
+				return nil, eff, next, contextError("custom fallback transport failed")
+			}
+			return resp, eff, next, nil
+		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no usable upstream route")
@@ -2618,11 +2694,29 @@ func syncAttemptMeta(ctx context.Context, tier Tier, protocol Protocol, attemptO
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, attemptOffset int, extra ...upstreamExtra) (*http.Response, error, int, bool, bool, unboundDomainEvidence) {
 	var lastResponse *http.Response
 	var lastErr error
+	anonUnavailable := map[string]struct{}{}
 	anonEvidence := func(entered bool, frozen, live429, terminal int, recovered bool) unboundDomainEvidence {
-		return unboundDomainEvidence{Domain: "anonymous", Entered: entered, Frozen: frozen, Live429: live429, Terminal: terminal, Recovered400: recovered}
+		return unboundDomainEvidence{Domain: "anonymous", Entered: entered, Frozen: frozen, Live429: live429, Unavailable: len(anonUnavailable), Terminal: terminal, Recovered400: recovered}
 	}
 	anonLive429 := map[string]struct{}{}
 	anonEntered := false
+	markAnonUnavailable := func(proxyRaw string, resp *http.Response, err error) {
+		if proxyRaw == "" {
+			return
+		}
+		if isContextCancelled(ctx) {
+			return
+		}
+		if err != nil && isStreamStartupFailureErr(err) {
+			return
+		}
+		if _, ok := anonUnavailable[proxyRaw]; ok {
+			return
+		}
+		if unboundObjectUnavailable(resp, err) {
+			anonUnavailable[proxyRaw] = struct{}{}
+		}
+	}
 	if !g.cfg.Anonymous {
 		return nil, errors.New("anonymous channel is disabled"), 0, false, false, anonEvidence(false, 0, 0, 0, false)
 	}
@@ -2716,6 +2810,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		firstDiag := out.Diag
 		if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 			anonLive429[cand.ProxyRaw] = struct{}{}
+			markAnonUnavailable(cand.ProxyRaw, resp, nil)
+		}
+		if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			markAnonUnavailable(cand.ProxyRaw, resp, nil)
 		}
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			if isStreamContext(ctx) {
@@ -2783,6 +2881,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			}
 			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
 				anonLive429[cand.ProxyRaw] = struct{}{}
+				markAnonUnavailable(cand.ProxyRaw, final.Resp, nil)
+			} else if stop == transientStopObservationLimit || stop == transientStopStable {
+				// L1-final transport/408/425/5xx or stable 401/403 after
+				// observation proves the object unavailable (each frozen
+				// candidate once; ordinary 4xx/400 already returned above,
+				// cancel already returned, stream sentinel never counts).
+				markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
 			}
 			lastResponse = final.Resp
 			lastErr = final.Err
@@ -2798,6 +2903,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		if isOrdinaryClientRejection(resp, err) {
 			g.logger.Debug("anonymous upstream rejected a non-retryable request; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", resp.StatusCode)
 			return resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, len(anonLive429), anonTerminalOf(resp, err), false)
+		}
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			markAnonUnavailable(cand.ProxyRaw, resp, nil)
 		}
 		lastResponse = resp
 		lastErr = err
@@ -3018,6 +3126,29 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	credEntered := make(map[string]bool)
 	credTerminal := make(map[string]int)
 	credRecovered := make(map[string]bool)
+	credUnavailable := make(map[string]map[string]struct{})
+	markCredUnavailable := func(credID, proxyRaw string, resp *http.Response, err error) {
+		if credID == "" || proxyRaw == "" {
+			return
+		}
+		if isContextCancelled(ctx) {
+			return
+		}
+		if err != nil && isStreamStartupFailureErr(err) {
+			return
+		}
+		set, ok := credUnavailable[credID]
+		if !ok {
+			set = make(map[string]struct{})
+			credUnavailable[credID] = set
+		}
+		if _, done := set[proxyRaw]; done {
+			return
+		}
+		if unboundObjectUnavailable(resp, err) {
+			set[proxyRaw] = struct{}{}
+		}
+	}
 	keyTerminalOf := func(resp *http.Response, err error) int {
 		if resp != nil {
 			return resp.StatusCode
@@ -3031,7 +3162,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			live := len(cred429Evidence[cred.id])
 			entered := credEntered[cred.id]
 			terminal := credTerminal[cred.id]
-			domains = append(domains, unboundDomainEvidence{Domain: cred.id, Entered: entered, Frozen: frozen, Live429: live, Terminal: terminal, Recovered400: credRecovered[cred.id]})
+			domains = append(domains, unboundDomainEvidence{Domain: cred.id, Entered: entered, Frozen: frozen, Live429: live, Unavailable: len(credUnavailable[cred.id]), Terminal: terminal, Recovered400: credRecovered[cred.id]})
 		}
 		return domains
 	}
@@ -3097,6 +3228,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		// eligible set has 429ed (last Retry-After). Single/progress 429
 		// never sets it. Candidate traversal is bounded only by the frozen slice.
 		if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			ev, ok := cred429Evidence[cand.CredID]
 			if !ok {
@@ -3117,6 +3249,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				cred429LastRetry[cand.CredID] = retryAfter
 				cred429LastStarted[cand.CredID] = firstStarted
 			}
+		}
+		if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
 		}
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false, buildKeyDomains()
@@ -3183,6 +3318,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				return final.Resp, nil, attempts, false, false, buildKeyDomains()
 			}
 			if final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests {
+				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, nil)
 				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
 				ev, ok := cred429Evidence[cand.CredID]
 				if !ok {
@@ -3201,6 +3337,13 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				lastResponse = final.Resp
 				lastErr = final.Err
 				continue
+			}
+			// L1-final transport/408/425/5xx or stable 401/403 after
+			// observation proves the object unavailable (each frozen candidate
+			// once; ordinary 4xx/400 already returned, cancel already
+			// returned, stream sentinel never counts).
+			if loopRes.Stop == transientStopObservationLimit || loopRes.Stop == transientStopStable {
+				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
 			}
 			credTerminal[cand.CredID] = keyTerminalOf(final.Resp, final.Err)
 			lastResponse = final.Resp
@@ -3222,6 +3365,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
 			credTerminal[cand.CredID] = keyTerminalOf(resp, err)
 			return resp, nil, attempts, false, false, buildKeyDomains()
+		}
+		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
 		}
 		lastResponse = resp
 		lastErr = err
