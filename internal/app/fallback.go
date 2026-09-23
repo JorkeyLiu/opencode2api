@@ -643,6 +643,61 @@ func (st *fallbackTakeoverStore) markEstablished(session string) {
 	}
 }
 
+// bindContext is the gateway-only ctx-aware takeover bind. It holds the same
+// store mutex as bind but checks ctx.Err() under that lock before writing:
+// an already-cancelled context never creates a new pending entry. Existing
+// bindings win first even under cancellation so a concurrent winner is never
+// misjudged as empty or capacity: the stored winner is returned with
+// cancelled=false. Only a missing entry with a cancelled context reports
+// cancelled=true (no write, not capacity). The legacy bind keeps its
+// unconditional semantics for tests and non-gateway callers.
+func (st *fallbackTakeoverStore) bindContext(ctx context.Context, session string, b fallbackBinding) (stored fallbackBinding, inserted bool, full bool, cancelled bool) {
+	if st == nil || session == "" {
+		return b, false, false, false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if existing, ok := st.entries[session]; ok {
+		return existing, false, false, false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return b, false, false, true
+	}
+	if len(st.entries) >= fallbackTakeoverStoreCap {
+		return b, false, true, false
+	}
+	if st.entries == nil {
+		st.entries = make(map[string]fallbackBinding)
+	}
+	st.entries[session] = b
+	return b, true, false, false
+}
+
+// markEstablishedContext is the gateway-only ctx-aware established flip. It
+// holds the same store mutex as markEstablished but checks ctx.Err() under
+// that lock before writing: a context already cancelled at lock time never
+// flips pending to established. It reports whether the flip happened; unknown
+// sessions and already-established bindings report false without writing.
+// The legacy markEstablished keeps its unconditional semantics for tests and
+// non-gateway callers.
+func (st *fallbackTakeoverStore) markEstablishedContext(ctx context.Context, session string) bool {
+	if st == nil || session == "" {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	b, ok := st.entries[session]
+	if !ok || b.Established {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	b.Established = true
+	st.entries[session] = b
+	return true
+}
+
 // isCustomFallbackSuccess reports the single custom success signal: an HTTP
 // 2xx with no transport/build error. It mirrors the existing custom success
 // semantics (header status only; stream vs non-stream body handling is

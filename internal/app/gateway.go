@@ -1524,7 +1524,7 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	crossing := !binding.Established
 	resp, effectiveRoute, nextAttempts, sendErr := g.doCustomFallbackRequestCrossingAuthority(ctx, route, ex, hasEx, bodies, ids, ch, binding, attemptOffset, crossing)
 	if isCustomFallbackSuccess(resp, sendErr) && g != nil && g.scheduler != nil && g.scheduler.fallbacks != nil {
-		g.scheduler.fallbacks.markEstablished(ids.Session)
+		g.scheduler.fallbacks.markEstablishedContext(ctx, ids.Session)
 	}
 	return resp, effectiveRoute, nextAttempts, sendErr
 }
@@ -1734,8 +1734,23 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 	if !ok {
 		return nil, route, attemptOffset + attempts, false, nil
 	}
+	// Fast pre-bind cancel gate: a cancelled context must not create a new
+	// pending entry. This is a faithful stop (handled=true with ctx.Err()),
+	// never an empty/capacity verdict; existing first-wins bindings are not
+	// misjudged because bindContext below still returns the stored winner
+	// even under cancellation and the cancelled path likewise stops without
+	// sending.
+	if isContextCancelled(ctx) {
+		return nil, route, attemptOffset + attempts, true, ctx.Err()
+	}
+	if g == nil || g.scheduler == nil || g.scheduler.fallbacks == nil {
+		return nil, route, attemptOffset + attempts, false, nil
+	}
 	binding := fallbackBindingFor(ch)
-	stored, _, full := g.scheduler.fallbacks.bind(ids.Session, binding)
+	stored, _, full, cancelled := g.scheduler.fallbacks.bindContext(ctx, ids.Session, binding)
+	if cancelled {
+		return nil, route, attemptOffset + attempts, true, ctx.Err()
+	}
 	if full {
 		effectiveRoute := route
 		effectiveRoute.Tier = TierCustom
@@ -1771,7 +1786,7 @@ func (g *Gateway) maybeTakeoverCustomFallback(ctx context.Context, route modelRo
 		return nil, effectiveRoute, nextAttempts, true, contextError("custom fallback transport failed")
 	}
 	if isCustomFallbackSuccess(resp, nil) && g != nil && g.scheduler != nil && g.scheduler.fallbacks != nil {
-		g.scheduler.fallbacks.markEstablished(ids.Session)
+		g.scheduler.fallbacks.markEstablishedContext(ctx, ids.Session)
 	}
 	return resp, effectiveRoute, nextAttempts, true, nil
 }
