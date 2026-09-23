@@ -1397,6 +1397,45 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	return resp, effectiveRoute, nextAttempts, sendErr
 }
 
+// customTakeoverQualification is the explicit L2 429-only custom takeover
+// proof (Bounded Increment 6, behavior lock, no new eligibility). The current
+// recovery-domain exhaustion is proven only when every currently eligible
+// target has supplied distinct live 429 evidence in this request/route:
+// pre-cooled skips never enter the frozen eligible set and never count as
+// evidence, partial 429 is false, any terminal non-429 outcome is false, a
+// 400 corrective-replay final route is false, and cancel/deadline or stream
+// committed paths are false. Credential/pool/proxy/session identity, last
+// Retry-After selection, Started stale fencing, active-channel lookup,
+// capacity fail-closed, and scheduler cooldown writes stay with the callers;
+// this helper owns only the shared qualification gate and creates no second
+// authority. Generalized L2 fallback remains unimplemented.
+type customTakeoverQualification struct {
+	ObservedLive429 int
+	Eligible        int
+	TerminalStatus  int
+	Recovered400    bool
+	Cancelled       bool
+	Committed       bool
+}
+
+// customTakeoverEligible reports strict 429-only takeover eligibility for one
+// recovery domain step. TerminalStatus is the final HTTP status (0 for a
+// transport error / no response). Eligible must be >0: the pre-cooled
+// local-429 fast path (zero live-eligible with an actively cooling proxy429)
+// stays a separate caller-owned branch and never qualifies here.
+func customTakeoverEligible(q customTakeoverQualification) bool {
+	if q.Cancelled || q.Committed || q.Recovered400 {
+		return false
+	}
+	if q.TerminalStatus != http.StatusTooManyRequests {
+		return false
+	}
+	if q.Eligible <= 0 {
+		return false
+	}
+	return q.ObservedLive429 >= q.Eligible
+}
+
 // maybeTakeoverCustomFallback binds the session to the currently active custom
 // channel and immediately retries the current request through it. It returns
 // handled=true when the caller must return directly (takeover bound, no
@@ -1655,7 +1694,15 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 		// custom channel. Replay results (recovered paths returned above),
 		// ordinary 4xx, 401/403, and transport/5xx terminals never trigger
 		// custom even when 429s were seen earlier on other candidates.
-		if lastResponse.StatusCode == http.StatusTooManyRequests && ids.Session != "" {
+		// The per-target live-429 proof lives in the frozen walks
+		// (doAnonymousUpstream/doKeyUpstream/pinned bindings); this outer
+		// step re-checks only the terminal-429 plus route-state half of the
+		// shared gate (1/1 degenerate counts preserve HEAD behavior).
+		terminal := 0
+		if lastResponse != nil {
+			terminal = lastResponse.StatusCode
+		}
+		if customTakeoverEligible(customTakeoverQualification{ObservedLive429: 1, Eligible: 1, TerminalStatus: terminal, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) && ids.Session != "" {
 			if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 				drainAndClose(lastResponse.Body)
 				if takeErr != nil {
@@ -1836,16 +1883,21 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		}
 		if latest > nowNanos {
 			local := pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable")
-			if ids.Session != "" {
-				if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
-					drainAndClose(local.Body)
-					if takeErr != nil {
-						return nil, eff, next, takeErr
+			// Cancel/deadline keeps the native 429 local terminal without a
+			// custom bind or new state (AGENTS L3 boundary); the non-cancel
+			// path below is unchanged.
+			if !isContextCancelled(ctx) {
+				if ids.Session != "" {
+					if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+						drainAndClose(local.Body)
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp, eff, next, nil
 					}
-					if resp == nil {
-						return nil, eff, next, contextError("custom fallback transport failed")
-					}
-					return resp, eff, next, nil
 				}
 			}
 			return local, effectiveRoute, attemptOffset, nil
@@ -1868,6 +1920,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 	maxObservation := g.observationAttempts()
 	interval := g.transientInterval()
 	var last429 *http.Response
+	live429 := 0
 	for _, ep := range eligible {
 		if isContextCancelled(ctx) {
 			if last429 != nil {
@@ -1972,6 +2025,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 					drainAndClose(last429.Body)
 				}
 				last429 = final.Resp
+				live429++
 				continue
 			}
 			if isStreamStartupFailureErr(final.Err) {
@@ -2001,6 +2055,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				drainAndClose(last429.Body)
 			}
 			last429 = resp
+			live429++
 			continue
 		}
 		if last429 != nil {
@@ -2008,8 +2063,19 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		}
 		return resp, effectiveRoute, attemptOffset + attempts, sendErr
 	}
+	// Pinned-anonymous live exhaustion: the loop above returns on every
+	// non-429 outcome, so a non-nil last429 here means every frozen eligible
+	// proxy supplied live 429 in this request (live429 == len(eligible)).
+	// The pure count+terminal half owns the native 429 envelope; the full
+	// shared gate owns only the custom attempt, so a full exhaustion under
+	// cancel still keeps its 429 envelope without a custom send.
+	terminalAnon := 0
 	if last429 != nil {
-		if ids.Session != "" {
+		terminalAnon = last429.StatusCode
+	}
+	anonExhausted := last429 != nil && customTakeoverEligible(customTakeoverQualification{ObservedLive429: live429, Eligible: len(eligible), TerminalStatus: terminalAnon, Recovered400: false, Cancelled: false, Committed: false})
+	if anonExhausted {
+		if ids.Session != "" && customTakeoverEligible(customTakeoverQualification{ObservedLive429: live429, Eligible: len(eligible), TerminalStatus: terminalAnon, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
 			// Preserve the native 429 body for the custom path decision: the
 			// takeover helper re-derives its own request, so drain here only
 			// when actually handing off.
@@ -2112,16 +2178,21 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		}
 		if latest > nowNanos {
 			local := pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable")
-			if ids.Session != "" {
-				if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
-					drainAndClose(local.Body)
-					if takeErr != nil {
-						return nil, eff, next, takeErr
+			// Cancel/deadline keeps the native 429 local terminal without a
+			// custom bind or new state (AGENTS L3 boundary); the non-cancel
+			// path below is unchanged.
+			if !isContextCancelled(ctx) {
+				if ids.Session != "" {
+					if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+						drainAndClose(local.Body)
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp, eff, next, nil
 					}
-					if resp == nil {
-						return nil, eff, next, contextError("custom fallback transport failed")
-					}
-					return resp, eff, next, nil
 				}
 			}
 			return local, effectiveRoute, attemptOffset, nil
@@ -2204,8 +2275,10 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			}
 			// Full exhaustion of this binding's eligible set writes
 			// credential429 (last Retry-After) and then tries custom;
-			// partial exhaustion drains and continues.
-			if len(observed429) >= len(eligible) {
+			// partial exhaustion drains and continues. The shared L2
+			// 429-only gate owns the exhaustion proof; identity/Started
+			// fencing stays with the callers.
+			if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: status, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
 				_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, status, retryAfter, firstStarted)
 				if ids.Session != "" {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
@@ -2269,7 +2342,11 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				if _, seen := observed429[ep.raw]; !seen {
 					observed429[ep.raw] = retryAfter
 				}
-				if len(observed429) >= len(eligible) {
+				finalStatus := 0
+				if final.Resp != nil {
+					finalStatus = final.Resp.StatusCode
+				}
+				if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: finalStatus, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
 					_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
 					if ids.Session != "" {
 						if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
@@ -2367,14 +2444,22 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		}
 		return resp, effectiveRoute, attemptOffset + attempts, sendErr
 	}
-	if last429 != nil && len(observed429) >= len(eligible) {
-		// Strict 429 exhaustion: every proxy of the frozen eligible set
-		// returned a distinct live 429 in this request. Partial 429 mixed
-		// with any non-429 transport/4xx/5xx outcome never reaches here
-		// with a full set (non-429 paths discard last429 and return or
-		// continue without a stale envelope), so custom takeover and the
-		// last native 429 envelope are only owed on this strict gate.
-		if ids.Session != "" {
+	terminalPinned := 0
+	if last429 != nil {
+		terminalPinned = last429.StatusCode
+	}
+	// Strict 429 exhaustion: every proxy of the frozen eligible set
+	// returned a distinct live 429 in this request. Partial 429 mixed
+	// with any non-429 transport/4xx/5xx outcome never reaches here
+	// with a full set (non-429 paths discard last429 and return or
+	// continue without a stale envelope). The pure count+terminal half
+	// owns the native 429 envelope; the full gate (plus cancel/deadline,
+	// committed, replay-final route state) owns only the custom attempt,
+	// so a full exhaustion under cancel still keeps its 429 envelope
+	// without a custom send.
+	exhaustionOwed := customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: terminalPinned, Recovered400: false, Cancelled: false, Committed: false})
+	if exhaustionOwed {
+		if ids.Session != "" && customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: terminalPinned, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
 			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 				drainAndClose(last429.Body)
 				if takeErr != nil {
@@ -2903,7 +2988,10 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				ev[cand.ProxyRaw] = retryAfter
 				cred429LastRetry[cand.CredID] = retryAfter
 				cred429LastStarted[cand.CredID] = firstStarted
-				if len(ev) >= credEligibleCount[cand.CredID] && credEligibleCount[cand.CredID] > 0 {
+				// Same strict proof as the L2 custom gate (frozen eligible
+				// set fully live-429ed, pre-cooled excluded); route state
+				// stays false here so the scheduler write is unchanged.
+				if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
 					_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, resp.StatusCode, retryAfter, firstStarted)
 				}
 			} else {
@@ -2969,7 +3057,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					ev[cand.ProxyRaw] = retryAfter
 					cred429LastRetry[cand.CredID] = retryAfter
 					cred429LastStarted[cand.CredID] = final.Started
-					if len(ev) >= credEligibleCount[cand.CredID] && credEligibleCount[cand.CredID] > 0 {
+					if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: final.Resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
 						_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
 					}
 				}
