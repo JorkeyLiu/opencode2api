@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -420,6 +421,166 @@ func TestUnboundExhaustionAnthropicStreamStartupAllowsCustom(t *testing.T) {
 	}
 	if attempts != 5 {
 		t.Fatalf("attempts=%d want 5 (4 native + 1 custom)", attempts)
+	}
+}
+
+// Cross-domain isolation: one exhausted anonymous/authenticated domain plus
+// one non-exhausted domain denies custom (AND, never summed). Both directions
+// are locked through the real doUpstreamTiers unbound path: the exhausted
+// side uses non-429 object-unavailable evidence (403), the live side ends
+// with an ordinary 422 that never counts as unavailable. Per-pool POST
+// counts prove both domains were entered (no early local return).
+func TestUnboundExhaustionAnonAuthDomainsNotMerged(t *testing.T) {
+	t.Run("AnonExhaustedAuthOrdinary", func(t *testing.T) {
+		var customHits atomic.Int32
+		gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-60606"}, &customHits, true)
+		var anonPosts, authPosts atomic.Int32
+		postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(403, `{"error":"forbidden"}`), nil
+		})
+		postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(422, `{"error":"unprocessable"}`), nil
+		})
+		ses := "ses_unbound_anonauth_iso_1"
+		resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+		if err != nil || resp == nil {
+			t.Fatalf("err=%v resp=%v", err, resp)
+		}
+		defer drainResp(resp)
+		if resp.StatusCode != 422 {
+			t.Fatalf("auth ordinary terminal must stay 422, got %d", resp.StatusCode)
+		}
+		if eff.Tier == TierCustom || eff.Tier != TierZen {
+			t.Fatalf("must keep native auth tier, got %+v", eff)
+		}
+		if customHits.Load() != 0 {
+			t.Fatalf("split anon/auth domains must not hit custom (hits=%d)", customHits.Load())
+		}
+		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+			t.Fatalf("split anon/auth domains must not bind fallback")
+		}
+		if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+			t.Fatalf("non-2xx isolation must not establish a session pin")
+		}
+		if got := postCount(&anonPosts); got != 1 {
+			t.Fatalf("anonPosts=%d want 1 (anon domain entered)", got)
+		}
+		if got := postCount(&authPosts); got != 1 {
+			t.Fatalf("authPosts=%d want 1 (auth domain entered)", got)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts=%d want 2 (1 anon + 1 auth, no custom)", attempts)
+		}
+	})
+	t.Run("AnonOrdinaryAuthExhausted", func(t *testing.T) {
+		var customHits atomic.Int32
+		gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{"zen-key-exhaust-60707"}, &customHits, true)
+		var anonPosts, authPosts atomic.Int32
+		postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(422, `{"error":"unprocessable"}`), nil
+		})
+		postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(403, `{"error":"forbidden"}`), nil
+		})
+		ses := "ses_unbound_anonauth_iso_2"
+		resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+		if err != nil || resp == nil {
+			t.Fatalf("err=%v resp=%v", err, resp)
+		}
+		defer drainResp(resp)
+		if resp.StatusCode != 403 {
+			t.Fatalf("auth exhausted terminal must stay 403, got %d", resp.StatusCode)
+		}
+		if eff.Tier == TierCustom || eff.Tier != TierZen {
+			t.Fatalf("must keep native auth tier, got %+v", eff)
+		}
+		if customHits.Load() != 0 {
+			t.Fatalf("split anon/auth domains must not hit custom (hits=%d)", customHits.Load())
+		}
+		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+			t.Fatalf("split anon/auth domains must not bind fallback")
+		}
+		if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+			t.Fatalf("non-2xx isolation must not establish a session pin")
+		}
+		if got := postCount(&anonPosts); got != 1 {
+			t.Fatalf("anonPosts=%d want 1 (anon domain entered)", got)
+		}
+		if got := postCount(&authPosts); got != 1 {
+			t.Fatalf("authPosts=%d want 1 (auth domain entered)", got)
+		}
+		if attempts != 2 {
+			t.Fatalf("attempts=%d want 2 (1 anon + 1 auth, no custom)", attempts)
+		}
+	})
+}
+
+// Cross-credential isolation with non-429 evidence: credential A exhausts via
+// 403 (object-unavailable) while credential B ends with an ordinary 422 that
+// never counts. Both credential domains are really walked through the
+// doUpstreamTiers unbound path (auth-only route, per-credential POST counts
+// branched on the Bearer key). The session is chosen so the 403 credential
+// orders first; otherwise an ordinary-first walk would stop before entering
+// the second credential and the test would not prove two-domain isolation.
+func TestUnboundExhaustionCredentialNon429DomainsNotMerged(t *testing.T) {
+	var customHits atomic.Int32
+	keys := []string{"zen-key-exhaust-60808a", "zen-key-exhaust-60808b"}
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, keys, &customHits, true)
+	if len(gw.authCreds) != 2 {
+		t.Fatalf("creds=%d want 2", len(gw.authCreds))
+	}
+	idA, idB := gw.authCreds[0].id, gw.authCreds[1].id
+	keyA := gw.authCreds[0].key
+	ses := ""
+	for i := 0; i < 1000; i++ {
+		cand := fmt.Sprintf("ses_unbound_cred_non429_iso_%d", i)
+		sa, sb := credOrderScore(cand, idA), credOrderScore(cand, idB)
+		firstA := sa > sb || (sa == sb && idA < idB)
+		if firstA {
+			ses = cand
+			break
+		}
+	}
+	if ses == "" {
+		t.Fatalf("no session orders credential A first")
+	}
+	var hitsA, hitsB atomic.Int32
+	postStub(t, gw, "z", 0, nil, nil, func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") == "Bearer "+keyA {
+			hitsA.Add(1)
+			return responseWithBody(403, `{"error":"forbidden"}`), nil
+		}
+		hitsB.Add(1)
+		return responseWithBody(422, `{"error":"unprocessable"}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+	if err != nil || resp == nil {
+		t.Fatalf("err=%v resp=%v", err, resp)
+	}
+	defer drainResp(resp)
+	if resp.StatusCode != 422 {
+		t.Fatalf("ordinary credential terminal must stay 422, got %d", resp.StatusCode)
+	}
+	if eff.Tier == TierCustom || eff.Tier != TierZen {
+		t.Fatalf("must keep native auth tier, got %+v", eff)
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("split credential domains must not hit custom (hits=%d)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+		t.Fatalf("split credential domains must not bind fallback")
+	}
+	if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+		t.Fatalf("non-2xx isolation must not establish a session pin")
+	}
+	if got := int(hitsA.Load()); got != 1 {
+		t.Fatalf("credA POSTs=%d want 1 (exhausted 403 domain entered first)", got)
+	}
+	if got := int(hitsB.Load()); got != 1 {
+		t.Fatalf("credB POSTs=%d want 1 (ordinary 422 domain entered second)", got)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2 (1 per credential, no custom)", attempts)
 	}
 }
 
