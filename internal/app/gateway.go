@@ -2028,8 +2028,10 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 // retries same-target). Local proxy429 cooldown skips without new evidence.
 // Only 429 walks to the next proxy; transport keeps the existing same-target
 // transient retry only, and 400/401/403/408/425/ordinary 4xx/5xx never move.
-// Any 2xx clears state and CAS-updates pin current. Full 429 exhaustion tries
-// the custom final fallback; other terminals return as-is.
+// Any 2xx clears state and CAS-updates pin current. Full live 429
+// exhaustion tries the custom final fallback; pre-cooled zero-send keeps
+// native 429 with Retry-After and never tries custom; other terminals
+// return as-is.
 func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL string, protocol Protocol, body []byte, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	pool := g.pools[pin.Pool]
 	if pool == nil || len(pool.items) == 0 {
@@ -2072,25 +2074,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 		}
 		if latest > nowNanos {
-			local := pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable")
-			// Cancel/deadline keeps the native 429 local terminal without a
-			// custom bind or new state (AGENTS L3 boundary); the non-cancel
-			// path below is unchanged.
-			if !isContextCancelled(ctx) {
-				if ids.Session != "" {
-					if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
-						drainAndClose(local.Body)
-						if takeErr != nil {
-							return nil, eff, next, takeErr
-						}
-						if resp == nil {
-							return nil, eff, next, contextError("custom fallback transport failed")
-						}
-						return resp, eff, next, nil
-					}
-				}
-			}
-			return local, effectiveRoute, attemptOffset, nil
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 		// Suspect exhaustion is 502, not 429: do not trigger custom fallback.
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
@@ -2351,8 +2335,10 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 // slice. 429 walks all currently sendable proxies until exhaustion.
 // Credential429 is written only after every eligible proxy has
 // returned live 429 in this request (last Retry-After); partial 429 never
-// writes it and pre-cooled skips never count. Full 429 exhaustion tries the
-// custom final fallback. Pre-existing cooling proxies are skipped before any
+// writes it and pre-cooled skips never count. Full live 429 exhaustion
+// tries the custom final fallback; pre-cooled zero-send keeps native 429
+// with Retry-After and never tries custom. Pre-existing cooling proxies
+// are skipped before any
 // send and never count as observed evidence. No moves on
 // 400/401/403/408/425/ordinary 4xx/5xx. Success on an alternate updates only
 // current/generation via CAS.
@@ -2407,9 +2393,11 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	if len(eligible) == 0 {
 		// No eligible proxy: distinguish 429 exhaustion from 502. If any
 		// proxy is under tier-429 cooldown, fast-fail 429 with max remaining
-		// and try the custom final fallback; channel/suspect cooling alone fast-fails
-		// 502 (its 403/5xx status is kept in the channel detail table, not as
-		// a pinned envelope); otherwise 502 (unhealthy/removed).
+		// and keep the native envelope (zero-send pre-cooled 429 never
+		// triggers custom: no native send, no proxyPosts, no fallback bind);
+		// channel/suspect cooling alone fast-fails 502 (its 403/5xx status
+		// is kept in the channel detail table, not as a pinned envelope);
+		// otherwise 502 (unhealthy/removed).
 		var latest int64
 		for _, proxy := range ordered {
 			if proxy == nil {
@@ -2420,25 +2408,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			}
 		}
 		if latest > nowNanos {
-			local := pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable")
-			// Cancel/deadline keeps the native 429 local terminal without a
-			// custom bind or new state (AGENTS L3 boundary); the non-cancel
-			// path below is unchanged.
-			if !isContextCancelled(ctx) {
-				if ids.Session != "" {
-					if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
-						drainAndClose(local.Body)
-						if takeErr != nil {
-							return nil, eff, next, takeErr
-						}
-						if resp == nil {
-							return nil, eff, next, contextError("custom fallback transport failed")
-						}
-						return resp, eff, next, nil
-					}
-				}
-			}
-			return local, effectiveRoute, attemptOffset, nil
+			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}

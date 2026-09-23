@@ -268,27 +268,104 @@ func TestFallbackPinnedLive429Takeover(t *testing.T) {
 }
 
 func TestFallbackPinnedLocalCooldown429(t *testing.T) {
-	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(fallbackChatOK("cm2")))
-	}))
-	defer custom.Close()
-	gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k", Model: "cm2"}}, "c1")
-	ses := "ses_pinned_cool_429"
-	bindAnonPin(t, gw, ses, "m")
-	pool := gw.pools["a"]
-	raw := pool.items[0].name
-	gw.scheduler.noteProxy429Failure(TierZen, "a", raw, AttemptClassRateLimited, 429, 0, time.Now().UnixNano())
-	route := anonAuthRoute()
-	ex := upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
-	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-cool"), 0, ex)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer drainResp(resp)
-	if resp.StatusCode != 200 || eff.Tier != TierCustom {
-		t.Fatalf("local cooldown 429 must trigger takeover: %d %+v", resp.StatusCode, eff)
-	}
+	t.Run("PinnedAnonymous", func(t *testing.T) {
+		var customHits atomic.Int32
+		custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			customHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(fallbackChatOK("cm2")))
+		}))
+		defer custom.Close()
+		gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k", Model: "cm2"}}, "c1")
+		ses := "ses_pinned_cool_429_anon"
+		bindAnonPin(t, gw, ses, "m")
+		pool := gw.pools["a"]
+		raw := pool.items[0].name
+		gw.scheduler.noteProxy429Failure(TierZen, "a", raw, AttemptClassRateLimited, 429, time.Minute, time.Now().UnixNano())
+		var proxyHits atomic.Int32
+		postStub(t, gw, "a", 0, &proxyHits, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		route := anonAuthRoute()
+		ex := upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
+		resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-cool-anon"), 0, ex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer drainResp(resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("pre-cooled pinned anon zero-send must keep native 429, got %d %+v", resp.StatusCode, eff)
+		}
+		if eff.Tier == TierCustom {
+			t.Fatalf("pre-cooled zero-send must not enter custom, eff=%+v", eff)
+		}
+		if customHits.Load() != 0 {
+			t.Fatalf("pre-cooled zero-send must not hit custom, hits=%d", customHits.Load())
+		}
+		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+			t.Fatalf("pre-cooled zero-send must not bind fallback")
+		}
+		if attempts != 0 {
+			t.Fatalf("pre-cooled zero-send must have attempts 0, got %d", attempts)
+		}
+		if proxyHits.Load() != 0 {
+			t.Fatalf("pre-cooled zero-send must have proxyPosts 0, got %d", proxyHits.Load())
+		}
+		if got := resp.Header.Get("Retry-After"); got == "" {
+			t.Fatalf("pre-cooled 429 must retain Retry-After, got empty")
+		}
+	})
+	t.Run("PinnedAuth", func(t *testing.T) {
+		var customHits atomic.Int32
+		custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			customHits.Add(1)
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(fallbackChatOK("cm2")))
+		}))
+		defer custom.Close()
+		gw, _ := fallbackTestGateway(t, []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k", Model: "cm2"}}, "c1")
+		pool := gw.pools["z"]
+		if pool == nil || len(pool.items) == 0 {
+			t.Fatal("z pool missing")
+		}
+		cred := credentialsForKeys(TierZen, []string{"zen-secret-pinned-auth-precool"})[0]
+		gw.authCreds = []credentialRef{cred}
+		ses := "ses_pinned_cool_429_auth"
+		gw.bindSessionPin(ses, "m", TierZen, cred.id, "z", pool.items[0].name, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+		gw.scheduler.noteProxy429Failure(TierZen, "z", pool.items[0].name, AttemptClassRateLimited, 429, time.Minute, time.Now().UnixNano())
+		var proxyHits atomic.Int32
+		postStub(t, gw, "z", 0, &proxyHits, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		route := authOnlyRoute()
+		ex := upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
+		resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r-cool-auth"), 0, ex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer drainResp(resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("pre-cooled pinned auth zero-send must keep native 429, got %d %+v", resp.StatusCode, eff)
+		}
+		if eff.Tier == TierCustom {
+			t.Fatalf("pre-cooled zero-send must not enter custom, eff=%+v", eff)
+		}
+		if customHits.Load() != 0 {
+			t.Fatalf("pre-cooled zero-send must not hit custom, hits=%d", customHits.Load())
+		}
+		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
+			t.Fatalf("pre-cooled zero-send must not bind fallback")
+		}
+		if attempts != 0 {
+			t.Fatalf("pre-cooled zero-send must have attempts 0, got %d", attempts)
+		}
+		if proxyHits.Load() != 0 {
+			t.Fatalf("pre-cooled zero-send must have proxyPosts 0, got %d", proxyHits.Load())
+		}
+		if got := resp.Header.Get("Retry-After"); got == "" {
+			t.Fatalf("pre-cooled 429 must retain Retry-After, got empty")
+		}
+	})
 }
 
 func TestFallbackAuthPinNoTrigger(t *testing.T) {
@@ -543,6 +620,15 @@ func TestFallbackSessionCrossModelAndActiveSwitch(t *testing.T) {
 	}
 	// Switch active to c2: old session stays on c1, new session uses c2.
 	gw.cfg.Fallback.Active = "c2"
+	// Clear pre-cooled proxy429 from the prior live 429 so the new session's
+	// takeover is live (eligible>0). Pre-cooled zero-send must stay native 429
+	// per the pinned pre-cool fix and would otherwise keep the new session on
+	// native 429 instead of custom.
+	for _, p := range gw.pools["a"].items {
+		if p != nil {
+			_ = gw.scheduler.noteProxy429Success(TierZen, "a", p.name, time.Now().Add(time.Hour).UnixNano())
+		}
+	}
 	sesNew := "ses_new_after_switch"
 	bindAnonPin(t, gw, sesNew, "m")
 	postStub(t, gw, "a", 0, nil, nil, func(*http.Request) (*http.Response, error) {
