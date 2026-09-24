@@ -271,6 +271,72 @@ func TestClassifyStableCause(t *testing.T) {
 		}
 	})
 
+	t.Run("targetForbiddenInitial403", func(t *testing.T) {
+		resp := responseWithBody(403, `{"error":"f"}`)
+		defer drainResp(resp)
+		r := classifyStableCause(context.Background(), stableLoopRes(attemptOutcome{Resp: resp}, transientStopStable, nil, nil))
+		if r.Cause != stableCauseTargetForbidden {
+			t.Fatalf("cause=%v want targetForbidden (initial 403 is explicit target-scoped cause, not L1-final)", r.Cause)
+		}
+		if r.StillTransient {
+			t.Fatalf("403 must not be transient")
+		}
+		if isSameTargetTransient(resp, nil) {
+			t.Fatalf("403 must never enter L1 transient")
+		}
+		if isOrdinaryClientRejection(resp, nil) {
+			t.Fatalf("403 must never reuse ordinary authority")
+		}
+		if !isStableTargetForbidden(resp, nil) {
+			t.Fatalf("403 must reuse target-forbidden authority")
+		}
+		if !finalNon429ObjectUnavailable(resp, nil) || !unboundObjectUnavailable(resp, nil) {
+			t.Fatalf("403 must stay object-unavailable for exhaustion")
+		}
+	})
+
+	t.Run("targetForbiddenTransientAfterFinal403", func(t *testing.T) {
+		init := responseWithBody(503, `{"error":"initial"}`)
+		final := responseWithBody(403, `{"error":"f"}`)
+		r := classifyStableCause(context.Background(), stableLoopRes(attemptOutcome{Resp: final}, transientStopStable, init, nil))
+		if r.Cause != stableCauseTargetForbidden {
+			drainResp(init)
+			drainResp(final)
+			t.Fatalf("cause=%v want targetForbidden (transient-then-403 final is explicit cause, not L1-final)", r.Cause)
+		}
+		if r.StillTransient {
+			drainResp(init)
+			drainResp(final)
+			t.Fatalf("final 403 must not stay transient")
+		}
+		if r.Stop != transientStopStable {
+			drainResp(init)
+			drainResp(final)
+			t.Fatalf("stop not preserved")
+		}
+		if r.InitialResp != init {
+			drainResp(init)
+			drainResp(final)
+			t.Fatalf("initial metadata not preserved")
+		}
+		drainResp(init)
+		drainResp(final)
+	})
+
+	t.Run("targetForbiddenLateCancelKeepsCause", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		resp := responseWithBody(403, `{"error":"f"}`)
+		defer drainResp(resp)
+		r := classifyStableCause(ctx, stableLoopRes(attemptOutcome{Resp: resp}, transientStopStable, nil, nil))
+		if r.Cause != stableCauseTargetForbidden {
+			t.Fatalf("cause=%v want targetForbidden (late cancel must not hide the 403 outcome)", r.Cause)
+		}
+		if !r.Cancelled {
+			t.Fatalf("cancelled must be true")
+		}
+	})
+
 	t.Run("contextNeverObjectUnavailable", func(t *testing.T) {
 		resp := responseWithBody(503, `{"error":"svc"}`)
 		defer drainResp(resp)

@@ -209,3 +209,8 @@
 - **2026-09-24 — 未绑定认证 request-local transport-suspect L2 原因（已实现/已验证切片，无广义矩阵）：**
   - 未绑定认证建立内，真实 L1-final true transport（`isTrueTransportError` 且 L1 已达 final/advance 点）建立本请求内 `(tier/channel,pool,proxy)` 稳定不可用原因：同身份后续冻结候选在 suspect 仍 active 时跳过无 POST（仅请求内真实 transport 证据触发，预冷不播种、过期不延长、跨池不命中、匿名域证据不借用）；跳过按本请求证据计入该凭证域 `Unavailable` 并标记 `Entered`，不增 `attempts`、不记 upstream attempt、不写任何调度状态、不计入 live429/`credential429`；401 凭证围栏、request-local proxy429 围栏、exact400 终态、ordinary4xx、target 403/5xx、L1、cancel/deadline/committed、route-session/pin/custom first-wins 均不变；已绑定行为不变。
   - 语义边界：仅未绑定认证；代理健康仍为连通性语义，suspect 为有界临时候选过滤；不冻结广义逐状态矩阵/退避/广义 fallback。
+
+- **2026-09-24 — 403 target-scoped stable cause 纯决策显式化（行为保持，无广义矩阵）：**
+  - `gateway.go` 纯决策接缝内将 HTTP 403 提升为独立显式原因 `stableCauseTargetForbidden`（`isStableTargetForbidden`：`err==nil && 403`，不进 L1、不属 ordinary、不再落入通用 L1-final）：`classifyStableCause` 在 live429 之后/ordinary 之前分类，initial 403 与 transient 后 final 403 均归此原因；`decideUnboundPostL1` 对此原因双 lane 均返回 `advanceNext+markUnavailable`（取消门优先：`Cancelled` 仍按既有 lane 门返回 context），与既有可观测 walk 一致——未绑定当前 target 标记不可用并推进下一冻结 target，逐域真实耗尽后才可能 custom；`finalNon429ObjectUnavailable`/`unboundObjectUnavailable` 的 403 叶语义、scheduler target-cooldown、已绑定不移动/不新增 custom/冷却语义、普通 4xx/401/429/transport/503/fallback/pin/session/stream 语义均不变，预算/退避/冷却数值不变。
+  - 验证：`stable_cause_test.go` 新增 initial 403 / transient-后-final 403 / late-cancel 保持 403 断言（含非 transient、非 ordinary、仍计入 object-unavailable）与既有 401-仍-L1Final 回归；`gateway_unbound_decision_test.go` 新增双 lane 403 advance+mark 与 cancelled-override 行；聚焦与 `go test ./...` 通过、gofmt 干净。
+  - 语义边界：仅纯决策分类显式化；不展开其他状态码，不冻结广义逐状态矩阵/退避/广义 fallback。

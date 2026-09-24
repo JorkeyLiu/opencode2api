@@ -808,6 +808,16 @@ func isStableCredential401(resp *http.Response, err error) bool {
 	return err == nil && resp != nil && resp.StatusCode == http.StatusUnauthorized
 }
 
+// isStableTargetForbidden reports a real stable HTTP 403: an exact 403
+// response with no transport error. It is a target-scoped stable cause:
+// the single (channel, credential, pool, proxy, model) target is
+// unavailable (existing scheduler target-cooldown semantics unchanged) and
+// the unbound walk advances to the next frozen target. It never enters L1
+// observation and never counts as ordinary rejection or generic L1-final.
+func isStableTargetForbidden(resp *http.Response, err error) bool {
+	return err == nil && resp != nil && resp.StatusCode == http.StatusForbidden
+}
+
 // isOrdinaryClientRejection reports deterministic request-shape rejections
 // that must end the current channel/tier without a same-target retry:
 // ordinary 4xx excluding 400 (dedicated recovery), 401/403/429 (cooldown
@@ -1285,11 +1295,12 @@ func (r transientLoopResult) sawStreamSentinel() bool {
 // observeSameTargetTransient stops. It only describes why the observation
 // stopped and what the final outcome is; it never selects candidates,
 // proxy moves, scheduler writes, custom fallback, or return envelopes.
-// L1Final covers every remaining live final (L1-final transient 408/425/5xx
-// including 503, true transport errors, stream-startup sentinels, and stable
-// 401/403); callers keep their existing fine-grained policy inside that
-// bucket (sentinel poisoning, stale-initial returns, transport walks,
-// 5xx no-move, exhaustion evidence).
+// stableCauseTargetForbidden is the explicit target-scoped 403 cause (never
+// ordinary rejection, never generic L1-final); L1Final covers every
+// remaining live final (L1-final transient 408/425/5xx including 503, true
+// transport errors, stream-startup sentinels, and stable 401); callers keep
+// their existing fine-grained policy inside that bucket (sentinel poisoning,
+// stale-initial returns, transport walks, 5xx no-move, exhaustion evidence).
 type stableCause int
 
 const (
@@ -1299,6 +1310,7 @@ const (
 	stableCauseExact400
 	stableCauseLive429
 	stableCauseOrdinaryRejection
+	stableCauseTargetForbidden
 	stableCauseL1Final
 )
 
@@ -1323,9 +1335,9 @@ type stableCauseResult struct {
 // outcome plus the L1 stop fact only: build failure and 2xx success precede
 // everything (a BuildErr/2xx final is returned as-is even under
 // cancellation), then the L1 stop-context (Stop == transientStopContext),
-// exact 400, live 429, ordinary rejection, and finally the L1-final bucket.
-// Late cancellation after observation (Stop == stable/observation-limit with
-// a cancelled ctx) is NOT folded into Cause; it is carried in Cancelled for
+// exact 400, live 429, target-scoped 403, ordinary rejection, and finally
+// the L1-final bucket. Late cancellation after observation (Stop ==
+// stable/observation-limit with a cancelled ctx) is NOT folded into Cause; it is carried in Cancelled for
 // each caller's own preserved gate, so an observationLimit+cancelled final
 // still classifies as its outcome (e.g. live 429, exact 400, L1-final)
 // exactly as the old per-path predicates did. All status predicates reuse
@@ -1353,6 +1365,8 @@ func classifyStableCause(ctx context.Context, loopRes transientLoopResult) stabl
 		res.Cause = stableCauseExact400
 	case final.Err == nil && final.Resp != nil && final.Resp.StatusCode == http.StatusTooManyRequests:
 		res.Cause = stableCauseLive429
+	case isStableTargetForbidden(final.Resp, final.Err):
+		res.Cause = stableCauseTargetForbidden
 	case isOrdinaryClientRejection(final.Resp, final.Err):
 		res.Cause = stableCauseOrdinaryRejection
 	default:
@@ -1411,8 +1425,10 @@ type unboundDecision struct {
 // two unbound walkers. Inputs are lane plus Cause/Stop/Cancelled only; it
 // never reads ctx, Final, attempts, Started, Retry-After, or any runtime
 // state. Mapping is current behavior only: build returns build,
-// success returns success, exact 400 replays, ordinary 4xx returns
-// faithfully, live 429 advances with mark, and L1-final advances with mark
+// success returns success, exact 400 replays, target-scoped 403 advances
+// with mark (same observable walk as before: current target unavailable,
+// next frozen target), ordinary 4xx returns faithfully, live 429 advances
+// with mark, and L1-final advances with mark
 // only for transientStopObservationLimit or transientStopStable.
 func decideUnboundPostL1(lane unboundLane, r stableCauseResult) unboundDecision {
 	switch {
@@ -1428,6 +1444,8 @@ func decideUnboundPostL1(lane unboundLane, r stableCauseResult) unboundDecision 
 		return unboundDecision{Action: unboundActionReplay}
 	case r.Cause == stableCauseOrdinaryRejection:
 		return unboundDecision{Action: unboundActionReturnOrdinary}
+	case r.Cause == stableCauseTargetForbidden:
+		return unboundDecision{Action: unboundActionAdvanceNext, MarkUnavailable: true}
 	case r.Cause == stableCauseLive429:
 		return unboundDecision{Action: unboundActionAdvanceNext, MarkUnavailable: true}
 	default:
@@ -3295,12 +3313,12 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 			case unboundActionAdvanceNext:
 				if decision.MarkUnavailable {
-					// Live 429, or L1-final transport/408/425/5xx, stable
-					// 401/403, or L1-final stream startup failure after
-					// observation proves the object unavailable (each frozen
-					// candidate once; ordinary 4xx/400 already returned
-					// above, cancel already returned, BuildErr/committed
-					// never reach here).
+					// Live 429, target-scoped 403, or L1-final
+					// transport/408/425/5xx, stable 401, or L1-final stream
+					// startup failure after observation proves the object
+					// unavailable (each frozen candidate once; ordinary
+					// 4xx/400 already returned above, cancel already
+					// returned, BuildErr/committed never reach here).
 					markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
 					if isStableCredential401(final.Resp, final.Err) && !isContextCancelled(ctx) {
 						anonCred401Seen = true
@@ -3875,9 +3893,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					lastErr = final.Err
 					continue
 				}
-				// L1-final transport/408/425/5xx, stable 401/403, or L1-final
-				// stream startup failure after observation proves the object
-				// unavailable (each frozen candidate once; ordinary 4xx/400
+				// L1-final transport/408/425/5xx, stable 401, target-scoped
+				// 403, or L1-final stream startup failure after observation
+				// proves the object unavailable (each frozen candidate once; ordinary 4xx/400
 				// already returned, cancel already returned, BuildErr/committed
 				// never reach here). Mark above already applied the Stop-gated
 				// decision.
