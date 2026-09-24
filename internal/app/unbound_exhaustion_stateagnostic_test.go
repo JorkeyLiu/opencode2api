@@ -212,11 +212,15 @@ func TestUnboundExhaustionDeadlineNoCustom(t *testing.T) {
 
 // Credential domains never merge: one exhausted credential plus one
 // ordinary-rejection credential denies custom even though anonymous is
-// exhausted. Per-credential fate branches on the Bearer key.
+// exhausted. Per-credential fate branches on the Bearer key. The two auth
+// proxies are distinct identities so the request-local proxy429 L2 skip
+// (same tier/pool/proxy live-429ed earlier in this request) does not merge
+// the domains: keyA exhausts via direct-429 + other-403, keyB stays partial
+// via direct-skip + other-422.
 func TestUnboundExhaustionCredentialDomainsNotMerged(t *testing.T) {
 	var customHits atomic.Int32
 	keys := []string{"zen-key-exhaust-50505a", "zen-key-exhaust-50505b"}
-	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, keys, &customHits, true)
+	gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct", "http://127.0.0.1:8081"}, keys, &customHits, true)
 	stub429(t, gw, "a", 0)
 	keyA := gw.authCreds[0].key
 	postStub(t, gw, "z", 0, nil, nil, func(r *http.Request) (*http.Response, error) {
@@ -224,6 +228,15 @@ func TestUnboundExhaustionCredentialDomainsNotMerged(t *testing.T) {
 			resp := responseWithBody(429, `{"error":"slow"}`)
 			resp.Header.Set("Retry-After", "9")
 			return resp, nil
+		}
+		// Reached only when the 422 credential orders first; when the 429
+		// credential orders first this same-proxy candidate is skipped via
+		// the request-local proxy429 L2 cause and never POSTs here.
+		return responseWithBody(422, `{"error":"unprocessable"}`), nil
+	})
+	postStub(t, gw, "z", 1, nil, nil, func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("Authorization") == "Bearer "+keyA {
+			return responseWithBody(403, `{"error":"forbidden"}`), nil
 		}
 		return responseWithBody(422, `{"error":"unprocessable"}`), nil
 	})

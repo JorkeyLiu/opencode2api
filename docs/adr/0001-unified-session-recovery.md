@@ -141,6 +141,11 @@
 
 ### 修订历史（Revision History）
 
+- **2026-09-24 — 未绑定认证 request-local proxy429 L2 原因（已实现/已验证切片，无广义矩阵）：**
+  - 未绑定认证建立内，真实发送的 live 429 即时建立本请求内 `(tier/channel,pool,proxy)` 稳定不可用原因：同身份后续冻结候选跳过无 POST（仅请求内真实 live 429 证据触发，预冷/并发调度状态不触发；身份含现有 channel/tier+pool+raw proxy，认证单 tier/pool 不弱化）；跳过按本请求证据计入该凭证域 `Unavailable` 并标记 `Entered`，不计入该凭证 live429/`credential429` 证据、不增 `attempts`、不记 upstream attempt、不写任何调度状态（`credential429` 仍仅当该凭证全部冻结 eligible 经真实发送 live 429 时写入，partial live429+skip 永不写入）；401 凭证围栏、exact400 终态、ordinary4xx、403/5xx target 范围、L1、匿名/已绑定、cancel/deadline/committed、pin/route-session、custom first-wins 均不变。
+  - 验证：新增 `unbound_proxy429_scope_test.go`（跨凭证跳过同代理并在另一代理成功/pin 且 attempts 仅计实发；后凭证全跳过按域耗尽接管 active custom 且 skips 非 attempts；1 实发 429+1 skip 不写 `credential429`；池限定身份单元）；既有 `TestUnboundExhaustionCredentialDomainsNotMerged` 改为双代理夹具以在新跳过语义下保持凭证域不合并证明（单共享代理下后凭证全跳过即耗尽接管为新正确行为）；聚焦/相关 `unbound/401/400/pinned/custom/429` 回归通过、gofmt 干净；全量门禁随后续终检，不声称广义矩阵完成。
+  - 语义边界：仅未绑定认证；预冷冻结排除不变；不同池/代理身份不跳过；不冻结广义逐状态矩阵/退避/广义 fallback。
+
 - **2026-09-24 — 未绑定 401 凭证级 L2 原因（已实现/已验证切片，无广义矩阵）：**
   - 未绑定建立（匿名/认证共享冻结遍历，含空会话直达路径）将首个真实稳定 401（`err==nil && 401` 且非取消；含 L1 同目标观察后稳定 401）视为凭证级 L2 原因：同请求内不再发送同 `CredID` 剩余冻结候选，直接进入下一 distinct credential（匿名单凭证则结束剩余代理遍历并按既有外层进入认证 lane）；跳过目标按该凭证级原因计入该域 `Unavailable`，无伪发送/`attempts`/upstream attempts/调度写入（401 本体既有 `credential401` 写入保留，403/429/408/425/5xx/transport/400/ordinary/cancel/deadline/committed/pin/custom 门不变）。
   - 验证：新增 `unbound_401_credential_scope_test.go`（auth 首 401 跳过同凭证并进下一凭证成功/pin、transient→L1 稳定 401 同跳过且 attempts=2+1、匿名首 401 单发送后进认证、双域 401 跳过仍按域耗尽接管 active custom 且 attempts=实发+custom），既有 `TestServerRetryAndNoRetryClasses/Unauthorized_no_retry` 按新语义更新为 401 跳过匿名次代理并进认证（429/403 行不变），`go test ./... -count=1` 通过、gofmt 干净。

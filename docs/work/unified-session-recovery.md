@@ -1,6 +1,6 @@
 # Unified session recovery — live work projection
 
-> Live projection, not history. History lives in git log and `docs/adr/0001`. This route can change as reality teaches us; provisional notes never override binding behavior. Current anchor: HEAD `bcbfb8e`.
+> Live projection, not history. History lives in git log and `docs/adr/0001`. This route can change as reality teaches us; provisional notes never override binding behavior.
 
 ## Outcome
 
@@ -8,8 +8,8 @@
 
 ## Reality
 
-- Behaviorally implemented: single-`retry.max_attempts` bounded same-target L1 observation; exact-400 corrective same-target replay that is route-terminal; cancellation/deadline/committed-byte stop boundaries; unbound custom eligibility by independent per-domain object-unavailable exhaustion; unbound 401 credential-scoped L2 cause (first real stable 401 skips remaining same-credential frozen targets, skips count as unavailable without sends, incl. L1-final 401); pinned full live-429 traversal plus bounded consumption; pinned transport/move/session rules and the 503 no-L2-observation policy. Exact semantics live in `AGENTS.md` §3–4 and `docs/adr/0001`, not here.
-- HEAD `bcbfb8e` changed none of the above: it centralized unbound post-L1 lane decisions into the pure `decideUnboundPostL1` seam (consumed by unbound anon/auth walkers) plus its unit test with cancellation-priority rows and 408/425 both-domain custom-takeover end-to-end evidence. Structural centralization plus tests only — not observable recovery-semantic progress.
+- Behaviorally implemented: single-`retry.max_attempts` bounded same-target L1 observation; exact-400 corrective same-target replay that is route-terminal; cancellation/deadline/committed-byte stop boundaries; unbound custom eligibility by independent per-domain object-unavailable exhaustion; unbound 401 credential-scoped L2 cause (first real stable 401 skips remaining same-credential frozen targets, skips count as unavailable without sends, incl. L1-final 401); unbound auth request-local proxy429 L2 cause (live 429 via real send establishes `(tier/channel,pool,proxy)` unavailable for this request, later same-identity frozen candidates skip without POST, skips count as unavailable+entered without attempts/writes and never as live429 for credential429); pinned full live-429 traversal plus bounded consumption; pinned transport/move/session rules and the 503 no-L2-observation policy. Exact semantics live in `AGENTS.md` §3–4 and `docs/adr/0001`, not here.
+- Current state includes unbound auth request-local proxy429 skip plus focused tests only — not observable progress beyond that single L2 cause.
 
 ## Distance
 
@@ -18,7 +18,7 @@
 
 ## Route / next move
 
-- Best route: develop L2 decisions alongside real gateway behavior — not a full status matrix up front, and not another helper-only centralization. `bcbfb8e` does not close the semantic distance above.
+- Best route: develop L2 decisions alongside real gateway behavior — not a full status matrix up front, and not another helper-only centralization. Structural centralization alone does not close the semantic distance above.
 - Next move: decide one concrete cause+context → action at the production path, implement it, observe whether the session continues/faithfully returns under pin/session constraints, and revise the working rule from that evidence. No prior full ADR/design adjudication is required; incomplete notes and ordinary reversible decisions resolve along the route, not as blockers.
 - If no first cause can be responsibly fixed from current evidence (no named user failure scenario, no known normative mismatch), let the next concrete runtime/code observation select it — e.g. which stable cause most often reaches L3 without a principled L2 resolution in live unbound/pinned traffic — and carry that decision into production development rather than waiting or declaring no next move.
 

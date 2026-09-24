@@ -3561,6 +3561,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	// with the same CredID are skipped without a send. Skips are accounted
 	// as unavailable for exhaustion without fake attempts or writes.
 	credStable401 := make(map[string]bool)
+	// reqProxy429 is the unbound authenticated request-local proxy L2 cause:
+	// each live 429 via a real send in this request immediately establishes
+	// a stable unavailable cause for its (tier/channel, pool, raw proxy)
+	// identity shared across credentials. A later frozen candidate with the
+	// same proxy429 identity is skipped without a POST only when that
+	// cooldown was established by an earlier real send in this request.
+	// Pre-existing cooldowns never trigger this skip beyond the frozen
+	// filtering at build time; the request-local evidence avoids
+	// races/ambiguity with concurrent scheduler state.
+	reqProxy429 := make(map[string]struct{})
 	markCredUnavailable := func(credID, proxyRaw string, resp *http.Response, err error) {
 		if credID == "" || proxyRaw == "" {
 			return
@@ -3625,6 +3635,26 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			}
 			continue
 		}
+		// Request-local proxy L2 cause: skip a later frozen candidate whose
+		// (tier/channel, pool, raw proxy) identity was live-429ed by an
+		// earlier real send in this same unbound auth request. The skip is
+		// accounted as unavailable for its credential-domain exhaustion
+		// proof and marks the domain entered (the frozen object is now
+		// unsendable from real request-local evidence). It never counts as
+		// live429 for credential429, never increments attempts, never
+		// records an upstream attempt, and never writes scheduler state.
+		if _, ok := reqProxy429[proxy429Identity(cand.Tier, cand.PoolName, cand.ProxyRaw)]; ok {
+			if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+				set, ok := credUnavailable[cand.CredID]
+				if !ok {
+					set = make(map[string]struct{})
+					credUnavailable[cand.CredID] = set
+				}
+				set[cand.ProxyRaw] = struct{}{}
+				credEntered[cand.CredID] = true
+			}
+			continue
+		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -3665,6 +3695,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		// never sets it. Candidate traversal is bounded only by the frozen slice.
 		if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
+			if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+				reqProxy429[proxy429Identity(cand.Tier, cand.PoolName, cand.ProxyRaw)] = struct{}{}
+			}
 			retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 			ev, ok := cred429Evidence[cand.CredID]
 			if !ok {
@@ -3762,6 +3795,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					}
 				}
 				if classified.Cause == stableCauseLive429 {
+					if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+						reqProxy429[proxy429Identity(cand.Tier, cand.PoolName, cand.ProxyRaw)] = struct{}{}
+					}
 					retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
 					ev, ok := cred429Evidence[cand.CredID]
 					if !ok {

@@ -166,8 +166,9 @@ func TestUnifiedAnonPinnedThreeProxyL1One(t *testing.T) {
 	}
 }
 
-// Multi-credential exhaustion: A fully 429s then B 200; credential429 only
-// for A; single-proxy credential exhausts; pre-cooled never counts.
+// Multi-credential exhaustion: A fully 429s on shared proxies then B skips
+// (same identities) returning native 429; credential429 only for A;
+// single-proxy credential exhausts; pre-cooled never counts.
 func TestUnifiedMultiCredentialExhaustion(t *testing.T) {
 	newMultiGateway := func(t *testing.T) *Gateway {
 		t.Helper()
@@ -188,70 +189,101 @@ func TestUnifiedMultiCredentialExhaustion(t *testing.T) {
 		}
 		return gw
 	}
-	t.Run("AExhaustsThenB200", func(t *testing.T) {
+	t.Run("ASharedProxyExhaustionSkipsB", func(t *testing.T) {
 		gw := newMultiGateway(t)
 		if len(gw.authCreds) != 2 {
 			t.Fatalf("creds=%d want 2", len(gw.authCreds))
 		}
-		credA, credB := gw.authCreds[0], gw.authCreds[1]
-		// Determine frozen order for empty session to stub deterministically:
-		// stub by proxy behavior keyed on credential via header? Simpler: both
-		// proxies for A 429, both for B 200 would be ambiguous in one pool.
-		// Instead drive via per-proxy stubs that inspect the Authorization key
-		// tail: A tail vs B tail.
-		tailA, tailB := credA.display, credB.display
-		stub := func(pool string, idx int, calls *atomic.Int32) {
-			postStub(t, gw, pool, idx, calls, nil, func(r *http.Request) (*http.Response, error) {
-				auth := r.Header.Get("Authorization")
-				// Credential key material never appears in logs, but the stub
-				// may inspect the live header to emulate per-credential fate.
-				if len(auth) > 0 && len(tailA) > 0 && containsTail(auth, tailA) && !containsTail(auth, tailB) {
-					// Distinguish A-only path by checking exact key suffix match
-					// without logging key material.
-					r2 := responseWithBody(429, `{"error":"t"}`)
-					r2.Header.Set("Retry-After", "7")
-					return r2, nil
+		// Two credentials share exactly the same two (tier,pool,proxy)
+		// identities. Freeze the order to learn the first credential, then
+		// live-429 both of its proxies; the second credential's identical
+		// identities must skip via request-local proxy429 fencing.
+		ses := "ses_multi_exh_1"
+		cands := gw.scheduler.orderCandidates(
+			gw.scheduler.buildAuthCandidates(TierZen, gw.credentials(), gw.pools["z"], "m", 9223372036854775807),
+			ses,
+		)
+		if len(cands) != 4 {
+			t.Fatalf("frozen=%d want 4 (2 creds x 2 proxies)", len(cands))
+		}
+		firstCred := cands[0].CredID
+		var firstKey, secondKey, secondID string
+		for _, c := range gw.credentials() {
+			if c.id == firstCred {
+				firstKey = c.key
+			} else {
+				secondKey = c.key
+				secondID = c.id
+			}
+		}
+		if firstKey == "" || secondKey == "" {
+			t.Fatalf("cred keys missing")
+		}
+		var firstProxies []string
+		for _, c := range cands {
+			if c.CredID == firstCred {
+				firstProxies = append(firstProxies, c.ProxyRaw)
+			}
+		}
+		if len(firstProxies) != 2 {
+			t.Fatalf("first proxies=%d want 2", len(firstProxies))
+		}
+		// Frozen try order determines the last live 429 Retry-After.
+		retryByRaw := map[string]string{firstProxies[0]: "7", firstProxies[1]: "9"}
+		var z0, z1 atomic.Int32
+		var firstPosts, secondPosts atomic.Int32
+		for idx := range gw.pools["z"].items {
+			raw := gw.pools["z"].items[idx].name
+			retry := retryByRaw[raw]
+			var counter *atomic.Int32
+			if idx == 0 {
+				counter = &z0
+			} else {
+				counter = &z1
+			}
+			postStub(t, gw, "z", idx, counter, nil, func(r *http.Request) (*http.Response, error) {
+				k := authHeaderKey(r)
+				if k == firstKey {
+					firstPosts.Add(1)
+					resp := responseWithBody(429, `{"error":"t"}`)
+					resp.Header.Set("Retry-After", retry)
+					return resp, nil
 				}
-				// Default: decide by credential below via explicit per-cred run.
-				return responseWithBody(200, `{"ok":true}`), nil
+				if k == secondKey {
+					secondPosts.Add(1)
+					return responseWithBody(200, `{"error":"must be skipped"}`), nil
+				}
+				return responseWithBody(500, `{"error":"unexpected key"}`), nil
 			})
 		}
-		_ = stub
-		// Deterministic approach: freeze candidates and stub per (cred,proxy)
-		// by replacing transports with routing funcs that branch on the
-		// Bearer key. Use the real keys directly.
-		keyA, keyB := gw.authCreds[0].key, gw.authCreds[1].key
-		var z0, z1 atomic.Int32
-		postStub(t, gw, "z", 0, &z0, nil, func(r *http.Request) (*http.Response, error) {
-			if r.Header.Get("Authorization") == "Bearer "+keyA {
-				resp := responseWithBody(429, `{"error":"t"}`)
-				resp.Header.Set("Retry-After", "7")
-				return resp, nil
-			}
-			return responseWithBody(200, `{"ok":true}`), nil
-		})
-		postStub(t, gw, "z", 1, &z1, nil, func(r *http.Request) (*http.Response, error) {
-			if r.Header.Get("Authorization") == "Bearer "+keyA {
-				resp := responseWithBody(429, `{"error":"t"}`)
-				resp.Header.Set("Retry-After", "9")
-				return resp, nil
-			}
-			return responseWithBody(200, `{"ok":true}`), nil
-		})
 		route := authOnlyRoute()
 		route.KeyTiers = []Tier{TierZen}
-		resp, _, _, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs("ses_multi_exh_1", "r1"), 0)
-		if err != nil || resp.StatusCode != 200 {
-			t.Fatalf("A exhaust then B must 200, err=%v resp=%v", err, resp)
+		resp, _, attempts, err := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), pinIDs(ses, "r1"), 0)
+		if err != nil || resp.StatusCode != 429 {
+			t.Fatalf("shared-proxy exhaustion must keep native 429, err=%v resp=%v", err, resp)
+		}
+		if got := resp.Header.Get("Retry-After"); got != "9" {
+			t.Fatalf("Retry-After=%q want 9 (last live 429)", got)
 		}
 		drainResp(resp)
-		if _, _, ok := gw.scheduler.credential429CooldownStatus(credA.id); !ok {
-			t.Fatalf("exhausted credential A must write credential429")
+		if attempts != 2 {
+			t.Fatalf("attempts=%d want 2 (first-cred sends only)", attempts)
 		}
-		if _, _, ok := gw.scheduler.credential429CooldownStatus(credB.id); ok {
-			t.Fatalf("successful credential B must not write credential429")
+		if got := int(z0.Load() + z1.Load()); got != 2 {
+			t.Fatalf("native real sends=%d want 2", got)
 		}
-		_ = keyB
+		if got := int(firstPosts.Load()); got != 2 {
+			t.Fatalf("first credential sends=%d want 2", got)
+		}
+		if got := int(secondPosts.Load()); got != 0 {
+			t.Fatalf("second credential sends=%d want 0 (request-local skip)", got)
+		}
+		if _, _, ok := gw.scheduler.credential429CooldownStatus(firstCred); !ok {
+			t.Fatalf("exhausted first credential must write credential429")
+		}
+		if _, _, ok := gw.scheduler.credential429CooldownStatus(secondID); ok {
+			t.Fatalf("skipped second credential must not write credential429")
+		}
 	})
 	t.Run("SingleProxyExhausts", func(t *testing.T) {
 		cfg := testGatewayConfig(map[string][]string{"z": {"direct"}}, ProxyRoutingConfig{Anonymous: "z", Authenticated: "z"})
