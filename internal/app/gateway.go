@@ -798,6 +798,16 @@ func isSameTargetTransient(resp *http.Response, err error) bool {
 	return status >= 500 && status <= 599
 }
 
+// isStableCredential401 reports a real stable HTTP 401: an exact 401
+// response with no transport error. Unbound walkers gate it on
+// !isContextCancelled and treat the first such outcome per credential as a
+// credential-scoped L2 cause: skip remaining same-credential frozen
+// candidates and account those skips as unavailable without new sends,
+// attempts, or scheduler writes. 403 keeps the existing walk.
+func isStableCredential401(resp *http.Response, err error) bool {
+	return err == nil && resp != nil && resp.StatusCode == http.StatusUnauthorized
+}
+
 // isOrdinaryClientRejection reports deterministic request-shape rejections
 // that must end the current channel/tier without a same-target retry:
 // ordinary 4xx excluding 400 (dedicated recovery), 401/403/429 (cooldown
@@ -3088,6 +3098,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		return unboundDomainEvidence{Domain: "anonymous", Entered: entered, Frozen: frozen, Unavailable: len(anonUnavailable), Recovered400: recovered}
 	}
 	anonEntered := false
+	// anonCred401Seen is the unbound credential-scoped L2 cause for the
+	// single anonymous credential: the first real stable 401 stops any
+	// remaining same-credential frozen sends in this request. Skipped
+	// targets are accounted as unavailable below without new sends.
+	anonCred401Seen := false
 	markAnonUnavailable := func(proxyRaw string, resp *http.Response, err error) {
 		if proxyRaw == "" {
 			return
@@ -3159,6 +3174,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				return lastResponse, lastErr, attempts, false, true, anonEvidence(anonEntered, anonFrozen, false)
 			}
 		}
+		// Credential-scoped L2 cause: after the first real stable 401 the
+		// remaining same-credential frozen targets are skipped without a
+		// send. The skip is accounted as unavailable for exhaustion without
+		// fake attempts, upstream attempts, or scheduler writes.
+		if anonCred401Seen {
+			if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+				if _, ok := anonUnavailable[cand.ProxyRaw]; !ok {
+					anonUnavailable[cand.ProxyRaw] = struct{}{}
+				}
+			}
+			continue
+		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -3192,6 +3219,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			markAnonUnavailable(cand.ProxyRaw, resp, nil)
+		}
+		if isStableCredential401(resp, err) && !isContextCancelled(ctx) {
+			anonCred401Seen = true
 		}
 		if err == nil && resp != nil && resp.StatusCode/100 == 2 {
 			if isStreamContext(ctx) {
@@ -3255,6 +3285,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 					// above, cancel already returned, BuildErr/committed
 					// never reach here).
 					markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
+					if isStableCredential401(final.Resp, final.Err) && !isContextCancelled(ctx) {
+						anonCred401Seen = true
+					}
 				}
 			}
 			lastResponse = final.Resp
@@ -3274,6 +3307,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			markAnonUnavailable(cand.ProxyRaw, resp, nil)
+		}
+		if isStableCredential401(resp, err) && !isContextCancelled(ctx) {
+			anonCred401Seen = true
 		}
 		lastResponse = resp
 		lastErr = err
@@ -3520,6 +3556,11 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	credEntered := make(map[string]bool)
 	credRecovered := make(map[string]bool)
 	credUnavailable := make(map[string]map[string]struct{})
+	// credStable401 is the unbound credential-scoped L2 cause: after the
+	// first real stable 401 for one CredID, remaining frozen candidates
+	// with the same CredID are skipped without a send. Skips are accounted
+	// as unavailable for exhaustion without fake attempts or writes.
+	credStable401 := make(map[string]bool)
 	markCredUnavailable := func(credID, proxyRaw string, resp *http.Response, err error) {
 		if credID == "" || proxyRaw == "" {
 			return
@@ -3569,6 +3610,20 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			if _, ok := g.scheduler.pinGet(ids.Session, route.ID); ok {
 				return lastResponse, lastErr, attempts, false, true, buildKeyDomains()
 			}
+		}
+		// Credential-scoped L2 cause: skip remaining same-credential frozen
+		// targets without a send; account the skip as unavailable for
+		// exhaustion without fake attempts, upstream attempts, or writes.
+		if credStable401[cand.CredID] {
+			if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+				set, ok := credUnavailable[cand.CredID]
+				if !ok {
+					set = make(map[string]struct{})
+					credUnavailable[cand.CredID] = set
+				}
+				set[cand.ProxyRaw] = struct{}{}
+			}
+			continue
 		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
@@ -3638,6 +3693,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		if err == nil && resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
 		}
+		if isStableCredential401(resp, err) && !isContextCancelled(ctx) {
+			credStable401[cand.CredID] = true
+		}
 		if isContextCancelled(ctx) {
 			return resp, err, attempts, false, false, buildKeyDomains()
 		}
@@ -3699,6 +3757,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			case unboundActionAdvanceNext:
 				if decision.MarkUnavailable {
 					markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
+					if isStableCredential401(final.Resp, final.Err) && !isContextCancelled(ctx) {
+						credStable401[cand.CredID] = true
+					}
 				}
 				if classified.Cause == stableCauseLive429 {
 					retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
@@ -3747,6 +3808,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 		}
 		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
 			markCredUnavailable(cand.CredID, cand.ProxyRaw, resp, nil)
+		}
+		if isStableCredential401(resp, err) && !isContextCancelled(ctx) {
+			credStable401[cand.CredID] = true
 		}
 		lastResponse = resp
 		lastErr = err

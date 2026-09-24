@@ -141,6 +141,11 @@
 
 ### 修订历史（Revision History）
 
+- **2026-09-24 — 未绑定 401 凭证级 L2 原因（已实现/已验证切片，无广义矩阵）：**
+  - 未绑定建立（匿名/认证共享冻结遍历，含空会话直达路径）将首个真实稳定 401（`err==nil && 401` 且非取消；含 L1 同目标观察后稳定 401）视为凭证级 L2 原因：同请求内不再发送同 `CredID` 剩余冻结候选，直接进入下一 distinct credential（匿名单凭证则结束剩余代理遍历并按既有外层进入认证 lane）；跳过目标按该凭证级原因计入该域 `Unavailable`，无伪发送/`attempts`/upstream attempts/调度写入（401 本体既有 `credential401` 写入保留，403/429/408/425/5xx/transport/400/ordinary/cancel/deadline/committed/pin/custom 门不变）。
+  - 验证：新增 `unbound_401_credential_scope_test.go`（auth 首 401 跳过同凭证并进下一凭证成功/pin、transient→L1 稳定 401 同跳过且 attempts=2+1、匿名首 401 单发送后进认证、双域 401 跳过仍按域耗尽接管 active custom 且 attempts=实发+custom），既有 `TestServerRetryAndNoRetryClasses/Unauthorized_no_retry` 按新语义更新为 401 跳过匿名次代理并进认证（429/403 行不变），`go test ./... -count=1` 通过、gofmt 干净。
+  - 语义边界：仅未绑定；已绑定 401 不移动/不跨域规则不变；预冷冻结排除不变；不冻结广义逐状态矩阵/退避/广义 fallback。
+
 - **2026-09-24 — 未绑定 post-L1 共享纯决策接缝（未提交行为保持增量，无原则变更）：**
   - HEAD `2463f1c` 之上工作树未提交：`internal/app/gateway.go` 新增 `decideUnboundPostL1`（`cause + lane context -> action` 纯函数，匿名/已认证 walker 消费，行为保持；发送/L1/重放执行/调度写入/credential429 证据/pin/body/custom 聚合仍归既有调用方） + 新 `internal/app/gateway_unbound_decision_test.go`（`TestDecideUnboundPostL1` 含取消优先行：exact400/ordinary/L1Final+Cancelled → return-context 双 lane、Success+Cancelled → return-success、Build+Cancelled → return-build） + 408/425 双域测试证据（同属本增量，见下条）。
   - 语义边界：纯决策接缝，不选响应、不排空、不触碰状态；不冻结广义 cause→L2 矩阵/fallback/退避，不声称三层已完全落地。

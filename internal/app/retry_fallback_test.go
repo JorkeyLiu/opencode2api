@@ -312,7 +312,7 @@ func TestServerRetryAndNoRetryClasses(t *testing.T) {
 		}
 		_ = monitor
 	})
-	for _, status := range []int{429, 403, 401} {
+	for _, status := range []int{429, 403} {
 		t.Run(http.StatusText(status)+"_no_retry", func(t *testing.T) {
 			monitor := NewMonitor()
 			gateway := routing400Gateway(t, monitor)
@@ -335,6 +335,36 @@ func TestServerRetryAndNoRetryClasses(t *testing.T) {
 			_ = monitor
 		})
 	}
+	// 401 is a credential-scoped L2 cause in unbound establishment: the first
+	// real 401 skips remaining same-credential anonymous proxies and proceeds
+	// to the authenticated lane (no same-target retry, no second anon send).
+	t.Run("Unauthorized_no_retry", func(t *testing.T) {
+		monitor := NewMonitor()
+		gateway := routing400Gateway(t, monitor)
+		var a0calls, a1calls, zcalls atomic.Int32
+		postStub(t, gateway, "a", 0, &a0calls, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(401, `{"error":"x"}`), nil
+		})
+		postStub(t, gateway, "a", 1, &a1calls, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		postStub(t, gateway, "z", 0, &zcalls, nil, func(*http.Request) (*http.Response, error) {
+			return responseWithBody(200, `{"ok":true}`), nil
+		})
+		ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
+		resp, _, _, err := gateway.doUpstreamTiers(ctx, anonAuthRoute(), routeBodies(), emptySessionIDs(), 0)
+		if err != nil || resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("status 401 err=%v resp=%v", err, resp)
+		}
+		drainAndClose(resp.Body)
+		if postCount(&a0calls) != 1 || postCount(&a1calls) != 0 {
+			t.Fatalf("401 must skip remaining anon proxy: %d/%d", postCount(&a0calls), postCount(&a1calls))
+		}
+		if postCount(&zcalls) != 1 {
+			t.Fatalf("401 must proceed to auth lane: z=%d", postCount(&zcalls))
+		}
+		_ = monitor
+	})
 }
 
 // 6. Anonymous ordinary 4xx ends the channel but still enters auth (covered by

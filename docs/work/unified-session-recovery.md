@@ -8,7 +8,7 @@
 
 ## Reality
 
-- Behaviorally implemented: single-`retry.max_attempts` bounded same-target L1 observation; exact-400 corrective same-target replay that is route-terminal; cancellation/deadline/committed-byte stop boundaries; unbound custom eligibility by independent per-domain object-unavailable exhaustion; pinned full live-429 traversal plus bounded consumption; pinned transport/move/session rules and the 503 no-L2-observation policy. Exact semantics live in `AGENTS.md` §3–4 and `docs/adr/0001`, not here.
+- Behaviorally implemented: single-`retry.max_attempts` bounded same-target L1 observation; exact-400 corrective same-target replay that is route-terminal; cancellation/deadline/committed-byte stop boundaries; unbound custom eligibility by independent per-domain object-unavailable exhaustion; unbound 401 credential-scoped L2 cause (first real stable 401 skips remaining same-credential frozen targets, skips count as unavailable without sends, incl. L1-final 401); pinned full live-429 traversal plus bounded consumption; pinned transport/move/session rules and the 503 no-L2-observation policy. Exact semantics live in `AGENTS.md` §3–4 and `docs/adr/0001`, not here.
 - HEAD `bcbfb8e` changed none of the above: it centralized unbound post-L1 lane decisions into the pure `decideUnboundPostL1` seam (consumed by unbound anon/auth walkers) plus its unit test with cancellation-priority rows and 408/425 both-domain custom-takeover end-to-end evidence. Structural centralization plus tests only — not observable recovery-semantic progress.
 
 ## Distance
