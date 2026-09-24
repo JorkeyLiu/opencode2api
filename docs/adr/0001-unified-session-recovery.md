@@ -113,7 +113,7 @@
 
 ## 8. 验证要求（Validation Required）
 
-以下为验证要求分项现状（锚点说明：下述“已执行”覆盖截至 HEAD `488f3c9`（当时工作区干净）的已实现切片验证，以及 `488f3c9..HEAD 4958720`（`419d5ac` native pin+stream cancel、`4958720` custom cancel）生产增量 + 未提交 gateway 一行取消门的静态输出审查与本轮 `go test ./... -count=1`/gofmt/build/diff --check 验证；广义矩阵外不假称为已整体审查）。其中锚点内已实现切片——单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝——对应的验证已执行且通过（见各项“已执行”标注）；广义 cause→action 矩阵/退避/广义 fallback 仍未决定，对应验证保持 pending，不宣称完整统一三层完成：
+以下为验证要求分项现状（锚点说明：下述“已执行”覆盖截至 HEAD `488f3c9`（当时工作区干净）的已实现切片验证，以及 `488f3c9..HEAD 2463f1c`（`419d5ac` native pin+stream cancel、`4958720` custom cancel、`2463f1c` gateway 取消资格门 + 两 unbound auth 用例，均已提交）生产增量（含本文档/ADR 同步更新）的静态输出审查与 `go test ./... -count=1`/gofmt/build/diff --check 验证，另加 HEAD `2463f1c` 之上本增量（随本提交合入：`gateway.go` 共享纯未绑定 post-L1 决策接缝，行为保持 + 新 `gateway_unbound_decision_test.go` 决策测试 + `unbound_exhaustion_stateagnostic_test.go` 表驱动 `TestUnboundExhaustion408425BothDomainsAllowCustom` 测试证据；其中 408/425 的聚焦/包级/`go test ./... -count=1`/gofmt/`git diff --check`/临时构建按委托记录通过，本轮新增接缝聚焦 `TestDecideUnboundPostL1`/gofmt/`git diff --check`已执行、全量与构建随本提交前终检执行见终检记录；广义矩阵外不假称为已整体审查）。其中锚点内已实现切片——单一 L1 观察、400 route-terminal、unbound 逐域状态无关耗尽、pinned 全量 live429 + 有界 consumption、cancel/deadline/committed、503 无独立 L2 循环、retry 旧字段拒绝——对应的验证已执行且通过（见各项“已执行”标注）；广义 cause→action 矩阵/退避/广义 fallback 仍未决定，对应验证保持 pending，不宣称完整统一三层完成：
 
 - `go test ./... -count=1` 通过（CI 门禁）——已执行（现有验证，全量回归通过；见工作文档 §8）。
 - `go build -o opencode2api ./cmd/opencode2api` 构建通过——已执行（现有验证）。
@@ -122,7 +122,9 @@
 - 400 同目标修正重放后终态的路径测试（L2 修正动作完成后按 L3 终止/忠实返回，重放后不进入正常恢复/不触发后续候选、通道或 fallback，重放结果即路由最终结果，不是 L1 retry；`TestAnonymous400ReplaysSameTarget` / `TestAuthZen400ReplaySuccess` / `TestAuth400RecoveryRouteTerminal` / `TestCustomTakeover400ReplayFinalNoCustom` / `TestMaybeReplayCandidate400Entry` / `TestClassifyStableCause`）——已执行。
 - 取消 / deadline / 已提交字节后停止恢复的测试（L3 边界；`TestCancelStopsRetryFallback` / `CommittedStream_*` 路由层回归 / `TestPinnedConsumptionAuthDeadlineNoCustom` / `TestPinnedConsumptionAuthCancelDuringSecondProxyNoCustom`）——已执行。
 - 预算收敛的拒绝语义测试（`retry.max_attempts` 为唯一 L1 最小观察计数，含首次发送，非统一错误额度/对象队列额度；已删除 `transient_max_attempts` 严格 unknown-field 拒绝、无值迁移；`TestTransientMaxAttemptsStrictlyRejected` / `TestObserveSameTargetTransientStops` 计数语义）——已执行。
-- 未引入新的未脱敏日志/指标输出的人工审查（历史区间 `b2c4798..488f3c9` 内生产 Go 变更仅 `internal/app/gateway.go`，无新增 logger/metrics/admin/history 输出，未见新的未脱敏路径；该结论仅适用于该旧区间，不得扩张到之后变更）——已执行（区间内）。`488f3c9..HEAD 4958720`（`419d5ac` 的 `scheduler.go`+`gateway.go` 取消边界、`4958720` 的 `fallback.go`+`gateway.go` custom 绑定）生产增量 + 未提交 gateway 一行（`doKeyUpstream` credential429 写入改走 `Cancelled: isContextCancelled(ctx)`）的全部生产 Go diff（`fallback.go`/`gateway.go`/`scheduler.go`）静态人工审查已执行：新增 logger/metrics/admin/history/body/key/session/proxy 输出 sink 0 个，流式 `logTargetCooldownSet` 为旧调用移入 cancel guard 内，monitor record 口径不变；限此范围未见新增未脱敏输出，不声称全库安全审计。本轮 `go test ./... -count=1`/gofmt/build/diff --check 已执行且通过。
+- 未绑定 408/425 双域 L1-final 耗尽接管的测试证据（同属本增量，随本提交合入，仅测试证据，无生产语义变更：`TestUnboundExhaustion408425BothDomainsAllowCustom` 表驱动 408/425，anon/auth 两域均进入、各单冻结候选、`MaxAttempts=3` 各 3 次同目标 L1 观察后按域耗尽→active custom 接管一次并绑定 session、不建 pin，`attempts=7`；408/425 调度中性：不写 proxy429/channel/target/credential401/credential429；不声称广义矩阵完成）——已执行（聚焦测试、包级测试、`go test ./... -count=1`、gofmt 干净、`git diff --check`、仓库外临时构建按委托记录通过，本文件内不重跑、不代验）。
+- 未绑定 post-L1 共享纯决策接缝与取消优先测试证据（本增量，随本提交合入，行为保持，无原则变更：`gateway.go` `decideUnboundPostL1` 为匿名/已认证 walker 共用的 `cause + lane context -> action` 纯函数——lane 区分匿名 `Cause==context||Cancelled` 与已认证 `Cancelled` 门，其余 build/success/exact400/ordinary/live429/L1-final 映射为当前行为，不选响应、不排空、不触碰调度/pin/custom/attempt 状态，发送/L1/重放执行/调度写入/credential429 证据/pin/body/custom 聚合仍归既有调用方；`gateway_unbound_decision_test.go` `TestDecideUnboundPostL1` 覆盖 exact400+Cancelled/ordinary+Cancelled/L1Final+Cancelled → return-context 双 lane、Success+Cancelled → return-success、Build+Cancelled → return-build 及既有 lane/mark 行；无生产语义变更，不冻结广义 cause→L2 矩阵/fallback/退避，不声称三层已完全落地）——已执行（本轮聚焦 `TestDecideUnboundPostL1` 通过、gofmt 干净、`git diff --check` 通过；全量回归与构建随本提交前终检执行，见终检记录）。
+- 未引入新的未脱敏日志/指标输出的人工审查（历史区间 `b2c4798..488f3c9` 内生产 Go 变更仅 `internal/app/gateway.go`，无新增 logger/metrics/admin/history 输出，未见新的未脱敏路径；该结论仅适用于该旧区间，不得扩张到之后变更）——已执行（区间内）。`488f3c9..HEAD 2463f1c`（`419d5ac` 的 `scheduler.go`+`gateway.go` 取消边界、`4958720` 的 `fallback.go`+`gateway.go` custom 绑定、`2463f1c` 的 `gateway.go` 一行取消资格门，均已提交）生产增量（含两 unbound auth 用例与文档同步）的全部生产 Go diff（`fallback.go`/`gateway.go`/`scheduler.go`）静态人工审查已执行：新增 logger/metrics/admin/history/body/key/session/proxy 输出 sink 0 个，流式 `logTargetCooldownSet` 为旧调用移入 cancel guard 内，monitor record 口径不变；限此范围未见新增未脱敏输出，不声称全库安全审计。本轮 `go test ./... -count=1`/gofmt/build/diff --check 已执行且通过。
 - 广义 cause→action 矩阵 / 退避 / 广义 fallback 与对象策略的验证——pending（对应行为仍未决定，不宣称完成）。
 
 > 历史记录：本文档创建时（2026-09-22）上述验证尚未执行；现行状态见上——当前已实现切片的对应验证已执行且通过，广义矩阵/对象策略验证仍 pending。
@@ -138,6 +140,20 @@
 **附注：** 本 ADR 仅记录已稳定的方向性决策，所有逐状态码行为矩阵、阈值、退避与计数器等实现细节均显式标记为待定，不得视为已接受决策；不擅自冻结所有状态码矩阵。
 
 ### 修订历史（Revision History）
+
+- **2026-09-24 — 未绑定 post-L1 共享纯决策接缝（未提交行为保持增量，无原则变更）：**
+  - HEAD `2463f1c` 之上工作树未提交：`internal/app/gateway.go` 新增 `decideUnboundPostL1`（`cause + lane context -> action` 纯函数，匿名/已认证 walker 消费，行为保持；发送/L1/重放执行/调度写入/credential429 证据/pin/body/custom 聚合仍归既有调用方） + 新 `internal/app/gateway_unbound_decision_test.go`（`TestDecideUnboundPostL1` 含取消优先行：exact400/ordinary/L1Final+Cancelled → return-context 双 lane、Success+Cancelled → return-success、Build+Cancelled → return-build） + 408/425 双域测试证据（同属本增量，见下条）。
+  - 语义边界：纯决策接缝，不选响应、不排空、不触碰状态；不冻结广义 cause→L2 矩阵/fallback/退避，不声称三层已完全落地。
+  - §8 新增对应“已执行”验证证据行（本轮聚焦/gofmt/`git diff --check` 通过，全量与构建本轮未执行）；最高原则、503 关闭口径、400 终态与已锁定 pins 不变；广义逐状态矩阵、广义 fallback 与退避仍未冻结、验证保持 pending。
+
+- **2026-09-24 — 未绑定 408/425 双域测试追加（同属当前未提交增量，仅测试证据，无原则/生产语义变更）：**
+  - HEAD `2463f1c` 之上工作树未提交：`internal/app/unbound_exhaustion_stateagnostic_test.go` 表驱动 `TestUnboundExhaustion408425BothDomainsAllowCustom`（408/425 各一子用例），无生产 Go 变更，不 commit。
+  - 语义边界：anon/auth 两域均进入、各单冻结候选、`MaxAttempts=3` 各 3 次同目标 L1 观察后按域耗尽→active custom 接管一次并绑定 session、不建 pin；408/425 调度中性（不写 proxy429/channel/target/credential401/credential429）；不声称生产行为变更或广义 cause→L2/fallback/backoff 矩阵完成。
+  - §8 新增对应“已执行”验证证据行（聚焦/包级/`go test ./... -count=1`/gofmt/`git diff --check`/临时构建按委托记录通过）；最高原则、503 关闭口径、400 终态与已锁定 pins 不变；广义逐状态矩阵、广义 fallback 与退避仍未冻结、验证保持 pending。
+
+- **2026-09-24 — `2463f1c` 取消后不写 credential cooldown 已提交（文档事实更新，无原则变更）：**
+  - HEAD `2463f1c`（`fix(recovery): suppress credential cooldown after cancellation`）已提交，工作树干净；含 `gateway.go` 一行（`doKeyUpstream` 全耗尽 `noteCredential429Failure` 前资格改走 `Cancelled: isContextCancelled(ctx)`，取消中 live 429 不写 `credential429`）与 `unbound_auth_started_test.go` 两用例（取消不写 / no-cancel 对照写）及文档同步更新；此前“HEAD `4958720` + 未提交”表述已 superseded。
+  - 最高原则、503 关闭口径、400 终态与已锁定 pins 不变；广义 cause→L2 映射、广义 fallback 与退避仍未冻结，不声称三层已完全落地。
 
 - **2026-09-24 — §8 验证锚点收束到区间覆盖（文档事实更新，无原则变更）：**
   - §8“已执行”明确仅覆盖截至 `488f3c9` 的已实现切片验证；当前 HEAD `4958720`（`419d5ac`/`4958720` 生产增量）与工作树未提交改动不在该锚点覆盖内，不假称为已整体审查。

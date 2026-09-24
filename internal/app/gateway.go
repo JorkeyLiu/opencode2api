@@ -1345,6 +1345,72 @@ func pinnedAuthContextEarlyReturn(r stableCauseResult) bool {
 	return r.Stop == transientStopContext || (r.Stop == transientStopStable && r.Cancelled)
 }
 
+// unboundLane selects the preserved per-lane context gate for the shared
+// unbound post-L1 decision: anonymous keeps Cause==stableCauseContext||
+// Cancelled, authenticated keeps Cancelled only.
+type unboundLane int
+
+const (
+	unboundLaneAnonymous unboundLane = iota
+	unboundLaneAuthenticated
+)
+
+// unboundAction is the pure post-L1 object action for one unbound frozen
+// candidate: return the build failure, return the 2xx success (caller binds),
+// return the context/cancelled final, run the existing same-target exact-400
+// replay (caller executes), return the ordinary rejection faithfully, or
+// advance to the next frozen candidate.
+type unboundAction int
+
+const (
+	unboundActionReturnBuild unboundAction = iota
+	unboundActionReturnSuccess
+	unboundActionReturnContext
+	unboundActionReplay
+	unboundActionReturnOrdinary
+	unboundActionAdvanceNext
+)
+
+// unboundDecision is the pure post-L1 decision: the action plus whether the
+// advance proves its object unavailable. It selects no response, drains
+// nothing, and touches no scheduler/pin/custom/attempt state; the caller
+// retains all effects.
+type unboundDecision struct {
+	Action          unboundAction
+	MarkUnavailable bool
+}
+
+// decideUnboundPostL1 is the single pure post-L1 decision seam shared by the
+// two unbound walkers. Inputs are lane plus Cause/Stop/Cancelled only; it
+// never reads ctx, Final, attempts, Started, Retry-After, or any runtime
+// state. Mapping is current behavior only: build returns build,
+// success returns success, exact 400 replays, ordinary 4xx returns
+// faithfully, live 429 advances with mark, and L1-final advances with mark
+// only for transientStopObservationLimit or transientStopStable.
+func decideUnboundPostL1(lane unboundLane, r stableCauseResult) unboundDecision {
+	switch {
+	case r.Cause == stableCauseBuildFailure:
+		return unboundDecision{Action: unboundActionReturnBuild}
+	case r.Cause == stableCauseSuccess:
+		return unboundDecision{Action: unboundActionReturnSuccess}
+	case lane == unboundLaneAnonymous && (r.Cause == stableCauseContext || r.Cancelled):
+		return unboundDecision{Action: unboundActionReturnContext}
+	case lane == unboundLaneAuthenticated && r.Cancelled:
+		return unboundDecision{Action: unboundActionReturnContext}
+	case r.Cause == stableCauseExact400:
+		return unboundDecision{Action: unboundActionReplay}
+	case r.Cause == stableCauseOrdinaryRejection:
+		return unboundDecision{Action: unboundActionReturnOrdinary}
+	case r.Cause == stableCauseLive429:
+		return unboundDecision{Action: unboundActionAdvanceNext, MarkUnavailable: true}
+	default:
+		if r.Stop == transientStopObservationLimit || r.Stop == transientStopStable {
+			return unboundDecision{Action: unboundActionAdvanceNext, MarkUnavailable: true}
+		}
+		return unboundDecision{Action: unboundActionAdvanceNext}
+	}
+}
+
 // observeSameTargetTransient owns only the L1 same-target observation mechanism
 // starting from an initial transient attemptOutcome: while it remains
 // isSameTargetTransient it drains the retried outcome, sleeps with
@@ -3156,12 +3222,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 			})
 			classified := classifyStableCause(ctx, loopRes)
 			final := classified.Final
-			stop := classified.Stop
-			_ = stop
-			if classified.Cause == stableCauseBuildFailure {
+			switch decision := decideUnboundPostL1(unboundLaneAnonymous, classified); decision.Action {
+			case unboundActionReturnBuild:
 				return nil, final.BuildErr, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
-			}
-			if classified.Cause == stableCauseSuccess {
+			case unboundActionReturnSuccess:
 				if isStreamContext(ctx) {
 					g.logger.Debug("anonymous transient retry stream committed", "component", "upstream", "event", "anonymous_transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
@@ -3169,11 +3233,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 				}
 				g.bindSessionPinCtx(ctx, ids.Session, route.ID, TierZen, anonymousSchedulerCredentialID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(g.cfg.Upstream.Zen))
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
-			}
-			if classified.Cause == stableCauseContext || classified.Cancelled {
+			case unboundActionReturnContext:
 				return final.Resp, final.Err, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
-			}
-			if classified.Cause == stableCauseExact400 {
+			case unboundActionReplay:
 				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, TierZen, g.cfg.Upstream.Zen, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 					attempts = replayed
 					if replayResp != nil || replayErr != nil {
@@ -3181,20 +3243,19 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 					}
 					return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
 				}
-			}
-			if classified.Cause == stableCauseOrdinaryRejection {
+			case unboundActionReturnOrdinary:
 				g.logger.Debug("anonymous transient retry hit ordinary rejection; ending anonymous channel", "component", "upstream", "event", "anonymous_attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", TierZen, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				return final.Resp, nil, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
-			}
-			if classified.Cause == stableCauseLive429 {
-				markAnonUnavailable(cand.ProxyRaw, final.Resp, nil)
-			} else if stop == transientStopObservationLimit || stop == transientStopStable {
-				// L1-final transport/408/425/5xx, stable 401/403, or L1-final
-				// stream startup failure after observation proves the object
-				// unavailable (each frozen candidate once; ordinary 4xx/400
-				// already returned above, cancel already returned,
-				// BuildErr/committed never reach here).
-				markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
+			case unboundActionAdvanceNext:
+				if decision.MarkUnavailable {
+					// Live 429, or L1-final transport/408/425/5xx, stable
+					// 401/403, or L1-final stream startup failure after
+					// observation proves the object unavailable (each frozen
+					// candidate once; ordinary 4xx/400 already returned
+					// above, cancel already returned, BuildErr/committed
+					// never reach here).
+					markAnonUnavailable(cand.ProxyRaw, final.Resp, final.Err)
+				}
 			}
 			lastResponse = final.Resp
 			lastErr = final.Err
@@ -3597,12 +3658,10 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 			})
 			classified := classifyStableCause(ctx, loopRes)
 			final := classified.Final
-			stop := classified.Stop
-			_ = stop
-			if classified.Cause == stableCauseBuildFailure {
+			switch decision := decideUnboundPostL1(unboundLaneAuthenticated, classified); decision.Action {
+			case unboundActionReturnBuild:
 				return nil, final.BuildErr, attempts, false, false, buildKeyDomains()
-			}
-			if classified.Cause == stableCauseSuccess {
+			case unboundActionReturnSuccess:
 				if isStreamContext(ctx) {
 					g.logger.Debug("upstream transient retry stream committed", "component", "upstream", "event", "transient_retry_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "status", final.Resp.StatusCode)
 				} else {
@@ -3610,11 +3669,9 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				}
 				g.bindSessionPinCtx(ctx, ids.Session, route.ID, route.Tier, cand.CredID, cand.PoolName, cand.ProxyRaw, route.Protocol, normalizeRouteAuthority(baseURL))
 				return final.Resp, nil, attempts, false, false, buildKeyDomains()
-			}
-			if classified.Cancelled {
+			case unboundActionReturnContext:
 				return final.Resp, final.Err, attempts, false, false, buildKeyDomains()
-			}
-			if classified.Cause == stableCauseExact400 {
+			case unboundActionReplay:
 				if handled, replayResp, replayErr, replayed := g.maybeReplayCandidate400(ctx, final.Resp, final.Err, final.Diag, route, route.Tier, baseURL, route.Protocol, body, ids, cand, scope, routeSession, attemptOffset, attempts, nil); handled {
 					attempts = replayed
 					if replayResp != nil || replayErr != nil {
@@ -3623,38 +3680,51 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					}
 					return final.Resp, nil, attempts, false, false, buildKeyDomains()
 				}
-			}
-			if classified.Cause == stableCauseOrdinaryRejection {
-				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
-				return final.Resp, nil, attempts, false, false, buildKeyDomains()
-			}
-			if classified.Cause == stableCauseLive429 {
-				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, nil)
-				retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
-				ev, ok := cred429Evidence[cand.CredID]
-				if !ok {
-					ev = make(map[string]time.Duration)
-					cred429Evidence[cand.CredID] = ev
-				}
-				if _, seen := ev[cand.ProxyRaw]; !seen {
-					ev[cand.ProxyRaw] = retryAfter
-					cred429LastRetry[cand.CredID] = retryAfter
-					cred429LastStarted[cand.CredID] = final.Started
-					if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: final.Resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
-						_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
-					}
-				}
+				// Defensive not-handled fall-through preserves the original
+				// advance tail (exact 400 mark is a no-op via
+				// unboundObjectUnavailable).
 				lastResponse = final.Resp
 				lastErr = final.Err
+				if final.Err != nil {
+					g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
+				} else if final.Resp != nil {
+					g.logger.Debug("upstream transient retry returned a retryable response", "component", "upstream", "event", "attempt_retryable_response", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+				} else {
+					g.logger.Debug("upstream transient retry still failing", "component", "upstream", "event", "attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "proxy", redactURL(cand.Proxy.name), "error", final.Err)
+				}
 				continue
-			}
-			// L1-final transport/408/425/5xx, stable 401/403, or L1-final
-			// stream startup failure after observation proves the object
-			// unavailable (each frozen candidate once; ordinary 4xx/400
-			// already returned, cancel already returned, BuildErr/committed
-			// never reach here).
-			if stop == transientStopObservationLimit || stop == transientStopStable {
-				markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
+			case unboundActionReturnOrdinary:
+				g.logger.Debug("upstream rejected a non-retryable request", "component", "upstream", "event", "attempt_rejected", "request_id", ids.Request, "attempt", attempts, "tier", route.Tier, "protocol", route.Protocol, "client_session_hash", clientSessionHash(ids.Session), "key_id", cand.CredDisplay, "status", final.Resp.StatusCode, "proxy", redactURL(cand.Proxy.name))
+				return final.Resp, nil, attempts, false, false, buildKeyDomains()
+			case unboundActionAdvanceNext:
+				if decision.MarkUnavailable {
+					markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
+				}
+				if classified.Cause == stableCauseLive429 {
+					retryAfter := parseRetryAfter(final.Resp.Header.Get("Retry-After"))
+					ev, ok := cred429Evidence[cand.CredID]
+					if !ok {
+						ev = make(map[string]time.Duration)
+						cred429Evidence[cand.CredID] = ev
+					}
+					if _, seen := ev[cand.ProxyRaw]; !seen {
+						ev[cand.ProxyRaw] = retryAfter
+						cred429LastRetry[cand.CredID] = retryAfter
+						cred429LastStarted[cand.CredID] = final.Started
+						if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: final.Resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
+							_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
+						}
+					}
+					lastResponse = final.Resp
+					lastErr = final.Err
+					continue
+				}
+				// L1-final transport/408/425/5xx, stable 401/403, or L1-final
+				// stream startup failure after observation proves the object
+				// unavailable (each frozen candidate once; ordinary 4xx/400
+				// already returned, cancel already returned, BuildErr/committed
+				// never reach here). Mark above already applied the Stop-gated
+				// decision.
 			}
 			lastResponse = final.Resp
 			lastErr = final.Err

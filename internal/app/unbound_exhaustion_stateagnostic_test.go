@@ -947,3 +947,101 @@ func TestUnboundExhaustion503PartialOrdinaryNoCustom(t *testing.T) {
 		t.Fatalf("attempts=%d want 4 (3 anon + 1 auth, no custom)", attempts)
 	}
 }
+
+// L1-final 408/425 in both entered native domains exhausts the unbound route
+// and takes over the active custom fallback. Anonymous and authenticated each
+// hold one frozen candidate returning the same transient status; with
+// MaxAttempts=3 each candidate is observed exactly 3 times on the same target
+// (unique L1 bound), then counts once as unavailable (Frozen=1/Unavailable=1
+// per domain). 408/425 are transient neutral and must not write any cooldown
+// state. Real doUpstreamTiers unbound path with a non-empty bindable session.
+func TestUnboundExhaustion408425BothDomainsAllowCustom(t *testing.T) {
+	for _, status := range []int{408, 425} {
+		t.Run(fmt.Sprintf("%d", status), func(t *testing.T) {
+			var customHits atomic.Int32
+			gw := unboundExhaustionGateway(t, []string{"direct"}, []string{"direct"}, []string{fmt.Sprintf("zen-key-exhaust-%d-both-1", status)}, &customHits, true)
+			gw.cfg.Retry.MaxAttempts = 3
+			gw.cfg.Retry.TransientRetryIntervalSeconds = 0
+			var anonPosts, authPosts atomic.Int32
+			postStub(t, gw, "a", 0, &anonPosts, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(status, `{"error":"transient"}`), nil
+			})
+			postStub(t, gw, "z", 0, &authPosts, nil, func(*http.Request) (*http.Response, error) {
+				return responseWithBody(status, `{"error":"transient"}`), nil
+			})
+			ses := fmt.Sprintf("ses_unbound_%d_both_1", status)
+			if ses == "" {
+				t.Fatalf("session must be non-empty bindable")
+			}
+			resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, unboundExhaustionExtra())
+			if err != nil || resp == nil {
+				t.Fatalf("err=%v resp=%v", err, resp)
+			}
+			defer drainResp(resp)
+			if resp.StatusCode != 200 || eff.Tier != TierCustom {
+				t.Fatalf("both-domain L1-final %d exhaustion must take over custom, got %d %+v", status, resp.StatusCode, eff)
+			}
+			if eff.ID != "cm-exhaust" {
+				t.Fatalf("custom response tier model=%q want cm-exhaust", eff.ID)
+			}
+			if customHits.Load() != 1 {
+				t.Fatalf("must hit custom exactly once, got %d", customHits.Load())
+			}
+			binding, ok := gw.scheduler.fallbacks.get(ses)
+			if !ok {
+				t.Fatalf("must bind session-keyed fallback")
+			}
+			if binding.ID == "" && binding.Name == "" {
+				t.Fatalf("fallback binding must carry channel identity: %+v", binding)
+			}
+			if _, ok := gw.scheduler.pinGet(ses, "m"); ok {
+				t.Fatalf("custom takeover must not establish a session pin")
+			}
+			if got := postCount(&anonPosts); got != 3 {
+				t.Fatalf("anonPosts=%d want 3 (initial + 2 same-target L1 retries)", got)
+			} else if got == 0 {
+				t.Fatalf("anonymous domain was never entered")
+			}
+			if got := postCount(&authPosts); got != 3 {
+				t.Fatalf("authPosts=%d want 3 (initial + 2 same-target L1 retries)", got)
+			} else if got == 0 {
+				t.Fatalf("authenticated domain was never entered")
+			}
+			if attempts != 7 {
+				t.Fatalf("attempts=%d want 7 (3 anon + 3 auth + 1 custom)", attempts)
+			}
+			anonRaw := gw.pools["a"].items[0].name
+			authRaw := gw.pools["z"].items[0].name
+			authCred := gw.authCreds[0].id
+			if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "a", anonRaw); ok {
+				t.Fatalf("%d must not write proxy429 for the anon proxy", status)
+			}
+			if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "z", authRaw); ok {
+				t.Fatalf("%d must not write proxy429 for the auth proxy", status)
+			}
+			if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "a", anonRaw); ok {
+				t.Fatalf("%d must not write channel for the anon proxy", status)
+			}
+			if _, _, ok := gw.scheduler.channelCooldownStatus(TierZen, "z", authRaw); ok {
+				t.Fatalf("%d must not write channel for the auth proxy", status)
+			}
+			anonTarget := targetIdentity(TierZen, anonymousSchedulerCredentialID, "a", anonRaw, "m")
+			if _, _, ok := gw.scheduler.targetCooldownStatus(anonTarget); ok {
+				t.Fatalf("%d must not write anon target cooldown", status)
+			}
+			authTarget := targetIdentity(TierZen, authCred, "z", authRaw, "m")
+			if _, _, ok := gw.scheduler.targetCooldownStatus(authTarget); ok {
+				t.Fatalf("%d must not write auth target cooldown", status)
+			}
+			if _, _, ok := gw.scheduler.credentialCooldownStatus(authCred); ok {
+				t.Fatalf("%d must not write credential 401 cooldown", status)
+			}
+			if _, _, ok := gw.scheduler.credential429CooldownStatus(authCred); ok {
+				t.Fatalf("%d takeover must not write credential429", status)
+			}
+			if _, _, ok := gw.scheduler.credential429CooldownStatus(anonymousSchedulerCredentialID); ok {
+				t.Fatalf("%d takeover must not write anon credential429", status)
+			}
+		})
+	}
+}
