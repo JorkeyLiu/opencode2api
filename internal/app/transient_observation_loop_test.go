@@ -356,42 +356,50 @@ func TestPinnedAuthObservationLimitTransport(t *testing.T) {
 	})
 }
 
-// Audit fix 1: pinnedAuth mixed initial 503 -> retry transport-nil at
-// observation limit must return the stale initial 503 (HEAD behavior), not
-// nil + transport error. Proves behavior via status/err, not internals.
-func TestPinnedAuthMixed503TransportStaleInitial(t *testing.T) {
-	newGW := func(t *testing.T, session string) (*Gateway, int, int) {
-		t.Helper()
-		cfg := testGatewayConfig(
-			map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
-			ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
-		)
-		cfg.Anonymous = false
-		cfg.Keys = []string{"zen-key-aaaaa"}
-		cfg.Retry.MaxAttempts = 2
-		cfg.Retry.TransientRetryIntervalSeconds = 0
-		norm, err := NormalizeConfig("config.json", cfg)
-		if err != nil {
-			t.Fatal(err)
-		}
-		gw, err := NewGateway(norm, discardGatewayLogger(), NewMonitor())
-		if err != nil {
-			t.Fatal(err)
-		}
-		cred := gw.authCreds[0]
-		raw := gw.pools[gw.authPoolName()].items[0].name
-		gw.bindSessionPin(session, "m", TierZen, cred.id, gw.authPoolName(), raw, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
-		pin, ok := gw.scheduler.pinGet(session, "m")
-		if !ok {
-			t.Fatalf("must bind pin")
-		}
-		ordered := affinityProxyOrder(gw.pools[gw.authPoolName()], pin.CredID, pin.ProxyRaw)
-		pinnedIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[0].name)
-		otherIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[1].name)
-		return gw, pinnedIdx, otherIdx
+// L1 Final observation authority (pinned-auth): once the same-target L1
+// loop ran, every transport next-proxy, consumption, and L3 decision resolves
+// final.Resp/final.Err. Initial only serves drain/ownership pointer comparison
+// and the existing initial-or-final stream-sentinel identity; it never
+// overrides Final. A) single-proxy initial 503 -> final bare transport is a
+// faithful final 502 (not the stale initial 503), no custom, pin unmoved. B) multi-proxy same sequence walks per the authenticated pinned
+// transport rule and a 2xx next proxy binds/moves generation-fenced. C)
+// consumed + all eligible really tried + last final transport takes custom per
+// the bounded consumption gate. D) reverse initial transport -> final 403
+// proves Final wins: 403 faithful, no erroneous transport walk.
+func TestPinnedAuthMixed503TransportFinalObservation(t *testing.T) {
+	var customHits atomic.Int32
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackChatOK("cm-mixed-final")))
+	}))
+	t.Cleanup(custom.Close)
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 2
+	cfg.Retry.TransientRetryIntervalSeconds = 0
+	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm-mixed-final"}}}
+	norm, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
 	}
-	ids := pinIDs("ses_pinned_mixed_503_transport_stale", "req-mixed-stale")
-	gw, pinnedIdx, otherIdx := newGW(t, ids.Session)
+	gw, err := NewGateway(norm, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := pinIDs("ses_pinned_mixed_final_single", "req-mixed-final-a")
+	cred := gw.authCreds[0]
+	raw := gw.pools[gw.authPoolName()].items[0].name
+	gw.bindSessionPin(ids.Session, "m", TierZen, cred.id, gw.authPoolName(), raw, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pinBefore, ok := gw.scheduler.pinGet(ids.Session, "m")
+	if !ok {
+		t.Fatalf("must bind pin")
+	}
+	pinnedIdx := poolIndexByRaw(gw, gw.authPoolName(), pinBefore.ProxyRaw)
 	var calls atomic.Int32
 	postStub(t, gw, gw.authPoolName(), pinnedIdx, &calls, nil, func(*http.Request) (*http.Response, error) {
 		if calls.Load() == 1 {
@@ -399,26 +407,247 @@ func TestPinnedAuthMixed503TransportStaleInitial(t *testing.T) {
 		}
 		return nil, errors.New("dial timeout")
 	})
-	var otherCalls atomic.Int32
-	postStub(t, gw, gw.authPoolName(), otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
-		return responseWithBody(200, `{"ok":true}`), nil
-	})
-	resp, _, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
 	if err != nil {
-		t.Fatalf("stale initial must return 503 response with nil err, got err=%v", err)
+		t.Fatalf("single-proxy mixed final must return faithful 502 response, err=%v", err)
 	}
-	if resp == nil || resp.StatusCode != 503 {
-		t.Fatalf("want stale initial 503, got %v err=%v", resp, err)
+	if resp == nil || resp.StatusCode != 502 {
+		t.Fatalf("want final-transport faithful 502 (not stale initial 503), got %v err=%v", resp, err)
 	}
 	drainResp(resp)
 	if postCount(&calls) != 2 {
-		t.Fatalf("pinned calls=%d want 2 (initial 503 + 1 transport retry)", postCount(&calls))
-	}
-	if postCount(&otherCalls) != 0 {
-		t.Fatalf("other=%d want 0 (stale 503 never walks)", postCount(&otherCalls))
+		t.Fatalf("pinned calls=%d want 2 (initial 503 + 1 transport observation)", postCount(&calls))
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts=%d want 2", attempts)
+	}
+	if eff.Tier == TierCustom {
+		t.Fatalf("single-proxy first non-429 must not take over custom")
+	}
+	if customHits.Load() != 0 {
+		t.Fatalf("custom hits=%d want 0 (single-proxy first non-429 never reaches custom)", customHits.Load())
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ids.Session); ok {
+		t.Fatalf("mixed final must not create a fallback binding")
+	}
+	pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
+	if pinAfter != pinBefore {
+		t.Fatalf("pin must not move on single-proxy mixed final: %+v -> %+v", pinBefore, pinAfter)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pinBefore.CredID); ok {
+		t.Fatalf("mixed non-429 final must not write credential429")
+	}
+}
+
+func TestPinnedAuthMixedFinalTransportWalksNextProxy(t *testing.T) {
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 2
+	cfg.Retry.TransientRetryIntervalSeconds = 0
+	norm, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(norm, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := pinIDs("ses_pinned_mixed_final_walk", "req-mixed-final-b")
+	cred := gw.authCreds[0]
+	raw := gw.pools[gw.authPoolName()].items[0].name
+	gw.bindSessionPin(ids.Session, "m", TierZen, cred.id, gw.authPoolName(), raw, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pinBefore, ok := gw.scheduler.pinGet(ids.Session, "m")
+	if !ok {
+		t.Fatalf("must bind pin")
+	}
+	ordered := affinityProxyOrder(gw.pools[gw.authPoolName()], pinBefore.CredID, pinBefore.ProxyRaw)
+	pinnedIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[0].name)
+	otherIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[1].name)
+	otherRaw := gw.pools[gw.authPoolName()].items[otherIdx].name
+	var calls, otherCalls atomic.Int32
+	postStub(t, gw, gw.authPoolName(), pinnedIdx, &calls, nil, func(*http.Request) (*http.Response, error) {
+		if calls.Load() == 1 {
+			return responseWithBody(503, `{"error":"svc"}`), nil
+		}
+		return nil, errors.New("dial timeout")
+	})
+	postStub(t, gw, gw.authPoolName(), otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
+	if err != nil {
+		t.Fatalf("walked next-proxy 2xx must succeed, err=%v", err)
+	}
+	if resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("want walked 200, got %v", resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom {
+		t.Fatalf("walked 2xx must not take over custom")
+	}
+	if postCount(&calls) != 2 {
+		t.Fatalf("pinned calls=%d want 2 (initial 503 + 1 transport observation)", postCount(&calls))
+	}
+	if postCount(&otherCalls) != 1 {
+		t.Fatalf("other=%d want 1 (final transport walks per auth pinned rule)", postCount(&otherCalls))
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts=%d want 3 (2 pinned + 1 walk)", attempts)
+	}
+	pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
+	if pinAfter.ProxyRaw != otherRaw {
+		t.Fatalf("pin must move to next proxy on final-transport walk, got %q want %q", pinAfter.ProxyRaw, otherRaw)
+	}
+	if pinAfter.Generation != pinBefore.Generation+1 {
+		t.Fatalf("walk must generation-fence the move (gen %d -> %d)", pinBefore.Generation, pinAfter.Generation)
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pinBefore.CredID); ok {
+		t.Fatalf("transport walk must not write credential429")
+	}
+}
+
+func TestPinnedAuthMixedFinalTransportConsumedTakeoverCustom(t *testing.T) {
+	var customHits atomic.Int32
+	custom := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		customHits.Add(1)
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(fallbackChatOK("cm-mixed-consumed")))
+	}))
+	t.Cleanup(custom.Close)
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 2
+	cfg.Retry.TransientRetryIntervalSeconds = 0
+	cfg.Fallback = FallbackConfig{Active: "c1", Channels: []FallbackChannelConfig{{Name: "c1", BaseURL: custom.URL, APIKey: "k1", Model: "cm-mixed-consumed"}}}
+	norm, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(norm, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := pinIDs("ses_pinned_mixed_final_consumed", "req-mixed-final-c")
+	cred := gw.authCreds[0]
+	raw := gw.pools[gw.authPoolName()].items[0].name
+	gw.bindSessionPin(ids.Session, "m", TierZen, cred.id, gw.authPoolName(), raw, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pinBefore, ok := gw.scheduler.pinGet(ids.Session, "m")
+	if !ok {
+		t.Fatalf("must bind pin")
+	}
+	ordered := affinityProxyOrder(gw.pools[gw.authPoolName()], pinBefore.CredID, pinBefore.ProxyRaw)
+	pinnedIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[0].name)
+	otherIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[1].name)
+	var firstCalls, secondCalls atomic.Int32
+	postStub(t, gw, gw.authPoolName(), pinnedIdx, &firstCalls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(429, `{"error":"throttled"}`), nil
+	})
+	postStub(t, gw, gw.authPoolName(), otherIdx, &secondCalls, nil, func(*http.Request) (*http.Response, error) {
+		if secondCalls.Load() == 1 {
+			return responseWithBody(503, `{"error":"svc"}`), nil
+		}
+		return nil, errors.New("dial timeout")
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0, consumptionExtra())
+	if err != nil {
+		t.Fatalf("consumed final transport must take custom, err=%v", err)
+	}
+	if resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("want custom 200 takeover, got resp=%v eff=%+v", resp, eff)
+	}
+	drainResp(resp)
+	if postCount(&firstCalls) != 1 {
+		t.Fatalf("first calls=%d want 1 (429 consume)", postCount(&firstCalls))
+	}
+	if postCount(&secondCalls) != 2 {
+		t.Fatalf("second calls=%d want 2 (initial 503 + 1 transport observation)", postCount(&secondCalls))
+	}
+	if customHits.Load() != 1 {
+		t.Fatalf("custom hits=%d want 1 (consumed + all tried + final transport)", customHits.Load())
+	}
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (429 + 503 + transport + custom)", attempts)
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ids.Session); !ok {
+		t.Fatalf("consumed takeover must bind fallback session")
+	}
+	if _, _, ok := gw.scheduler.credential429CooldownStatus(pinBefore.CredID); ok {
+		t.Fatalf("non-429 consumption takeover must not write credential429")
+	}
+}
+
+func TestPinnedAuthReverseTransportToFinal403(t *testing.T) {
+	cfg := testGatewayConfig(
+		map[string][]string{"a": {"direct"}, "z": {"direct", "http://127.0.0.1:8081"}},
+		ProxyRoutingConfig{Anonymous: "a", Authenticated: "z"},
+	)
+	cfg.Anonymous = false
+	cfg.Keys = []string{"zen-key-aaaaa"}
+	cfg.Retry.MaxAttempts = 2
+	cfg.Retry.TransientRetryIntervalSeconds = 0
+	norm, err := NormalizeConfig("config.json", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw, err := NewGateway(norm, discardGatewayLogger(), NewMonitor())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := pinIDs("ses_pinned_reverse_transport_403", "req-reverse-403")
+	cred := gw.authCreds[0]
+	raw := gw.pools[gw.authPoolName()].items[0].name
+	gw.bindSessionPin(ids.Session, "m", TierZen, cred.id, gw.authPoolName(), raw, ProtocolChat, normalizeRouteAuthority(gw.cfg.Upstream.Zen))
+	pinBefore, ok := gw.scheduler.pinGet(ids.Session, "m")
+	if !ok {
+		t.Fatalf("must bind pin")
+	}
+	ordered := affinityProxyOrder(gw.pools[gw.authPoolName()], pinBefore.CredID, pinBefore.ProxyRaw)
+	pinnedIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[0].name)
+	otherIdx := poolIndexByRaw(gw, gw.authPoolName(), ordered[1].name)
+	var calls, otherCalls atomic.Int32
+	postStub(t, gw, gw.authPoolName(), pinnedIdx, &calls, nil, func(*http.Request) (*http.Response, error) {
+		if calls.Load() == 1 {
+			return nil, errors.New("dial timeout")
+		}
+		return responseWithBody(403, `{"error":"forbidden"}`), nil
+	})
+	postStub(t, gw, gw.authPoolName(), otherIdx, &otherCalls, nil, func(*http.Request) (*http.Response, error) {
+		return responseWithBody(200, `{"ok":true}`), nil
+	})
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
+	if err != nil {
+		t.Fatalf("final 403 must return faithfully, err=%v", err)
+	}
+	if resp == nil || resp.StatusCode != 403 {
+		t.Fatalf("want final 403 (Final over Initial), got %v", resp)
+	}
+	drainResp(resp)
+	if eff.Tier == TierCustom {
+		t.Fatalf("final 403 must not take over custom")
+	}
+	if postCount(&calls) != 2 {
+		t.Fatalf("pinned calls=%d want 2 (initial transport + 403 observation)", postCount(&calls))
+	}
+	if postCount(&otherCalls) != 0 {
+		t.Fatalf("other=%d want 0 (final HTTP never takes an erroneous transport walk)", postCount(&otherCalls))
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts=%d want 2", attempts)
+	}
+	pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
+	if pinAfter != pinBefore {
+		t.Fatalf("pin must not move on final 403: %+v -> %+v", pinBefore, pinAfter)
+	}
+	if _, ok := gw.scheduler.fallbacks.get(ids.Session); ok {
+		t.Fatalf("final 403 must not create a fallback binding")
 	}
 }
 

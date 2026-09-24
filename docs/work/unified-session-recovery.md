@@ -2,25 +2,22 @@
 
 > Live projection, not history. History lives in git log and `docs/adr/0001`. This route can change as reality teaches us; provisional notes never override binding behavior.
 
-## Outcome
+## 结构完成结论（Structural completion）
 
-- User-observable result: steady-state fluctuation is absorbed, a stable cause gets a context-appropriate resolution, and the session either continues the same session or faithfully returns in the target protocol envelope.
+四 walker（`doPinnedAnonymous` / `doPinnedAuth` / `doAnonymousUpstream` / `doKeyUpstream`）单候选恢复已真实替换为共享权威：`initial send → 有限 L1 observation → exact400 一次同目标 corrective replay 终态` 的 single-candidate runner（`recoverSingleCandidate`）+ typed decision（`decideCandidateRecovery`，`cause + lane context -> typed action`）。旧重复 initial/post-L1 决策链已删除，无并行旧权威（含 `decideUnboundPostL1` / `pinnedAuthContextEarlyReturn` 移除）。pinned-auth Final-authority 修复已纳入。frozen 候选、request-local fences、scheduler 证据写入、pin bind/move fencing、route-session/body/attempt metadata、response ownership、custom 门仍归 walker 所有；共享 authority 不建立新状态生命周期。
 
-## Reality
+## 1) 已验证结构交付
 
-- Behaviorally implemented: single-`retry.max_attempts` bounded same-target L1 observation; exact-400 corrective same-target replay that is route-terminal; cancellation/deadline/committed-byte stop boundaries; unbound custom eligibility by independent per-domain object-unavailable exhaustion; unbound 401 credential-scoped L2 cause (first real stable 401 skips remaining same-credential frozen targets, skips count as unavailable without sends, incl. L1-final 401); unbound auth request-local proxy429 L2 cause (live 429 via real send establishes `(tier/channel,pool,proxy)` unavailable for this request, later same-identity frozen candidates skip without POST, skips count as unavailable+entered without attempts/writes and never as live429 for credential429); unbound auth request-local transport-suspect L2 cause (qualifying L1-final true transport establishes `(channel,pool,proxy)` for this request, later same-identity skips only while suspect stays active, skips count as unavailable+entered without attempts/writes and never as live429/credential429; 408/425/5xx/stream-startup/429/cancel never establish it); 403 target-scoped stable cause in the pure decision seam (initial 403 and transient-after final 403 classify as explicit `stableCauseTargetForbidden`, unbound decision stays advance+mark, scheduler/pinned/exhaustion semantics unchanged); pinned full live-429 traversal plus bounded consumption; pinned transport/move/session rules and the 503 no-L2-observation policy. Exact semantics live in `AGENTS.md` §3–4 and `docs/adr/0001`, not here.
-- Current state includes the 403 pure-decision explicitation plus focused tests only — not observable progress beyond that single cause.
+- 单候选控制流单一权威落地，行为保持；全 suite、`go build`、gofmt 通过（见本次提交终检）。
 
-## Distance
+## 2) 仍未落地的方向（ADR pending）
 
-- Accepted principle — cause + context → object action — is the basic idea to develop through production work, not a complete matrix to design first. Broad cause+context → L2 object action is not fully operationalized; 403 is now explicit in the pure seam but its L2 resolution reuses the existing advance+mark/exhaustion path, no complete status matrix or behavior change is claimed.
-- No AGENTS-specified implementation mismatch in unbound or pinned paths is currently known beyond the closed 403 explicitation; the gap statement itself is not claimed complete.
+- 广义对象选择/策略方向仍未落地，保持 ADR pending：逐状态码广义矩阵、预算数值与退避未冻结。跨 pool / 跨 credential 等受 pin 约束禁止的动作不是既定目标，不得冒充为既定目标。
 
-## Route / next move
+## 3) 后续整体统一恢复的前提
 
-- Best route: develop L2 decisions alongside real gateway behavior — not a full status matrix up front, and not another helper-only centralization. Structural centralization alone does not close the semantic distance above.
-- Next move: decide one concrete cause+context → action at the production path, implement it, observe whether the session continues/faithfully returns under pin/session constraints, and revise the working rule from that evidence. No prior full ADR/design adjudication is required; incomplete notes and ordinary reversible decisions resolve along the route, not as blockers. The 403 seam is closed under this rule; the next cause (if any) is selected the same way.
-- If no first cause can be responsibly fixed from current evidence (no named user failure scenario, no known normative mismatch), let the next concrete runtime/code observation select it — e.g. which stable cause most often reaches L3 without a principled L2 resolution in live unbound/pinned traffic — and carry that decision into production development rather than waiting or declaring no next move.
+- 如继续整体统一恢复，必须先对照 ADR 闭环（`observe stability -> resolve stable cause -> continue session or faithfully return`）确定尚未被共享决策承接的实际生产责任/结果差距，再按完整责任边界迁移。
+- 不能用逐 cause 无限循环或 helper-only 增量当路线，也不能无证据声称所有语义完成；当前证据无法确定的下一动作不编造成已确定。
 
 ## Constraints
 

@@ -367,20 +367,26 @@ func TestPinnedAuthContextEarlyReturn(t *testing.T) {
 		name   string
 		stop   transientStopReason
 		cancel bool
-		want   bool
+		want   recoveryAction
 	}{
-		{name: "stopContext", stop: transientStopContext, cancel: false, want: true},
-		{name: "stableCancelled", stop: transientStopStable, cancel: true, want: true},
-		{name: "observationLimitCancelledNoEarlyReturn", stop: transientStopObservationLimit, cancel: true, want: false},
-		{name: "observationLimitNoCancel", stop: transientStopObservationLimit, cancel: false, want: false},
-		{name: "stableNoCancel", stop: transientStopStable, cancel: false, want: false},
+		{name: "stopContext", stop: transientStopContext, cancel: false, want: recoveryReturnContext},
+		{name: "stableCancelled", stop: transientStopStable, cancel: true, want: recoveryReturnContext},
+		{name: "observationLimitCancelledNoEarlyReturn", stop: transientStopObservationLimit, cancel: true, want: recoveryFaithful},
+		{name: "observationLimitNoCancel", stop: transientStopObservationLimit, cancel: false, want: recoveryFaithful},
+		{name: "stableNoCancel", stop: transientStopStable, cancel: false, want: recoveryFaithful},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := mk(tc.stop, tc.cancel)
-			drainResp(r.Final.Resp)
-			if got := pinnedAuthContextEarlyReturn(r); got != tc.want {
-				t.Fatalf("earlyReturn=%v want %v (stop=%v cancelled=%v)", got, tc.want, tc.stop, tc.cancel)
+			defer drainResp(r.Final.Resp)
+			// The strict pinned-auth context gate now lives in the shared
+			// decision: stop-context or stable+cancelled returns context; an
+			// observation-limit 503 final (transient fact) stays on the
+			// L1-final path even when the ctx cancelled after observation.
+			// 503-with-body carries no transport error, so the L1-final path
+			// is faithful (no walk).
+			if got := decideCandidateRecovery(recoveryLane{Bound: true, Anonymous: false}, r); got.Action != tc.want {
+				t.Fatalf("action=%v want %v (stop=%v cancelled=%v)", got.Action, tc.want, tc.stop, tc.cancel)
 			}
 		})
 	}
