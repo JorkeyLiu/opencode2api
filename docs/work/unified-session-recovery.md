@@ -10,10 +10,12 @@
 
 - 单候选控制流单一权威落地，行为保持；全 suite、`go build`、gofmt 通过（见本次提交终检）。
 - 单候选结构交付已完成收口：post-L1 context/replay 资格已收归统一纯决策（typed action 决定能否进入 exact400 replay，无并行 context 门）；pinned custom 出口、耗尽证明归属、状态所有权均未动。
+- L1 最小观察延迟已落地（窄实现，非广义矩阵）：共享 `transientDelay` 对零/负/低于下限输入取内部命名下限 100ms，再与配置正间隔与解析后 `Retry-After` 取 max；显式 `transient_retry_interval_seconds=0` 仍合法并持久化 0（缺失默认 3），运行时永不立即重发；`sleepWithContext`、exact400 重放延迟、计数/lane/调度/pin/响应归属/遍历均未动。
 
 ## 2) 仍未落地的方向（ADR pending）
 
-- 广义对象选择/策略方向仍未落地，保持 ADR pending：逐状态码广义矩阵、预算数值与退避未冻结。跨 pool / 跨 credential 等受 pin 约束禁止的动作不是既定目标，不得冒充为既定目标。
+- 广义对象选择/策略方向仍未落地，保持 ADR pending：逐状态码广义矩阵、预算数值与退避未冻结。跨 pool / 跨 credential 等受 pin 约束禁止的动作不是既定目标，不得冒充为既定目标。本次 L1 下限仅为已接受的窄实现，不声称广义退避/矩阵完成。
+- 下一已知差距（未落地）：共享 runner（`recoverSingleCandidate`）仍先做 initial send 再判断取消，缺少发送前取消检查（cancellation pre-send）；L1 floor 等待本身可取消/可 deadline（已验证无再次发送），但已取消上下文仍会产生一次 initial 发送，需后续单独处理，不在本增量内。
 
 ## 3) 后续整体统一恢复的前提
 

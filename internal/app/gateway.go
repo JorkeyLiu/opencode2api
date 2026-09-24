@@ -1227,8 +1227,21 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 	return attemptOutcome{Resp: resp, Err: err, Diag: diag, Started: started}
 }
 
+// minL1ObservationDelay is the named internal L1 floor for same-target
+// stability observation. Explicit retry.transient_retry_interval_seconds=0
+// stays valid config (persists 0, missing defaults to 3s) but never means an
+// immediate resend: the shared transientDelay raises zero/negative/below-floor
+// input to this minimum, then takes the max with the configured positive
+// interval and any parsed Retry-After. This is a narrow L1 floor only, not a
+// broad backoff matrix; exact-400 corrective replay keeps its own no-delay
+// path and sleepWithContext/counts/lanes/scheduler/pin/traversal are untouched.
+const minL1ObservationDelay = 100 * time.Millisecond
+
 func transientDelay(interval time.Duration, resp *http.Response) time.Duration {
 	d := interval
+	if d < minL1ObservationDelay {
+		d = minL1ObservationDelay
+	}
 	if resp != nil {
 		if ra := parseRetryAfter(resp.Header.Get("Retry-After")); ra > d {
 			d = ra

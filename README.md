@@ -371,6 +371,7 @@ socks5://127.0.0.1:1080  # 备用代理
 | --- | --- |
 | `retry.max_attempts` | **最终语义（已收敛单一 L1 计数）：** 唯一 L1 同目标稳定性观察上限，含首次发送。全部 `isSameTargetTransient`（传输错误、408、425、500-599、流启动失败）均使用它；400/429/普通 4xx 为稳定结果，不进 L1。认证普通发送预算已删除：不再截断同目标 L1，也不再截断候选遍历；候选遍历由冻结 eligible/candidate 切片自然有界。429 证据、凭证耗尽（冻结全集实际 429 才写，取最后 Retry-After）、Started fencing、custom（未绑定按逐域真实请求对象耗尽状态无关判断 per b2c4798，已绑定含受限 pinned L2 consumption）保留，但无 ordinary refund。400 同目标修正后终态（路由最终动作），503 受 deadline/cancel/committed bytes 约束观察，取消/deadline/已提交字节后停止。模型刷新不再复用该值，改用冻结 `keys × healthy proxies` 全遍历。逐状态矩阵、广义 fallback 与退避数值仍未冻结（见 ADR 0001），本次仅完成单一 L1 计数收敛。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
+| `retry.transient_retry_interval_seconds` | L1 同目标观察间隔（秒，0..30，缺失默认 3）。显式 `0` 合法并持久化 `0`，但运行时共享 `transientDelay` 仍保留内部 100ms 最小等待（与正间隔、`Retry-After` 取 max），永不立即重发；exact400 修正重放不经此延迟。本次仅为窄的 L1 下限实现，不构成广义退避矩阵（见 ADR 0001）。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
 
