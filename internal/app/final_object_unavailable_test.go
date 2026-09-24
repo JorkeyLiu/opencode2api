@@ -67,41 +67,45 @@ func TestUnboundObjectUnavailableLive429Counts(t *testing.T) {
 	}
 }
 
-// Pinned consumption wrapper excludes 429 and keeps consumed/all-attempted gates.
+// Pinned consumption via the single domain authority: 429 stays on its own
+// full-live-429 proof, consumption requires consumed+full attempt set.
 func TestPinnedConsumptionWrapper429AndGates(t *testing.T) {
 	r429 := responseWithBody(429, `{"error":"t"}`)
 	r403 := responseWithBody(403, `{"error":"f"}`)
 	r400 := responseWithBody(400, `{"error":"bad"}`)
 	r404 := responseWithBody(404, `{"error":"n"}`)
 	transportErr := errors.New("boom")
-	if pinnedConsumptionAllowCustom(2, 2, true, false, r429, nil) {
-		t.Fatalf("pinned 429 must not qualify (separate full-live-429 gate owns it)")
+	decide := func(eligible, attempted int, consumed, cancelled bool, resp *http.Response, err error) domainRecoveryResult {
+		return decideDomainRecovery(domainRecoveryInput{Cancelled: cancelled, Pinned: &pinnedDomainEvidence{Eligible: eligible, Attempted: attempted, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(resp, err), FinalIsLive429: resp != nil && resp.StatusCode == 429}})
 	}
-	if !pinnedConsumptionAllowCustom(2, 2, true, false, r403, nil) {
+	if decide(2, 2, true, false, r429, nil).AllowCustom {
+		t.Fatalf("pinned 429 must not qualify via consumption (separate full-live-429 gate owns it)")
+	}
+	if !decide(2, 2, true, false, r403, nil).AllowCustom {
 		t.Fatalf("pinned consumed+full 403 must qualify")
 	}
-	if !pinnedConsumptionAllowCustom(2, 2, true, false, nil, transportErr) {
+	if !decide(2, 2, true, false, nil, transportErr).AllowCustom {
 		t.Fatalf("pinned consumed+full transport must qualify")
 	}
-	if pinnedConsumptionAllowCustom(2, 2, false, false, r403, nil) {
+	if decide(2, 2, false, false, r403, nil).AllowCustom {
 		t.Fatalf("pinned without real switch/send (consumed=false) must not qualify")
 	}
-	if pinnedConsumptionAllowCustom(1, 1, false, false, r403, nil) {
+	if decide(1, 1, false, false, r403, nil).AllowCustom {
 		t.Fatalf("single-proxy initial non-429 (consumed=false) must stay ineligible")
 	}
-	if pinnedConsumptionAllowCustom(2, 1, true, false, r403, nil) {
+	if decide(2, 1, true, false, r403, nil).AllowCustom {
 		t.Fatalf("partial eligible unattempted must not qualify")
 	}
-	if pinnedConsumptionAllowCustom(2, 2, true, true, r403, nil) {
+	if decide(2, 2, true, true, r403, nil).AllowCustom {
 		t.Fatalf("cancelled must never qualify")
 	}
-	if pinnedConsumptionAllowCustom(2, 2, true, false, r400, nil) {
+	if decide(2, 2, true, false, r400, nil).AllowCustom {
 		t.Fatalf("pinned exact-400 replay final must never qualify")
 	}
-	if pinnedConsumptionAllowCustom(2, 2, true, false, r404, nil) {
+	if decide(2, 2, true, false, r404, nil).AllowCustom {
 		t.Fatalf("pinned ordinary 4xx must never qualify")
 	}
-	if pinnedConsumptionAllowCustom(0, 0, true, false, r403, nil) {
+	if decide(0, 0, true, false, r403, nil).AllowCustom {
 		t.Fatalf("zero eligible must never qualify")
 	}
 }

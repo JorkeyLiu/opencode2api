@@ -21,36 +21,39 @@ func TestUnboundDomainsExhaustedAllowCustom(t *testing.T) {
 	mk := func(entered bool, frozen, unavailable int, recovered bool) unboundDomainEvidence {
 		return unboundDomainEvidence{Domain: "d", Entered: entered, Frozen: frozen, Unavailable: unavailable, Recovered400: recovered}
 	}
-	if !unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, false, false) {
+	allow := func(domains []unboundDomainEvidence, recovered, cancelled, committed bool) bool {
+		return decideDomainRecovery(domainRecoveryInput{Recovered400: recovered, Cancelled: cancelled, Committed: committed, UnboundDomains: domains}).AllowCustom
+	}
+	if !allow([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, false, false) {
 		t.Fatalf("single exhausted domain with non-429 terminal must allow")
 	}
-	if !unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{
+	if !allow([]unboundDomainEvidence{
 		{Domain: "anonymous", Entered: true, Frozen: 2, Unavailable: 2},
 		{Domain: "cred", Entered: true, Frozen: 1, Unavailable: 1},
 	}, false, false, false) {
 		t.Fatalf("mixed 429/non-429 full exhaustion must allow")
 	}
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 2, 1, false)}, false, false, false) {
+	if allow([]unboundDomainEvidence{mk(true, 2, 1, false)}, false, false, false) {
 		t.Fatalf("partial exhaustion must deny")
 	}
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(false, 0, 0, false)}, false, false, false) {
+	if allow([]unboundDomainEvidence{mk(false, 0, 0, false)}, false, false, false) {
 		t.Fatalf("empty/pre-cooled domain must deny")
 	}
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, true)}, true, false, false) {
+	if allow([]unboundDomainEvidence{mk(true, 1, 1, true)}, true, false, false) {
 		t.Fatalf("400 replay must deny")
 	}
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, true, false) {
+	if allow([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, true, false) {
 		t.Fatalf("cancel must deny")
 	}
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, false, true) {
+	if allow([]unboundDomainEvidence{mk(true, 1, 1, false)}, false, false, true) {
 		t.Fatalf("committed must deny")
 	}
-	if unboundDomainsExhaustedAllowCustom(nil, false, false, false) {
+	if allow(nil, false, false, false) {
 		t.Fatalf("no domains must deny")
 	}
 	// Per-domain independence: one exhausted plus one partial denies (no
 	// cross-domain summing).
-	if unboundDomainsExhaustedAllowCustom([]unboundDomainEvidence{mk(true, 1, 1, false), mk(true, 2, 1, false)}, false, false, false) {
+	if allow([]unboundDomainEvidence{mk(true, 1, 1, false), mk(true, 2, 1, false)}, false, false, false) {
 		t.Fatalf("credential domains must not merge counts")
 	}
 }

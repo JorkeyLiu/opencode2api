@@ -1,7 +1,7 @@
 # ADR 0001: 统一会话恢复（Unified Session Recovery）
 
-- **状态：** 原则已接受 / 分层实现待验证（Principle accepted / Layered implementation pending validation）
-- **日期：** 2026-09-22
+- **状态：** 已接受并已落地（Accepted+Implemented）— 统一会话恢复完整闭环已实现，详细矩阵以本文与 `recovery.go`/`gateway.go`/`scheduler.go` 为准
+- **日期：** 2026-09-22（2026-09-24 定版 Final）
 - **作者：** opencode2api maintainers
 - **关联范围：** `gateway.go` / `scheduler.go` / `fallback.go` / `stream.go` / `availability*.go` / 会话亲和与路由层
 
@@ -240,3 +240,14 @@
   - 调用方安全：四 walker 既有 `recoveryReturnContext` 分支均可安全处理 nil 响应 + `ctx.Err`（无 `Header`/排空空指针，`mark*Unavailable` 与 401/proxy429/suspect 证据本就带 cancel 门，外层 custom 门在 cancelled 下恒否），无需拓宽 walker 变更。
   - 验证：`recovery_runner_test.go` 原 pre-cancel 单发送期望更新为零发送（`TestRunnerCancelledStableNoMarkOrAdvance` 非零初值保持 + `TestRunnerStartedPreservedAndCancelStops` 后半），新增 `TestRunnerCancelDuringExecPreservesResponseNoAdvance`（执行中取消保留真实响应/`Started` 身份、无 mark/advance/replay）与 `TestRunnerPreSendCancelZeroSendFourLanes`（四 lane × pre-cancel/expired-deadline，非零初值、无 replay、无 meta 副作用），`transient_observation_loop_test.go` 新增 L1 `contextExpiredDeadlineAtEntry`（初始态无发送、保留初始未排空）与既有 `contextPreCancel`/`contextSleepInterrupt` 回归；runner/transient 决策、cancel/deadline、gateway cancel+stream+400 聚焦与 `go test ./... -count=1` 通过、gofmt 干净。
   - 语义边界：仅发送前可观察取消零发送与 L1 睡后复查；不冻结广义逐状态矩阵/退避/广义 fallback；残余广义策略仍未决，不编造下一 helper 任务。
+
+- **2026-09-24 — FINAL 统一会话恢复定版（Accepted+Implemented，完整矩阵落地）：**
+  - **L1 最终映射（定版，行为保持）：** 同目标有界观察仅 `true transport`、`408`、`425`、`500-599`（含 `503`）与 `pre-commit stream-startup failure`；`retry.max_attempts` 含首次发送；`min delay 100ms`（`transientDelay` 命名下限，`interval`/`Retry-After` 取 max）；`400/401/403/429/ordinary4xx` 永不 L1；L1 无指数退避/jitter，调度冷却指数退避+jitter 与 caps 保持不变（`scheduler.go`）。
+  - **L2 修正重放（定版）：** 精确 `400` 一次同目标同凭证/池/代理/协议/路由会话/请求身份 corrective replay（Responses 陈旧 `previous_response_id`/`reasoning` 清理），后按 L3 route-terminal 终态返回，永不进入候选/通道/custom。
+  - **未绑定域（定版）：** 请求冻结 eligible 域的稳定不可用证据完整集为 `live429`、`stable401`（同凭证剩余跳过计 Unavailable 无发送）、`403`、`L1-final 408/425/5xx/true transport/stream-startup`；`auth request-local live429/suspect` 跳过计 `Unavailable+Entered` 但永不计 `live429/credential429`；`Build/400/ordinary4xx/cancel/deadline/committed` 不计；每已进入冻结域须独立耗尽（`Entered && Frozen>0 && Unavailable>=Frozen`）才可 custom，且为 state-agnostic。
+  - **已绑定域（定版）：** pin 固定 `credential+pool+channel/model/protocol/authority`，永不跨域；代理移动仅 `pinned-anon/auth` 在 `live429` 时 walk，`pinned-auth` 额外在 `L1-final true transport` 时 walk，其余 `400/401/403/408/425/ordinary4xx/5xx/stream-startup` 永不移动；`generation fencing` 保留。
+  - **已绑定 custom 双证明（单域权威下双路径，不合并证据）：** `(a)` 全量 `live429` 发送（`pre-cooled zero-send` 排除，`credential429` 仅此路径写入，`partial` 永不写）；`(b)` 有界 consumption：已真实 `move/send` 到另一冻结 eligible、`Attempted>=Eligible` 且 `Final` 为非 429 的 `object-unavailable`（`401/403/L1-final 408/425/5xx/true transport/stream-startup`），单代理首发非 429、`400/replay/ordinary4xx/cancel/deadline/committed/build` 不触发，非 429 接管永不写 `credential429`；`429` 仅为证据种类非自动直切。
+  - **L3 停止与忠实返回（定版）：** `cancellation/deadline/committed` 一旦可观察立即停止（`recoverSingleCandidate` 入口与 L1 睡后复查），`success` 继续/绑定/移动，否则按目标协议忠实返回；不承诺与竞态 wire dispatch 的原子性。
+  - **结构落地（单域权威）：** 保留 `classifyStableCause`/`decideCandidateRecovery`/`recoverSingleCandidate` 为单候选权威；新增 `recovery.go` 单域权威 `decideDomainRecovery`（`domainRecoveryInput{Recovered400,Cancelled,Committed,UnboundDomains, Pinned}` → `domainRecoveryResult{Kind: domainNone|domainUnboundExhausted|domainPinnedFullLive429|domainPinnedConsumption, AllowCustom}`），统一接管 `customTakeoverEligible`/`pinnedConsumptionAllowCustom`/`unboundDomainExhausted`/`unboundDomainsExhaustedAllowCustom` 的全部 `fallback/exhaustion` 判定，叶证据分类仍留 `gateway.go`，无第二判定；未绑定外层与双 pinned 游走器已迁移至该权威（仅保留 `draining/ownership/scheduler writes/pin fencing/request-local evidence/custom` 调用），旧判定与死分支已删，保持可观察行为仅在取消时 `credential429` 抑制与 lock 一致。
+  - **详细矩阵正典：** 本 ADR 与 `recovery.go`（`decideDomainRecovery`/`pinnedDomainEvidence`/`unboundDomainEvidence`）、`gateway.go`（`finalNon429ObjectUnavailable`/`unboundObjectUnavailable`/`transientDelay`/`isSameTargetTransient`）为正典；`AGENTS.md` 仅保留高层不变式并链接至此。
+  - **验证：** 新增 `domain_recovery_decision_test.go` 正典表驱动 `TestDecideDomainRecovery`（unbound 全域 AND、unentered/zero/recovered400/stops 否决；pinned full-live429 允许 vs partial/precooled/terminal 否决；pinned consumption 允许 vs 未 consumed/attempted<eligible/非 unavailable/stops 否决；证明种类互异；无状态直切），既有 `TestDecideCandidateRecovery`/`recovery_runner_test.go` 保持正典；`go test ./... -count=1` 通过、`go build`/`gofmt`/`git diff --check` 干净。

@@ -145,6 +145,124 @@ type candidateRecovery struct {
 	ReplayErr       error
 }
 
+// domainExhaustionKind distinguishes the four domain-level outcomes owned by
+// the single domain recovery authority. NoExhaustion means no proof satisfied;
+// the three exhausted kinds are distinct proofs, not merged counts.
+type domainExhaustionKind int
+
+const (
+	domainNone domainExhaustionKind = iota
+	domainUnboundExhausted
+	domainPinnedFullLive429
+	domainPinnedConsumption
+)
+
+// unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
+// for one frozen unbound recovery domain (anonymous lane or one credential).
+// It is semantic evidence only: Entered reports whether the domain sent at
+// least one live upstream attempt in this request; Frozen is the frozen
+// candidate count; Unavailable counts distinct frozen candidates with live
+// unavailable evidence in this request (live 429, 401/403 terminal, L1-final
+// transport/408/425/5xx, or L1-final stream startup failure); Recovered400
+// marks a 400 corrective-replay final for that domain.
+type unboundDomainEvidence struct {
+	Domain       string
+	Entered      bool
+	Frozen       int
+	Unavailable  int
+	Recovered400 bool
+}
+
+// pinnedDomainEvidence is the semantic evidence for one pinned binding's
+// frozen eligible set. Eligible is the frozen eligible proxy count; ObservedLive429
+// counts distinct live 429 evidence; TerminalStatus is the final HTTP status
+// (0 for transport); Attempted counts really attempted frozen candidates;
+// Consumed reports whether a real switch/send to another frozen eligible
+// already occurred in this request; FinalIsObjectUnavailable reports the leaf
+// finalNon429ObjectUnavailable classification of the last real send's outcome;
+// FinalIsLive429 reports whether the final is an HTTP 429.
+type pinnedDomainEvidence struct {
+	Eligible                 int
+	ObservedLive429          int
+	TerminalStatus           int
+	Attempted                int
+	Consumed                 bool
+	FinalIsObjectUnavailable bool
+	FinalIsLive429           bool
+}
+
+// domainRecoveryInput is the typed semantic evidence for the single domain-
+// level recovery decision authority. It contains no runtime stores, only
+// evidence counts and stop gates. UnboundDomains non-nil means evaluating the
+// unbound per-domain AND exhaustion; Pinned non-nil means evaluating the
+// pinned two-proof exhaustion. At most one of the two is evaluated per call.
+type domainRecoveryInput struct {
+	Recovered400   bool
+	Cancelled      bool
+	Committed      bool
+	UnboundDomains []unboundDomainEvidence
+	Pinned         *pinnedDomainEvidence
+}
+
+// domainRecoveryResult is the typed domain-level outcome. Kind distinguishes
+// no exhaustion from the three distinct exhausted proofs; AllowCustom reports
+// whether a custom fallback selection is permitted after the L3 stop gates
+// (cancelled/deadline/committed/recovered400). Exhaustion (Kind != domainNone)
+// is the pure availability proof; AllowCustom is the stop-gated permission.
+type domainRecoveryResult struct {
+	Kind        domainExhaustionKind
+	AllowCustom bool
+}
+
+// decideDomainRecovery is the single pure typed domain-level recovery decision
+// authority. It owns all fallback/exhaustion policy split among the superseded
+// helpers and returns a typed kind plus the stop-gated custom permission. Leaf
+// evidence classifiers (finalNon429ObjectUnavailable etc.) remain in gateway.go;
+// this authority never reads runtime stores, attempts, or scheduler state.
+func decideDomainRecovery(in domainRecoveryInput) domainRecoveryResult {
+	// Unbound per-domain AND exhaustion (state-agnostic, no terminal requirement).
+	if in.UnboundDomains != nil {
+		if len(in.UnboundDomains) == 0 {
+			return domainRecoveryResult{Kind: domainNone, AllowCustom: false}
+		}
+		allExhausted := true
+		for _, d := range in.UnboundDomains {
+			if d.Recovered400 {
+				allExhausted = false
+				break
+			}
+			if !d.Entered || d.Frozen <= 0 || d.Unavailable < d.Frozen {
+				allExhausted = false
+				break
+			}
+		}
+		if !allExhausted {
+			return domainRecoveryResult{Kind: domainNone, AllowCustom: false}
+		}
+		allow := !in.Recovered400 && !in.Cancelled && !in.Committed
+		return domainRecoveryResult{Kind: domainUnboundExhausted, AllowCustom: allow}
+	}
+	if in.Pinned != nil {
+		p := in.Pinned
+		// Full live-429 proof: every frozen eligible proxy supplied distinct live 429.
+		full := p.Eligible > 0 && p.ObservedLive429 >= p.Eligible && p.TerminalStatus == 429
+		// Bounded consumption proof: a real move/send already occurred, every
+		// eligible was really attempted, final is non-429 object-unavailable.
+		consumption := p.Consumed && p.Attempted >= p.Eligible && p.Eligible > 0 && !p.FinalIsLive429 && p.FinalIsObjectUnavailable
+		var kind domainExhaustionKind
+		if full {
+			kind = domainPinnedFullLive429
+		} else if consumption {
+			kind = domainPinnedConsumption
+		} else {
+			return domainRecoveryResult{Kind: domainNone, AllowCustom: false}
+		}
+		allow := !in.Recovered400 && !in.Cancelled && !in.Committed
+		return domainRecoveryResult{Kind: kind, AllowCustom: allow}
+	}
+	return domainRecoveryResult{Kind: domainNone, AllowCustom: false}
+}
+
 // recoverSingleCandidate owns one frozen candidate's full lifecycle with a
 // single initial send, a single bounded L1 observation authority, and a
 // single exact-400 corrective-action authority. exec performs one real send

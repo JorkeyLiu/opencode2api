@@ -1585,45 +1585,6 @@ func (g *Gateway) doCustomFallbackPinned(ctx context.Context, route modelRoute, 
 	return resp, effectiveRoute, nextAttempts, sendErr
 }
 
-// customTakeoverQualification is the explicit L2 429-only custom takeover
-// proof (Bounded Increment 6, behavior lock, no new eligibility). The current
-// recovery-domain exhaustion is proven only when every currently eligible
-// target has supplied distinct live 429 evidence in this request/route:
-// pre-cooled skips never enter the frozen eligible set and never count as
-// evidence, partial 429 is false, any terminal non-429 outcome is false, a
-// 400 corrective-replay final route is false, and cancel/deadline or stream
-// committed paths are false. Credential/pool/proxy/session identity, last
-// Retry-After selection, Started stale fencing, active-channel lookup,
-// capacity fail-closed, and scheduler cooldown writes stay with the callers;
-// this helper owns only the shared qualification gate and creates no second
-// authority. Generalized L2 fallback remains unimplemented.
-type customTakeoverQualification struct {
-	ObservedLive429 int
-	Eligible        int
-	TerminalStatus  int
-	Recovered400    bool
-	Cancelled       bool
-	Committed       bool
-}
-
-// customTakeoverEligible reports strict 429-only takeover eligibility for one
-// recovery domain step. TerminalStatus is the final HTTP status (0 for a
-// transport error / no response). Eligible must be >0: the pre-cooled
-// local-429 fast path (zero live-eligible with an actively cooling proxy429)
-// stays a separate caller-owned branch and never qualifies here.
-func customTakeoverEligible(q customTakeoverQualification) bool {
-	if q.Cancelled || q.Committed || q.Recovered400 {
-		return false
-	}
-	if q.TerminalStatus != http.StatusTooManyRequests {
-		return false
-	}
-	if q.Eligible <= 0 {
-		return false
-	}
-	return q.ObservedLive429 >= q.Eligible
-}
-
 // finalNon429ObjectUnavailable is the single leaf authority for the
 // overlapping non-429 final-unavailable classification shared by the unbound
 // and pinned exhaustion wrappers. It reports whether one live final outcome
@@ -1661,59 +1622,6 @@ func finalNon429ObjectUnavailable(resp *http.Response, err error) bool {
 	return status >= 500 && status <= 599
 }
 
-// pinnedConsumptionAllowCustom is the bounded pinned L2 consumption
-// exhaustion gate (pinned native only). It never replaces the 429-only
-// compat gate above: 429 finals return false here and stay owned by
-// customTakeoverEligible (with credential429 writes). Consumption means a
-// real switch/send to the next frozen eligible proxy already happened in
-// this request (429 walk or pinned-auth transport next-proxy); the initial
-// same-target L1 observation alone never counts, so single-proxy first
-// non-429 failures (consumed=false) never qualify. Exhaustion requires
-// every frozen eligible proxy to have a real live send in this request
-// (attempted >= eligible); pre-cooled skips never enter eligible and
-// BuildErr/no-send never counts. The final must prove its object
-// unavailable: live 401/403, L1-final transport/408/425/5xx, or L1-final
-// stream startup failure (only after a consume action). Exact-400,
-// ordinary 4xx, cancel/deadline, and committed streams never qualify;
-// without an active custom the caller keeps the native faithful envelope.
-func pinnedConsumptionAllowCustom(eligible, attempted int, consumed, cancelled bool, resp *http.Response, err error) bool {
-	if cancelled {
-		return false
-	}
-	if eligible <= 0 || attempted < eligible {
-		return false
-	}
-	if !consumed {
-		return false
-	}
-	if err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests {
-		return false
-	}
-	return finalNon429ObjectUnavailable(resp, err)
-}
-
-// unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
-// for one frozen unbound recovery domain: the anonymous lane or one
-// authenticated credential. Domains are never summed: the outer unbound custom
-// decision requires every collected domain to independently satisfy the
-// state-agnostic object-exhaustion gate. Entered reports whether the domain
-// actually sent at least one live upstream attempt in this request;
-// empty/pre-cooled domains stay Entered=false/Frozen=0 and can never prove
-// exhaustion. Frozen is the frozen candidate count; Unavailable counts the
-// distinct frozen candidates with live unavailable evidence in this request
-// (live 429, 401/403 terminal, L1-final transport/408/425/5xx, or L1-final
-// stream startup failure; each frozen candidate counts at most once,
-// intermediate L1 retries never count separately). The unbound gate reads
-// only Entered/Frozen/Unavailable. Recovered400 marks a 400
-// corrective-replay final for that domain (never counts as unavailable).
-type unboundDomainEvidence struct {
-	Domain       string
-	Entered      bool
-	Frozen       int
-	Unavailable  int
-	Recovered400 bool
-}
-
 // unboundObjectUnavailable reports whether one live final outcome proves its
 // object unavailable for unbound exhaustion: live 429, 401/403, L1-final
 // transport/408/425/5xx, or L1-final stream startup failure. 400 corrective
@@ -1727,42 +1635,6 @@ func unboundObjectUnavailable(resp *http.Response, err error) bool {
 		return true
 	}
 	return finalNon429ObjectUnavailable(resp, err)
-}
-
-// unboundDomainExhausted reports state-agnostic object exhaustion for one
-// unbound domain: every frozen candidate has live unavailable evidence in this
-// request. Pre-cooled/empty domains (Entered=false/Frozen<=0) and 400-replay
-// finals never qualify.
-func unboundDomainExhausted(d unboundDomainEvidence) bool {
-	if d.Recovered400 {
-		return false
-	}
-	if !d.Entered || d.Frozen <= 0 {
-		return false
-	}
-	return d.Unavailable >= d.Frozen
-}
-
-// unboundDomainsExhaustedAllowCustom is the single unbound custom authority:
-// state-agnostic per-domain object exhaustion. Every collected domain
-// (anonymous lane plus each authenticated credential, never summed) must
-// independently satisfy unboundDomainExhausted, and the route must not be
-// recovered/cancelled/committed. It is state-agnostic: no terminal or
-// live-429 equality requirement. Pinned paths must not use it; they keep
-// customTakeoverEligible (429-only).
-func unboundDomainsExhaustedAllowCustom(domains []unboundDomainEvidence, recovered400, cancelled, committed bool) bool {
-	if recovered400 || cancelled || committed {
-		return false
-	}
-	if len(domains) == 0 {
-		return false
-	}
-	for _, d := range domains {
-		if !unboundDomainExhausted(d) {
-			return false
-		}
-	}
-	return true
 }
 
 // maybeTakeoverCustomFallback binds the session to the currently active custom
@@ -2073,9 +1945,9 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 		// the frozen walks (doAnonymousUpstream/doKeyUpstream); this outer
 		// step requires every collected domain (anonymous lane plus each
 		// authenticated credential, never summed) to independently satisfy
-		// the state-agnostic object-exhaustion gate. Pinned paths keep the
-		// separate 429-only gate and never read this predicate.
-		if ids.Session != "" && unboundDomainsExhaustedAllowCustom(unboundDomains, unboundRecovered, isContextCancelled(ctx), false) {
+		// the state-agnostic object-exhaustion gate via the single domain
+		// authority. Pinned paths use the separate pinned proofs.
+		if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Recovered400: unboundRecovered, Cancelled: isContextCancelled(ctx), Committed: false, UnboundDomains: unboundDomains}).AllowCustom {
 			if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 				drainAndClose(lastResponse.Body)
 				if takeErr != nil {
@@ -2093,7 +1965,7 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 	// carries no lastResponse but the same per-domain proof still applies.
 	// 400 replays return above, ordinary 4xx returns above with a response,
 	// and cancel/deadline denies via the gate.
-	if ids.Session != "" && len(unboundDomains) > 0 && unboundDomainsExhaustedAllowCustom(unboundDomains, unboundRecovered, isContextCancelled(ctx), false) {
+	if ids.Session != "" && len(unboundDomains) > 0 && decideDomainRecovery(domainRecoveryInput{Recovered400: unboundRecovered, Cancelled: isContextCancelled(ctx), Committed: false, UnboundDomains: unboundDomains}).AllowCustom {
 		if resp, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 			if takeErr != nil {
 				return nil, eff, next, takeErr
@@ -2367,7 +2239,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				drainAndClose(last429.Body)
 				last429 = nil
 			}
-			if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, final.Err) {
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(nil, final.Err), FinalIsLive429: false}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					if takeErr != nil {
 						return nil, eff, next, takeErr
@@ -2392,7 +2264,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			// ownership (a retry transport error carrying a non-nil
 			// response was drained before return; an initial transport with
 			// no retry was returned undrained; stable finals never drain).
-			if pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+			if decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
 				if ids.Session != "" {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 						if last429 != nil {
@@ -2425,16 +2297,17 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 	// Pinned-anonymous live exhaustion: the loop above returns on every
 	// non-429 outcome, so a non-nil last429 here means every frozen eligible
 	// proxy supplied live 429 in this request (live429 == len(eligible)).
-	// The pure count+terminal half owns the native 429 envelope; the full
-	// shared gate owns only the custom attempt, so a full exhaustion under
-	// cancel still keeps its 429 envelope without a custom send.
+	// The single domain authority owns the native 429 envelope; the stop-gated
+	// allow owns only the custom attempt, so a full exhaustion under cancel
+	// still keeps its 429 envelope without a custom send.
 	terminalAnon := 0
 	if last429 != nil {
 		terminalAnon = last429.StatusCode
 	}
-	anonExhausted := last429 != nil && customTakeoverEligible(customTakeoverQualification{ObservedLive429: live429, Eligible: len(eligible), TerminalStatus: terminalAnon, Recovered400: false, Cancelled: false, Committed: false})
+	anonDomainRes := decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), ObservedLive429: live429, TerminalStatus: terminalAnon}})
+	anonExhausted := anonDomainRes.Kind == domainPinnedFullLive429
 	if anonExhausted {
-		if ids.Session != "" && customTakeoverEligible(customTakeoverQualification{ObservedLive429: live429, Eligible: len(eligible), TerminalStatus: terminalAnon, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
+		if ids.Session != "" && anonDomainRes.AllowCustom {
 			// Preserve the native 429 body for the custom path decision: the
 			// takeover helper re-derives its own request, so drain here only
 			// when actually handing off.
@@ -2616,7 +2489,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			if final.Resp != nil {
 				finalStatus = final.Resp.StatusCode
 			}
-			if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: finalStatus, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
+			if decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), ObservedLive429: len(observed429), TerminalStatus: finalStatus}}).AllowCustom {
 				_ = g.scheduler.noteCredential429Failure(pin.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
 				if ids.Session != "" {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
@@ -2657,8 +2530,8 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// yields local502. The partial-429 initial-sentinel poison lives
 			// in the Live429 branch above (exhaustion precedes poisoning);
 			// this branch is the general L1-final sentinel path and stays
-			// consumption-gated for custom.
-			if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), nil, final.Err) {
+			// consumption-gated for custom via the single domain authority.
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(nil, final.Err), FinalIsLive429: false}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					discardLast429()
 					if takeErr != nil {
@@ -2686,7 +2559,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				consumed = true
 				continue
 			}
-			if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					if final.Resp != nil {
 						drainAndClose(final.Resp.Body)
@@ -2710,10 +2583,10 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// recoveryFaithful / recoveryReturnOrdinary (401/403/ordinary
 			// 4xx, 5xx/408/425 no-move finals, suppressed replay): no
 			// cross-proxy moves. Only a consumed last-eligible 401/403 may
-			// take over custom via the bounded gate; ordinary 4xx and
-			// single/unconsumed finals stay faithful. Non-429 takeovers
+			// take over custom via the single domain authority; ordinary 4xx
+			// and single/unconsumed finals stay faithful. Non-429 takeovers
 			// never write credential429.
-			if ids.Session != "" && pinnedConsumptionAllowCustom(len(eligible), idx+1, consumed, isContextCancelled(ctx), final.Resp, final.Err) {
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					discardLast429()
 					if final.Resp != nil {
@@ -2736,18 +2609,17 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	if last429 != nil {
 		terminalPinned = last429.StatusCode
 	}
-	// Strict 429 exhaustion: every proxy of the frozen eligible set
-	// returned a distinct live 429 in this request. Partial 429 mixed
-	// with any non-429 transport/4xx/5xx outcome never reaches here
-	// with a full set (non-429 paths discard last429 and return or
-	// continue without a stale envelope). The pure count+terminal half
-	// owns the native 429 envelope; the full gate (plus cancel/deadline,
-	// committed, replay-final route state) owns only the custom attempt,
-	// so a full exhaustion under cancel still keeps its 429 envelope
-	// without a custom send.
-	exhaustionOwed := customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: terminalPinned, Recovered400: false, Cancelled: false, Committed: false})
+	// Strict 429 exhaustion via the single domain authority: every proxy of
+	// the frozen eligible set returned a distinct live 429 in this request.
+	// Partial 429 mixed with any non-429 transport/4xx/5xx outcome never
+	// reaches here with a full set (non-429 paths discard last429 and return
+	// or continue without a stale envelope). The pure kind owns the native
+	// 429 envelope; the stop-gated allow owns only the custom attempt, so a
+	// full exhaustion under cancel still keeps its 429 envelope without a
+	// custom send.
+	exhaustionOwed := decideDomainRecovery(domainRecoveryInput{Cancelled: false, Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), ObservedLive429: len(observed429), TerminalStatus: terminalPinned}}).Kind == domainPinnedFullLive429
 	if exhaustionOwed {
-		if ids.Session != "" && customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(observed429), Eligible: len(eligible), TerminalStatus: terminalPinned, Recovered400: false, Cancelled: isContextCancelled(ctx), Committed: false}) {
+		if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), ObservedLive429: len(observed429), TerminalStatus: terminalPinned}}).AllowCustom {
 			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 				drainAndClose(last429.Body)
 				if takeErr != nil {
@@ -3462,7 +3334,7 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					ev[cand.ProxyRaw] = retryAfter
 					cred429LastRetry[cand.CredID] = retryAfter
 					cred429LastStarted[cand.CredID] = final.Started
-					if customTakeoverEligible(customTakeoverQualification{ObservedLive429: len(ev), Eligible: credEligibleCount[cand.CredID], TerminalStatus: final.Resp.StatusCode, Recovered400: false, Cancelled: false, Committed: false}) {
+					if decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: credEligibleCount[cand.CredID], ObservedLive429: len(ev), TerminalStatus: final.Resp.StatusCode}}).AllowCustom {
 						_ = g.scheduler.noteCredential429Failure(cand.CredID, AttemptClassRateLimited, final.Resp.StatusCode, retryAfter, final.Started)
 					}
 				}

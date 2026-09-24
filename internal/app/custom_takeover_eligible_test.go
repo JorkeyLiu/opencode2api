@@ -12,42 +12,41 @@ import (
 	"time"
 )
 
-// Bounded Increment 6: lock on the existing strict 429-only custom
-// fallback qualification (429-only centralization + cancel/no-state-change
-// boundary fix). The helper centralizes the previously scattered exhaustion
-// gates; cancel/deadline/committed/replay-final route state never qualifies.
-// The outer unbound 1/1 step is a terminal-only recheck; the real eligible
-// exhaustion proof lives in the frozen inner walks.
+// Adapted to the single domain authority: pinned full-live429 proof via
+// decideDomainRecovery. The helper previously centralizing the 429-only gate
+// is now the typed domain decision; cancel/recovered/committed deny via
+// AllowCustom, terminal mismatch and partial deny via Kind.
 func TestCustomTakeoverEligible(t *testing.T) {
 	cases := []struct {
 		name string
-		q    customTakeoverQualification
+		in   domainRecoveryInput
 		want bool
 	}{
-		{name: "all eligible live 429", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 429}, want: true},
-		{name: "single eligible live 429", q: customTakeoverQualification{ObservedLive429: 1, Eligible: 1, TerminalStatus: 429}, want: true},
-		{name: "observed exceeds eligible", q: customTakeoverQualification{ObservedLive429: 3, Eligible: 2, TerminalStatus: 429}, want: true},
-		{name: "partial 429", q: customTakeoverQualification{ObservedLive429: 1, Eligible: 2, TerminalStatus: 429}, want: false},
-		{name: "no evidence", q: customTakeoverQualification{ObservedLive429: 0, Eligible: 2, TerminalStatus: 429}, want: false},
-		{name: "zero eligible never qualifies", q: customTakeoverQualification{ObservedLive429: 0, Eligible: 0, TerminalStatus: 429}, want: false},
-		{name: "pre-cooled excluded still partial", q: customTakeoverQualification{ObservedLive429: 1, Eligible: 2, TerminalStatus: 429}, want: false},
-		{name: "terminal 400", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 400}, want: false},
-		{name: "terminal 401", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 401}, want: false},
-		{name: "terminal 403", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 403}, want: false},
-		{name: "terminal 404", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 404}, want: false},
-		{name: "terminal 408", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 408}, want: false},
-		{name: "terminal 425", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 425}, want: false},
-		{name: "terminal 500", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 500}, want: false},
-		{name: "terminal 503", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 503}, want: false},
-		{name: "terminal transport", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 0}, want: false},
-		{name: "400 replay final", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 429, Recovered400: true}, want: false},
-		{name: "cancelled", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 429, Cancelled: true}, want: false},
-		{name: "committed stream", q: customTakeoverQualification{ObservedLive429: 2, Eligible: 2, TerminalStatus: 429, Committed: true}, want: false},
+		{name: "all eligible live 429", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 429}}, want: true},
+		{name: "single eligible live 429", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 1, ObservedLive429: 1, TerminalStatus: 429}}, want: true},
+		{name: "observed exceeds eligible", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 3, TerminalStatus: 429}}, want: true},
+		{name: "partial 429", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 1, TerminalStatus: 429}}, want: false},
+		{name: "no evidence", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 0, TerminalStatus: 429}}, want: false},
+		{name: "zero eligible never qualifies", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 0, ObservedLive429: 0, TerminalStatus: 429}}, want: false},
+		{name: "pre-cooled excluded still partial", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 1, TerminalStatus: 429}}, want: false},
+		{name: "terminal 400", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 400}}, want: false},
+		{name: "terminal 401", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 401}}, want: false},
+		{name: "terminal 403", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 403}}, want: false},
+		{name: "terminal 404", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 404}}, want: false},
+		{name: "terminal 408", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 408}}, want: false},
+		{name: "terminal 425", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 425}}, want: false},
+		{name: "terminal 500", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 500}}, want: false},
+		{name: "terminal 503", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 503}}, want: false},
+		{name: "terminal transport", in: domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 0}}, want: false},
+		{name: "400 replay final", in: domainRecoveryInput{Recovered400: true, Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 429}}, want: false},
+		{name: "cancelled", in: domainRecoveryInput{Cancelled: true, Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 429}}, want: false},
+		{name: "committed stream", in: domainRecoveryInput{Committed: true, Pinned: &pinnedDomainEvidence{Eligible: 2, ObservedLive429: 2, TerminalStatus: 429}}, want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := customTakeoverEligible(tc.q); got != tc.want {
-				t.Fatalf("eligible=%v want %v (q=%+v)", got, tc.want, tc.q)
+			got := decideDomainRecovery(tc.in).AllowCustom
+			if got != tc.want {
+				t.Fatalf("eligible=%v want %v (in=%+v)", got, tc.want, tc.in)
 			}
 		})
 	}

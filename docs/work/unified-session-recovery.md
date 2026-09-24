@@ -1,33 +1,25 @@
-# Unified session recovery — live work projection
+# Unified session recovery — final state
 
-> Live projection, not history. History lives in git log and `docs/adr/0001`. This route can change as reality teaches us; provisional notes never override binding behavior.
+> Final state. History lives in git log and `docs/adr/0001-unified-session-recovery.md`. No remaining route.
 
-## 结构完成结论（Structural completion）
+## Outcome complete
 
-四 walker（`doPinnedAnonymous` / `doPinnedAuth` / `doAnonymousUpstream` / `doKeyUpstream`）单候选恢复已真实替换为共享权威：`initial send → 有限 L1 observation → exact400 一次同目标 corrective replay 终态` 的 single-candidate runner（`recoverSingleCandidate`）+ typed decision（`decideCandidateRecovery`，`cause + lane context -> typed action`）。旧重复 initial/post-L1 决策链已删除，无并行旧权威（含 `decideUnboundPostL1` / `pinnedAuthContextEarlyReturn` 移除）。pinned-auth Final-authority 修复已纳入。frozen 候选、request-local fences、scheduler 证据写入、pin bind/move fencing、route-session/body/attempt metadata、response ownership、custom 门仍归 walker 所有；共享 authority 不建立新状态生命周期。
+统一会话恢复已定版并落地完毕，无剩余路线。详细矩阵正典为 `docs/adr/0001` 与 `internal/app/recovery.go`/`gateway.go`/`scheduler.go`；本文件不再承载 live 策略。
 
-## 1) 已验证结构交付
+## Current authority
 
-- 单候选控制流单一权威落地，行为保持；全 suite、`go build`、gofmt 通过（见本次提交终检）。
-- 单候选结构交付已完成收口：post-L1 context/replay 资格已收归统一纯决策（typed action 决定能否进入 exact400 replay，无并行 context 门）；pinned custom 出口、耗尽证明归属、状态所有权均未动。
-- L1 最小观察延迟已落地（窄实现，非广义矩阵）：共享 `transientDelay` 对零/负/低于下限输入取内部命名下限 100ms，再与配置正间隔与解析后 `Retry-After` 取 max；显式 `transient_retry_interval_seconds=0` 仍合法并持久化 0（缺失默认 3），运行时永不立即重发；`sleepWithContext`、exact400 重放延迟、计数/lane/调度/pin/响应归属/遍历均未动。
-- 发送前取消检查已落地（窄实现，非广义矩阵）：共享 runner（`recoverSingleCandidate`）入口先判断已取消 context，未发送即返回 typed `recoveryReturnContext`（`ctx.Err` + `transientStopContext`，无 `Started`/初始响应伪造、无 unavailable 证据，不增 attempts、不 sync meta、不 replay）；L1 `observeSameTargetTransient` 在 sleep 成功后、increment/exec 前复查 `ctx.Err`，覆盖 timer/context 同时就绪；通用 `sleepWithContext` 未动，无全局钩子；exact400 语义、四 lane 决策、committed stream、scheduler/pin/custom 门均未动；仅承诺已可观察取消前不发，不承诺与竞态 wire dispatch 的原子性。
+- **Single-candidate authority**（`recovery.go`）：`classifyStableCause` + `decideCandidateRecovery`（`cause + lane context -> typed action`）+ `recoverSingleCandidate`（`initial send → 有界 L1 observation → exact400 一次同目标 corrective replay 终态`）。四 walker（`doPinnedAnonymous`/`doPinnedAuth`/`doAnonymousUpstream`/`doKeyUpstream`）均消费该 runner，旧重复决策链已删。
+- **Domain authority**（`recovery.go`）：`decideDomainRecovery`（`domainRecoveryInput{Recovered400,Cancelled,Committed,UnboundDomains, Pinned}` → `domainRecoveryResult{Kind: domainNone|domainUnboundExhausted|domainPinnedFullLive429|domainPinnedConsumption, AllowCustom}`），统一接管全部 `fallback/exhaustion` 判定（原 `customTakeoverEligible`/`pinnedConsumptionAllowCustom`/`unboundDomainExhausted`/`unboundDomainsExhaustedAllowCustom` 已删，叶分类 `finalNon429ObjectUnavailable`/`unboundObjectUnavailable` 保留）。未绑定外层与双 pinned 游走器已迁移至该权威，仅保留 `draining/ownership/scheduler writes/pin fencing/request-local evidence/custom` 调用。
+- **L1/L2/L3 闭环完整**：L1 同目标有界观察（`true transport/408/425/500-599` 含 `503`/`stream-startup`，`retry.max_attempts` 含首次，`100ms` 下限，`interval`/`Retry-After` 取 max，无指数/jitter）、L2 `400` 一次同目标 corrective replay 后 route-terminal、未绑定/已绑定双域独立耗尽与双 pinned 证明（`full live429` 与 `bounded consumption` 不合并）、L3 取消/deadline/committed 立即停止与忠实返回；无第二判定，无广义 pending。
 
-## 2) 仍未落地的方向（ADR pending）
+## No remaining route
 
-- 广义对象选择/策略方向仍未落地，保持 ADR pending：逐状态码广义矩阵、预算数值与退避未冻结。跨 pool / 跨 credential 等受 pin 约束禁止的动作不是既定目标，不得冒充为既定目标。本次 L1 下限与发送前取消检查均为已接受的窄实现，不声称广义退避/矩阵完成。
-- 残余未决（未编造下一 helper 任务）：广义逐状态策略/矩阵仍未决，不从 pending 自动派生实现任务。
-
-## 3) 后续整体统一恢复的前提
-
-- 如继续整体统一恢复，必须先对照 ADR 闭环（`observe stability -> resolve stable cause -> continue session or faithfully return`）确定尚未被共享决策承接的实际生产责任/结果差距，再按完整责任边界迁移。
-- 不能用逐 cause 无限循环或 helper-only 增量当路线，也不能无证据声称所有语义完成；当前证据无法确定的下一动作不编造成已确定。
-- 不同耗尽证明（unbound 逐域状态无关耗尽、pinned 有界 consumption）与 scheduler/pin/route-session 状态所有权仍归 walker 与既有域所有者，不是第二决策权威；未决策略（广义逐状态矩阵/退避/广义 fallback）仍未决，不能从 pending 自动派生实现任务；本收口不声称整个 ADR 目标全部完成。
+无待实现 helper、无 pending 矩阵；后续变更以 `AGENTS.md` §3/§4 与 ADR 为合同，任何偏离须先修订 ADR。
 
 ## Constraints
 
-- Binding: `AGENTS.md` §3 (recovery closed loop, pin/move, session affinity) and §4 (400-terminal, 429/401/403/5xx/channel, streaming, custom takeover, identity hygiene) plus `docs/adr/0001`. This file never duplicates their matrices; on conflict they win and provisional wording yields.
+- Binding: `AGENTS.md` §3/§4 + `docs/adr/0001`. On conflict they win.
 
 ## Verification
 
-- Tests prove the chosen behavior, not progress by itself. Gate is `go test ./...`; supported build is `go build -o opencode2api ./cmd/opencode2api`.
+- Gate: `go test ./... -count=1`, `go build -o opencode2api ./cmd/opencode2api`, `gofmt`, `git diff --check`.
