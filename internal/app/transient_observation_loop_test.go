@@ -180,6 +180,32 @@ func TestObserveSameTargetTransientStops(t *testing.T) {
 		drainResp(final.Resp)
 	})
 
+	t.Run("contextExpiredDeadlineAtEntry", func(t *testing.T) {
+		gw := newGW(t)
+		attempts := 1
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		if ctx.Err() != context.DeadlineExceeded {
+			t.Fatalf("test ctx must be deadline-exceeded, got %v", ctx.Err())
+		}
+		initial := attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
+		loopRes := gw.observeSameTargetTransient(ctx, initial, TierZen, ProtocolChat, &attempts, 0, 3, 0, func(monitorAttempt int) attemptOutcome {
+			t.Fatalf("must not execute on deadline-exceeded context")
+			return attemptOutcome{}
+		})
+		final, stop := loopRes.Final, loopRes.Stop
+		if stop != transientStopContext {
+			t.Fatalf("stop=%v want context", stop)
+		}
+		if attempts != 1 {
+			t.Fatalf("attempts=%d want 1 (no observation send)", attempts)
+		}
+		if final.Resp == nil || final.Resp.StatusCode != 503 {
+			t.Fatalf("expired deadline must return initial transient undrained")
+		}
+		drainResp(final.Resp)
+	})
+
 	t.Run("contextSleepInterrupt", func(t *testing.T) {
 		gw := newGW(t)
 		attempts := 1

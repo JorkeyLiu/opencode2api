@@ -1441,6 +1441,16 @@ func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemp
 			}
 			return mk(attemptOutcome{Err: ctxErr}, transientStopContext)
 		}
+		// Timer/context simultaneous readiness: the sleep timer may win the
+		// select while ctx cancelled concurrently. Recheck before any new
+		// send; no change to the shared sleep helper, no global hooks.
+		if isContextCancelled(ctx) {
+			ctxErr := context.Canceled
+			if ctx != nil && ctx.Err() != nil {
+				ctxErr = ctx.Err()
+			}
+			return mk(attemptOutcome{Err: ctxErr}, transientStopContext)
+		}
 		*attempts++
 		syncAttemptMeta(ctx, tier, protocol, attemptOffset, *attempts)
 		cur = exec(attemptOffset + *attempts)

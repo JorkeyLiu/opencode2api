@@ -233,4 +233,10 @@
 - **2026-09-24 — L1 最小观察延迟窄实现（已接受生产边界，无广义矩阵）：**
   - 共享 `transientDelay` 增加命名内部下限 `minL1ObservationDelay=100ms`：零/负/低于下限输入先取下限，再与配置正间隔与解析后 `Retry-After` 取 max；显式 `retry.transient_retry_interval_seconds=0` 仍合法并持久化 0（缺失默认 3），运行时永不立即重发，符合已接受 ADR “L1 从不立即重发”；`sleepWithContext`、exact400 修正重放延迟、计数/lane/调度/pin/响应归属/遍历均未动。
   - 验证：新增 `transient_delay_floor_test.go`（`TestTransientDelayFloor` 精确下限/正间隔/`Retry-After` 取 max；`TestObserveIntervalZeroHasMinimumDelay` 以配置 0 的真实 `transientInterval()` 走真实 L1 环证明非立即重发，稳健下限 50ms、无窄上界；`TestObserveIntervalZeroFloorCancellable` 证明 floor 等待中 cancel/deadline 无再次发送）；transient/runner/400/耗尽/配置往返聚焦回归通过、gofmt 干净。
-  - 语义边界：仅 L1 floor；不构成广义退避矩阵，不冻结逐状态矩阵/预算/广义 fallback；下一已知差距为共享 runner 缺少发送前取消检查（已取消仍做一次 initial send），不在本增量内。
+  - 语义边界：仅 L1 floor；不构成广义退避矩阵，不冻结逐状态矩阵/预算/广义 fallback。
+
+- **2026-09-24 — 发送前取消零发送窄实现（已接受停止边界，无广义矩阵）：**
+  - `recovery.go` `recoverSingleCandidate` 入口先查已取消 context：未做 initial increment/meta/exec 即返回 typed `recoveryReturnContext`（`ctx.Err` + `transientStopContext`，无 `Started`/初始响应伪造、无 unavailable 证据，保留既有 attempts/meta，不 replay）；`gateway.go` `observeSameTargetTransient` 在 sleep 成功后、increment/exec 前复查 `ctx.Err`，覆盖 timer/context 同时就绪；通用 `sleepWithContext` 未动，无全局钩子；exact400 语义、四 lane 决策、committed stream、scheduler/pin/custom 门均未动；仅承诺已可观察取消前不发，不承诺与竞态 wire dispatch 的原子性，不新增子系统。
+  - 调用方安全：四 walker 既有 `recoveryReturnContext` 分支均可安全处理 nil 响应 + `ctx.Err`（无 `Header`/排空空指针，`mark*Unavailable` 与 401/proxy429/suspect 证据本就带 cancel 门，外层 custom 门在 cancelled 下恒否），无需拓宽 walker 变更。
+  - 验证：`recovery_runner_test.go` 原 pre-cancel 单发送期望更新为零发送（`TestRunnerCancelledStableNoMarkOrAdvance` 非零初值保持 + `TestRunnerStartedPreservedAndCancelStops` 后半），新增 `TestRunnerCancelDuringExecPreservesResponseNoAdvance`（执行中取消保留真实响应/`Started` 身份、无 mark/advance/replay）与 `TestRunnerPreSendCancelZeroSendFourLanes`（四 lane × pre-cancel/expired-deadline，非零初值、无 replay、无 meta 副作用），`transient_observation_loop_test.go` 新增 L1 `contextExpiredDeadlineAtEntry`（初始态无发送、保留初始未排空）与既有 `contextPreCancel`/`contextSleepInterrupt` 回归；runner/transient 决策、cancel/deadline、gateway cancel+stream+400 聚焦与 `go test ./... -count=1` 通过、gofmt 干净。
+  - 语义边界：仅发送前可观察取消零发送与 L1 睡后复查；不冻结广义逐状态矩阵/退避/广义 fallback；残余广义策略仍未决，不编造下一 helper 任务。

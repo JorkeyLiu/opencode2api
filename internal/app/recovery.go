@@ -156,15 +156,27 @@ type candidateRecovery struct {
 // state, drains no final response, logs nothing, and never touches custom
 // fallback; every effect stays with the walker executing the typed action.
 //
-// Lifecycle: initial send -> build/success/cancelled terminal; exact-400
-// corrective replay once (route-terminal, suppressed replay maps to faithful
-// preservation of the original 400); non-transient stable classified once via
-// the shared pure decision; transient observed to stable/limit/context via
-// the single L1 authority (503 included, bounded by maxObservation, never a
-// second L2 loop; 429 never enters L1 and never consumes the budget) then
-// classified and decided the same way, with a post-L1 exact-400 replaying
-// once as well. Cancel/deadline stops perform no further sends.
+// Lifecycle: pre-send cancel check -> initial send -> build/success/cancelled
+// terminal; exact-400 corrective replay once (route-terminal, suppressed
+// replay maps to faithful preservation of the original 400); non-transient
+// stable classified once via the shared pure decision; transient observed to
+// stable/limit/context via the single L1 authority (503 included, bounded by
+// maxObservation, never a second L2 loop; 429 never enters L1 and never
+// consumes the budget) then classified and decided the same way, with a
+// post-L1 exact-400 replaying once as well. Cancel/deadline stops perform no
+// further sends. A ctx already cancelled before the initial send performs no
+// send, no increment, no meta sync, and no replay: typed return-context with
+// ctx.Err, transientStopContext, no fabricated Started/InitialResp, and no
+// unavailable evidence. This promises only observable pre-send cancellation;
+// it makes no atomicity claim against a racing wire dispatch.
 func (g *Gateway) recoverSingleCandidate(ctx context.Context, lane recoveryLane, tier Tier, protocol Protocol, maxObservation int, interval time.Duration, attempts *int, attemptOffset int, exec func(monitorAttempt int) attemptOutcome, replay func(final attemptOutcome, attempts int) (bool, *http.Response, error, int)) candidateRecovery {
+	if isContextCancelled(ctx) {
+		ctxErr := context.Canceled
+		if ctx != nil && ctx.Err() != nil {
+			ctxErr = ctx.Err()
+		}
+		return candidateRecovery{Action: recoveryReturnContext, Final: attemptOutcome{Err: ctxErr}, Stop: transientStopContext, Cancelled: true, Cause: stableCauseContext, MarkUnavailable: false, InitialResp: nil, InitialErr: nil, ReplayResp: nil, ReplayErr: nil}
+	}
 	*attempts++
 	syncAttemptMeta(ctx, tier, protocol, attemptOffset, *attempts)
 	initial := exec(attemptOffset + *attempts)

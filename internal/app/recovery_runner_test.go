@@ -143,21 +143,18 @@ func TestRunnerLaneDivergenceOnTransportFinal(t *testing.T) {
 }
 
 func TestRunnerCancelledStableNoMarkOrAdvance(t *testing.T) {
-	// Cancelled initial stable failures (429/401/403) stop before any walker
-	// mark: one send, no L1, no replay, return-context with no unavailable
+	// Pre-cancelled runner performs zero sends: no increment, no meta sync,
+	// no exec, no L1, no replay, typed return-context with ctx.Err and
+	// transientStopContext, no fabricated Started/InitialResp, no unavailable
 	// evidence. Walkers return on this action before mark/fence/custom, so
 	// no next candidate, no request-local evidence, and no erroneous custom.
-	// Scheduler writes are already cancel-gated inside sendUpstreamOnce via
-	// applyAttemptOutcome, so the only HEAD-vs-current delta is the discarded
-	// request-local cred429Evidence entry HEAD left for a cancelled 429.
 	cases := []struct {
 		name   string
 		status int
-		cause  stableCause
 	}{
-		{name: "live429", status: 429, cause: stableCauseLive429},
-		{name: "stable401", status: 401, cause: stableCauseL1Final},
-		{name: "target403", status: 403, cause: stableCauseTargetForbidden},
+		{name: "live429", status: 429},
+		{name: "stable401", status: 401},
+		{name: "target403", status: 403},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -173,19 +170,168 @@ func TestRunnerCancelledStableNoMarkOrAdvance(t *testing.T) {
 				t.Fatalf("%s with cancelled ctx must never replay", tc.name)
 				return false, nil, nil, rel
 			}
-			attempts := 0
+			attempts := 7
+			rec := gw.recoverSingleCandidate(ctx, recoveryLane{Bound: false, Anonymous: false}, TierZen, ProtocolChat, 5, time.Second, &attempts, 0, exec, replay)
+			if sends != 0 {
+				t.Fatalf("%s pre-cancelled must send zero times: sends=%d", tc.name, sends)
+			}
+			if attempts != 7 {
+				t.Fatalf("%s pre-cancelled must preserve attempts: attempts=%d want 7", tc.name, attempts)
+			}
+			if rec.Action != recoveryReturnContext || rec.MarkUnavailable {
+				t.Fatalf("%s cancelled must return-context with no mark: %+v", tc.name, rec)
+			}
+			if rec.Cause != stableCauseContext || !rec.Cancelled {
+				t.Fatalf("%s pre-cancelled must report context cause and cancelled flag: %+v", tc.name, rec)
+			}
+			if rec.Stop != transientStopContext {
+				t.Fatalf("%s pre-cancelled must stop with context: %+v", tc.name, rec)
+			}
+			if rec.Final.Resp != nil || rec.Final.Err != context.Canceled {
+				t.Fatalf("%s pre-cancelled must carry ctx err with no response: resp=%v err=%v", tc.name, rec.Final.Resp, rec.Final.Err)
+			}
+			if rec.Final.Started != 0 || rec.InitialResp != nil || rec.InitialErr != nil {
+				t.Fatalf("%s pre-cancelled must not fabricate Started/InitialResp: %+v", tc.name, rec)
+			}
+			if rec.ReplayResp != nil || rec.ReplayErr != nil {
+				t.Fatalf("%s pre-cancelled must not replay: %+v", tc.name, rec)
+			}
+		})
+	}
+}
+
+func TestRunnerCancelDuringExecPreservesResponseNoAdvance(t *testing.T) {
+	// Cancel-during-exec keeps the real response/Started identity: the send
+	// already happened because ctx was live at entry, but no mark/advance/
+	// replay follows once cancellation is observable. This retains the
+	// pre-send-check coverage that the real outcome is not rewritten.
+	cases := []struct {
+		name   string
+		status int
+		cause  stableCause
+	}{
+		{name: "live429", status: 429, cause: stableCauseLive429},
+		{name: "stable401", status: 401, cause: stableCauseL1Final},
+		{name: "target403", status: 403, cause: stableCauseTargetForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gw := &Gateway{}
+			ctx, cancel := context.WithCancel(context.Background())
+			const started int64 = 987654321
+			sends := 0
+			exec := func(monitorAttempt int) attemptOutcome {
+				sends++
+				cancel()
+				return attemptOutcome{Resp: responseWithBody(tc.status, `{"error":"x"}`), Started: started}
+			}
+			replay := func(final attemptOutcome, rel int) (bool, *http.Response, error, int) {
+				t.Fatalf("%s cancelled during exec must never replay", tc.name)
+				return false, nil, nil, rel
+			}
+			attempts := 7
 			rec := gw.recoverSingleCandidate(ctx, recoveryLane{Bound: false, Anonymous: false}, TierZen, ProtocolChat, 5, time.Second, &attempts, 0, exec, replay)
 			defer drainResp(rec.Final.Resp)
-			if sends != 1 || attempts != 1 {
-				t.Fatalf("%s cancelled must send exactly once: sends=%d attempts=%d", tc.name, sends, attempts)
+			defer drainResp(rec.InitialResp)
+			if sends != 1 || attempts != 8 {
+				t.Fatalf("%s cancel-during-exec must send once: sends=%d attempts=%d", tc.name, sends, attempts)
 			}
 			if rec.Action != recoveryReturnContext || rec.MarkUnavailable {
 				t.Fatalf("%s cancelled must return-context with no mark: %+v", tc.name, rec)
 			}
 			if rec.Cause != tc.cause || !rec.Cancelled {
-				t.Fatalf("%s cancelled must keep cause and cancelled flag: %+v", tc.name, rec)
+				t.Fatalf("%s cancelled must keep classified cause and cancelled flag: %+v", tc.name, rec)
+			}
+			if rec.Final.Resp == nil || rec.Final.Resp.StatusCode != tc.status {
+				t.Fatalf("%s must preserve the real response identity: %+v", tc.name, rec)
+			}
+			if rec.Final.Started != started {
+				t.Fatalf("%s must preserve Started: %d", tc.name, rec.Final.Started)
+			}
+			if rec.InitialResp != rec.Final.Resp {
+				t.Fatalf("%s InitialResp must match the real send: %+v", tc.name, rec)
 			}
 		})
+	}
+}
+
+func TestRunnerPreSendCancelZeroSendFourLanes(t *testing.T) {
+	// Pre-cancel and expired deadline across all four lanes with nonzero
+	// initial attempts: zero sends, attempts/meta preserved, no replay or
+	// side effects, typed return-context with transientStopContext.
+	lanes := []struct {
+		name string
+		lane recoveryLane
+	}{
+		{name: "unbound-anon", lane: recoveryLane{Bound: false, Anonymous: true}},
+		{name: "unbound-auth", lane: recoveryLane{Bound: false, Anonymous: false}},
+		{name: "pinned-anon", lane: recoveryLane{Bound: true, Anonymous: true}},
+		{name: "pinned-auth", lane: recoveryLane{Bound: true, Anonymous: false}},
+	}
+	ctxKinds := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{name: "pre-cancel", ctx: func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, want: context.Canceled},
+		{name: "expired-deadline", ctx: func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			return ctx, cancel
+		}, want: context.DeadlineExceeded},
+	}
+	for _, ln := range lanes {
+		for _, ck := range ctxKinds {
+			t.Run(ln.name+"/"+ck.name, func(t *testing.T) {
+				gw := &Gateway{}
+				ctx, cancel := ck.ctx()
+				defer cancel()
+				if ctx.Err() == nil {
+					t.Fatalf("test ctx must already be done")
+				}
+				meta := &requestMeta{Attempts: 99}
+				ctx = context.WithValue(ctx, requestMetaKey{}, meta)
+				sends := 0
+				exec := func(monitorAttempt int) attemptOutcome {
+					sends++
+					t.Fatalf("pre-send cancelled must never exec")
+					return attemptOutcome{}
+				}
+				replay := func(final attemptOutcome, rel int) (bool, *http.Response, error, int) {
+					t.Fatalf("pre-send cancelled must never replay")
+					return false, nil, nil, rel
+				}
+				attempts := 7
+				rec := gw.recoverSingleCandidate(ctx, ln.lane, TierZen, ProtocolChat, 5, time.Second, &attempts, 10, exec, replay)
+				if sends != 0 {
+					t.Fatalf("pre-send cancelled must send zero times: sends=%d", sends)
+				}
+				if attempts != 7 {
+					t.Fatalf("pre-send cancelled must preserve attempts: got %d want 7", attempts)
+				}
+				if meta.Attempts != 99 {
+					t.Fatalf("pre-send cancelled must not sync meta: got %d want 99", meta.Attempts)
+				}
+				if rec.Action != recoveryReturnContext || rec.MarkUnavailable {
+					t.Fatalf("pre-send cancelled must return-context with no mark: %+v", rec)
+				}
+				if rec.Stop != transientStopContext || !rec.Cancelled || rec.Cause != stableCauseContext {
+					t.Fatalf("pre-send cancelled must report context stop/cause: %+v", rec)
+				}
+				if rec.Final.Resp != nil || rec.Final.Err != ck.want {
+					t.Fatalf("pre-send cancelled must carry ctx err with no response: resp=%v err=%v want %v", rec.Final.Resp, rec.Final.Err, ck.want)
+				}
+				if rec.Final.Started != 0 || rec.InitialResp != nil || rec.InitialErr != nil {
+					t.Fatalf("pre-send cancelled must not fabricate Started/InitialResp: %+v", rec)
+				}
+				if rec.ReplayResp != nil || rec.ReplayErr != nil {
+					t.Fatalf("pre-send cancelled must not replay: %+v", rec)
+				}
+			})
+		}
 	}
 }
 
@@ -261,7 +407,7 @@ func TestRunnerStartedPreservedAndCancelStops(t *testing.T) {
 	if rec.Final.Started != started {
 		t.Fatalf("final.Started must survive the runner for credential429 fencing: %d", rec.Final.Started)
 	}
-	// Cancelled context stops with a single send and no observation loop.
+	// Pre-cancelled context performs zero sends and no observation loop.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	sends := 0
@@ -269,10 +415,15 @@ func TestRunnerStartedPreservedAndCancelStops(t *testing.T) {
 		sends++
 		return attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
 	}
-	attempts = 0
+	attempts = 7
 	recCancel := gw.recoverSingleCandidate(ctx, recoveryLane{Bound: false, Anonymous: false}, TierZen, ProtocolChat, 5, time.Second, &attempts, 0, execCancel, replay)
-	defer drainResp(recCancel.Final.Resp)
-	if sends != 1 || recCancel.Action != recoveryReturnContext {
-		t.Fatalf("cancel must stop after the initial send: sends=%d action=%v", sends, recCancel.Action)
+	if sends != 0 || attempts != 7 {
+		t.Fatalf("pre-cancel must send zero times and preserve attempts: sends=%d attempts=%d", sends, attempts)
+	}
+	if recCancel.Action != recoveryReturnContext || recCancel.Stop != transientStopContext {
+		t.Fatalf("pre-cancel must return context: %+v", recCancel)
+	}
+	if recCancel.Final.Resp != nil || recCancel.Final.Err != context.Canceled {
+		t.Fatalf("pre-cancel must carry ctx err with no response: %+v", recCancel)
 	}
 }
