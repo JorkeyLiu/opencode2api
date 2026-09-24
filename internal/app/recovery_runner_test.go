@@ -189,6 +189,63 @@ func TestRunnerCancelledStableNoMarkOrAdvance(t *testing.T) {
 	}
 }
 
+func TestRunnerPostL1Exact400UsesUnifiedDecision(t *testing.T) {
+	// Post-L1 exact-400 eligibility comes from the unified pure decision:
+	// allowed replays once terminal, late-cancelled returns context without
+	// replay. Pinned-auth lane also guards the strict stable+cancelled gate.
+	gw := &Gateway{}
+	lane := recoveryLane{Bound: true, Anonymous: false}
+	execAllowed := func() func(int) attemptOutcome {
+		sends := 0
+		return func(monitorAttempt int) attemptOutcome {
+			sends++
+			if sends == 1 {
+				return attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
+			}
+			return attemptOutcome{Resp: responseWithBody(400, `{"error":"bad"}`)}
+		}
+	}()
+	replays := 0
+	replayAllowed := func(final attemptOutcome, rel int) (bool, *http.Response, error, int) {
+		replays++
+		if !isRouteTerminalBadRequest(final.Resp, final.Err) {
+			t.Fatalf("post-L1 replay must see the exact 400 final")
+		}
+		drainResp(final.Resp)
+		return true, responseWithBody(200, `{"ok":true}`), nil, rel + 1
+	}
+	attempts := 0
+	rec := gw.recoverSingleCandidate(context.Background(), lane, TierZen, ProtocolChat, 3, 0, &attempts, 0, execAllowed, replayAllowed)
+	defer drainResp(rec.ReplayResp)
+	if replays != 1 || rec.Action != recoveryReplayTerminal {
+		t.Fatalf("post-L1 exact 400 must replay once terminal via unified decision: %+v replays=%d", rec, replays)
+	}
+	// Late-cancelled post-L1 exact 400 stays context via the same decision.
+	ctx, cancel := context.WithCancel(context.Background())
+	attemptsBlocked := 0
+	execBlocked := func(monitorAttempt int) attemptOutcome {
+		if attemptsBlocked == 1 {
+			cancel()
+			return attemptOutcome{Resp: responseWithBody(400, `{"error":"bad"}`)}
+		}
+		attemptsBlocked++
+		return attemptOutcome{Resp: responseWithBody(503, `{"error":"svc"}`)}
+	}
+	attempts = 0
+	replayBlocked := func(final attemptOutcome, rel int) (bool, *http.Response, error, int) {
+		t.Fatalf("late-cancelled post-L1 exact 400 must never replay")
+		return false, nil, nil, rel
+	}
+	recBlocked := gw.recoverSingleCandidate(ctx, lane, TierZen, ProtocolChat, 3, 0, &attempts, 0, execBlocked, replayBlocked)
+	defer drainResp(recBlocked.Final.Resp)
+	if recBlocked.Action != recoveryReturnContext || !recBlocked.Cancelled {
+		t.Fatalf("late-cancelled post-L1 exact 400 must return context: %+v", recBlocked)
+	}
+	if recBlocked.Cause != stableCauseExact400 {
+		t.Fatalf("cancel must not rewrite the classified cause: %+v", recBlocked)
+	}
+}
+
 func TestRunnerStartedPreservedAndCancelStops(t *testing.T) {
 	gw := &Gateway{}
 	const started int64 = 123456789

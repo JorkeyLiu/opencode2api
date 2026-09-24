@@ -9,6 +9,7 @@
 ## 1) 已验证结构交付
 
 - 单候选控制流单一权威落地，行为保持；全 suite、`go build`、gofmt 通过（见本次提交终检）。
+- 单候选结构交付已完成收口：post-L1 context/replay 资格已收归统一纯决策（typed action 决定能否进入 exact400 replay，无并行 context 门）；pinned custom 出口、耗尽证明归属、状态所有权均未动。
 
 ## 2) 仍未落地的方向（ADR pending）
 
@@ -18,6 +19,7 @@
 
 - 如继续整体统一恢复，必须先对照 ADR 闭环（`observe stability -> resolve stable cause -> continue session or faithfully return`）确定尚未被共享决策承接的实际生产责任/结果差距，再按完整责任边界迁移。
 - 不能用逐 cause 无限循环或 helper-only 增量当路线，也不能无证据声称所有语义完成；当前证据无法确定的下一动作不编造成已确定。
+- 不同耗尽证明（unbound 逐域状态无关耗尽、pinned 有界 consumption）与 scheduler/pin/route-session 状态所有权仍归 walker 与既有域所有者，不是第二决策权威；未决策略（广义逐状态矩阵/退避/广义 fallback）仍未决，不能从 pending 自动派生实现任务；本收口不声称整个 ADR 目标全部完成。
 
 ## Constraints
 

@@ -209,28 +209,13 @@ func (g *Gateway) recoverSingleCandidate(ctx context.Context, lane recoveryLane,
 	loopRes := g.observeSameTargetTransient(ctx, initial, tier, protocol, attempts, attemptOffset, maxObservation, interval, exec)
 	initResp, initErr = loopRes.InitialResp, loopRes.InitialErr
 	classified := classifyStableCause(ctx, loopRes)
-	switch {
-	case classified.Cause == stableCauseBuildFailure:
-		return mk(recoveryReturnBuild, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-	case classified.Cause == stableCauseSuccess:
-		return mk(recoveryReturnSuccess, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-	}
-	if lane.Bound && !lane.Anonymous {
-		if classified.Stop == transientStopContext || (classified.Stop == transientStopStable && classified.Cancelled) {
-			return mk(recoveryReturnContext, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-		}
-	} else if lane.Bound && lane.Anonymous {
-		if classified.Cause == stableCauseContext || classified.Cancelled {
-			return mk(recoveryReturnContext, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-		}
-	} else if !lane.Bound && lane.Anonymous {
-		if classified.Cause == stableCauseContext || classified.Cancelled {
-			return mk(recoveryReturnContext, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-		}
-	} else if classified.Cancelled {
-		return mk(recoveryReturnContext, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
-	}
-	if classified.Cause == stableCauseExact400 {
+	// Post-L1 context/replay eligibility reuses the unified pure decision:
+	// the typed action decides whether the exact-400 corrective replay may
+	// run, preserving build/success/context/replay priority and all lane
+	// differences (including the pinned-auth strict observationLimit+
+	// Cancelled gate). No parallel context gate lives here.
+	decision := decideCandidateRecovery(lane, classified)
+	if decision.Action == recoveryReplayTerminal {
 		if handled, replayResp, replayErr, replayed := replay(classified.Final, *attempts); handled {
 			*attempts = replayed
 			if replayResp != nil || replayErr != nil {
@@ -239,6 +224,5 @@ func (g *Gateway) recoverSingleCandidate(ctx context.Context, lane recoveryLane,
 		}
 		return mk(recoveryFaithful, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, false, nil, nil)
 	}
-	decision := decideCandidateRecovery(lane, classified)
 	return mk(decision.Action, classified.Final, classified.Stop, classified.Cancelled, classified.Cause, decision.MarkUnavailable, nil, nil)
 }
