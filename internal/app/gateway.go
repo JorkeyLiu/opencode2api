@@ -899,6 +899,23 @@ func isTrueTransportError(ctx context.Context, err error) bool {
 	return true
 }
 
+// shouldSkipRequestLocalSuspect is the smallest predicate for the unbound
+// authenticated request-local transport-suspect skip: a later frozen
+// candidate is skipped only when its (tier/channel, pool, raw proxy)
+// identity has request-local qualifying evidence in this request AND the
+// scheduler suspect cooldown for that identity is still active. An expired
+// cooldown never extends via membership alone; pool qualification is inherent
+// in the identity.
+func shouldSkipRequestLocalSuspect(local map[string]struct{}, tier Tier, pool, proxyRaw string, suspectActive bool) bool {
+	if local == nil || proxyRaw == "" {
+		return false
+	}
+	if _, ok := local[suspectIdentity(tier, pool, proxyRaw)]; !ok {
+		return false
+	}
+	return suspectActive
+}
+
 func streamedAttemptDuration(startedNanos int64) time.Duration {
 	if startedNanos <= 0 {
 		return 0
@@ -3571,6 +3588,14 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 	// filtering at build time; the request-local evidence avoids
 	// races/ambiguity with concurrent scheduler state.
 	reqProxy429 := make(map[string]struct{})
+	// reqTransportSuspect is the unbound authenticated request-local
+	// transport-suspect L2 cause: a qualifying true transport error via a
+	// real send (L1-final, isTrueTransportError) establishes the
+	// (tier/channel, pool, raw proxy) identity for this request only.
+	// Pre-existing suspect state never seeds this map (already filtered at
+	// freeze); anonymous-phase evidence is never borrowed here. Pinned
+	// paths never read it.
+	reqTransportSuspect := make(map[string]struct{})
 	markCredUnavailable := func(credID, proxyRaw string, resp *http.Response, err error) {
 		if credID == "" || proxyRaw == "" {
 			return
@@ -3654,6 +3679,30 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 				credEntered[cand.CredID] = true
 			}
 			continue
+		}
+		// Request-local transport-suspect L2 cause: skip a later frozen
+		// candidate whose (tier/channel, pool, raw proxy) identity has
+		// qualifying request-local evidence AND whose scheduler suspect
+		// cooldown is still active. No POST, no attempts increment, no
+		// upstream attempt record, no scheduler/health writes. The skip
+		// counts as unavailable for its credential-domain exhaustion proof
+		// and marks the domain entered; it never counts as live429 or
+		// credential429 evidence. Expired cooldowns never skip despite
+		// membership; distinct pool identities never match.
+		if _, ok := reqTransportSuspect[suspectIdentity(cand.Tier, cand.PoolName, cand.ProxyRaw)]; ok {
+			_, _, suspectActive := g.scheduler.suspectCooldownStatus(cand.Tier, cand.PoolName, cand.ProxyRaw)
+			if shouldSkipRequestLocalSuspect(reqTransportSuspect, cand.Tier, cand.PoolName, cand.ProxyRaw, suspectActive) {
+				if !isContextCancelled(ctx) && cand.ProxyRaw != "" {
+					set, ok := credUnavailable[cand.CredID]
+					if !ok {
+						set = make(map[string]struct{})
+						credUnavailable[cand.CredID] = set
+					}
+					set[cand.ProxyRaw] = struct{}{}
+					credEntered[cand.CredID] = true
+				}
+				continue
+			}
 		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
@@ -3792,6 +3841,16 @@ func (g *Gateway) doKeyUpstream(ctx context.Context, route modelRoute, bodies ma
 					markCredUnavailable(cand.CredID, cand.ProxyRaw, final.Resp, final.Err)
 					if isStableCredential401(final.Resp, final.Err) && !isContextCancelled(ctx) {
 						credStable401[cand.CredID] = true
+					}
+					// Request-local transport-suspect evidence: only a real
+					// qualifying true transport final at the L1 final/advance
+					// point establishes the identity. 408/425/5xx,
+					// stream-startup sentinel, cancel/deadline, and 429 never
+					// qualify via isTrueTransportError.
+					if (classified.Stop == transientStopObservationLimit || classified.Stop == transientStopStable) && isTrueTransportError(ctx, final.Err) {
+						if cand.ProxyRaw != "" {
+							reqTransportSuspect[suspectIdentity(cand.Tier, cand.PoolName, cand.ProxyRaw)] = struct{}{}
+						}
 					}
 				}
 				if classified.Cause == stableCauseLive429 {

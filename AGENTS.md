@@ -45,7 +45,8 @@
   from config. NEVER treat
   it as editable directly; change it only by changing config (or the seed/env
   inputs that produce config) and letting the runtime rebuild. Scheduler
-  state has six layers: proxy transport health (connectivity only),
+  state has seven layers: proxy transport health (connectivity only, distinct
+  from bounded temporary transport-suspect candidate filtering),
   channel-qualified `(channel,pool,proxy)` 429 rate-limit cooldowns,
   channel-qualified `(channel,pool,proxy)` comparative channel-availability
   cooldowns for 403/5xx, per-(channel, credential) 401 cooldowns,
@@ -53,8 +54,17 @@
   currently eligible proxy for that credential has returned live 429 in one
   request (frozen-eligible exhaustion using the last Retry-After; partial 429
   never writes it, pre-cooled skips never count as live evidence, single
-  eligible exhausting alone still writes it), and per-(channel, credential, pool, proxy,
-  model) target cooldowns for 403/5xx only. Scheduler identity has no
+  eligible exhausting alone still writes it), per-(channel, credential, pool, proxy,
+  model) target cooldowns for 403/5xx only, and per-(channel, pool, proxy)
+  short-lived transport-suspect filtering for true transport failures only
+  (bounded temporary candidate filtering, never readiness). Unbound
+  authenticated establishment additionally keeps request-local suspect
+  evidence: a qualifying L1-final true transport error records its
+  (channel,pool,proxy) identity for this request only, and a later frozen
+  candidate with the same identity skips while that suspect cooldown is
+  still active (expired cooldowns never skip; distinct pools never match).
+  Suspect skips count as unavailable with the domain marked entered and never
+  as live429/credential429 evidence. Scheduler identity has no
   Zen-vs-Go tier separation on live paths: anonymous and authenticated share
   Zen channel-scoped proxy state as appropriate while retaining
   credential/target/session distinctions and the current pin/retry invariants.
@@ -194,7 +204,7 @@
 
 ## 4. Invariants (MUST Preserve)
 
-> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码为候选/429 fallback 基线加已收敛的单一 L1 计数（400 同目标 corrective replay 终态、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、候选遍历由冻结切片自然有界、模型刷新独立全遍历、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、未绑定 401 凭证级 L2 原因（首个真实稳定 401 后跳过同凭证剩余冻结目标、无伪发送、跳过按凭证原因计入 Unavailable）、未绑定认证 request-local proxy429 L2 原因（同请求内真实 live 429 建立 `(tier/channel,pool,proxy)` 不可用，同身份后续冻结候选跳过无 POST、跳过计入 Unavailable+Entered、无 attempt/上游记录/调度写入，partial live429+skip 永不写 credential429；request-local skip 与 live 证据区分：skip 计入 Unavailable 但永不计入 live429/credential429 证据）、custom：未绑定按逐域真实请求对象耗尽状态无关判断 per b2c4798（每域 Entered && Frozen>0 && Unavailable>=Frozen，Unavailable=live 429/401/403/L1-final 408/425/5xx/transport 含 L1-final stream startup，每冻结候选各计一次，其中 401 同凭证跳过目标按该凭证级原因计入、request-local proxy429 跳过目标按本请求真实 429 证据计入、无伪发送/attempt；400/ordinary 4xx/cancel/deadline/committed/build 不计，状态无关、不要求终态429），已绑定在原全 429 live 发送路径（proxy429 预冷零发送保持本地 429 不接管）之外新增受限 pinned L2 consumption 耗尽——仅已实际进入下一代理的 L2 消耗、冻结 eligible 全部真实尝试且末位对象不可用（401/403/L1-final 408/425/5xx/transport/stream-startup）时接管，单代理首发非 429、400 replay、ordinary 4xx、cancel/deadline、committed stream 不接管，非 429 不写 credential429；未绑定与已绑定均不按单一错误种类直接决策，二者独立耗尽证据不同），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；本次仅完成单一 L1 计数收敛，广义逐状态码语义映射、广义 fallback 与退避数值仍待定，MUST NOT be read as completed — see ADR 0001.
+> **Implementation honesty (current baseline vs. accepted principle).** Invariants below describe the *implemented baseline* — 当前代码为候选/429 fallback 基线加已收敛的单一 L1 计数（400 同目标 corrective replay 终态、`retry.max_attempts` 为唯一 L1 同目标观察上限含首次发送、候选遍历由冻结切片自然有界、模型刷新独立全遍历、503 受约束同目标观察、cancel/deadline/committed bytes 后停止、未绑定 401 凭证级 L2 原因（首个真实稳定 401 后跳过同凭证剩余冻结目标、无伪发送、跳过按凭证原因计入 Unavailable）、未绑定认证 request-local proxy429 L2 原因（同请求内真实 live 429 建立 `(tier/channel,pool,proxy)` 不可用，同身份后续冻结候选跳过无 POST、跳过计入 Unavailable+Entered、无 attempt/上游记录/调度写入，partial live429+skip 永不写 credential429；  request-local skip 与 live 证据区分：skip 计入 Unavailable 但永不计入 live429/credential429 证据）、未绑定认证 request-local transport-suspect（本请求内真实 L1-final true transport 建立 `(channel,pool,proxy)` 身份，同身份后续冻结候选在 suspect 仍 active 时跳过无 POST、跳过计入 Unavailable+Entered、无 attempt/上游记录/调度写入，过期不跳、跨池不命中；408/425/5xx/stream-startup/429/cancel 不建立该证据）、custom：未绑定按逐域真实请求对象耗尽状态无关判断 per b2c4798（每域 Entered && Frozen>0 && Unavailable>=Frozen，Unavailable=live 429/401/403/L1-final 408/425/5xx/transport 含 L1-final stream startup，每冻结候选各计一次，其中 401 同凭证跳过目标按该凭证级原因计入、request-local proxy429 跳过目标按本请求真实 429 证据计入、request-local suspect 跳过目标按本请求真实 transport 证据计入、无伪发送/attempt；400/ordinary 4xx/cancel/deadline/committed/build 不计，状态无关、不要求终态429），已绑定在原全 429 live 发送路径（proxy429 预冷零发送保持本地 429 不接管）之外新增受限 pinned L2 consumption 耗尽——仅已实际进入下一代理的 L2 消耗、冻结 eligible 全部真实尝试且末位对象不可用（401/403/L1-final 408/425/5xx/transport/stream-startup）时接管，单代理首发非 429、400 replay、ordinary 4xx、cancel/deadline、committed stream 不接管，非 429 不写 credential429；未绑定与已绑定均不按单一错误种类直接决策，二者独立耗尽证据不同），不是统一三层已落地。已接受的统一语义三层模型为 `L1 Observe stability / L2 Resolve stable cause / L3 Continue session or faithfully return`（L1 观察含 `retry` 作为观察手段，L2 解决含 400 修正与所有对象粒度的选择包括 `fallback`，L3 继续或忠实返回；`fallback` 只是 L2 对象选择而非固定末级，恢复域是候选组织/可用性过滤的上下文而非层级；400 重放属于 L2 稳定非法请求解决、完成后按 L3 终态返回，不是 L1 retry），该模型尚未完全落地；本次仅完成单一 L1 计数收敛，广义逐状态码语义映射、广义 fallback 与退避数值仍待定，MUST NOT be read as completed — see ADR 0001.
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
@@ -246,7 +256,14 @@
   (shared across credentials): later frozen candidates with the same identity
   are skipped without a POST (pre-existing cooldowns alone never trigger this;
   only request-local live-429 evidence does), counted as unavailable+entered
-  without attempts, upstream records, or scheduler writes; 403/429 never
+  without attempts, upstream records, or scheduler writes; a qualifying
+  L1-final true transport error in this unbound auth request likewise
+  establishes a request-local `(channel,pool,proxy)` suspect cause for later
+  same-identity frozen candidates, skipped only while that suspect cooldown
+  stays active (expired cooldowns never skip; 408/425/5xx/stream-startup/429/
+  cancel never establish it), counted as unavailable+entered without
+  attempts/records/writes and never as live429/credential429 evidence;
+  403/429 never
   observe same-target; transport/408/425/5xx observe same-target
   up to the unique L1 limit; any other
   4xx MUST end the route. Exhaustion of one credential's frozen eligible set
@@ -262,7 +279,8 @@
   replay 2xx pins the session+model when still unbound; once pinned, the
   binding walks the same credential+pool on 429 only per the Session affinity spine.
 - Scheduler state: proxy health is transport connectivity only (HTTP statuses
-  never change it); a single foreground transport error never cools
+  never change it; bounded temporary transport-suspect filtering is a
+  separate short-lived candidate filter, never health); a single foreground transport error never cools
   credential/target/proxy429/channel state and never flips proxy healthy directly —
   it only triggers the existing async neutral proxy health verification,
   and only that independent probe on explicit isProxyFailure may flip
@@ -368,7 +386,7 @@
    with masked GET, authenticated-session reveal (POST-only non-GET behind admin
   session auth + CSRF + Origin, no-store response, and full-chain
   redaction without plaintext logging). When `active` names a channel, it is
-  the final fallback for eligible native-route exhaustion: unbound (new) requests use per-domain real-request state-agnostic object-unavailable exhaustion per b2c4798 (each domain Entered && Frozen>0 && Unavailable>=Frozen, Unavailable=live 429/401/403/L1-final 408/425/5xx/transport incl. L1-final stream startup per frozen candidate, 400/ordinary 4xx/cancel/deadline/committed/build excluded, state-agnostic, not requiring terminal 429; 401 same-credential skips count by credential cause, request-local proxy429 skips count by this-request live-429 evidence with Entered, neither counts as live429 for credential429), while established (pinned) bindings keep the existing full-429 live-send path (proxy429 pre-cooled zero-send keeps native 429 with Retry-After and never tries custom) and add a bounded pinned L2 consumption gate — only after a real switch/send to the next frozen eligible proxy has already happened in this request, every frozen eligible has been really tried (pre-cooled skips not counted, BuildErr/no-send not counted) and the final is object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup) may the pinned non-429 exhaust to custom; single-proxy initial non-429, exact-400 replay (and its second-400/ordinary 4xx outcome), ordinary 4xx, cancel/deadline, and committed-stream never qualify, and non-429 takeovers never write credential429; unbound and pinned do not decide by single error kind directly and their independent exhaustion proofs differ; other non-429 terminals remain faithful without custom even when 429s were seen earlier on other candidates.
+  the final fallback for eligible native-route exhaustion: unbound (new) requests use per-domain real-request state-agnostic object-unavailable exhaustion per b2c4798 (each domain Entered && Frozen>0 && Unavailable>=Frozen, Unavailable=live 429/401/403/L1-final 408/425/5xx/transport incl. L1-final stream startup per frozen candidate, 400/ordinary 4xx/cancel/deadline/committed/build excluded, state-agnostic, not requiring terminal 429;   401 same-credential skips count by credential cause, request-local proxy429 skips count by this-request live-429 evidence with Entered, request-local suspect skips count by this-request live transport evidence with Entered, none counts as live429 for credential429), while established (pinned) bindings keep the existing full-429 live-send path (proxy429 pre-cooled zero-send keeps native 429 with Retry-After and never tries custom) and add a bounded pinned L2 consumption gate — only after a real switch/send to the next frozen eligible proxy has already happened in this request, every frozen eligible has been really tried (pre-cooled skips not counted, BuildErr/no-send not counted) and the final is object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup) may the pinned non-429 exhaust to custom; single-proxy initial non-429, exact-400 replay (and its second-400/ordinary 4xx outcome), ordinary 4xx, cancel/deadline, and committed-stream never qualify, and non-429 takeovers never write credential429; unbound and pinned do not decide by single error kind directly and their independent exhaustion proofs differ; other non-429 terminals remain faithful without custom even when 429s were seen earlier on other candidates.
   Without an
   active channel the original envelope is kept (native 429 stays 429, other statuses faithful); with one, the current request retries at
   once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
