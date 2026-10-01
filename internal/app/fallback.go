@@ -1184,8 +1184,22 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 	setRequestModel(ctx, channelModel)
 	syncAttemptMeta(ctx, TierCustom, channelProtocol, attemptOffset, 1)
 	started := time.Now()
-	resp, sendErr := g.fallbackCustomClient().Do(req)
-	duration := time.Since(started)
+	// True client streams never inherit the shared custom total timeout via
+	// the client clone: establishment is bounded by the startup budget and
+	// a committed SSE body follows the client context only. The shared
+	// client is never mutated. Non-SSE compat bodies (streaming requests
+	// answered with complete JSON/untyped) bypass the gate by design and
+	// re-arm the original total on the request controller after Do returns,
+	// so a headers-to-tail stall stays bounded by min(startup budget,
+	// original total) through body end.
+	baseClient := g.fallbackCustomClient()
+	origTotal := baseClient.Timeout
+	client := baseClient
+	streaming := isStreamContext(ctx)
+	if streaming {
+		client = streamCustomClient(baseClient)
+	}
+	resp, sendErr := client.Do(req)
 	// Defensive: an http.Client must return either resp or err, but a
 	// misbehaving RoundTripper returning (nil, nil) must never surface as
 	// nil response + nil error (handleInference would panic on defer
@@ -1193,13 +1207,79 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 	if resp == nil && sendErr == nil {
 		sendErr = errors.New("custom fallback transport failed")
 	}
-	class := classifyUpstreamAttempt(resp, sendErr)
 	customRoute := route
 	customRoute.Tier = TierCustom
 	customRoute.Protocol = channelProtocol
 	if channelModel != "" {
 		customRoute.ID = channelModel
 	}
+	// True client streams reuse the native startup gate on the channel
+	// protocol, but only for real SSE streams: a custom channel may answer a
+	// streaming request with a complete JSON document (existing compat, e.g.
+	// the exhaustion fallback probes), which must keep passing through
+	// untouched. Only Content-Type text/event-stream enters the gate; JSON
+	// or untyped bodies keep the pre-existing passthrough (and its existing
+	// whole-budget semantics). Startup failure returns a
+	// custom error with no native/custom switch and no retry, and never
+	// writes Zen scheduler state (observability recording only).
+	if streaming && sendErr == nil && resp != nil && resp.StatusCode/100 == 2 && isCustomSSEStream(resp) {
+		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, channelProtocol)
+		if verifyErr != nil && isContextCancelled(ctx) {
+			drainAndClose(resp.Body)
+			duration := time.Since(started)
+			budgetErr := streamStartupBudgetErr(ctx)
+			class := classifyUpstreamAttempt(nil, budgetErr)
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+			return nil, effectiveRoute, attemptOffset + 1, budgetErr
+		}
+		if gate.ShouldCommit() {
+			// Linearized custom commit: only the pending->committed winner
+			// creates the gated body. Expiry/cancel losers drain and return
+			// the budget/cancel error with no success record and no
+			// established flip (the pinned path flips only on success).
+			if !markStreamStartupCommitted(ctx) {
+				drainAndClose(resp.Body)
+				duration := time.Since(started)
+				budgetErr := streamStartupBudgetErr(ctx)
+				class := classifyUpstreamAttempt(nil, budgetErr)
+				g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+				return nil, effectiveRoute, attemptOffset + 1, budgetErr
+			}
+			duration := time.Since(started)
+			class := classifyUpstreamAttempt(resp, nil)
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, nil, duration, class, false, false, false, badRequestDiag{})
+			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
+			return resp, effectiveRoute, attemptOffset + 1, nil
+		}
+		drainAndClose(resp.Body)
+		duration := time.Since(started)
+		fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
+		class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
+		g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{})
+		return nil, effectiveRoute, attemptOffset + 1, errors.New("upstream stream startup failure")
+	}
+	// Non-SSE compat passthrough on true streams keeps the pre-existing body
+	// untouched but stays time-bounded through body end: the startup budget
+	// remains armed (handleInference skips its headers-point stop for this
+	// exact case) and the original shared-client total is re-armed on the
+	// same controller, so the tail observes min(startup budget, total).
+	if streaming && sendErr == nil && resp != nil && resp.StatusCode/100 == 2 && !isCustomSSEStream(resp) && origTotal > 0 {
+		remaining := origTotal - time.Since(started)
+		if remaining <= 0 {
+			if b := streamStartupBudgetFromCtx(ctx); b != nil {
+				b.expire()
+			}
+			drainAndClose(resp.Body)
+			duration := time.Since(started)
+			budgetErr := streamStartupBudgetErr(ctx)
+			class := classifyUpstreamAttempt(nil, budgetErr)
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+			return nil, effectiveRoute, attemptOffset + 1, budgetErr
+		}
+		armStreamStartupTotalTimeout(ctx, remaining)
+	}
+	duration := time.Since(started)
+	class := classifyUpstreamAttempt(resp, sendErr)
 	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{})
 	_ = binding
 	if sendErr != nil {

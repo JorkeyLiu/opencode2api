@@ -493,10 +493,38 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if meta != nil {
 			meta.Stream = stream
 		}
-		requestCtx, cancel := context.WithTimeout(r.Context(), time.Duration(g.cfg.Retry.TimeoutSeconds)*time.Second)
+		startupTimeout := time.Duration(g.cfg.Retry.TimeoutSeconds) * time.Second
+		// True client streams use a startup-only budget: the timeout covers
+		// establishment (headers, non-committing 200s, L1 observation,
+		// candidate/fallback recovery) until the first deliverable event
+		// passes the stream startup gate. After commit the timer is revoked
+		// and the remaining stream follows the client context only, so a
+		// healthy long stream is never truncated by total output duration.
+		// Non-stream requests (including the anonymous internal SSE fold)
+		// keep the existing whole-request timeout.
+		var requestCtx context.Context
+		var cancel context.CancelFunc
+		if stream {
+			var stop func()
+			requestCtx, cancel, stop = newStreamStartupBudget(r.Context(), startupTimeout)
+			defer stop()
+		} else {
+			requestCtx, cancel = context.WithTimeout(r.Context(), startupTimeout)
+		}
 		defer cancel()
 		ex := upstreamExtra{External: external, Payload: cloneMap(payload)}
 		resp, upstreamRoute, err := g.doUpstream(requestCtx, route, bodies, ids, ex)
+		// Disarm the startup timer promptly, except for custom non-SSE
+		// compat bodies on true streams: those bypass the gate by design,
+		// so stopping on headers would lift all time protection and leave
+		// a headers-to-tail stall unbounded. Committed streams already
+		// revoked the budget at the gate decision (stop is a no-op);
+		// uncommitted native/custom-SSE outcomes keep the timeout verdict
+		// (a fired timer already cancelled the context). The deferred
+		// stop() still owns final cleanup after the body is consumed.
+		if !(stream && resp != nil && resp.StatusCode/100 == 2 && upstreamRoute.Tier == TierCustom && !isCustomSSEStream(resp)) {
+			stopStreamStartupBudget(requestCtx)
+		}
 		if err != nil {
 			finalTier := route.Tier
 			finalProtocol := string(external)
@@ -1047,7 +1075,7 @@ func (g *Gateway) verifyStreamGate(ctx context.Context, body io.Reader, protocol
 			break
 		}
 		if ctx != nil && ctx.Err() != nil {
-			return gate, pending.Bytes(), parser, ctx.Err()
+			return gate, pending.Bytes(), parser, streamStartupBudgetErr(ctx)
 		}
 		// Drain complete frames from pending before reading more
 		drained := false
@@ -1095,6 +1123,9 @@ func (g *Gateway) verifyStreamGate(ctx context.Context, body io.Reader, protocol
 			} else if errors.Is(readErr, errSSEUnexpectedEOF) {
 				gate.NoteReadError(readErr)
 			} else if streamClientCancelled(ctx, readErr) {
+				if streamStartupExpired(ctx) {
+					return gate, pending.Bytes(), parser, context.DeadlineExceeded
+				}
 				return gate, pending.Bytes(), parser, readErr
 			} else {
 				gate.NoteReadError(readErr)
@@ -1105,14 +1136,14 @@ func (g *Gateway) verifyStreamGate(ctx context.Context, body io.Reader, protocol
 		if ctx != nil {
 			select {
 			case <-ctx.Done():
-				return gate, pending.Bytes(), parser, ctx.Err()
+				return gate, pending.Bytes(), parser, streamStartupBudgetErr(ctx)
 			default:
 			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if ctx != nil && ctx.Err() != nil && !gate.ShouldCommit() && !gate.HasStartupFailure() {
-		return gate, pending.Bytes(), parser, ctx.Err()
+		return gate, pending.Bytes(), parser, streamStartupBudgetErr(ctx)
 	}
 	return gate, pending.Bytes(), parser, nil
 }
@@ -1235,15 +1266,27 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
 		if verifyErr != nil && isContextCancelled(ctx) {
 			drainAndClose(resp.Body)
-			return attemptOutcome{Resp: nil, Err: ctx.Err(), Diag: diag, Started: started}
+			return attemptOutcome{Resp: nil, Err: streamStartupBudgetErr(ctx), Diag: diag, Started: started}
 		}
 		if gate.ShouldCommit() {
+			// Linearized commit: only the pending->committed winner creates
+			// the gated body and records success/pin. An expired (or
+			// parent-cancelled) loser returns the budget/cancel error with
+			// no gated body, no success, and no pin. The winning commit
+			// stops the timer(s) synchronously inside tryCommit.
+			if !markStreamStartupCommitted(ctx) {
+				drainAndClose(resp.Body)
+				return attemptOutcome{Resp: nil, Err: streamStartupBudgetErr(ctx), Diag: diag, Started: started}
+			}
 			// A cancelled stream keeps its already-gated committed body and
 			// envelope, but never applies scheduler success: cancellation is
 			// not a clear signal. The monitoring record below keeps the
 			// existing recording policy unchanged (still recorded on cancel),
 			// mirroring applyAttemptOutcome's cancel behavior on non-stream
 			// paths (early return without state change, record still kept).
+			// With a controller present the mark above already refused a
+			// cancelled context, so this recheck only guards the legacy
+			// controller-free compat path (direct executeAttempt callers).
 			if !isContextCancelled(ctx) {
 				g.applyStreamSuccess(cand, started)
 			}
