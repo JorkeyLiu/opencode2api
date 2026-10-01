@@ -47,14 +47,41 @@ func TestHistoryConfigDefaultsStrictValidation(t *testing.T) {
 		mut  func(*Config)
 	}{
 		{"retention low", func(c *Config) { c.History.RetentionDays = 0 }},
-		{"retention high", func(c *Config) { c.History.RetentionDays = 91 }},
 		{"bytes low", func(c *Config) { c.History.MaxBytesMB = 15 }},
-		{"bytes high", func(c *Config) { c.History.MaxBytesMB = 2049 }},
 	} {
 		cfg := testHistoryConfig("config.json")
 		tc.mut(&cfg)
 		if _, err := NormalizeConfig("config.json", cfg); err == nil {
 			t.Fatalf("%s should fail", tc.name)
+		}
+	}
+	// No fixed business max: old-limit+1 and larger values pass; only the
+	// technical representable range rejects.
+	for _, tc := range []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{"retention 91", func(c *Config) { c.History.RetentionDays = 91 }},
+		{"retention 365", func(c *Config) { c.History.RetentionDays = 365 }},
+		{"bytes 2049", func(c *Config) { c.History.MaxBytesMB = 2049 }},
+		{"bytes 8192", func(c *Config) { c.History.MaxBytesMB = 8192 }},
+	} {
+		cfg := testHistoryConfig("config.json")
+		tc.mut(&cfg)
+		if _, err := NormalizeConfig("config.json", cfg); err != nil {
+			t.Fatalf("%s should pass, got %v", tc.name, err)
+		}
+	}
+	{
+		cfg := testHistoryConfig("config.json")
+		cfg.History.RetentionDays = int(1) << 40
+		if _, err := NormalizeConfig("config.json", cfg); err == nil {
+			t.Fatalf("retention huge should fail on representability")
+		}
+		cfg = testHistoryConfig("config.json")
+		cfg.History.MaxBytesMB = 8796093022208
+		if _, err := NormalizeConfig("config.json", cfg); err == nil {
+			t.Fatalf("bytes huge should fail on representability")
 		}
 	}
 }

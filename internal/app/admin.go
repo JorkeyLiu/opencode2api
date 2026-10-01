@@ -167,7 +167,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusInternalServerError, "internal_error", "could not create session")
 		return
 	}
-	expires := time.Now().Add(time.Duration(cfg.WebUI.SessionTTLMinutes) * time.Minute)
+	expires := time.Now().Add(minutesToDuration(cfg.WebUI.SessionTTLMinutes))
 	a.mu.Lock()
 	delete(a.attempts, client)
 	a.cleanupSessionsLocked(time.Now())
@@ -176,7 +176,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.sessions[tokenDigest(token)] = adminSession{Username: cfg.WebUI.Username, AuthVersion: secretFingerprint(cfg.WebUI.PasswordHash), CSRF: csrf, Expires: expires}
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds()), Secure: requestIsSecure(r)})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: sessionCookieMaxAgeSeconds(cfg.WebUI.SessionTTLMinutes), Secure: requestIsSecure(r)})
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("admin login succeeded", "component", "auth", "event", "login_succeeded", "client_ip", client)
 	writeJSON(w, http.StatusOK, map[string]any{"username": cfg.WebUI.Username, "csrf_token": csrf, "expires_at": expires.UTC()})

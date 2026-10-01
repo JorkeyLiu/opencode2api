@@ -111,7 +111,7 @@ type PerformanceConfig struct {
 	RateLimitCooldownSeconds        int `json:"rate_limit_cooldown_seconds"`
 	TransportSuspectCooldownSeconds int `json:"transport_suspect_cooldown_seconds"`
 	// Legacy compat input only: accepted on load, ignored at runtime, never emitted.
-	// The 429 maximum is the fixed 3600s backoff cap.
+	// The effective 429 max is max(1h, configured base) with no second field.
 	RateLimitCooldownMaxSeconds int `json:"rate_limit_cooldown_max_seconds,omitempty"`
 }
 
@@ -473,6 +473,9 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Retry.TimeoutSeconds < 1 {
 		return Config{}, errors.New("retry.timeout_seconds must be at least 1")
 	}
+	if int64(cfg.Retry.TimeoutSeconds) > maxRepresentableSecondsInt64 {
+		return Config{}, errors.New("retry.timeout_seconds must be at least 1 and within representable duration range (at most 9223372036 seconds)")
+	}
 	// attempt_timeout_seconds load-time migration correction: a config loaded
 	// from disk where the field is absent normalizes to the canonical default
 	// single-attempt timeout (5 seconds), clamped down to the whole-route
@@ -487,33 +490,41 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Retry.AttemptTimeoutSeconds < 1 || cfg.Retry.AttemptTimeoutSeconds > cfg.Retry.TimeoutSeconds {
 		return Config{}, errors.New("retry.attempt_timeout_seconds must be between 1 and retry.timeout_seconds")
 	}
-	// transient_retry_interval_seconds: absent defaults to 3; explicit 0 is valid (0..30) and must not be defaulted.
+	// transient_retry_interval_seconds: absent defaults to 3; explicit 0 is
+	// valid and must not be defaulted. No fixed business max applies; only the
+	// minimum (0) and the technical representable duration range bound it.
 	if !cfg.retryTransientIntervalPresent && cfg.Retry.TransientRetryIntervalSeconds == 0 {
 		cfg.Retry.TransientRetryIntervalSeconds = 3
 	}
-	if cfg.Retry.TransientRetryIntervalSeconds < 0 || cfg.Retry.TransientRetryIntervalSeconds > 30 {
-		return Config{}, errors.New("retry.transient_retry_interval_seconds must be between 0 and 30")
+	if cfg.Retry.TransientRetryIntervalSeconds < 0 || int64(cfg.Retry.TransientRetryIntervalSeconds) > maxRepresentableSecondsInt64 {
+		return Config{}, errors.New("retry.transient_retry_interval_seconds must be at least 0 and within representable duration range (at most 9223372036 seconds)")
 	}
 	if cfg.Models.RefreshSeconds < 1 {
 		return Config{}, errors.New("models.refresh_seconds must be at least 1")
 	}
+	if int64(cfg.Models.RefreshSeconds) > maxRefreshSecondsInt64 {
+		return Config{}, errors.New("models.refresh_seconds must be at least 1 and within representable range (at most 4611686018 seconds to allow doubled staleness window)")
+	}
 	if cfg.Performance.MaxIdleConns < 1 || cfg.Performance.MaxIdleConnsPerHost < 1 || cfg.Performance.MaxConnsPerHost < 0 || cfg.Performance.IdleConnTimeoutSeconds < 1 || cfg.Performance.ConnectTimeoutSeconds < 1 || cfg.Performance.FailureCooldownSeconds < 1 {
 		return Config{}, errors.New("performance values must be positive (max_conns_per_host may be zero for unlimited)")
+	}
+	if int64(cfg.Performance.IdleConnTimeoutSeconds) > maxRepresentableSecondsInt64 || int64(cfg.Performance.ConnectTimeoutSeconds) > maxRepresentableSecondsInt64 || int64(cfg.Performance.FailureCooldownSeconds) > maxRepresentableSecondsInt64 {
+		return Config{}, errors.New("performance idle/connect/failure durations must be within representable duration range (at most 9223372036 seconds each)")
 	}
 	if cfg.Performance.RateLimitCooldownSeconds == 0 {
 		cfg.Performance.RateLimitCooldownSeconds = 300
 	}
-	// Legacy max is accepted as compat input but ignored; the 429 maximum is
-	// the fixed 3600s backoff cap.
+	// Legacy max is accepted as compat input but ignored; the effective 429
+	// max is max(1h, configured base) with no second max field.
 	cfg.Performance.RateLimitCooldownMaxSeconds = 0
-	if cfg.Performance.RateLimitCooldownSeconds < 300 || cfg.Performance.RateLimitCooldownSeconds > 3600 {
-		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be between 300 and 3600")
+	if cfg.Performance.RateLimitCooldownSeconds < 300 || int64(cfg.Performance.RateLimitCooldownSeconds) > maxRepresentableSecondsInt64 {
+		return Config{}, errors.New("performance.rate_limit_cooldown_seconds must be at least 300 and within representable duration range (at most 9223372036 seconds)")
 	}
 	if !cfg.performanceSuspectPresent && cfg.Performance.TransportSuspectCooldownSeconds == 0 {
 		cfg.Performance.TransportSuspectCooldownSeconds = 15
 	}
-	if cfg.Performance.TransportSuspectCooldownSeconds < 1 || cfg.Performance.TransportSuspectCooldownSeconds > 300 {
-		return Config{}, errors.New("performance.transport_suspect_cooldown_seconds must be between 1 and 300")
+	if cfg.Performance.TransportSuspectCooldownSeconds < 1 || int64(cfg.Performance.TransportSuspectCooldownSeconds) > maxRepresentableSecondsInt64 {
+		return Config{}, errors.New("performance.transport_suspect_cooldown_seconds must be at least 1 and within representable duration range (at most 9223372036 seconds)")
 	}
 	if cfg.Logging.Level != "debug" && cfg.Logging.Level != "info" && cfg.Logging.Level != "warn" && cfg.Logging.Level != "error" {
 		return Config{}, errors.New("logging.level must be debug, info, warn, or error")
@@ -536,8 +547,8 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 		if cfg.WebUI.Password == "" && cfg.WebUI.PasswordHash == "" {
 			return Config{}, errors.New("webui.password is required for first-time setup")
 		}
-		if cfg.WebUI.SessionTTLMinutes < 5 || cfg.WebUI.SessionTTLMinutes > 10080 {
-			return Config{}, errors.New("webui.session_ttl_minutes must be between 5 and 10080")
+		if cfg.WebUI.SessionTTLMinutes < 5 || cfg.WebUI.SessionTTLMinutes > maxSessionTTLMinutes {
+			return Config{}, errors.New("webui.session_ttl_minutes must be at least 5 and within representable range (at most 35791394 minutes for cookie/Duration)")
 		}
 	}
 	for model, protocol := range cfg.Models.Protocols {
@@ -548,11 +559,11 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if err := validateFallbackConfig(&cfg.Fallback); err != nil {
 		return Config{}, err
 	}
-	if cfg.History.RetentionDays < 1 || cfg.History.RetentionDays > 90 {
-		return Config{}, errors.New("history.retention_days must be between 1 and 90")
+	if cfg.History.RetentionDays < 1 || cfg.History.RetentionDays > maxRetentionDays {
+		return Config{}, errors.New("history.retention_days must be at least 1 and within representable range (at most 106751 days)")
 	}
-	if cfg.History.MaxBytesMB < 16 || cfg.History.MaxBytesMB > 2048 {
-		return Config{}, errors.New("history.max_bytes_mb must be between 16 and 2048")
+	if cfg.History.MaxBytesMB < 16 || int64(cfg.History.MaxBytesMB) > maxHistoryMBInt64 {
+		return Config{}, errors.New("history.max_bytes_mb must be at least 16 and within representable range (at most 8796093022207 MB)")
 	}
 	cfg.History.Directory = strings.TrimSpace(cfg.History.Directory)
 	return cfg, nil

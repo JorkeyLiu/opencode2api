@@ -83,13 +83,15 @@ const (
 	// config field is missing or zero. Explicit nonzero values are kept.
 	defaultRateLimitBaseSeconds = 300
 
-	// defaultRateLimitMaxSeconds is the fixed 429 maximum clamp. The 429
-	// maximum is not a configurable field; the single configurable 429 value
-	// is the base (300..3600) and the backoff always clamps at 3600.
+	// defaultRateLimitMaxSeconds is the fixed internal backoff floor for 429
+	// cooldowns (1h). It is not configurable and is not a business max: the
+	// effective 429 max is max(1h, configured base) via rateLimitMax(), with
+	// no second max field.
 	defaultRateLimitMaxSeconds = 3600
 
-	// rateLimitMaxFixedSeconds is the fixed numeric/backoff maximum for 429
-	// cooldowns. It is not configurable.
+	// rateLimitMaxFixedSeconds is the fixed internal backoff floor for 429
+	// cooldowns. It is not configurable and is not a business max: the
+	// effective 429 max is max(3600s, configured base) via rateLimitMax().
 	rateLimitMaxFixedSeconds = 3600
 
 	// maxProxy429States bounds the live proxy429State map (pool x proxy).
@@ -308,8 +310,9 @@ func newTargetScheduler(baseCooldown time.Duration, rateLimitBases ...time.Durat
 	if len(rateLimitBases) > 1 && rateLimitBases[1] > 0 {
 		suspectCooldown = rateLimitBases[1]
 	}
-	// The 429 maximum is fixed at 3600s; any legacy max argument is accepted
-	// for compatibility but ignored.
+	// The effective 429 max is max(3600s, configured base); the stored value
+	// preserves that so migration keeps a larger base's remaining instead of
+	// clamping it back to 3600s. No second max config exists.
 	rateLimitMax := rateLimitMaxFixedSeconds * time.Second
 	if rateLimitMax < rateLimitCooldown {
 		rateLimitMax = rateLimitCooldown
@@ -611,6 +614,33 @@ func (st *routeSessionStore) migrateRouteSessionsFrom(old *routeSessionStore, va
 // absurd config values never wrap negative through time.Duration overflow.
 const maxDurationValue = time.Duration(math.MaxInt64)
 
+// Technical representability upper bounds for unbounded operator durations.
+// These are not business limits: they are the largest values whose derived
+// runtime arithmetic (Duration multiply, cookie MaxAge int, history bytes)
+// stays representable on 64-bit and, where noted, on 32-bit. Config values
+// above these bounds are rejected as unrepresentable, never silently
+// saturated. Choices (rationale for doc sync):
+//   - maxRepresentableSeconds = MaxInt64/1e9 = 9223372036: time.Duration is
+//     int64 nanoseconds, so seconds*Second saturates beyond this.
+//   - maxRefreshSeconds = maxRepresentableSeconds/2 = 4611686018: models
+//     staleness uses 2*refresh*Second, so refresh must allow doubling.
+//   - maxSessionTTLMinutes = MaxInt32/60 = 35791394 (~68y): cookie MaxAge is a
+//     Go int of seconds (minutes*60) and must not overflow 32-bit int;
+//     this also fits time.Duration (limit would be 153722867 minutes).
+//   - maxRetentionDays = MaxInt64/86400e9 = 106751 (~292y): days*24h as
+//     time.Duration; history AddDate cutoff itself has no such bound.
+//   - maxHistoryMB = MaxInt64>>20 = 8796093022207: MB<<20 as int64 bytes.
+//   - suspectFixedCapSeconds = 300: preserved internal backoff/migration floor;
+//     effective suspect cap is max(300s, configured base), never a business max.
+const (
+	maxRepresentableSecondsInt64 int64 = int64(math.MaxInt64) / int64(time.Second)
+	maxRefreshSecondsInt64       int64 = int64(math.MaxInt64) / int64(time.Second) / 2
+	maxSessionTTLMinutes               = 35791394
+	maxRetentionDays                   = 106751
+	maxHistoryMBInt64            int64 = int64(math.MaxInt64) >> 20
+	suspectFixedCapSeconds             = 300
+)
+
 // secondsToDuration converts whole seconds to a duration, saturating at
 // MaxInt64 instead of overflowing for absurd values.
 func secondsToDuration(seconds int) time.Duration {
@@ -621,6 +651,93 @@ func secondsToDuration(seconds int) time.Duration {
 		return maxDurationValue
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// minutesToDuration converts whole minutes to a duration, saturating at
+// MaxInt64 instead of overflowing. Validation rejects unrepresentable inputs
+// first; this is defense-in-depth for directly constructed configs.
+func minutesToDuration(minutes int) time.Duration {
+	if minutes <= 0 {
+		return 0
+	}
+	if int64(minutes) > int64(maxDurationValue)/int64(time.Minute) {
+		return maxDurationValue
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+// daysToDuration converts whole days to a duration, saturating at MaxInt64.
+func daysToDuration(days int) time.Duration {
+	if days <= 0 {
+		return 0
+	}
+	if int64(days) > int64(maxDurationValue)/int64(24*time.Hour) {
+		return maxDurationValue
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// megabytesToBytes converts whole MB to bytes, saturating at MaxInt64.
+func megabytesToBytes(mb int) int64 {
+	if mb <= 0 {
+		return 0
+	}
+	if int64(mb) > maxHistoryMBInt64 {
+		return math.MaxInt64
+	}
+	return int64(mb) << 20
+}
+
+// refreshStaleAfter returns max(2*refreshSeconds*Second, 1m) with saturating
+// arithmetic so a large (but validated) refresh never wraps negative.
+func refreshStaleAfter(refreshSeconds int) time.Duration {
+	if refreshSeconds <= 0 {
+		return time.Minute
+	}
+	base := secondsToDuration(refreshSeconds)
+	doubled := saturatingShiftLeft(base, 1)
+	if doubled < time.Minute {
+		return time.Minute
+	}
+	return doubled
+}
+
+// sessionCookieMaxAgeSeconds returns minutes*60 clamped to MaxInt32 so the
+// http.Cookie MaxAge int never overflows on 32-bit platforms. Validated
+// configs already fit; this is defense-in-depth.
+func sessionCookieMaxAgeSeconds(minutes int) int {
+	if minutes <= 0 {
+		return 0
+	}
+	secs := int64(minutes) * 60
+	if secs > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int(secs)
+}
+
+// refreshTickerInterval returns a safe positive ticker interval for the model
+// refresh loop. Validation guarantees refreshSeconds>=1 and representable;
+// non-positive inputs fall back to 300s and saturation guards direct use.
+func refreshTickerInterval(refreshSeconds int) time.Duration {
+	d := secondsToDuration(refreshSeconds)
+	if d <= 0 {
+		return 300 * time.Second
+	}
+	return d
+}
+
+// staleAfterSecondsForAPI renders a staleness duration as whole seconds for
+// the health API without overflowing Go int on 32-bit platforms.
+func staleAfterSecondsForAPI(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	secs := int64(d / time.Second)
+	if secs > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int(secs)
 }
 
 // cooldownDeadline returns nowNanos+delay, saturating at MaxInt64 so absurd
@@ -677,21 +794,27 @@ func deterministicJitter(delay time.Duration, identity string, failures uint32) 
 }
 
 // backoffDelay computes base*2^min(failures-1,3) with deterministic jitter,
-// taking the larger of the jittered backoff and retryAfter, capped at 5min.
-// It preserves the non-429 (credential 401 / target / channel) behavior.
+// taking the larger of the jittered backoff and retryAfter, capped at the
+// effective failure max = max(5m, configured base). Default/old bases keep
+// the 5-minute behavior; a larger configured base really takes effect.
 func (s *targetScheduler) backoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	return backoffDelayForBase(s.failureBase(), failures, identity, retryAfter)
 }
 
 // rateLimitBackoffDelay uses the 429 minimum/start/base with the same
 // exponential/jitter/Retry-After conventions as backoffDelay, but clamps at
-// the configured 429 maximum (default 1h), not the generic 5-minute cap.
+// the effective 429 max = max(1h, configured base), not the generic 5-minute
+// cap. No second max config exists.
 func (s *targetScheduler) rateLimitBackoffDelay(failures uint32, identity string, retryAfter time.Duration) time.Duration {
 	return backoffDelayForBaseWithCap(s.rateLimitBase(), s.rateLimitMax(), failures, identity, retryAfter)
 }
 
 func backoffDelayForBase(base time.Duration, failures uint32, identity string, retryAfter time.Duration) time.Duration {
-	return backoffDelayForBaseWithCap(base, targetBackoffCap, failures, identity, retryAfter)
+	cap := targetBackoffCap
+	if base > cap {
+		cap = base
+	}
+	return backoffDelayForBaseWithCap(base, cap, failures, identity, retryAfter)
 }
 
 func backoffDelayForBaseWithCap(base, cap time.Duration, failures uint32, identity string, retryAfter time.Duration) time.Duration {
@@ -752,7 +875,35 @@ func (s *targetScheduler) rateLimitBase() time.Duration {
 }
 
 func (s *targetScheduler) rateLimitMax() time.Duration {
-	return rateLimitMaxFixedSeconds * time.Second
+	// Effective 429 max = max(fixed 1h, configured base). The stored build
+	// value already holds max(3600s, base); recompute the max so schedulers
+	// constructed before this change (or with a zero stored value) still
+	// honor a larger base instead of clamping it away.
+	fixed := rateLimitMaxFixedSeconds * time.Second
+	if s != nil && s.rateLimitMaxDur > fixed {
+		fixed = s.rateLimitMaxDur
+	}
+	if base := s.rateLimitBase(); base > fixed {
+		return base
+	}
+	return fixed
+}
+
+// failureCap is the effective non-429 max = max(5m, configured base).
+func (s *targetScheduler) failureCap() time.Duration {
+	if base := s.failureBase(); base > targetBackoffCap {
+		return base
+	}
+	return targetBackoffCap
+}
+
+// suspectCap is the effective suspect max = max(300s, configured base).
+func (s *targetScheduler) suspectCap() time.Duration {
+	fixed := time.Duration(suspectFixedCapSeconds) * time.Second
+	if base := s.suspectBase(); base > fixed {
+		return base
+	}
+	return fixed
 }
 
 // credentialCoolUntil returns the credential cooldown deadline (nanos), or 0.
@@ -1398,15 +1549,15 @@ func (s *targetScheduler) rateLimitDelayLocked(failures uint32, identity string,
 
 // suspectDelay returns the suspect cooldown with deterministic exponential
 // backoff, starting at the configured transport_suspect_cooldown_seconds and
-// capped at 300 seconds (the validated max). It reuses the established
-// scheduler backoff/jitter style (base*2^min(failures-1,3) with jitter, capped).
+// capped at the effective suspect max = max(300s, configured base). It reuses
+// the established scheduler backoff/jitter style
+// (base*2^min(failures-1,3) with jitter, capped).
 func (s *targetScheduler) suspectDelay(identity string, failures uint32) time.Duration {
 	base := s.suspectBase()
 	if base <= 0 {
 		base = 15 * time.Second
 	}
-	cap := 300 * time.Second
-	return backoffDelayForBaseWithCap(base, cap, failures, identity, 0)
+	return backoffDelayForBaseWithCap(base, s.suspectCap(), failures, identity, 0)
 }
 
 func (s *targetScheduler) suspectBase() time.Duration {
@@ -2138,13 +2289,15 @@ func splitNul5(s string) []string {
 }
 
 // migrateFrom copies still-future credential, credential429, target,
-// proxy429, and channel cooldowns from the old scheduler. Non-429 remaining
-// (credential 401, target, channel) is capped at the generic 5 minutes;
-// proxy429 and credential429 remaining is capped at the NEW configured 429
-// max. Expired cooldowns never migrate, including expired failure memory
-// (failures>0 out of cooldown): the new instance restarts backoff from
-// zero. New resources start at zero state and removed identities are
-// dropped. Proxy429 and channel migrate by (tier, pool, proxy) identity
+// proxy429, channel, and suspect cooldowns from the old scheduler. Non-429
+// remaining (credential 401, target, channel) is capped at the NEW effective
+// failure max = max(5m, configured base); proxy429 and credential429
+// remaining is capped at the NEW effective 429 max = max(1h, configured base);
+// suspect remaining is capped at the NEW effective suspect max = max(300s,
+// configured base). Expired cooldowns never migrate, including expired
+// failure memory (failures>0 out of cooldown): the new instance restarts
+// backoff from zero. New resources start at zero state and removed identities
+// are dropped. Proxy429 and channel migrate by (tier, pool, proxy) identity
 // only and preserve backoff/Retry-After remaining within the cap; old
 // pool-only identities (no tier separator count) are dropped.
 // Credential429 migrates by tier+key (internal credential ID). Migrated
@@ -2220,12 +2373,13 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	failCap := s.failureCap()
 	for id, entry := range creds {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > failCap {
+			entry.cooldownUntil = cooldownDeadline(now, failCap)
 		}
 		fresh := entry
 		s.credState[id] = &fresh
@@ -2242,8 +2396,8 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > failCap {
+			entry.cooldownUntil = cooldownDeadline(now, failCap)
 		}
 		if len(s.targetState) >= maxTargetStates {
 			s.pruneStaleTargetsLocked(now)
@@ -2304,8 +2458,8 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > targetBackoffCap {
-			entry.cooldownUntil = cooldownDeadline(now, targetBackoffCap)
+		if remaining := time.Duration(entry.cooldownUntil - now); remaining > failCap {
+			entry.cooldownUntil = cooldownDeadline(now, failCap)
 		}
 		if s.channelState == nil {
 			s.channelState = make(map[string]*channelEntry)
@@ -2327,8 +2481,10 @@ func (s *targetScheduler) migrateFrom(old *targetScheduler) migrationSummary {
 		if entry.cooldownUntil <= now {
 			continue
 		}
-		if remaining := time.Duration(entry.cooldownUntil - now); remaining > 300*time.Second {
-			entry.cooldownUntil = cooldownDeadline(now, 300*time.Second)
+		if suspectCap := s.suspectCap(); true {
+			if remaining := time.Duration(entry.cooldownUntil - now); remaining > suspectCap {
+				entry.cooldownUntil = cooldownDeadline(now, suspectCap)
+			}
 		}
 		if s.suspectState == nil {
 			s.suspectState = make(map[string]*transportSuspectEntry)

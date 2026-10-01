@@ -46,8 +46,8 @@ func TestRateLimitCooldownDefaultAndValidation(t *testing.T) {
 	if gotLegacy.Performance.RateLimitCooldownMaxSeconds != 0 {
 		t.Fatalf("legacy max must be cleared, got %d", gotLegacy.Performance.RateLimitCooldownMaxSeconds)
 	}
-	// Valid single values pass (300..3600 inclusive).
-	for _, v := range []int{300, 301, 600, 3599, 3600} {
+	// Valid single values pass: minimum 300 with no fixed business max.
+	for _, v := range []int{300, 301, 600, 3599, 3600, 3601, 7200} {
 		c := normalized
 		c.Performance.RateLimitCooldownSeconds = v
 		if _, err := NormalizeConfig("config.json", c); err != nil {
@@ -64,13 +64,19 @@ func TestRateLimitCooldownDefaultAndValidation(t *testing.T) {
 	if gotZero.Performance.RateLimitCooldownSeconds != 300 {
 		t.Fatalf("rate_limit 0 normalized=%d want 300", gotZero.Performance.RateLimitCooldownSeconds)
 	}
-	// Out-of-range values fail.
-	for _, v := range []int{-1, 1, 299, 3601, 7200} {
+	// Below-minimum values fail; oversized values fail only on technical
+	// representability, never on the removed 3600 business max.
+	for _, v := range []int{-1, 1, 299} {
 		c := normalized
 		c.Performance.RateLimitCooldownSeconds = v
 		if _, err := NormalizeConfig("config.json", c); err == nil {
 			t.Fatalf("rate_limit=%d must fail", v)
 		}
+	}
+	huge := normalized
+	huge.Performance.RateLimitCooldownSeconds = int(1) << 40
+	if _, err := NormalizeConfig("config.json", huge); err == nil {
+		t.Fatalf("rate_limit huge must fail on representability")
 	}
 	// Unknown field inside performance is rejected; legacy max remains known.
 	bad := `{"max_idle_conns":1,"max_idle_conns_per_host":1,"max_conns_per_host":0,"idle_conn_timeout_seconds":1,"connect_timeout_seconds":1,"failure_cooldown_seconds":1,"rate_limit_cooldown_seconds":300,"bogus":1}`
@@ -104,7 +110,8 @@ func TestRateLimitCooldownDefaultAndValidation(t *testing.T) {
 }
 
 func TestSchedulerDualBaseSeparation(t *testing.T) {
-	// The 429 maximum is fixed at 3600s; the legacy max argument is ignored.
+	// The effective 429 max is max(1h, configured base); the legacy max
+	// argument is ignored.
 	s := newTargetScheduler(10*time.Second, 60*time.Second, 600*time.Second)
 	if s.failureBase() != 10*time.Second {
 		t.Fatalf("failure base=%v want 10s", s.failureBase())
@@ -145,17 +152,18 @@ func TestSchedulerDualBaseSeparation(t *testing.T) {
 	if chRem < 7*time.Second || chRem > 13*time.Second {
 		t.Fatalf("channel cooldown=%v want ~10s", chRem)
 	}
-	// Non-429 Retry-After still caps at the generic 5 minutes.
+	// Non-429 Retry-After still caps at the effective failure max (5m for a
+	// 10s base).
 	capped := s.backoffDelay(1, "cap-fail", 400*time.Second)
 	if capped != targetBackoffCap {
 		t.Fatalf("failure Retry-After cap=%v want 5m", capped)
 	}
-	// 429 Retry-After clamps at the fixed 3600s max.
+	// 429 Retry-After clamps at the effective 429 max (3600s for a 60s base).
 	cappedR := s.rateLimitBackoffDelay(1, "cap-rate", 10000*time.Second)
 	if cappedR != 3600*time.Second {
 		t.Fatalf("rate Retry-After cap=%v want 3600s", cappedR)
 	}
-	// Consecutive 429 strikes escalate exponentially toward the fixed max.
+	// Consecutive 429 strikes escalate exponentially toward the effective max.
 	second := s.rateLimitBackoffDelay(2, "cap-rate", 0)
 	if second < 96*time.Second || second > 144*time.Second {
 		t.Fatalf("rate second strike=%v want ~120s", second)
@@ -183,7 +191,8 @@ func TestSchedulerRateLimitSaturationSafe(t *testing.T) {
 	if d > secondsToDuration(hugeSec) {
 		t.Fatalf("huge backoff=%v exceeds cap", d)
 	}
-	// Absurd Retry-After header clamps to the fixed 3600s max.
+	// Absurd Retry-After header clamps to the effective 429 max (3600s for a
+	// 60s base).
 	s := newTargetScheduler(10*time.Second, 60*time.Second)
 	got := s.rateLimitBackoffDelay(1, "huge-ra", secondsToDuration(hugeSec))
 	if got != 3600*time.Second {
@@ -216,7 +225,7 @@ func TestGatewayDualBaseAndMigrationKeepsRemaining(t *testing.T) {
 		t.Fatalf("gateway bases=%v/%v/%v want 10s/300s/3600s", gw.scheduler.failureBase(), gw.scheduler.rateLimitBase(), gw.scheduler.rateLimitMax())
 	}
 	// Old scheduler records a proxy429; migration preserves remaining capped
-	// at the fixed 3600s max, not recomputed.
+	// at the effective 429 max (3600s for a 300s base), not recomputed.
 	oldS := newTargetScheduler(15*time.Second, 300*time.Second)
 	ch := oldS.noteProxy429Failure(TierZen, "shared", "direct", "rate_limited", 429, 0, 0)
 	remainingBefore := time.Duration(ch.CooldownUntil - time.Now().UnixNano())
@@ -228,7 +237,7 @@ func TestGatewayDualBaseAndMigrationKeepsRemaining(t *testing.T) {
 		t.Fatal("migrated proxy429 must stay future")
 	}
 	if remainingAfter > 3600*time.Second {
-		t.Fatalf("migrated remaining=%v exceeds fixed 3600s max", remainingAfter)
+		t.Fatalf("migrated remaining=%v exceeds effective 3600s max", remainingAfter)
 	}
 	diff := remainingBefore - remainingAfter
 	if diff < 0 {
@@ -237,8 +246,8 @@ func TestGatewayDualBaseAndMigrationKeepsRemaining(t *testing.T) {
 	if diff > 5*time.Second {
 		t.Fatalf("migration must preserve remaining, before=%v after=%v", remainingBefore, remainingAfter)
 	}
-	// Non-429 layers keep the generic 5-minute clamp: inject a far-future
-	// target and migrate.
+	// Non-429 layers keep the effective failure clamp (5m for a 10s base):
+	// inject a far-future target and migrate.
 	oldTarget := newTargetScheduler(10*time.Second, 300*time.Second)
 	oldTarget.mu.Lock()
 	oldTarget.targetState["t\x00c\x00p\x00x\x00m"] = &targetEntry{failures: 1, cooldownUntil: time.Now().Add(1000 * time.Second).UnixNano(), lastFailureAt: time.Now().UnixNano(), lastStatus: 500}
@@ -292,7 +301,8 @@ func TestWebUIRateLimitFieldAndAutosave(t *testing.T) {
 			t.Fatalf("legacy 429 max field must stay removed: %q", stale)
 		}
 	}
-	// Single 429 input carries the 300..3600 validation limit (3600 is a cap, not a second field).
+	// Single 429 input keeps its minimum with no business max attribute; the
+	// resident ring keeps its memory protection.
 	for _, id := range []string{`id="c-ratelimit-cooldown"`} {
 		tagIdx := strings.Index(html, id)
 		if tagIdx < 0 {
@@ -310,8 +320,29 @@ func TestWebUIRateLimitFieldAndAutosave(t *testing.T) {
 		if !strings.Contains(tag, `type="number"`) {
 			t.Fatalf("%s must stay type=number, got %q", id, tag)
 		}
-		if !strings.Contains(tag, `min="300"`) || !strings.Contains(tag, `max="3600"`) {
-			t.Fatalf("%s must carry min=300 max=3600, got %q", id, tag)
+		if !strings.Contains(tag, `min="300"`) {
+			t.Fatalf("%s must keep min=300, got %q", id, tag)
+		}
+		if strings.Contains(tag, "max=") {
+			t.Fatalf("%s must not carry a business max attribute, got %q", id, tag)
+		}
+	}
+	for _, id := range []string{`id="c-ring"`} {
+		tagIdx := strings.Index(html, id)
+		if tagIdx < 0 {
+			t.Fatalf("missing %s tag", id)
+		}
+		tagStart := strings.LastIndex(html[:tagIdx], "<input")
+		if tagStart < 0 {
+			t.Fatalf("missing %s input tag", id)
+		}
+		tagEnd := strings.Index(html[tagStart:], ">")
+		if tagEnd < 0 {
+			t.Fatalf("unterminated %s input tag", id)
+		}
+		tag := html[tagStart : tagStart+tagEnd+1]
+		if !strings.Contains(tag, `min="100"`) || !strings.Contains(tag, `max="50000"`) {
+			t.Fatalf("%s must keep min=100 max=50000 memory protection, got %q", id, tag)
 		}
 	}
 	// Numeric commit-only binding: change/blur remain, input must not autosave.

@@ -139,7 +139,7 @@ func mustParseTime(v string) time.Time {
 }
 
 func historyDefWindow(def time.Duration, retentionDays int) time.Duration {
-	maxRange := time.Duration(retentionDays) * 24 * time.Hour
+	maxRange := daysToDuration(retentionDays)
 	if maxRange < 24*time.Hour {
 		maxRange = 24 * time.Hour
 	}
@@ -150,7 +150,7 @@ func historyDefWindow(def time.Duration, retentionDays int) time.Duration {
 }
 
 func historyMaxRange(retentionDays int) time.Duration {
-	maxRange := time.Duration(retentionDays) * 24 * time.Hour
+	maxRange := daysToDuration(retentionDays)
 	if maxRange < 24*time.Hour {
 		maxRange = 24 * time.Hour
 	}

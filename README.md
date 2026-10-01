@@ -82,7 +82,7 @@ lifetime 从当前进程启动开始；last hour 使用 60 个一分钟 Bucket�
 
 ### 持久历史
 
-`history` 为轻量内嵌脱敏投影（标准库 NDJSON，无新依赖、无独立部署），只保存请求/attempt/分钟元数据，不保存 body、headers、query、session、完整 key、指纹、原始代理 URL、错误文本或 Playground 载荷。目录为空时为配置目录下 `history`，相对路径相对配置目录，绝对路径允许；目录 `0700`、文件 `0600`。分文件 `requests-YYYYMMDD-NNN.ndjson`、`attempts-…`、`minutes-…`，单段 32MB 或跨 UTC 日轮转；按 `retention_days`（1–90）与 `max_bytes_mb`（16–2048）清理最老已封段，当前写入段不删。初始化/写入/读取失败只 warn 并退化为 memory-only，不影响 Gateway 启动、Apply、healthz 或推理；`history` 热生效。`GET /api/monitor` 增加 `history` 状态（`enabled_config/active/directory[basename]/retention_days/max_bytes_mb/dropped/gap/last_error/oldest_at/newest_at/size_bytes`）。
+`history` 为轻量内嵌脱敏投影（标准库 NDJSON，无新依赖、无独立部署），只保存请求/attempt/分钟元数据，不保存 body、headers、query、session、完整 key、指纹、原始代理 URL、错误文本或 Playground 载荷。目录为空时为配置目录下 `history`，相对路径相对配置目录，绝对路径允许；目录 `0700`、文件 `0600`。分文件 `requests-YYYYMMDD-NNN.ndjson`、`attempts-…`、`minutes-…`，单段 32MB 或跨 UTC 日轮转；按 `retention_days`（最小 1 天，无固定业务上限）与 `max_bytes_mb`（最小 16MB 磁盘预算，无固定业务上限）清理最老已封段，当前写入段不删。旧 90 天/2048MB 业务上限已无效；极大值超出存储/整数可表示范围会被拒绝，不声称无限取值。初始化/写入/读取失败只 warn 并退化为 memory-only，不影响 Gateway 启动、Apply、healthz 或推理；`history` 热生效。`GET /api/monitor` 增加 `history` 状态（`enabled_config/active/directory[basename]/retention_days/max_bytes_mb/dropped/gap/last_error/oldest_at/newest_at/size_bytes`）。
 
 历史查询（管理 Session，`no-store`，GET 无 CSRF，每 IP 每分钟 30 次，单请求 5s 超时）：
 
@@ -371,7 +371,7 @@ socks5://127.0.0.1:1080  # 备用代理
 | --- | --- |
 | `retry.max_attempts` | **最终语义（已收敛单一 L1 计数）：** 唯一 L1 同目标稳定性观察上限，含首次发送。全部 `isSameTargetTransient`（传输错误、408、425、500-599、流启动失败）均使用它；400/429/普通 4xx 为稳定结果，不进 L1。认证普通发送预算已删除：不再截断同目标 L1，也不再截断候选遍历；候选遍历由冻结 eligible/candidate 切片自然有界。429 证据、凭证耗尽（冻结全集实际 429 才写，取最后 Retry-After）、Started fencing、custom（未绑定按逐域真实请求对象耗尽状态无关判断 per b2c4798，已绑定含受限 pinned L2 consumption）保留，但无 ordinary refund。400 同目标修正后终态（路由最终动作），503 受 deadline/cancel/committed bytes 约束观察，取消/deadline/已提交字节后停止。模型刷新不再复用该值，改用冻结 `keys × healthy proxies` 全遍历。逐状态矩阵、广义 fallback 与退避数值仍未冻结（见 ADR 0001），本次仅完成单一 L1 计数收敛。 |
 | `retry.timeout_seconds` | 单个客户端请求的总超时时间，同时用于限制上游响应头等待时间。 |
-| `retry.transient_retry_interval_seconds` | L1 同目标观察间隔（秒，0..30，缺失默认 3）。显式 `0` 合法并持久化 `0`，但运行时共享 `transientDelay` 仍保留内部 100ms 最小等待（与正间隔、`Retry-After` 取 max），永不立即重发；exact400 修正重放不经此延迟。本次仅为窄的 L1 下限实现，不构成广义退避矩阵（见 ADR 0001）。 |
+| `retry.transient_retry_interval_seconds` | L1 同目标观察间隔（秒，最小 0，缺失默认 3，无固定业务上限）。显式 `0` 合法并持久化 `0`，但运行时共享 `transientDelay` 仍保留内部 100ms 最小等待（与正间隔、`Retry-After` 取 max），永不立即重发；exact400 修正重放不经此延迟。本次仅为窄的 L1 下限实现，不构成广义退避矩阵（见 ADR 0001）。极大值超出 Go 时间可表示范围会被拒绝，不声称无限取值。 |
 
 流式响应一旦已经向客户端输出数据，就不会切换节点重新生成，避免拼接两个不同的响应。
 
@@ -415,14 +415,14 @@ socks5://127.0.0.1:1080  # 备用代理
 | `performance.idle_conn_timeout_seconds` | 空闲连接在连接池中保留的时间。 |
 | `performance.connect_timeout_seconds` | 与上游或代理建立 TCP 连接的超时时间。 |
 | `performance.failure_cooldown_seconds` | 非 429 冷却的基础时间。401 按此对 credential 全局指数退避，403/5xx 按此对单个 target 与通道可用性指数退避，均带确定性 ±20% 抖动、总封顶 5 分钟；403 的 `Retry-After` 取更大值同样封顶 5 分钟。 |
-| `performance.rate_limit_cooldown_seconds` | 429 冷却基准（秒），默认 300，可配 300..3600。429 proxy 与 credential429 连续打击按此起算指数退避（`base*2^min(n-1,3)`，确定性 ±20% 抖动），`Retry-After` 取 `max(退避, Retry-After)` 后统一 clamp 到固定 3600s 最大值；缺失或显式 0 时兼容为 300。非 429 冷却仍用通用 5 分钟封顶与 `failure_cooldown_seconds` 行为。时长换算与连续翻倍均为饱和安全，极端取值不会回绕为负。 |
+| `performance.rate_limit_cooldown_seconds` | 429 冷却基准（秒），默认 300，最小 300，无固定业务上限。429 proxy 与 credential429 连续打击按此起算指数退避（`base*2^min(n-1,3)`，确定性 ±20% 抖动），`Retry-After` 取 `max(退避, Retry-After)`；内部退避有效上限至少覆盖配置基准（429 取配置基准与 1 小时中较大者），无第二可配最大值字段；缺失或显式 0 时兼容为 300。非 429 冷却仍用通用 5 分钟封顶与 `failure_cooldown_seconds` 行为。时长换算与连续翻倍均为饱和安全，极端取值不会回绕为负；极大值超出 Go 时间可表示范围会被拒绝，不声称无限取值。 |
 
 ### `logging`
 
 | 字段 | 含义 |
 | --- | --- |
 | `logging.level` | 日志级别，支持 `debug`、`info`、`warn` 和 `error`，可通过 WebUI 热切换。 |
-| `logging.ring_size` | WebUI 最近日志环容量，范围 100–50000，默认 2000。stdout 不受此容量限制。 |
+| `logging.ring_size` | WebUI 最近日志环容量，常驻内存保护范围 100–50000，默认 2000。stdout 不受此容量限制。 |
 
 每条 stdout 日志都是单行 JSON，包含时间、级别、组件、事件以及适用的 request ID、模型、tier、状态码、耗时、重试次数和实际使用的 Key 尾码。已建立上游路由的请求会以 `info` 级别记录 `request_routed` 事件；真实 Key 只显示最后 5 个字符，anonymous 请求显示为 `anonymous`。普通“请求完成”事件仍使用 `debug` 级别；警告和错误按原级别输出。日志不会输出完整上游 key、本地 key、Authorization、Cookie、代理认证信息或请求消息正文。
 
@@ -435,7 +435,7 @@ socks5://127.0.0.1:1080  # 备用代理
 | `webui.username` | 单一管理员账号。 |
 | `webui.password` | 仅用于首次初始化的明文密码，至少 10 个字符；启动后自动删除。 |
 | `webui.password_hash` | 自动生成的 Argon2id 哈希，不应手动编辑，也不会由 WebUI API 返回。 |
-| `webui.session_ttl_minutes` | 登录 session 有效时间，范围 5–10080 分钟。 |
+| `webui.session_ttl_minutes` | 登录 session 有效时间，最小 5 分钟，无固定业务上限；极大值超出整数/cookie 可表示范围会被拒绝。 |
 
 WebUI 中普通配置响应只包含 key 尾码/指纹及脱敏 proxy；运行桌面和路由诊断会显示每个请求最终使用的 Key 最后 5 个字符或 `anonymous`。需要查看完整值时必须再次输入管理密码，敏感响应禁止浏览器缓存。
 

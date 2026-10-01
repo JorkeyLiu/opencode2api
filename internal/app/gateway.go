@@ -112,7 +112,7 @@ type healthRouting struct {
 }
 
 func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, error) {
-	timeout := time.Duration(cfg.Retry.AttemptTimeoutSeconds) * time.Second
+	timeout := secondsToDuration(cfg.Retry.AttemptTimeoutSeconds)
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
@@ -150,7 +150,7 @@ func NewGateway(cfg Config, logger *slog.Logger, monitor *Monitor) (*Gateway, er
 		suspectCooldown = 15 * time.Second
 	}
 	catalog := newModelCatalog("", cfg.Models.Protocols)
-	catalog.SetRefreshInterval(time.Duration(cfg.Models.RefreshSeconds) * time.Second)
+	catalog.SetRefreshInterval(secondsToDuration(cfg.Models.RefreshSeconds))
 	authCreds := credentialsForKeys(TierZen, cfg.Keys)
 	return &Gateway{
 		cfg:       cfg,
@@ -263,7 +263,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		proxyHealthy += healthy
 	}
 	authKeys := len(g.credentials())
-	staleAfter := max(2*time.Duration(g.cfg.Models.RefreshSeconds)*time.Second, time.Minute)
+	staleAfter := refreshStaleAfter(g.cfg.Models.RefreshSeconds)
 
 	modelStatus := "ready"
 	var lastRefresh *time.Time
@@ -316,7 +316,7 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			Exposed:           models.Exposed,
 			Zen:               models.Zen,
 			LastRefresh:       lastRefresh,
-			StaleAfterSeconds: int(staleAfter / time.Second),
+			StaleAfterSeconds: staleAfterSecondsForAPI(staleAfter),
 			CacheSource:       models.CacheSource,
 			Stale:             models.Stale,
 		},
@@ -493,7 +493,10 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		if meta != nil {
 			meta.Stream = stream
 		}
-		startupTimeout := time.Duration(g.cfg.Retry.TimeoutSeconds) * time.Second
+		startupTimeout := secondsToDuration(g.cfg.Retry.TimeoutSeconds)
+		if startupTimeout <= 0 {
+			startupTimeout = 5 * time.Second
+		}
 		// True client streams use a startup-only budget: the timeout covers
 		// establishment (headers, non-committing 200s, L1 observation,
 		// candidate/fallback recovery) until the first deliverable event
@@ -920,12 +923,12 @@ func (g *Gateway) transientInterval() time.Duration {
 	if g == nil {
 		return 3 * time.Second
 	}
-	d := time.Duration(g.cfg.Retry.TransientRetryIntervalSeconds) * time.Second
+	// No fixed business max: any validated non-negative interval is honored
+	// as-is. The shared transientDelay still enforces the 100ms L1 floor, so
+	// explicit 0 never means an immediate resend.
+	d := secondsToDuration(g.cfg.Retry.TransientRetryIntervalSeconds)
 	if d < 0 {
 		d = 0
-	}
-	if d > 30*time.Second {
-		d = 30 * time.Second
 	}
 	return d
 }
@@ -3999,7 +4002,7 @@ func (g *Gateway) StartModelRefresh(ctx context.Context) {
 	}
 	go func() {
 		refresh()
-		ticker := time.NewTicker(time.Duration(g.cfg.Models.RefreshSeconds) * time.Second)
+		ticker := time.NewTicker(refreshTickerInterval(g.cfg.Models.RefreshSeconds))
 		defer ticker.Stop()
 		for {
 			select {

@@ -445,7 +445,7 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>每个密钥上游最大尝试次数</label><input id="c-attempts" type="number" min="1"></div>
             <div class="field"><label>请求超时（秒，流式仅启动前）</label><input id="c-timeout" type="number" min="1"></div>
             <div class="field"><label>单次尝试超时（秒）</label><input id="c-attempt-timeout" type="number" min="1"></div>
-            <div class="field"><label>观测重试间隔（秒）</label><input id="c-transient-interval" type="number" min="0" max="30"></div>
+            <div class="field"><label>观测重试间隔（秒）</label><input id="c-transient-interval" type="number" min="0"></div>
           </div>
           <div class="note">单次尝试超时限制单个上游尝试的头部等待时间，需小于等于请求超时；超时后尝试下一个可用代理。观测重试间隔用于稳定性恢复观察。</div>
         </div>
@@ -453,7 +453,7 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
           <h2>模型目录</h2>
           <div class="cap">模型列表刷新周期；协议覆盖为高级 JSON，一般无需修改。</div>
           <div class="form-grid">
-            <div class="field"><label>模型刷新（秒）</label><input id="c-refresh" type="number" min="10"></div>
+            <div class="field"><label>模型刷新（秒）</label><input id="c-refresh" type="number" min="1"></div>
             <div class="field full"><details class="advanced"><summary>协议覆盖（JSON，高级）</summary><div class="note">手动指定模型协议，JSON 格式，保存时校验。</div><textarea id="c-protocols" class="mono scroll-bound" spellcheck="false"></textarea></details></div>
           </div>
         </div>
@@ -467,8 +467,8 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>空闲超时（秒）</label><input id="c-idle-timeout" type="number"></div>
             <div class="field"><label>连接超时（秒）</label><input id="c-connect" type="number"></div>
             <div class="field"><label>失败冷却（秒）</label><input id="c-cooldown" type="number"></div>
-            <div class="field"><label>429 冷却（秒）</label><input id="c-ratelimit-cooldown" type="number" min="300" max="3600"></div>
-            <div class="field"><label>传输暂不可用冷却（秒）</label><input id="c-suspect-cooldown" type="number" min="1" max="300"></div>
+            <div class="field"><label>429 冷却（秒）</label><input id="c-ratelimit-cooldown" type="number" min="300"></div>
+            <div class="field"><label>传输暂不可用冷却（秒）</label><input id="c-suspect-cooldown" type="number" min="1"></div>
           </div>
           <div class="note">传输暂不可用为短暂网络异常冷却，超时后自动恢复。</div>
         </div>
@@ -480,8 +480,8 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
             <div class="field"><label>日志缓存条数</label><input id="c-ring" type="number" min="100" max="50000"></div>
             <div class="field full"><label class="check-label"><input id="c-hist-enabled" type="checkbox"><span>启用历史记录（重启后仍可查询）</span></label></div>
             <div class="field"><label>历史目录（空=配置目录/history）</label><input id="c-hist-dir" placeholder="history"></div>
-            <div class="field"><label>历史保留天数（1-90）</label><input id="c-hist-retention" type="number" min="1" max="90"></div>
-            <div class="field"><label>历史上限 MB（16-2048）</label><input id="c-hist-max" type="number" min="16" max="2048"></div>
+            <div class="field"><label>历史保留天数</label><input id="c-hist-retention" type="number" min="1"></div>
+            <div class="field"><label>历史磁盘上限（MB）</label><input id="c-hist-max" type="number" min="16"></div>
           </div>
         </div>
         <div class="section config-card">
@@ -490,7 +490,7 @@ table.table th.avail-ts,table.table td.avail-ts{text-align:left;white-space:nowr
           <div class="form-grid">
             <div class="field"><label>API 监听地址（需重启）</label><input id="c-listen"></div>
             <div class="field"><label>WebUI 监听地址（需重启）</label><input id="c-web-listen"></div>
-            <div class="field"><label>管理会话有效期（分钟）</label><input id="c-session" type="number" min="1"></div>
+            <div class="field"><label>管理会话有效期（分钟）</label><input id="c-session" type="number" min="5"></div>
             <div class="field full hidden"><label>WebUI 是否启用</label><input id="c-web-enabled" type="checkbox"></div>
           </div>
         </div>

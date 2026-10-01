@@ -371,9 +371,10 @@ type gatewayMigrationSummary struct {
 // validity). Both native route-session scopes are proxy-independent; legacy
 // proxy-bound overrides (ProxyRaw != "") are dropped and re-derived
 // statelessly. Only still-future cooldowns and still-fresh route overrides
-// migrate (non-429 remaining capped at the generic 5 minutes, proxy429 and
-// credential429 remaining capped at the NEW configured 429 max, idle TTL
-// for sessions); new resources start at zero/stateless state and removed
+// migrate (non-429 remaining capped at the NEW effective failure max
+// max(5m, base), proxy429 and credential429 remaining capped at the NEW
+// effective 429 max max(1h, base), suspect remaining capped at the NEW
+// effective suspect max max(300s, base), idle TTL for sessions); new resources start at zero/stateless state and removed
 // identities are dropped. Session-affinity pins migrate without validity
 // filtering up to the pin cap as tombstone-like bindings: both channels
 // validate proxy-independently (binding without proxy); removed/changed

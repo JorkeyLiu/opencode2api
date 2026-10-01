@@ -80,8 +80,10 @@ func TestTransientExplicitValidAndInvalid(t *testing.T) {
 		{"max 0 invalid", `"max_attempts":0,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":3`, true},
 		{"interval 0 valid", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":0`, false},
 		{"interval 30 valid", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":30`, false},
+		{"interval 31 valid (no business max)", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":31`, false},
+		{"interval 120 valid (no business max)", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":120`, false},
 		{"interval -1 invalid", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":-1`, true},
-		{"interval 31 invalid", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":31`, true},
+		{"interval huge invalid (unrepresentable)", `"max_attempts":3,"timeout_seconds":300,"attempt_timeout_seconds":5,"transient_retry_interval_seconds":1099511627776`, true},
 	}
 	for _, c := range cases {
 		raw := strings.Replace(baseRaw, `"models"`, `"retry":{`+c.retryJSON+`},"models"`, 1)

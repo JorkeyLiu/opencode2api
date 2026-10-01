@@ -160,8 +160,18 @@ func TestPerformanceSuspectValidation(t *testing.T) {
 	}
 	cfg.Performance.TransportSuspectCooldownSeconds = 400
 	cfg.performanceSuspectPresent = true
-	if _, err := NormalizeConfig("config.json", cfg); err == nil {
-		t.Fatalf("suspect >300 must fail")
+	if _, err := NormalizeConfig("config.json", cfg); err != nil {
+		t.Fatalf("suspect 400 must pass (no business max), got %v", err)
+	}
+	cfg.Performance.TransportSuspectCooldownSeconds = 900
+	if _, err := NormalizeConfig("config.json", cfg); err != nil {
+		t.Fatalf("suspect 900 must pass (no business max), got %v", err)
+	}
+	huge := testBaseConfig()
+	huge.Performance.TransportSuspectCooldownSeconds = int(1) << 40
+	huge.performanceSuspectPresent = true
+	if _, err := NormalizeConfig("config.json", huge); err == nil {
+		t.Fatalf("suspect huge must fail on representability")
 	}
 	// explicit zero must be rejected
 	cfg2 := testBaseConfig()

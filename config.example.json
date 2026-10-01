@@ -30,17 +30,19 @@
     "zen": "https://opencode.ai/zen"
   },
   // retry.max_attempts: 唯一 L1 同目标稳定性观察上限（含首次发送）；全部 isSameTargetTransient（传输错误、408、425、500-599、流启动失败）均使用它，400/429/普通4xx为稳定结果不进L1；候选遍历由冻结切片自然有界，模型刷新用独立全遍历。本次仅完成单一L1计数收敛，逐状态矩阵、广义fallback与退避数值仍未冻结。
-  // retry.transient_retry_interval_seconds: 缺失默认 3（0..30）；显式 0 合法并持久化 0，但运行时共享 transientDelay 仍保留内部 100ms 最小等待（与正间隔、Retry-After 取 max），永不立即重发；exact400 修正重放不经此延迟。
+  // retry.transient_retry_interval_seconds: 缺失默认 3（最小 0，无固定业务上限，仅受可表示时长范围约束）；显式 0 合法并持久化 0，但运行时共享 transientDelay 仍保留内部 100ms 最小等待（与正间隔、Retry-After 取 max），永不立即重发；exact400 修正重放不经此延迟。
   "retry": {
     "max_attempts": 3,
     "timeout_seconds": 300,
     "attempt_timeout_seconds": 5,
     "transient_retry_interval_seconds": 3
   },
+  // models.refresh_seconds: 最小 1，无固定业务上限（考虑 2 倍过期窗口的可表示范围，上限 4611686018 秒）。
   "models": {
     "refresh_seconds": 300,
     "protocols": {}
   },
+  // performance: rate_limit_cooldown_seconds 缺失或 0 默认 300，最小 300，无固定业务上限（有效 429 上限为 max(1h, 配置基数)）；transport_suspect_cooldown_seconds 缺失默认 15，最小 1，无固定业务上限（有效上限为 max(300s, 配置基数)）；其余时长仅受可表示范围约束。
   "performance": {
     "max_idle_conns": 2048,
     "max_idle_conns_per_host": 256,
@@ -51,16 +53,19 @@
     "rate_limit_cooldown_seconds": 300,
     "transport_suspect_cooldown_seconds": 15
   },
+  // logging.ring_size: 常驻内存保护范围 100..50000，默认 2000。
   "logging": {
     "level": "info",
     "ring_size": 2000
   },
+  // history: retention_days 最小 1（上限仅为可表示范围 106751 天）；max_bytes_mb 最小 16（上限仅为可表示范围 8796093022207 MB）。
   "history": {
     "enabled": true,
     "directory": "",
     "retention_days": 7,
     "max_bytes_mb": 128
   },
+  // webui.session_ttl_minutes: 最小 5，无固定业务上限（上限仅为 cookie/Duration 可表示范围 35791394 分钟）。
   "webui": {
     "enabled": true,
     "listen": "0.0.0.0:8081",

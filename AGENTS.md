@@ -306,8 +306,9 @@
   channel-qualified proxy429/channel and credential429 state only when the send
   started at or after the latest recorded failure (stale in-flight 2xx never
   clears a newer cooldown; newer failures stay authoritative). 429 config is
-  one base/cooldown seconds value default 300, validated 300..3600; fixed
-  internal exponential backoff cap 3600; no second configurable max.
+  a single base/cooldown seconds value default 300, minimum 300, no fixed
+  business upper bound; the effective internal backoff ceiling is at least
+  the configured base (no second configurable max field).
   `retry.max_attempts` is the unique L1 same-target observation limit (including
   the first send), not a uniform per-status error-count quota.
   Proxy429/channel use deterministic exponential backoff with Retry-After
@@ -467,7 +468,10 @@
   to add or gate a model.
 - Config schema changes MUST keep strict unknown-field rejection and the
   save/Apply transactional semantics (validate-first, build-new-runtime,
-  atomic switch, old-instance-on-failure). New listeners or planes MUST state
+  atomic switch, old-instance-on-failure). Numeric ranges reject values
+  beyond technical representability (Go duration/storage or integer limits)
+  with no hidden clamping; the log ring keeps its resident-memory protection
+  bound. New listeners or planes MUST state
   explicitly whether they are hot-swapped or restart-required.
 - All new output (logs, metrics, admin payloads) MUST flow through the
   existing redaction model — no new raw-secret or body paths.

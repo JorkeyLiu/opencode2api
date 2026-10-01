@@ -97,11 +97,11 @@ func newTransportPool(poolName string, proxies []string, cfg PerformanceConfig, 
 		transport.MaxIdleConns = cfg.MaxIdleConns
 		transport.MaxIdleConnsPerHost = cfg.MaxIdleConnsPerHost
 		transport.MaxConnsPerHost = cfg.MaxConnsPerHost
-		transport.IdleConnTimeout = time.Duration(cfg.IdleConnTimeoutSeconds) * time.Second
+		transport.IdleConnTimeout = secondsToDuration(cfg.IdleConnTimeoutSeconds)
 		transport.ResponseHeaderTimeout = responseHeaderTimeout
 		transport.ForceAttemptHTTP2 = true
 		transport.DialContext = (&net.Dialer{
-			Timeout:   time.Duration(cfg.ConnectTimeoutSeconds) * time.Second,
+			Timeout:   secondsToDuration(cfg.ConnectTimeoutSeconds),
 			KeepAlive: 30 * time.Second,
 		}).DialContext
 		if raw == "direct" {

@@ -1050,3 +1050,68 @@ func TestWebUISecretChipToggle(t *testing.T) {
 		}
 	}
 }
+
+func TestWebUIConfigNumericBoundsUncapped(t *testing.T) {
+	html := readConfigWebUI(t)
+	inputTag := func(id string) string {
+		needle := `id="` + id + `"`
+		idx := strings.Index(html, needle)
+		if idx < 0 {
+			t.Fatalf("missing input %q", id)
+		}
+		start := strings.LastIndex(html[:idx], "<input")
+		if start < 0 {
+			t.Fatalf("missing input tag for %q", id)
+		}
+		end := strings.Index(html[idx:], ">")
+		if end < 0 {
+			t.Fatalf("missing input tag close for %q", id)
+		}
+		return html[start : idx+end+1]
+	}
+	// Ordinary params keep their minimum but carry no business max attribute.
+	for _, tc := range []struct{ id, min string }{
+		{"c-transient-interval", `min="0"`},
+		{"c-ratelimit-cooldown", `min="300"`},
+		{"c-suspect-cooldown", `min="1"`},
+		{"c-hist-retention", `min="1"`},
+		{"c-hist-max", `min="16"`},
+	} {
+		tag := inputTag(tc.id)
+		if !strings.Contains(tag, tc.min) {
+			t.Fatalf("%s must keep %s, got %q", tc.id, tc.min, tag)
+		}
+		if strings.Contains(tag, "max=") {
+			t.Fatalf("%s must not carry a business max attribute, got %q", tc.id, tag)
+		}
+	}
+	// Memory protection stays: ring keeps its resident bound.
+	ring := inputTag("c-ring")
+	if !strings.Contains(ring, `min="100"`) || !strings.Contains(ring, `max="50000"`) {
+		t.Fatalf("c-ring must keep min=100 max=50000 memory protection, got %q", ring)
+	}
+	// Local min consistency: session/backend>=5, refresh/backend>=1.
+	session := inputTag("c-session")
+	if !strings.Contains(session, `min="5"`) {
+		t.Fatalf("c-session must use min=5, got %q", session)
+	}
+	if strings.Contains(session, "max=") {
+		t.Fatalf("c-session must not carry a business max attribute, got %q", session)
+	}
+	refresh := inputTag("c-refresh")
+	if !strings.Contains(refresh, `min="1"`) {
+		t.Fatalf("c-refresh must use min=1, got %q", refresh)
+	}
+	// History labels no longer show the old business ranges.
+	for _, stale := range []string{"1-90", "1–90", "16-2048", "（1-90）", "（16-2048）"} {
+		if strings.Contains(html, stale) {
+			t.Fatalf("history range copy must stay removed: %q", stale)
+		}
+	}
+	if !strings.Contains(html, "历史保留天数") {
+		t.Fatal("history retention label must remain")
+	}
+	if !strings.Contains(html, "历史磁盘上限") {
+		t.Fatal("history disk-budget label must remain")
+	}
+}

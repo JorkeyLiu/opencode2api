@@ -261,7 +261,7 @@ func OpenHistoryStore(configPath string, cfg HistoryConfig, logger *slog.Logger,
 		open:          make(map[historyRecordKind]*historyOpenSegment),
 		enabledConfig: cfg.Enabled,
 		retentionDays: cfg.RetentionDays,
-		maxBytes:      int64(cfg.MaxBytesMB) << 20,
+		maxBytes:      megabytesToBytes(cfg.MaxBytesMB),
 	}
 	if cfg.RetentionDays < 1 {
 		s.retentionDays = 7

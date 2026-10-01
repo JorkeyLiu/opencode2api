@@ -419,7 +419,7 @@ func (c *modelCatalog) Snapshot() modelCatalogSnapshot {
 	}
 	stale := c.stale
 	if !c.updatedAt.IsZero() && c.refreshAfter > 0 {
-		stale = stale || time.Since(c.updatedAt) > max(2*c.refreshAfter, time.Minute)
+		stale = stale || time.Since(c.updatedAt) > max(saturatingShiftLeft(c.refreshAfter, 1), time.Minute)
 	}
 	return modelCatalogSnapshot{
 		Zen: len(c.zen), Total: len(c.zen), Exposed: exposed,

@@ -203,7 +203,7 @@ func TestCanonicalCustomChannelAppearsBeforeProbe(t *testing.T) {
 	}
 }
 
-// Single 429 field: default 300, range 300..3600, fixed 3600 cap.
+// Single 429 field: default 300, minimum 300, no fixed business max.
 func TestCanonicalSingle429Field(t *testing.T) {
 	if got := defaultConfig().Performance.RateLimitCooldownSeconds; got != 300 {
 		t.Fatalf("default=%d want 300", got)
@@ -217,11 +217,18 @@ func TestCanonicalSingle429Field(t *testing.T) {
 	if got.Performance.RateLimitCooldownSeconds != 300 {
 		t.Fatalf("0 must default to 300, got %d", got.Performance.RateLimitCooldownSeconds)
 	}
-	for _, bad := range []int{299, 3601} {
+	for _, bad := range []int{299} {
 		c := testBaseConfig()
 		c.Performance.RateLimitCooldownSeconds = bad
 		if _, err := NormalizeConfig("config.json", c); err == nil {
 			t.Fatalf("%d must fail", bad)
+		}
+	}
+	for _, good := range []int{3601, 7200} {
+		c := testBaseConfig()
+		c.Performance.RateLimitCooldownSeconds = good
+		if _, err := NormalizeConfig("config.json", c); err != nil {
+			t.Fatalf("%d must pass, got %v", good, err)
 		}
 	}
 	s := newTargetScheduler(time.Second, 300*time.Second)
