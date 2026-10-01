@@ -191,6 +191,7 @@ func (g *Gateway) runCredentialCheck(ctx context.Context, tier Tier, cred creden
 		return credentialCheckResponse{}, http.StatusServiceUnavailable, "no_available_proxy", "no eligible proxies for this credential (transport-healthy and not proxy429-cooled)"
 	}
 	targets := make([]bulkSendTarget, 0, len(eligible))
+	credFree := g.nativeFreeAgentShape(model)
 	for _, proxy := range eligible {
 		if len(targets) >= bulkMaxTotalSends {
 			break
@@ -198,6 +199,7 @@ func (g *Gateway) runCredentialCheck(ctx context.Context, tier Tier, cred creden
 		targets = append(targets, bulkSendTarget{
 			PoolName: poolName, Index: proxy.index, Proxy: proxy, Raw: proxy.name,
 			Tier: tier, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display,
+			FreeModel:  credFree,
 			ProbeModel: model, ProbeProtocol: proto,
 		})
 	}

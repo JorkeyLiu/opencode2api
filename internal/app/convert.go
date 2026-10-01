@@ -53,19 +53,68 @@ type bridgeToolChoice struct {
 }
 
 type bridgeRequest struct {
-	Model       string
-	System      []bridgeBlock
-	Developer   []bridgeBlock
-	Messages    []bridgeMessage
-	Tools       []bridgeTool
-	ToolChoice  bridgeToolChoice
-	Stream      bool
-	Temperature any
-	TopP        any
-	MaxTokens   any
-	Stop        any
-	Reasoning   any
-	Metadata    any
+	Model            string
+	System           []bridgeBlock
+	Developer        []bridgeBlock
+	Messages         []bridgeMessage
+	Tools            []bridgeTool
+	ToolChoice       bridgeToolChoice
+	Stream           bool
+	Temperature      any
+	TopP             any
+	MaxTokens        any
+	Stop             any
+	Reasoning        any
+	Metadata         any
+	SafetyIdentifier any
+	ServiceTier      any
+}
+
+// isUsableToolName reports whether a tool name can identify a real tool
+// block. Empty arguments remain valid (see bridgeArgumentsJSON {} fallback);
+// only a missing/blank name is phantom.
+func isUsableToolName(name string) bool {
+	return strings.TrimSpace(name) != ""
+}
+
+// isToolFinishSignal reports the canonical tool terminal signals that must
+// be downgraded when no usable tool block exists. Ordinary terminals
+// (length/content_filter/error/failed/incomplete/stop/...) are never matched.
+func isToolFinishSignal(stop string) bool {
+	switch strings.ToLower(strings.TrimSpace(stop)) {
+	case "tool_calls", "tool_use", "function_call", "function_calls":
+		return true
+	default:
+		return false
+	}
+}
+
+// filterUsableBridgeTools keeps only tool blocks with a usable name,
+// preserving IDs/order/arguments. Empty arguments stay valid.
+func filterUsableBridgeTools(tools []bridgeBlock) []bridgeBlock {
+	filtered := make([]bridgeBlock, 0, len(tools))
+	for _, tool := range tools {
+		if !isUsableToolName(tool.Name) {
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	return filtered
+}
+
+// normalizeBridgeResponseTools drops phantom nameless/whitespace tool blocks
+// and downgrades a tool terminal to normal completion when nothing usable
+// remains. Ordinary stops, provider errors and valid named tools are kept.
+func normalizeBridgeResponseTools(response *bridgeResponse) {
+	if response == nil {
+		return
+	}
+	if len(response.Tools) > 0 {
+		response.Tools = filterUsableBridgeTools(response.Tools)
+	}
+	if isToolFinishSignal(response.Stop) && len(response.Tools) == 0 {
+		response.Stop = "stop"
+	}
 }
 
 type bridgeUsage struct {
@@ -293,6 +342,8 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		request.MaxTokens = firstAny(input["max_completion_tokens"], input["max_tokens"])
 		request.Stop = input["stop"]
 		request.Reasoning = firstAny(input["reasoning_effort"], input["reasoning"])
+		request.SafetyIdentifier = input["safety_identifier"]
+		request.ServiceTier = input["service_tier"]
 		for i, raw := range sliceAt(input, "messages") {
 			message, ok := raw.(map[string]any)
 			if !ok {
@@ -355,6 +406,8 @@ func decodeBridgeRequest(protocol Protocol, input map[string]any) (bridgeRequest
 		request.MaxTokens = input["max_output_tokens"]
 		request.Stop = input["stop"]
 		request.Reasoning = firstAny(input["reasoning"], input["reasoning_effort"])
+		request.SafetyIdentifier = input["safety_identifier"]
+		request.ServiceTier = input["service_tier"]
 		instructions, err := decodeOpenAIBlocksChecked(input["instructions"])
 		if err != nil {
 			return request, fmt.Errorf("instructions: %w", err)
@@ -550,6 +603,8 @@ func encodeChatRequest(request bridgeRequest) (map[string]any, error) {
 	put(output, "top_p", request.TopP)
 	put(output, "max_tokens", request.MaxTokens)
 	put(output, "stop", request.Stop)
+	put(output, "safety_identifier", request.SafetyIdentifier)
+	put(output, "service_tier", request.ServiceTier)
 	if effort := reasoningEffort(request.Reasoning); effort != nil {
 		output["reasoning_effort"] = effort
 	}
@@ -727,6 +782,8 @@ func encodeResponsesRequest(request bridgeRequest) map[string]any {
 	put(output, "max_output_tokens", request.MaxTokens)
 	put(output, "stop", request.Stop)
 	put(output, "metadata", request.Metadata)
+	put(output, "safety_identifier", request.SafetyIdentifier)
+	put(output, "service_tier", request.ServiceTier)
 	if len(request.System) > 0 {
 		output["instructions"] = bridgeBlocksText(request.System)
 	}
@@ -1367,7 +1424,7 @@ func decodeBridgeResponse(protocol Protocol, input map[string]any) (bridgeRespon
 			}
 		}
 		response.Stop = "stop"
-		if len(response.Tools) > 0 {
+		if len(filterUsableBridgeTools(response.Tools)) > 0 {
 			response.Stop = "tool_calls"
 		}
 		if stringAt(input, "status") == "incomplete" {
@@ -1408,6 +1465,10 @@ func encodeBridgeResponse(protocol Protocol, response bridgeResponse) map[string
 	if response.ID == "" {
 		response.ID = randomID("resp", 12)
 	}
+	// Drop phantom nameless/whitespace tool blocks and downgrade a tool
+	// terminal to normal completion when nothing usable remains. Empty
+	// arguments stay valid via the {} fallback in bridgeArgumentsJSON.
+	normalizeBridgeResponseTools(&response)
 	switch protocol {
 	case ProtocolChat:
 		message := map[string]any{"role": "assistant", "content": response.Text}

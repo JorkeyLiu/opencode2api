@@ -111,7 +111,9 @@ func (g *Gateway) runScopedCheck(ctx context.Context, poolName string, index int
 	targets := make([]bulkSendTarget, 0, 8)
 	truncated := false
 	skipped := 0
-	addOne := func(tier Tier, credKey, credID, credDisp string, isPublic bool, model string, proto Protocol, ok bool) {
+	anonFree := anonOK && g.nativeFreeAgentShape(anonModel)
+	authFree := authOK && g.nativeFreeAgentShape(authModel)
+	addOne := func(tier Tier, credKey, credID, credDisp string, isPublic bool, freeModel bool, model string, proto Protocol, ok bool) {
 		if !ok {
 			return
 		}
@@ -123,17 +125,18 @@ func (g *Gateway) runScopedCheck(ctx context.Context, poolName string, index int
 		targets = append(targets, bulkSendTarget{
 			PoolName: poolName, Index: proxy.index, Proxy: proxy, Raw: raw,
 			Tier: tier, CredKey: credKey, CredID: credID, CredDisp: credDisp, IsPublic: isPublic,
+			FreeModel:  freeModel,
 			ProbeModel: model, ProbeProtocol: proto,
 		})
 	}
 	// Anonymous applies when this pool serves the anonymous channel;
 	// authenticated applies when it serves the authenticated channel.
 	if poolName == anonPoolName {
-		addOne(TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, anonModel, anonProto, anonOK)
+		addOne(TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, anonFree, anonModel, anonProto, anonOK)
 	}
 	if poolName == authPoolName && hasAuthKeys {
 		for _, cred := range g.credentials() {
-			addOne(TierZen, cred.key, cred.id, cred.display, false, authModel, authProto, authOK)
+			addOne(TierZen, cred.key, cred.id, cred.display, false, authFree, authModel, authProto, authOK)
 		}
 	}
 	tested := len(targets)

@@ -161,6 +161,8 @@ func (g *Gateway) runCredentialsBatch(ctx context.Context) credentialsBatchRespo
 			eligibleByCred[i] = eligibleByCred[i][:bulkMaxNodesPerCredential]
 		}
 	}
+	// Frozen free decision for credential probes (same single authority).
+	authFree := g.nativeFreeAgentShape(model)
 capped:
 	for i, cred := range creds {
 		for k, proxy := range eligibleByCred[i] {
@@ -182,6 +184,7 @@ capped:
 			targets = append(targets, bulkSendTarget{
 				PoolName: poolName, Index: proxy.index, Proxy: proxy, Raw: proxy.name,
 				Tier: TierZen, CredKey: cred.key, CredID: cred.id, CredDisp: cred.display,
+				FreeModel:  authFree,
 				ProbeModel: model, ProbeProtocol: proto,
 			})
 		}

@@ -10,25 +10,31 @@ import (
 	"time"
 )
 
-// Anonymous Zen free-tier agent shaping.
+// Native Zen free-tier agent shaping (authorized: anonymous AND authenticated).
 //
-// Upstream policy evidence: canonical identity alone is insufficient for the
-// native anonymous free tier. Agent-shaped streams (stream:true plus the core
+// Upstream policy evidence: canonical identity alone is insufficient for
+// native Zen free models. Agent-shaped streams (stream:true plus the core
 // tool set) are accepted. This file is the single shared authority for that
-// shaping: normal anonymous inference (unbound and pinned), exact-400 replay,
-// and native anonymous availability probes all pass through it. Authenticated
-// Zen keys, custom fallback channels, custom probes, model discovery,
-// capability fetches, proxy health, and the admin transport probe never use
-// it.
+// shaping: normal native inference (anonymous/authenticated, unbound and
+// pinned), exact-400 replay, and native availability probes all pass through
+// it. The free decision reuses the local model metadata classification
+// (zero input+output cost or case-insensitive free ID, never hardcoded IDs)
+// and is independent of cfg.Anonymous. Native paid models, custom fallback
+// channels, custom probes, model discovery, capability fetches, proxy health,
+// and the admin transport probe never use it.
 //
 // The shaped body always forces upstream stream:true and ensures the five
 // core tools are present. Caller history, fields, and extra tools are
 // preserved. Non-stream callers still receive collapsed protocol-correct JSON:
 // the gateway consumes the upstream SSE fully before writing client bytes.
 
-var anonymousCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
+var nativeAgentCoreTools = []string{"bash", "edit", "glob", "grep", "read"}
 
-var anonymousCoreToolDescriptions = map[string]string{
+// anonymousCoreTools is the legacy name kept for existing tests/callers.
+// It aliases the single native authority above; no independent copy exists.
+var anonymousCoreTools = nativeAgentCoreTools
+
+var nativeAgentCoreToolDescriptions = map[string]string{
 	"bash": "Run shell commands",
 	"edit": "Edit files",
 	"glob": "Find files by pattern",
@@ -36,27 +42,37 @@ var anonymousCoreToolDescriptions = map[string]string{
 	"read": "Read files",
 }
 
+var anonymousCoreToolDescriptions = nativeAgentCoreToolDescriptions
+
 // isAnonymousCandidate reports the fixed anonymous public credential/channel.
-// Callers should prefer this helper over scattering key comparisons.
+// Retained for observability only; shaping no longer gates on lane.
 func isAnonymousCandidate(cand targetCandidate) bool {
 	return cand.CredID == anonymousSchedulerCredentialID
 }
 
-// applyAnonymousAgentShape mutates one prepared upstream payload for the
-// anonymous native Zen free tier: it forces stream:true and ensures all five
-// core tools exist. Missing tools are appended in deterministic core order;
-// caller definitions with the same name are never overwritten. Absent/null
-// tools become an array; a present non-array or structurally unrecognized
-// entry fails loudly instead of being silently discarded.
-func applyAnonymousAgentShape(protocol Protocol, payload map[string]any) error {
+// applyNativeAgentShape mutates one prepared upstream payload for the
+// native Zen free tier (anonymous and authenticated): it forces stream:true
+// and ensures all five core tools exist. Missing tools are appended in
+// deterministic core order; caller definitions with the same name are never
+// overwritten. Absent/null tools become an array; a present non-array or
+// structurally unrecognized entry fails loudly instead of being silently
+// discarded. This is the single shaping authority; there is no independent
+// auth copy.
+func applyNativeAgentShape(protocol Protocol, payload map[string]any) error {
 	if payload == nil {
-		return fmt.Errorf("anonymous agent shape requires an object body")
+		return fmt.Errorf("native agent shape requires an object body")
 	}
 	payload["stream"] = true
 	if protocol == ProtocolChat {
 		ensureChatStreamOptions(payload)
 	}
-	return ensureAnonymousCoreTools(protocol, payload)
+	return ensureNativeAgentCoreTools(protocol, payload)
+}
+
+// applyAnonymousAgentShape is the legacy name delegating to the single
+// native authority above.
+func applyAnonymousAgentShape(protocol Protocol, payload map[string]any) error {
+	return applyNativeAgentShape(protocol, payload)
 }
 
 func ensureChatStreamOptions(payload map[string]any) {
@@ -69,10 +85,10 @@ func ensureChatStreamOptions(payload map[string]any) {
 	opts["include_usage"] = true
 }
 
-func ensureAnonymousCoreTools(protocol Protocol, payload map[string]any) error {
+func ensureNativeAgentCoreTools(protocol Protocol, payload map[string]any) error {
 	raw, exists := payload["tools"]
 	if !exists || raw == nil {
-		payload["tools"] = anonymousCoreToolDefs(protocol, nil)
+		payload["tools"] = nativeAgentCoreToolDefs(protocol, nil)
 		return nil
 	}
 	arr, ok := raw.([]any)
@@ -85,7 +101,7 @@ func ensureAnonymousCoreTools(protocol Protocol, payload map[string]any) error {
 		if !ok {
 			return fmt.Errorf("tools[%d] must be an object", i)
 		}
-		name, ok := anonymousToolName(protocol, item)
+		name, ok := nativeAgentToolName(protocol, item)
 		if !ok {
 			return fmt.Errorf("tools[%d] must be a function tool", i)
 		}
@@ -93,21 +109,25 @@ func ensureAnonymousCoreTools(protocol Protocol, payload map[string]any) error {
 			present[name] = true
 		}
 	}
-	for _, name := range anonymousCoreTools {
+	for _, name := range nativeAgentCoreTools {
 		if present[name] {
 			continue
 		}
-		arr = append(arr, anonymousCoreToolDef(protocol, name))
+		arr = append(arr, nativeAgentCoreToolDef(protocol, name))
 	}
 	payload["tools"] = arr
 	return nil
 }
 
-// anonymousToolName extracts the tool name for the target protocol. It
+func ensureAnonymousCoreTools(protocol Protocol, payload map[string]any) error {
+	return ensureNativeAgentCoreTools(protocol, payload)
+}
+
+// nativeAgentToolName extracts the tool name for the target protocol. It
 // returns ok=false only for structurally unrecognized entries that must fail
 // loudly. A structurally valid entry without a name returns ("", true) so the
 // caller preserves it without treating it as covering a core tool.
-func anonymousToolName(protocol Protocol, item map[string]any) (string, bool) {
+func nativeAgentToolName(protocol Protocol, item map[string]any) (string, bool) {
 	switch protocol {
 	case ProtocolChat, ProtocolResponses:
 		if stringAt(item, "type") != "function" {
@@ -128,16 +148,24 @@ func anonymousToolName(protocol Protocol, item map[string]any) (string, bool) {
 	}
 }
 
-func anonymousCoreToolDefs(protocol Protocol, _ map[string]bool) []any {
-	out := make([]any, 0, len(anonymousCoreTools))
-	for _, name := range anonymousCoreTools {
-		out = append(out, anonymousCoreToolDef(protocol, name))
+func anonymousToolName(protocol Protocol, item map[string]any) (string, bool) {
+	return nativeAgentToolName(protocol, item)
+}
+
+func nativeAgentCoreToolDefs(protocol Protocol, _ map[string]bool) []any {
+	out := make([]any, 0, len(nativeAgentCoreTools))
+	for _, name := range nativeAgentCoreTools {
+		out = append(out, nativeAgentCoreToolDef(protocol, name))
 	}
 	return out
 }
 
-func anonymousCoreToolDef(protocol Protocol, name string) map[string]any {
-	desc := anonymousCoreToolDescriptions[name]
+func anonymousCoreToolDefs(protocol Protocol, _ map[string]bool) []any {
+	return nativeAgentCoreToolDefs(protocol, nil)
+}
+
+func nativeAgentCoreToolDef(protocol Protocol, name string) map[string]any {
+	desc := nativeAgentCoreToolDescriptions[name]
 	if desc == "" {
 		desc = name
 	}
@@ -163,17 +191,20 @@ func anonymousCoreToolDef(protocol Protocol, name string) map[string]any {
 	}
 }
 
-// shapedAnonymousBody applies the shared anonymous agent shape to one frozen
-// canonical body. It decodes, shapes, and re-encodes; route-session fields
-// are preserved for the caller to stamp afterwards via
-// applyRouteSessionToBody. Authenticated and custom bodies never pass through
-// here.
-func shapedAnonymousBody(canonical []byte, protocol Protocol) ([]byte, error) {
+func anonymousCoreToolDef(protocol Protocol, name string) map[string]any {
+	return nativeAgentCoreToolDef(protocol, name)
+}
+
+// shapedNativeAgentBody applies the shared native free agent shape to one
+// frozen canonical body. It decodes, shapes, and re-encodes; route-session
+// fields are preserved for the caller to stamp afterwards via
+// applyRouteSessionToBody. Paid and custom bodies never pass through here.
+func shapedNativeAgentBody(canonical []byte, protocol Protocol) ([]byte, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(canonical, &payload); err != nil {
-		return nil, fmt.Errorf("anonymous agent shape: %w", err)
+		return nil, fmt.Errorf("native agent shape: %w", err)
 	}
-	if err := applyAnonymousAgentShape(protocol, payload); err != nil {
+	if err := applyNativeAgentShape(protocol, payload); err != nil {
 		return nil, err
 	}
 	encoded, err := json.Marshal(payload)
@@ -181,6 +212,12 @@ func shapedAnonymousBody(canonical []byte, protocol Protocol) ([]byte, error) {
 		return nil, fmt.Errorf("request contains unsupported JSON values")
 	}
 	return encoded, nil
+}
+
+// shapedAnonymousBody is the legacy name delegating to the single native
+// authority above.
+func shapedAnonymousBody(canonical []byte, protocol Protocol) ([]byte, error) {
+	return shapedNativeAgentBody(canonical, protocol)
 }
 
 // collapseUpstreamSSE consumes one upstream SSE stream for a non-stream
@@ -263,7 +300,7 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 				if event.ToolID != "" {
 					tool.ID = event.ToolID
 				}
-				if event.ToolName != "" {
+				if isUsableToolName(event.ToolName) {
 					tool.Name = event.ToolName
 				}
 			case "tool_delta":
@@ -271,7 +308,7 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 				if event.ToolID != "" {
 					tool.ID = event.ToolID
 				}
-				if event.ToolName != "" {
+				if isUsableToolName(event.ToolName) {
 					tool.Name = event.ToolName
 				}
 				tool.Arguments.WriteString(event.Text)
@@ -305,9 +342,30 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 		return nil, bridgeUsage{}, false, fmt.Errorf("upstream SSE stream ended before a terminal event")
 	}
 	if stop == "" {
-		if len(order) > 0 {
+		hasUsable := false
+		for _, key := range order {
+			if tool := tools[key]; tool != nil && isUsableToolName(tool.Name) {
+				hasUsable = true
+				break
+			}
+		}
+		if hasUsable {
 			stop = "tool_calls"
 		} else {
+			stop = "stop"
+		}
+	}
+	// Downgrade a phantom tool terminal when no usable tool block exists.
+	// Empty arguments stay valid; only blank names are phantom.
+	if isToolFinishSignal(stop) {
+		hasUsable := false
+		for _, key := range order {
+			if tool := tools[key]; tool != nil && isUsableToolName(tool.Name) {
+				hasUsable = true
+				break
+			}
+		}
+		if !hasUsable {
 			stop = "stop"
 		}
 	}
@@ -326,6 +384,9 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 	}
 	for _, key := range order {
 		tool := tools[key]
+		if tool == nil || !isUsableToolName(tool.Name) {
+			continue
+		}
 		response.Tools = append(response.Tools, bridgeBlock{
 			Kind: "tool_call", ID: tool.ID, Name: tool.Name,
 			ArgumentsJSON: tool.Arguments.String(),
@@ -338,10 +399,11 @@ func collapseUpstreamSSE(reader io.Reader, from, to Protocol, model string) ([]b
 	return encoded, usage, reported, nil
 }
 
-// collapseAnonymousProbeBody validates one anonymous probe HTTP body. Plain
-// JSON completions validate directly; event-stream bytes collapse internally
-// to JSON first so valid SSE never reports a false parse_error.
-func collapseAnonymousProbeBody(protocol Protocol, model string, raw []byte) ([]byte, bool) {
+// collapseNativeAgentProbeBody validates one native free probe HTTP body.
+// Plain JSON completions validate directly; event-stream bytes collapse
+// internally to JSON first so valid SSE never reports a false parse_error.
+// Paid probes use plain validation only via bulkProbeSuccessBody.
+func collapseNativeAgentProbeBody(protocol Protocol, model string, raw []byte) ([]byte, bool) {
 	if bulkProbeSuccessBody(protocol, raw) {
 		return raw, true
 	}
@@ -357,4 +419,8 @@ func collapseAnonymousProbeBody(protocol Protocol, model string, raw []byte) ([]
 		return nil, false
 	}
 	return collapsed, true
+}
+
+func collapseAnonymousProbeBody(protocol Protocol, model string, raw []byte) ([]byte, bool) {
+	return collapseNativeAgentProbeBody(protocol, model, raw)
 }

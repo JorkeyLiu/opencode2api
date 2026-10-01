@@ -396,11 +396,11 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 			if id != "" {
 				parser.toolIDs[key] = id
 			}
-			if name := stringAt(function, "name"); name != "" {
+			if name := stringAt(function, "name"); isUsableToolName(name) {
 				parser.toolNames[key] = mergeToolName(parser.toolNames[key], name)
 			}
 			if arguments := stringAt(function, "arguments"); arguments != "" {
-				if !parser.tools[key] && parser.toolNames[key] != "" {
+				if !parser.tools[key] && isUsableToolName(parser.toolNames[key]) {
 					parser.tools[key] = true
 					events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
 				}
@@ -413,7 +413,7 @@ func (parser *bridgeStreamParser) parseChatEvent(eventName string, value map[str
 				continue
 			}
 			for _, key := range parser.toolOrder {
-				if !parser.tools[key] && parser.toolNames[key] != "" {
+				if !parser.tools[key] && isUsableToolName(parser.toolNames[key]) {
 					parser.tools[key] = true
 					events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
 				}
@@ -523,7 +523,7 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 		if stringAt(item, "type") == "function_call" {
 			key := responseToolKey(value, item)
 			parser.rememberTool(key, stringAt(item, "call_id"), stringAt(item, "name"))
-			if parser.toolNames[key] != "" {
+			if isUsableToolName(parser.toolNames[key]) {
 				parser.tools[key] = true
 				return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]}}
 			}
@@ -555,7 +555,7 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			key := responseToolKey(value, item)
 			parser.rememberTool(key, stringAt(item, "call_id"), stringAt(item, "name"))
 			events := make([]bridgeStreamEvent, 0, 2)
-			if !parser.tools[key] {
+			if !parser.tools[key] && isUsableToolName(parser.toolNames[key]) {
 				parser.tools[key] = true
 				events = append(events, bridgeStreamEvent{Kind: "tool_start", ToolKey: key, ToolID: parser.toolIDs[key], ToolName: parser.toolNames[key]})
 			}
@@ -626,7 +626,7 @@ func (parser *bridgeStreamParser) rememberTool(key, id, name string) {
 	if id != "" {
 		parser.toolIDs[key] = id
 	}
-	if name != "" {
+	if isUsableToolName(name) {
 		parser.toolNames[key] = name
 	}
 }
@@ -687,6 +687,7 @@ type bridgeStreamEmitter struct {
 
 	sequence        int
 	nextOutput      int
+	nextChatTool    int
 	textOpen        bool
 	reasoningOpen   bool
 	reasoningClosed bool
@@ -756,7 +757,7 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.ToolID != "" {
 			tool.ID = event.ToolID
 		}
-		if event.ToolName != "" {
+		if isUsableToolName(event.ToolName) {
 			tool.Name = event.ToolName
 		}
 		if err := emitter.startTool(tool); err != nil {
@@ -768,7 +769,7 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		if event.ToolID != "" {
 			tool.ID = event.ToolID
 		}
-		if event.ToolName != "" {
+		if isUsableToolName(event.ToolName) {
 			tool.Name = event.ToolName
 		}
 		tool.Arguments.WriteString(event.Text)
@@ -834,7 +835,7 @@ func (emitter *bridgeStreamEmitter) tool(key string) *bridgeStreamTool {
 		Key:    key,
 		ID:     randomID("call", 12),
 		ItemID: randomID("fc", 12),
-		Index:  len(emitter.order),
+		Index:  -1,
 	}
 	emitter.tools[key] = tool
 	emitter.order = append(emitter.order, key)
@@ -1025,7 +1026,7 @@ func (emitter *bridgeStreamEmitter) finishReasoning() error {
 }
 
 func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
-	if tool.Started || tool.Name == "" {
+	if tool.Started || !isUsableToolName(tool.Name) {
 		return nil
 	}
 	if emitter.target == ProtocolResponses || emitter.target == ProtocolAnthropic {
@@ -1042,6 +1043,16 @@ func (emitter *bridgeStreamEmitter) startTool(tool *bridgeStreamTool) error {
 	tool.Started = true
 	switch emitter.target {
 	case ProtocolChat:
+		// Chat tool indices are assigned at emission time so only actually
+		// emitted tools consume dense 0..n-1 indices. Nameless phantom
+		// entries never start and never consume an index; every chunk for
+		// one tool reuses its assigned index and already emitted tools are
+		// never renumbered. This counter is Chat-only and independent of
+		// text/message/output numbering used by other protocols.
+		if tool.Index < 0 {
+			tool.Index = emitter.nextChatTool
+			emitter.nextChatTool++
+		}
 		return emitter.chatChunk(map[string]any{"tool_calls": []any{map[string]any{
 			"index": tool.Index,
 			"id":    tool.ID,
@@ -1098,6 +1109,55 @@ func (emitter *bridgeStreamEmitter) emitPendingToolArguments(tool *bridgeStreamT
 	return emitter.emitToolDelta(tool, delta)
 }
 
+// hasUsableStreamTool reports whether any accumulated tool carries a usable
+// (non-blank) name. Empty arguments remain valid.
+func (emitter *bridgeStreamEmitter) hasUsableStreamTool() bool {
+	for _, key := range emitter.order {
+		if tool := emitter.tools[key]; tool != nil && isUsableToolName(tool.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasStartedUsableStreamTool reports whether any usable tool was actually
+// emitted (Started). Phantom nameless/whitespace entries never count.
+func (emitter *bridgeStreamEmitter) hasStartedUsableStreamTool() bool {
+	for _, key := range emitter.order {
+		if tool := emitter.tools[key]; tool != nil && tool.Started && isUsableToolName(tool.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// materializePendingStreamTools starts pending legitimate named tools so a
+// valid name with empty args still emits its block. Nameless/whitespace
+// entries are skipped.
+func (emitter *bridgeStreamEmitter) materializePendingStreamTools() error {
+	for _, key := range emitter.order {
+		tool := emitter.tools[key]
+		if tool == nil || !isUsableToolName(tool.Name) {
+			continue
+		}
+		if err := emitter.startTool(tool); err != nil {
+			return err
+		}
+		if err := emitter.emitPendingToolArguments(tool); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// downgradePhantomToolStop maps a tool terminal to normal completion when no
+// usable/actually emitted tool block exists. Ordinary terminals are kept.
+func (emitter *bridgeStreamEmitter) downgradePhantomToolStop() {
+	if isToolFinishSignal(emitter.stop) && !emitter.hasStartedUsableStreamTool() {
+		emitter.stop = "stop"
+	}
+}
+
 func (emitter *bridgeStreamEmitter) Finish() error {
 	if emitter.done {
 		return nil
@@ -1109,7 +1169,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		}
 	}
 	if emitter.stop == "" {
-		if len(emitter.order) > 0 {
+		if emitter.hasUsableStreamTool() {
 			emitter.stop = "tool_calls"
 		} else {
 			emitter.stop = "stop"
@@ -1120,6 +1180,10 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 	}
 	switch emitter.target {
 	case ProtocolChat:
+		if err := emitter.materializePendingStreamTools(); err != nil {
+			return err
+		}
+		emitter.downgradePhantomToolStop()
 		if err := emitter.chatChunk(map[string]any{}, chatStop(emitter.stop)); err != nil {
 			return err
 		}
@@ -1143,6 +1207,9 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		}
 		for _, key := range emitter.order {
 			tool := emitter.tools[key]
+			if tool == nil || !isUsableToolName(tool.Name) {
+				continue
+			}
 			if err := emitter.startTool(tool); err != nil {
 				return err
 			}
@@ -1155,6 +1222,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 				}
 			}
 		}
+		emitter.downgradePhantomToolStop()
 		if err := emitter.sse("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": anthropicStop(emitter.stop), "stop_sequence": nil},
@@ -1168,6 +1236,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		if err := emitter.finishResponsesItems(); err != nil {
 			return err
 		}
+		emitter.downgradePhantomToolStop()
 		response := bridgeResponse{
 			ID:        emitter.id,
 			Model:     emitter.model,
@@ -1182,6 +1251,9 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		}
 		for _, key := range emitter.order {
 			tool := emitter.tools[key]
+			if tool == nil || !isUsableToolName(tool.Name) {
+				continue
+			}
 			response.Tools = append(response.Tools, bridgeBlock{Kind: "tool_call", ID: tool.ID, Name: tool.Name, ArgumentsJSON: tool.Arguments.String()})
 		}
 		completed := encodeBridgeResponse(ProtocolResponses, response)
@@ -1207,6 +1279,9 @@ func (emitter *bridgeStreamEmitter) finishResponsesItems() error {
 	}
 	for _, key := range emitter.order {
 		tool := emitter.tools[key]
+		if tool == nil || !isUsableToolName(tool.Name) {
+			continue
+		}
 		arguments := tool.Arguments.String()
 		if arguments == "" {
 			arguments = "{}"

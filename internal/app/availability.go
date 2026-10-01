@@ -139,6 +139,12 @@ type bulkSendTarget struct {
 	CredID   string
 	CredDisp string
 	IsPublic bool
+	// FreeModel is the frozen native free decision for ProbeModel, computed
+	// once at target construction via nativeFreeAgentShape. Build and
+	// validation must use this flag (or IsPublic for legacy anon targets)
+	// and never re-read the refreshable catalog, so a mid-probe refresh
+	// cannot split shape-vs-collapse decisions. Paid targets stay false.
+	FreeModel bool
 	// ProbeModel/ProbeProtocol select the real minimal inference request for
 	// this tier. Empty ProbeModel means no directory model was available and
 	// the target must not be built (caller reports no_model instead).
@@ -266,11 +272,14 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	} else if !authOK {
 		noModel["authenticated"] = true
 	}
+	// Frozen free decisions per lane for probe shaping (single authority).
+	anonFree := anonOK && g.nativeFreeAgentShape(anonModel)
+	authFree := authOK && g.nativeFreeAgentShape(authModel)
 	// Build send targets with bounded amplification.
 	targets := make([]bulkSendTarget, 0, bulkMaxTotalSends)
 	skipped := 0
 	truncated := false
-	addTargets := func(poolName string, tier Tier, credKey, credID, credDisp string, isPublic bool, cap int, probeModel string, probeProto Protocol, probeOK bool) int {
+	addTargets := func(poolName string, tier Tier, credKey, credID, credDisp string, isPublic bool, freeModel bool, cap int, probeModel string, probeProto Protocol, probeOK bool) int {
 		if !probeOK {
 			return 0
 		}
@@ -297,6 +306,7 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 			targets = append(targets, bulkSendTarget{
 				PoolName: n.poolName, Index: n.index, Proxy: n.proxy, Raw: n.raw,
 				Tier: tier, CredKey: credKey, CredID: credID, CredDisp: credDisp, IsPublic: isPublic,
+				FreeModel:  freeModel,
 				ProbeModel: probeModel, ProbeProtocol: probeProto,
 			})
 			added++
@@ -307,11 +317,11 @@ func (g *Gateway) runBulkCheck(ctx context.Context) bulkCheckResponse {
 	// authenticated pool. Each key probes enough nodes to establish success,
 	// node-specific failure, or two-distinct-429 evidence. Caps keep
 	// amplification bounded; truncation is reported.
-	publicTested := addTargets(anonPoolName, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, bulkMaxPublicNodes, anonModel, anonProto, anonOK)
+	publicTested := addTargets(anonPoolName, TierZen, anonymousZenKey, anonymousSchedulerCredentialID, anonymousCredentialID, true, anonFree, bulkMaxPublicNodes, anonModel, anonProto, anonOK)
 	_ = publicTested
 	if hasAuthKeys {
 		for _, cred := range authCreds {
-			addTargets(authPoolName, TierZen, cred.key, cred.id, cred.display, false, bulkMaxNodesPerCredential, authModel, authProto, authOK)
+			addTargets(authPoolName, TierZen, cred.key, cred.id, cred.display, false, authFree, bulkMaxNodesPerCredential, authModel, authProto, authOK)
 		}
 	}
 	tested := len(targets)
@@ -437,6 +447,17 @@ func bulkProbeCanonicalBody(model string, protocol Protocol, baseURL, routeSessi
 	return applyRouteSessionToBody(canonical, routeSession, protocol, false)
 }
 
+// probeNeedsNativeShape reports whether one native probe target needs the
+// free agent shape. IsPublic implies free in production (anonymous lane only
+// serves free models, kept for legacy dummy targets); FreeModel covers
+// authenticated free models explicitly. Paid targets stay false.
+func probeNeedsNativeShape(tgt bulkSendTarget) bool {
+	if tgt.Tier != TierZen {
+		return false
+	}
+	return tgt.IsPublic || tgt.FreeModel
+}
+
 // buildBulkProbeRequest constructs one scheduler-neutral minimal-inference
 // probe through the shared gateway helpers only: bulkProbeScope for the
 // target-bound scope, stateless deriveFirstRouteSession (never the scheduler
@@ -444,7 +465,9 @@ func bulkProbeCanonicalBody(model string, protocol Protocol, baseURL, routeSessi
 // newUpstreamRequest for endpoint/auth/OpenCode/protocol headers. It never
 // reads scheduler cooldowns, route-session overrides, or pins, and never
 // writes metrics/history. Header and body share one internally consistent
-// canonical session/request/project triple.
+// canonical session/request/project triple. Native free probes (anonymous
+// and authenticated free) share the single native agent shape authority;
+// paid probes stay unshaped minimal inference.
 func buildBulkProbeRequest(ctx context.Context, base string, tgt bulkSendTarget, protocol Protocol, model string) (*http.Request, requestIDs, string, []byte, error) {
 	ids := bulkProbeIDs()
 	scope := bulkProbeScope(base, tgt, protocol)
@@ -453,8 +476,8 @@ func buildBulkProbeRequest(ctx context.Context, base string, tgt bulkSendTarget,
 	if err != nil {
 		return nil, ids, routeSession, nil, err
 	}
-	if tgt.IsPublic {
-		shaped, shapeErr := shapedAnonymousBody(body, protocol)
+	if probeNeedsNativeShape(tgt) {
+		shaped, shapeErr := shapedNativeAgentBody(body, protocol)
 		if shapeErr != nil {
 			return nil, ids, routeSession, nil, shapeErr
 		}
@@ -515,8 +538,12 @@ func (g *Gateway) bulkProbeOnce(parent context.Context, tgt bulkSendTarget) bulk
 	if err != nil {
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
 	}
-	if tgt.IsPublic {
-		if _, ok := collapseAnonymousProbeBody(protocol, model, raw); !ok {
+	// Frozen shape-vs-collapse coherence: the same target flag that shaped
+	// the request decides collapse. Free probes (both lanes) collapse SSE
+	// for factual observation; paid probes validate plain JSON only. No
+	// catalog re-lookup here, so a mid-probe refresh cannot disagree.
+	if probeNeedsNativeShape(tgt) {
+		if _, ok := collapseNativeAgentProbeBody(protocol, model, raw); !ok {
 			return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, ParseError: true}
 		}
 		return bulkSendResult{Target: tgt, StartedNanos: startedNanos, DurationMS: durationMS, Status: status, RetryAfter: retryAfter, Success: true, Models: 1}

@@ -563,6 +563,10 @@ func TestAnonymousRetryAndReplayShapingConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gw.catalog.ReplaceWithCapabilities([]string{"free-model"}, nil,
+		map[Tier]map[string]Protocol{TierZen: {"free-model": ProtocolChat}, TierGo: {}},
+		map[Tier]map[string]bool{TierZen: {}, TierGo: {}},
+		nil)
 	// Transient retry: first 500, then SSE success. Both sends must be shaped identically.
 	usageJSON := `{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`
 	sse := chatSSEBody("chatcmpl-r", "hi", "", "", usageJSON)
@@ -579,13 +583,14 @@ func TestAnonymousRetryAndReplayShapingConsistent(t *testing.T) {
 		resp.Header.Set("Content-Type", "text/event-stream")
 		return resp, nil
 	})
-	route := modelRoute{ID: "m", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: true}
-	prepared, err := prepareUpstreamRequest(ProtocolChat, ProtocolChat, map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}, gw.cfg.Upstream.Zen)
+	route := modelRoute{ID: "free-model", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, Anonymous: true}
+	bodiesMap, shaped, err := gw.prepareRouteBodies(ProtocolChat, route, map[string]any{"model": "free-model", "messages": []any{map[string]any{"role": "user", "content": "hi"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, _ := json.Marshal(prepared)
-	bodiesMap := map[Tier][]byte{TierZen: encoded}
+	if !shaped {
+		t.Fatalf("free model must freeze shaped=true")
+	}
 	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
 	resp, _, _, err := gw.doUpstreamTiers(ctx, route, bodiesMap, clientSessionIDs("ses-retry-shape"), 0)
 	if err != nil {
@@ -655,26 +660,33 @@ func TestAuthenticatedInferenceUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gw.catalog.ReplaceWithCapabilities([]string{"m"}, nil,
-		map[Tier]map[string]Protocol{TierZen: {"m": ProtocolChat}, TierGo: {}},
+	// Explicitly PAID guard: paid-model is neither free-named nor zero-cost,
+	// so authenticated paid requests must keep original stream/tools/body.
+	gw.catalog.ReplaceWithCapabilities([]string{"paid-model"}, nil,
+		map[Tier]map[string]Protocol{TierZen: {"paid-model": ProtocolChat}, TierGo: {}},
 		map[Tier]map[string]bool{TierZen: {}, TierGo: {}},
 		nil)
+	if gw.nativeFreeAgentShape("paid-model") {
+		t.Fatalf("paid-model fixture must not be free")
+	}
 	var seen []byte
 	stubProxy(t, gw, "shared", 0, func(r *http.Request) (*http.Response, error) {
 		raw, _ := io.ReadAll(r.Body)
 		seen = raw
-		return responseWithBody(200, bulkChatSuccessBody("m")), nil
+		return responseWithBody(200, bulkChatSuccessBody("paid-model")), nil
 	})
 	// Force authenticated-only route (anonymous disabled for this model path
 	// is not available, so call the key lane directly with a non-stream body).
-	route := modelRoute{ID: "m", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, KeyTiers: []Tier{TierZen}}
-	prepared, err := prepareUpstreamRequest(ProtocolChat, ProtocolChat, map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}, gw.cfg.Upstream.Zen)
+	route := modelRoute{ID: "paid-model", Tier: TierZen, Protocol: ProtocolChat, Protocols: map[Tier]Protocol{TierZen: ProtocolChat}, KeyTiers: []Tier{TierZen}}
+	bodiesMap, shaped, err := gw.prepareRouteBodies(ProtocolChat, route, map[string]any{"model": "paid-model", "messages": []any{map[string]any{"role": "user", "content": "hi"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, _ := json.Marshal(prepared)
+	if shaped {
+		t.Fatalf("paid model must freeze shaped=false")
+	}
 	ctx := context.WithValue(context.Background(), requestMetaKey{}, &requestMeta{})
-	resp, _, _, err := gw.doUpstreamTiers(ctx, route, map[Tier][]byte{TierZen: encoded}, clientSessionIDs("ses-auth-untouched"), 0)
+	resp, _, _, err := gw.doUpstreamTiers(ctx, route, bodiesMap, clientSessionIDs("ses-auth-untouched"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

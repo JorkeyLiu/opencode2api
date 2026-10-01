@@ -474,19 +474,15 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			meta.Tier = string(route.Tier)
 			meta.Protocol = string(external)
 		}
-		bodies, err := g.prepareRouteBodies(external, route, payload)
+		bodies, nativeShaped, err := g.prepareRouteBodies(external, route, payload)
 		if err != nil {
 			writeAPIError(w, external, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
 		}
-		if route.Anonymous {
-			if canonical := bodies[route.Tier]; len(canonical) > 0 {
-				if _, shapeErr := shapedAnonymousBody(canonical, route.ProtocolFor(route.Tier)); shapeErr != nil {
-					writeAPIError(w, external, http.StatusBadRequest, shapeErr.Error(), "invalid_request_error", "")
-					return
-				}
-			}
-		}
+		// Frozen shape validation already happened inside prepareRouteBodies
+		// (single authority). No second shaping check here; bodies carry the
+		// effective shape and nativeShaped is the request-local collapse
+		// authority below.
 		ids := deriveRequestIDs(r, payload)
 		if meta != nil {
 			meta.Request = ids.Request
@@ -534,11 +530,16 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			copyErrorResponse(w, external, resp, ids.Request)
 			return
 		}
-		_, _, anonymousLane := requestCredential(requestCtx)
-		if !stream && anonymousLane && upstreamRoute.Tier == TierZen {
+		// Frozen collapse authority: a native free request was forced to
+		// upstream SSE even for non-stream callers, so collapse it back to
+		// protocol-correct JSON. Paid/custom bodies never enter here; the
+		// flag was frozen in prepareRouteBodies and never re-reads the
+		// refreshable catalog, so a mid-request model refresh cannot split
+		// body-vs-collapse decisions.
+		if !stream && nativeShaped && upstreamRoute.Tier == TierZen {
 			collapsed, collapsedUsage, collapsedReported, collapseErr := collapseUpstreamSSE(resp.Body, upstreamRoute.Protocol, external, model)
 			if collapseErr != nil {
-				g.logger.Warn("anonymous upstream stream collapse failed", "component", "stream", "event", "anonymous_collapse_failed", "request_id", ids.Request, "model", model, "client_session_hash", clientSessionHash(ids.Session), "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", collapseErr)
+				g.logger.Warn("native agent upstream stream collapse failed", "component", "stream", "event", "native_agent_collapse_failed", "request_id", ids.Request, "model", model, "client_session_hash", clientSessionHash(ids.Session), "source_protocol", upstreamRoute.Protocol, "target_protocol", external, "error", collapseErr)
 				writeAPIError(w, external, http.StatusBadGateway, "upstream stream failed", "upstream_error", ids.Request)
 				return
 			}
@@ -599,7 +600,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 	}
 }
 
-func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[string]any) (map[Tier][]byte, error) {
+func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[string]any) (map[Tier][]byte, bool, error) {
 	tiers := make([]Tier, 0, len(route.KeyTiers)+1)
 	seen := make(map[Tier]bool, len(route.KeyTiers)+1)
 	addTier := func(tier Tier) {
@@ -614,8 +615,13 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 		addTier(tier)
 	}
 	if len(tiers) == 0 {
-		return nil, errors.New("no usable upstream tier")
+		return nil, false, errors.New("no usable upstream tier")
 	}
+	// Frozen native free decision for this request: computed once here via
+	// the single metadata authority. Bodies below embed the agent shape when
+	// free, and the returned flag is the request-local collapse authority.
+	// No later catalog lookup may disagree with this frozen value.
+	nativeShaped := g.nativeFreeAgentShape(route.ID)
 	bodies := make(map[Tier][]byte, len(tiers))
 	for _, tier := range tiers {
 		protocol := route.ProtocolFor(tier)
@@ -629,15 +635,28 @@ func (g *Gateway) prepareRouteBodies(from Protocol, route modelRoute, input map[
 				// the request actually falls back.
 				continue
 			}
-			return nil, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+			return nil, false, fmt.Errorf("prepare %s upstream request: %w", tier, err)
+		}
+		if nativeShaped && tier == TierZen {
+			// Single native free shaping authority: anonymous and
+			// authenticated free bodies share this exact policy. Paid
+			// bodies skip it untouched. The frozen canonical now carries
+			// the effective shape, so all native walkers consume identical
+			// bytes without per-candidate reshaping.
+			if err := applyNativeAgentShape(protocol, upstreamPayload); err != nil {
+				if tier != route.Tier {
+					continue
+				}
+				return nil, false, err
+			}
 		}
 		encoded, err := json.Marshal(upstreamPayload)
 		if err != nil {
-			return nil, errors.New("request contains unsupported JSON values")
+			return nil, false, errors.New("request contains unsupported JSON values")
 		}
 		bodies[tier] = encoded
 	}
-	return bodies, nil
+	return bodies, nativeShaped, nil
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, extra ...upstreamExtra) (*http.Response, modelRoute, error) {
@@ -855,6 +874,18 @@ func (g *Gateway) observationAttempts() int {
 		n = 1
 	}
 	return n
+}
+
+// nativeFreeAgentShape is the single frozen free decision for native Zen
+// agent shaping (anonymous and authenticated). It reuses the local model
+// metadata classification (zero input+output cost or case-insensitive free
+// ID, never hardcoded IDs) via catalog.anonymousDecision and is independent
+// of cfg.Anonymous. Paid models return false and keep original semantics.
+func (g *Gateway) nativeFreeAgentShape(model string) bool {
+	if g == nil || g.catalog == nil || strings.TrimSpace(model) == "" {
+		return false
+	}
+	return g.catalog.anonymousDecision(model).Allowed
 }
 
 func (g *Gateway) transientInterval() time.Duration {
@@ -2152,11 +2183,10 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: anonymousZenKey, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
 	scope := routeScopeForCandidate(baseURL, probe, protocol)
 	routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
-	shaped, err := shapedAnonymousBody(body, protocol)
-	if err != nil {
-		return nil, effectiveRoute, attemptOffset, err
-	}
-	candBody, err := applyRouteSessionToBody(shaped, routeSession, protocol, false)
+	// Frozen body already carries the native free agent shape when free
+	// (see prepareRouteBodies); no per-candidate reshaping here so L1
+	// repeats and within-pool 429 moves reuse identical bytes.
+	candBody, err := applyRouteSessionToBody(body, routeSession, protocol, false)
 	if err != nil {
 		return nil, effectiveRoute, attemptOffset, err
 	}
@@ -2814,13 +2844,9 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route modelRoute, bod
 		}
 		scope := routeScopeForCandidate(g.cfg.Upstream.Zen, cand, route.Protocol)
 		routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
-		shaped, err := shapedAnonymousBody(body, route.Protocol)
-		if err != nil {
-			attempts++
-			syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
-			return nil, err, attempts, false, false, anonEvidence(anonEntered, anonFrozen, false)
-		}
-		candBody, err := applyRouteSessionToBody(shaped, routeSession, route.Protocol, false)
+		// Frozen body already carries the native free agent shape when free;
+		// no per-candidate reshaping so retries reuse identical bytes.
+		candBody, err := applyRouteSessionToBody(body, routeSession, route.Protocol, false)
 		if err != nil {
 			attempts++
 			syncAttemptMeta(ctx, TierZen, route.Protocol, attemptOffset, attempts)
@@ -2928,10 +2954,11 @@ func (g *Gateway) maybeReplayCandidate400(ctx context.Context, resp *http.Respon
 
 // replayCandidate400 performs the single same-target 400 recovery replay: it
 // keeps the same route session, rebuilds a fresh candidate body from the
-// frozen canonical body (overwriting present session fields with the same
-// wire session and, for Responses, dropping stale previous_response_id /
-// reasoning refs), and re-sends on the identical credential/proxy/protocol
-// with the same request ID and attempt number +1. The first 400 is neutral
+// frozen canonical body (which already carries the native free agent shape
+// when free, so the replay keeps identical core shape), overwriting present
+// session fields with the same wire session and, for Responses, dropping
+// stale previous_response_id / reasoning refs, and re-sends on the identical
+// credential/proxy/protocol with the same request ID and attempt number +1. The first 400 is neutral
 // and its body is drained before the replay. The first 400 body was already
 // read once bounded for diagnostics by sendUpstreamOnce and restored, so
 // draining here preserves control flow without a second network read. The
@@ -2959,17 +2986,10 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 	}
 	newSession := observed
 	_ = scope
+	// Frozen canonical already embeds the native free shape when free; the
+	// replay must keep that identical shape and never reshape in place.
+	// Never mutates ex.Payload or the frozen canonical destructively.
 	shapedCanonical := canonical
-	if anonymous {
-		shaped, shapeErr := shapedAnonymousBody(canonical, protocol)
-		if shapeErr != nil {
-			if firstResp != nil {
-				drainAndClose(firstResp.Body)
-			}
-			return nil, shapeErr, attempts
-		}
-		shapedCanonical = shaped
-	}
 	replayBody, cleanup, err := applyRouteSessionToBodyWithReport(shapedCanonical, newSession, protocol, true)
 	if err != nil {
 		if firstResp != nil {
