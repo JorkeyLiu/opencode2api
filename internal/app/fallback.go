@@ -1229,7 +1229,14 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 			duration := time.Since(started)
 			budgetErr := streamStartupBudgetErr(ctx)
 			class := classifyUpstreamAttempt(nil, budgetErr)
-			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+			var gateCause error
+			if gate != nil {
+				gateCause = gate.FailureCause()
+			}
+			if gateCause == nil {
+				gateCause = verifyErr
+			}
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gateCause))
 			return nil, effectiveRoute, attemptOffset + 1, budgetErr
 		}
 		if gate.ShouldCommit() {
@@ -1242,12 +1249,12 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 				duration := time.Since(started)
 				budgetErr := streamStartupBudgetErr(ctx)
 				class := classifyUpstreamAttempt(nil, budgetErr)
-				g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+				g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
 				return nil, effectiveRoute, attemptOffset + 1, budgetErr
 			}
 			duration := time.Since(started)
 			class := classifyUpstreamAttempt(resp, nil)
-			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, nil, duration, class, false, false, false, badRequestDiag{})
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, nil, duration, class, false, false, false, badRequestDiag{}, failureDiag{})
 			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
 			return resp, effectiveRoute, attemptOffset + 1, nil
 		}
@@ -1255,7 +1262,7 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 		duration := time.Since(started)
 		fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
 		class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
-		g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{})
+		g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, errors.New("upstream stream startup failure"), FailureStageStreamStartup, gate.FailureCause()))
 		return nil, effectiveRoute, attemptOffset + 1, errors.New("upstream stream startup failure")
 	}
 	// Non-SSE compat passthrough on true streams keeps the pre-existing body
@@ -1273,14 +1280,14 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 			duration := time.Since(started)
 			budgetErr := streamStartupBudgetErr(ctx)
 			class := classifyUpstreamAttempt(nil, budgetErr)
-			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{})
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageRequest, nil))
 			return nil, effectiveRoute, attemptOffset + 1, budgetErr
 		}
 		armStreamStartupTotalTimeout(ctx, remaining)
 	}
 	duration := time.Since(started)
 	class := classifyUpstreamAttempt(resp, sendErr)
-	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{})
+	g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, sendErr, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, resp, sendErr, FailureStageRequest, nil))
 	_ = binding
 	if sendErr != nil {
 		// Custom transport errors stay on the bound channel: return the

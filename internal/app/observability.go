@@ -428,6 +428,12 @@ type UpstreamAttempt struct {
 	FailureClass string `json:"failure_class"`
 	Retryable    bool   `json:"retryable"`
 	CoolsDown    bool   `json:"cools_down"`
+	// FailureStage/FailureReason are the additive transport diagnosis
+	// (see classifyFailureDiag): observable phase and cause as fixed
+	// whitelist enums. Success and real 400/429/503 attempts omit both;
+	// old records without them stay compatible. Never raw text.
+	FailureStage  string `json:"failure_stage,omitempty"`
+	FailureReason string `json:"failure_reason,omitempty"`
 	// RouteSessionReplay marks the exact-400 same-target replay attempt.
 	// Dropped flags are true only when the replay actually removed that
 	// category of stale Responses refs; all three are omitted (false) on
@@ -940,6 +946,11 @@ func (m *Monitor) RecordAttempt(attempt UpstreamAttempt) {
 		}
 		attempt.FailureClass, attempt.Retryable, attempt.CoolsDown = class.Class, class.Retryable, class.CoolsDown
 	}
+	// Transport diagnosis hygiene at the single ingestion point: success and
+	// real 400/429/503 attempts never carry stage/reason; anything else is
+	// restricted to the fixed whitelist at the projection boundary so no
+	// caller can persist raw strings.
+	attempt.FailureStage, attempt.FailureReason = sanitizeFailureDiag(attempt.Success, attempt.Status, attempt.FailureStage, attempt.FailureReason)
 	if attempt.Outcome == "" {
 		attempt.Outcome = outcomeFromClass(attempt.FailureClass, attempt.Success)
 	}

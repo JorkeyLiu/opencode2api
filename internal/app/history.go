@@ -139,6 +139,8 @@ type historyAttemptLine struct {
 	FailureClass              string `json:"failure_class,omitempty"`
 	Retryable                 bool   `json:"retryable"`
 	CoolsDown                 bool   `json:"cools_down"`
+	FailureStage              string `json:"failure_stage,omitempty"`
+	FailureReason             string `json:"failure_reason,omitempty"`
 	RouteSessionReplay        bool   `json:"route_session_replay,omitempty"`
 	DroppedPreviousResponseID bool   `json:"dropped_previous_response_id,omitempty"`
 	DroppedReasoningRefs      bool   `json:"dropped_reasoning_refs,omitempty"`
@@ -490,6 +492,7 @@ func (s *HistoryStore) EnqueueAttempt(a UpstreamAttempt) {
 		Status: a.Status, DurationMS: max(a.DurationMS, 0),
 		Success: a.Success, Outcome: a.Outcome,
 		FailureClass: a.FailureClass, Retryable: a.Retryable, CoolsDown: a.CoolsDown,
+		FailureStage: a.FailureStage, FailureReason: a.FailureReason,
 		RouteSessionReplay:        a.RouteSessionReplay,
 		DroppedPreviousResponseID: a.DroppedPreviousResponseID,
 		DroppedReasoningRefs:      a.DroppedReasoningRefs,
@@ -524,6 +527,12 @@ func (s *HistoryStore) EnqueueAttempt(a UpstreamAttempt) {
 	if line.Anonymous {
 		line.KeyID = anonymousCredentialID
 	}
+	// Transport diagnosis hygiene at the durable projection boundary:
+	// success and real 400/429/503 attempts never persist stage/reason;
+	// anything else is restricted to the fixed whitelist so direct Enqueue
+	// callers cannot persist raw strings. Old lines without the fields
+	// stay compatible (both empty).
+	line.FailureStage, line.FailureReason = sanitizeFailureDiag(line.Success, line.Status, line.FailureStage, line.FailureReason)
 	data, err := json.Marshal(line)
 	if err != nil {
 		return

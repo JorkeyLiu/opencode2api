@@ -138,8 +138,15 @@ func TestCancelStreamCommitNoSchedulerWriteNoPin(t *testing.T) {
 	if customHits.Load() != 0 {
 		t.Fatalf("cancelled stream must not hit custom (hits=%d)", customHits.Load())
 	}
-	if got := len(monitor.Snapshot().Upstream.Recent); got != 0 {
-		t.Fatalf("cancel-path record policy unchanged (never recorded): recent=%d want 0", got)
+	// Diagnostic-only change: the cancelled send really happened, so it keeps
+	// exactly one observation with a caller-cancel diagnosis and no scheduler
+	// write (asserted above), no pin, and no custom hit.
+	recent := monitor.Snapshot().Upstream.Recent
+	if len(recent) != 1 {
+		t.Fatalf("cancelled send must keep exactly one diagnostic observation: recent=%d want 1", len(recent))
+	}
+	if recent[0].Success || recent[0].FailureReason != FailureReasonCallerCancelled || recent[0].FailureStage != FailureStageRequest {
+		t.Fatalf("cancel observation must carry caller_cancelled: %+v", recent[0])
 	}
 }
 
@@ -205,8 +212,15 @@ func TestCancelStreamCommitAttemptNoClear(t *testing.T) {
 	if customHits.Load() != 0 {
 		t.Fatalf("executeAttempt must never hit custom (hits=%d)", customHits.Load())
 	}
-	if got := len(monitor.Snapshot().Upstream.Recent); got != 0 {
-		t.Fatalf("cancel-path record policy unchanged (never recorded): recent=%d want 0", got)
+	// Diagnostic-only change: the cancelled send really happened, so it keeps
+	// exactly one observation with a caller-cancel diagnosis; the seeded
+	// cooldowns above already prove no scheduler write happened.
+	recent := monitor.Snapshot().Upstream.Recent
+	if len(recent) != 1 {
+		t.Fatalf("cancelled attempt must keep exactly one diagnostic observation: recent=%d want 1", len(recent))
+	}
+	if recent[0].Success || recent[0].FailureReason != FailureReasonCallerCancelled {
+		t.Fatalf("cancel observation must carry caller_cancelled: %+v", recent[0])
 	}
 
 	// Sensitivity control: the same seeds with an uncancelled commit clear.
@@ -229,8 +243,12 @@ func TestCancelStreamCommitAttemptNoClear(t *testing.T) {
 	if _, _, ok := gw.scheduler.proxy429CooldownStatus(TierZen, "a", proxyRaw); ok {
 		t.Fatalf("control commit must clear the seeded proxy429 cooldown")
 	}
-	if got := len(monitor.Snapshot().Upstream.Recent); got != 1 {
-		t.Fatalf("control commit must record exactly its own attempt: recent=%d want 1", got)
+	if got := len(monitor.Snapshot().Upstream.Recent); got != 2 {
+		t.Fatalf("control commit must add exactly its own attempt after the cancel observation: recent=%d want 2", got)
+	}
+	committed := monitor.Snapshot().Upstream.Recent[len(monitor.Snapshot().Upstream.Recent)-1]
+	if !committed.Success || committed.FailureStage != "" || committed.FailureReason != "" {
+		t.Fatalf("committed attempt must succeed with no failure diagnosis: %+v", committed)
 	}
 }
 

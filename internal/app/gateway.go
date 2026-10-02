@@ -512,7 +512,11 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			requestCtx, cancel, stop = newStreamStartupBudget(r.Context(), startupTimeout)
 			defer stop()
 		} else {
-			requestCtx, cancel = context.WithTimeout(r.Context(), startupTimeout)
+			child, childCancel := context.WithTimeout(r.Context(), startupTimeout)
+			// Observation-only deadline fact: lets the transport diagnosis
+			// tell the gateway's own whole-request deadline from caller
+			// cancellation. No lifecycle or causality change.
+			requestCtx, cancel = withNonstreamDeadline(child, r.Context(), startupTimeout), childCancel
 		}
 		defer cancel()
 		ex := upstreamExtra{External: external, Payload: cloneMap(payload)}
@@ -1222,7 +1226,7 @@ func (g *Gateway) applyStreamSuccess(cand targetCandidate, startedNanos int64) {
 // credential429, or channel state. A cancelled stream never cools the target:
 // cancellation is not an object-unavailable signal. The monitoring record below
 // keeps the existing recording policy unchanged (still recorded on cancel).
-func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandidate, route modelRoute, ids requestIDs, attempt int, startedNanos int64) {
+func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandidate, route modelRoute, ids requestIDs, attempt int, startedNanos int64, fdiag failureDiag) {
 	if g == nil || g.scheduler == nil {
 		return
 	}
@@ -1233,7 +1237,10 @@ func (g *Gateway) noteStreamStartupFailure(ctx context.Context, cand targetCandi
 	class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
 	fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
 	duration := streamedAttemptDuration(startedNanos)
-	g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attempt, cand.CredDisplay, credentialChannel(cand), cand.CredID == anonymousSchedulerCredentialID, cand.Proxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{})
+	// The pseudo-502 status is preserved; the startup diagnosis rides
+	// alongside so the gate outcome stays readable. Cancel still cools
+	// nothing (handled above); the record itself is kept per policy.
+	g.recordUpstreamAttemptWithClass(route, route.Protocol, ids, attempt, cand.CredDisplay, credentialChannel(cand), cand.CredID == anonymousSchedulerCredentialID, cand.Proxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{}, fdiag)
 	_ = ctx
 }
 
@@ -1269,7 +1276,20 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
 		if verifyErr != nil && isContextCancelled(ctx) {
 			drainAndClose(resp.Body)
-			return attemptOutcome{Resp: nil, Err: streamStartupBudgetErr(ctx), Diag: diag, Started: started}
+			// Cancelled/budget gate path: the send really happened, so keep
+			// exactly one observation for it (never a forged unsent attempt,
+			// never a second record). Scheduler state is untouched: cancel
+			// is not a clear/cool signal.
+			budgetErr := streamStartupBudgetErr(ctx)
+			var gateCause error
+			if gate != nil {
+				gateCause = gate.FailureCause()
+			}
+			if gateCause == nil {
+				gateCause = verifyErr
+			}
+			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gateCause))
+			return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
 		}
 		if gate.ShouldCommit() {
 			// Linearized commit: only the pending->committed winner creates
@@ -1279,7 +1299,11 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 			// stops the timer(s) synchronously inside tryCommit.
 			if !markStreamStartupCommitted(ctx) {
 				drainAndClose(resp.Body)
-				return attemptOutcome{Resp: nil, Err: streamStartupBudgetErr(ctx), Diag: diag, Started: started}
+				// Lost the commit race after a real send: one observation,
+				// no success, no pin, no scheduler write.
+				budgetErr := streamStartupBudgetErr(ctx)
+				g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
+				return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
 			}
 			// A cancelled stream keeps its already-gated committed body and
 			// envelope, but never applies scheduler success: cancellation is
@@ -1293,11 +1317,13 @@ func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tie
 			if !isContextCancelled(ctx) {
 				g.applyStreamSuccess(cand, started)
 			}
-			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{})
+			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{}, failureDiag{})
 			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
 			return attemptOutcome{Resp: resp, Err: nil, Diag: diag, Started: started}
 		}
-		g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started)
+		// Pre-commit startup failure: capture the gate cause before the
+		// sentinel replacement below so the diagnosis stays factual.
+		g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started, classifyFailureDiag(ctx, nil, errors.New("upstream stream startup failure"), FailureStageStreamStartup, gate.FailureCause()))
 		drainAndClose(resp.Body)
 		return attemptOutcome{Resp: nil, Err: errors.New("upstream stream startup failure"), Diag: diag, Started: started}
 	}
@@ -2760,7 +2786,7 @@ func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier T
 	if err == nil && resp != nil && resp.StatusCode == http.StatusBadRequest {
 		diag = peek400Diag(resp)
 	}
-	g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class, false, false, false, diag)
+	g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class, false, false, false, diag, classifyFailureDiag(ctx, resp, err, FailureStageRequest, nil))
 	return resp, err, duration, class, diag, startedNanos, nil
 }
 
@@ -3066,7 +3092,7 @@ func (g *Gateway) replayCandidate400(ctx context.Context, route modelRoute, tier
 		replayDiag = peek400Diag(resp)
 	}
 	sessionHash := clientSessionHash(ids.Session)
-	g.recordUpstreamAttemptWithClass(route, protocol, ids, attemptOffset+attempts, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class, true, cleanup.DroppedPreviousResponseID, cleanup.DroppedReasoningRefs, replayDiag)
+	g.recordUpstreamAttemptWithClass(route, protocol, ids, attemptOffset+attempts, credDisplay, channel, anonymous, cand.Proxy, resp, err, duration, class, true, cleanup.DroppedPreviousResponseID, cleanup.DroppedReasoningRefs, replayDiag, classifyFailureDiag(ctx, resp, err, FailureStageRequest, nil))
 	if g.logger != nil {
 		firstArgs := diagLogArgs(firstDiag, "")
 		replayArgs := diagLogArgs(replayDiag, "replay_")
@@ -3796,8 +3822,8 @@ func extractResponseUsage(protocol Protocol, body []byte) (bridgeUsage, bool) {
 	return decodeOpenAIUsage(usage), true
 }
 
-func (g *Gateway) recordUpstreamAttemptWithClass(route modelRoute, protocol Protocol, ids requestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration, class attemptClassification, routeSessionReplay, droppedPrev, droppedReasoning bool, diag badRequestDiag) {
-	if g.monitor == nil {
+func (g *Gateway) recordUpstreamAttemptWithClass(route modelRoute, protocol Protocol, ids requestIDs, attempt int, keyID, channel string, anonymous bool, proxy *proxyTransport, resp *http.Response, err error, duration time.Duration, class attemptClassification, routeSessionReplay, droppedPrev, droppedReasoning bool, diag badRequestDiag, fdiag failureDiag) {
+	if g == nil {
 		return
 	}
 	status := 0
@@ -3815,20 +3841,46 @@ func (g *Gateway) recordUpstreamAttemptWithClass(route modelRoute, protocol Prot
 	if protocol == "" {
 		protocol = route.Protocol
 	}
+	// Observability identity normalization at the shared record point (same
+	// rule as Monitor ingestion, idempotent there): anonymous stays the
+	// stable literal so the INFO log below shares monitor/history values.
+	if anonymous || channel == anonymousCredentialID || keyID == anonymousCredentialID {
+		anonymous = true
+		keyID = anonymousCredentialID
+	}
 	// Diagnostic hygiene: only exact 400 carries hint/type/code/fingerprint.
 	// Non-400 attempts omit all four even if a stale diag was passed.
 	var hint, typ, code, fp string
 	if status == http.StatusBadRequest && !diag.empty() {
 		hint, typ, code, fp = diag.Hint, diag.Type, diag.Code, diag.Fingerprint
 	}
-	g.monitor.RecordAttempt(UpstreamAttempt{
+	// Transport diagnosis rides the same record: success and real
+	// 400/429/503 responses omit stage/reason (sanitized again at the
+	// Monitor/history projection boundaries); Do/gate failures and the
+	// pre-commit startup pseudo-outcome carry the whitelist enums.
+	stage, reason := sanitizeFailureDiag(success, status, fdiag.Stage, fdiag.Reason)
+	record := UpstreamAttempt{
 		Time: time.Now().UTC(), RequestID: ids.Request, Model: route.ID, Tier: tier, Protocol: string(protocol), ClientSessionHash: clientSessionHash(ids.Session), Attempt: attempt,
 		KeyID: keyID, Channel: channel, Anonymous: anonymous, Proxy: proxyName, ProxyPool: proxyPool, Status: status,
 		DurationMS: max(duration.Milliseconds(), 0), Success: success, Outcome: outcomeFromClass(class.Class, success),
 		FailureClass: class.Class, Retryable: class.Retryable, CoolsDown: class.CoolsDown,
+		FailureStage: stage, FailureReason: reason,
 		RouteSessionReplay: routeSessionReplay, DroppedPreviousResponseID: droppedPrev, DroppedReasoningRefs: droppedReasoning,
 		ErrorHint: hint, ErrorType: typ, ErrorCode: code, ErrorFingerprint: fp,
-	})
+	}
+	if g.monitor != nil {
+		g.monitor.RecordAttempt(record)
+	}
+	// Per-attempt INFO diagnostic: one independent event per real failed
+	// upstream send, built only from the sanitized final record above so the
+	// log shares monitor/history stage/reason. Success never logs. History
+	// disabled does not suppress this; monitor disabled does not suppress it
+	// either. Unsent/build errors never reach here, so no forged attempt log
+	// is possible from this path.
+	if g.logger == nil || record.Success {
+		return
+	}
+	g.logger.Info("upstream attempt failed", upstreamAttemptFailedInfoArgs(record)...)
 }
 
 func newUpstreamRequest(ctx context.Context, baseURL string, protocol Protocol, body []byte, ids requestIDs, key, routeSession string) (*http.Request, error) {
