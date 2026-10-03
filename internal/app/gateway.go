@@ -960,6 +960,30 @@ func isStreamStartupFailureErr(err error) bool {
 	return err != nil && err.Error() == "upstream stream startup failure"
 }
 
+var errStreamStartupTimeout = errors.New("upstream stream startup timeout")
+
+func isStreamStartupTimeoutErr(err error) bool {
+	return err != nil && err.Error() == "upstream stream startup timeout"
+}
+
+// isAnyStreamStartupErr reports either pre-commit startup sentinel: the
+// generic startup failure or the bounded candidate-local startup timeout.
+// Both cool the single target, enter the same L1 observation, and walk the
+// frozen binding on stable/limit. Only the diagnosis differs.
+func isAnyStreamStartupErr(err error) bool {
+	return isStreamStartupFailureErr(err) || isStreamStartupTimeoutErr(err)
+}
+
+// isSSEStreamBody reports a real SSE stream body by Content-Type. Native
+// non-stream internal SSE (anonymous agent-shaped fold) and streaming SSE
+// share this gate; complete JSON stays on the existing beyond-headers path.
+func isSSEStreamBody(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
 func isTrueTransportError(ctx context.Context, err error) bool {
 	if err == nil {
 		return false
@@ -967,7 +991,7 @@ func isTrueTransportError(ctx context.Context, err error) bool {
 	if isContextCancelled(ctx) {
 		return false
 	}
-	if isStreamStartupFailureErr(err) {
+	if isAnyStreamStartupErr(err) {
 		return false
 	}
 	// 408/425 are HTTP statuses, not transport err, so not here.
@@ -1267,67 +1291,122 @@ type attemptOutcome struct {
 // proxy fallback, accumulate credential429 evidence,
 // invoke custom fallback, replay exact 400, bind/move pins, or change
 // route-session/body construction.
+//
+// Startup bounding: each native SSE startup (true client streams plus native
+// non-stream internal SSE) is bounded by retry.attempt_timeout_seconds from
+// response headers through the first deliverable event, while the parent
+// request context keeps the ultimate deadline (startup budget for client
+// streams, whole-request deadline for non-stream). A candidate-local expiry
+// while the parent is still live closes the stalled body to unblock the gate
+// and returns the startup-timeout sentinel: target cooldown, L1 observation,
+// walk/fallback. A parent win (ultimate deadline/caller cancel) returns the
+// parent error with zero state writes and no later sends. On commit the
+// candidate timer is stopped (tail survives past attempt_timeout under the
+// parent only); for client streams the overall startup budget is additionally
+// revoked, while non-stream full-request deadlines stay armed.
 func (g *Gateway) executeAttempt(ctx context.Context, route modelRoute, tier Tier, baseURL string, protocol Protocol, candBody []byte, ids requestIDs, cand targetCandidate, routeSession, channel, credDisplay string, anonymous bool, monitorAttempt int) attemptOutcome {
 	resp, err, _, _, diag, started, buildErr := g.sendUpstreamOnce(ctx, route, tier, baseURL, protocol, candBody, ids, cand, routeSession, channel, credDisplay, anonymous, monitorAttempt)
 	if buildErr != nil {
 		return attemptOutcome{BuildErr: buildErr, Diag: diag, Started: started}
 	}
-	if err == nil && resp != nil && resp.StatusCode/100 == 2 && isStreamContext(ctx) {
-		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
-		if verifyErr != nil && isContextCancelled(ctx) {
+	needsGate := err == nil && resp != nil && resp.StatusCode/100 == 2 && (isStreamContext(ctx) || isSSEStreamBody(resp))
+	if !needsGate {
+		return attemptOutcome{Resp: resp, Err: err, Diag: diag, Started: started}
+	}
+	// Bounded candidate startup observation: attempt_timeout from headers to
+	// first deliverable. The candidate-local expiry and the first-deliverable
+	// commit arbitrate through one shared candidateStartupGate: exactly one
+	// of pending->expired / pending->committed wins. A losing timer never
+	// closes the committed tail even if its callback already entered; a
+	// losing commit never records success or moves a pin. Parent wins stay
+	// owner via the cancel branch above and live-parent expiry checks below.
+	candGate := newCandidateStartupGate(g.attemptTimeout(), ctx, resp.Body)
+	stopGateTimer := func() {
+		candGate.stop()
+	}
+	gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, protocol)
+	if verifyErr != nil && isContextCancelled(ctx) {
+		stopGateTimer()
+		drainAndClose(resp.Body)
+		// Cancelled/budget gate path: the send really happened, so keep
+		// exactly one observation for it (never a forged unsent attempt,
+		// never a second record). Scheduler state is untouched: cancel
+		// is not a clear/cool signal. A candidate-expiry racing a parent
+		// win stays parent-owned: ultimate deadline/cancel wins with zero
+		// writes and no later sends.
+		budgetErr := streamStartupBudgetErr(ctx)
+		var gateCause error
+		if gate != nil {
+			gateCause = gate.FailureCause()
+		}
+		if gateCause == nil {
+			gateCause = verifyErr
+		}
+		g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gateCause))
+		return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
+	}
+	if gate.ShouldCommit() {
+		// Linearized commit through the shared candidate gate first, then
+		// the request startup budget: only the pending->committed winner
+		// creates the gated body and records success/pin. A candidate-expiry
+		// winner returns the bounded startup-timeout sentinel with target
+		// recovery instead; a budget/parent winner returns the budget/cancel
+		// error with no gated body, no success, and no pin.
+		if !candGate.tryCommit(ctx) {
+			stopGateTimer()
+			if candGate.expired() && !isContextCancelled(ctx) {
+				g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started, failureDiag{Stage: FailureStageStreamStartup, Reason: FailureReasonStreamStartupTimeout})
+				drainAndClose(resp.Body)
+				return attemptOutcome{Resp: nil, Err: errStreamStartupTimeout, Diag: diag, Started: started}
+			}
 			drainAndClose(resp.Body)
-			// Cancelled/budget gate path: the send really happened, so keep
-			// exactly one observation for it (never a forged unsent attempt,
-			// never a second record). Scheduler state is untouched: cancel
-			// is not a clear/cool signal.
+			// Lost the commit race after a real send: one observation,
+			// no success, no pin, no scheduler write.
 			budgetErr := streamStartupBudgetErr(ctx)
-			var gateCause error
-			if gate != nil {
-				gateCause = gate.FailureCause()
-			}
-			if gateCause == nil {
-				gateCause = verifyErr
-			}
-			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gateCause))
+			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
 			return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
 		}
-		if gate.ShouldCommit() {
-			// Linearized commit: only the pending->committed winner creates
-			// the gated body and records success/pin. An expired (or
-			// parent-cancelled) loser returns the budget/cancel error with
-			// no gated body, no success, and no pin. The winning commit
-			// stops the timer(s) synchronously inside tryCommit.
-			if !markStreamStartupCommitted(ctx) {
-				drainAndClose(resp.Body)
-				// Lost the commit race after a real send: one observation,
-				// no success, no pin, no scheduler write.
-				budgetErr := streamStartupBudgetErr(ctx)
-				g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
-				return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
-			}
-			// A cancelled stream keeps its already-gated committed body and
-			// envelope, but never applies scheduler success: cancellation is
-			// not a clear signal. The monitoring record below keeps the
-			// existing recording policy unchanged (still recorded on cancel),
-			// mirroring applyAttemptOutcome's cancel behavior on non-stream
-			// paths (early return without state change, record still kept).
-			// With a controller present the mark above already refused a
-			// cancelled context, so this recheck only guards the legacy
-			// controller-free compat path (direct executeAttempt callers).
-			if !isContextCancelled(ctx) {
-				g.applyStreamSuccess(cand, started)
-			}
-			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{}, failureDiag{})
-			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
-			return attemptOutcome{Resp: resp, Err: nil, Diag: diag, Started: started}
+		if !markStreamStartupCommitted(ctx) {
+			stopGateTimer()
+			drainAndClose(resp.Body)
+			// Lost the commit race after a real send: one observation,
+			// no success, no pin, no scheduler write.
+			budgetErr := streamStartupBudgetErr(ctx)
+			g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, nil, budgetErr, streamedAttemptDuration(started), classifyUpstreamAttempt(nil, budgetErr), false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
+			return attemptOutcome{Resp: nil, Err: budgetErr, Diag: diag, Started: started}
 		}
-		// Pre-commit startup failure: capture the gate cause before the
-		// sentinel replacement below so the diagnosis stays factual.
-		g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started, classifyFailureDiag(ctx, nil, errors.New("upstream stream startup failure"), FailureStageStreamStartup, gate.FailureCause()))
-		drainAndClose(resp.Body)
-		return attemptOutcome{Resp: nil, Err: errors.New("upstream stream startup failure"), Diag: diag, Started: started}
+		stopGateTimer()
+		// A cancelled stream keeps its already-gated committed body and
+		// envelope, but never applies scheduler success: cancellation is
+		// not a clear signal. The monitoring record below keeps the
+		// existing recording policy unchanged (still recorded on cancel),
+		// mirroring applyAttemptOutcome's cancel behavior on non-stream
+		// paths (early return without state change, record still kept).
+		// With a controller present the mark above already refused a
+		// cancelled context, so this recheck only guards the legacy
+		// controller-free compat path (direct executeAttempt callers).
+		if !isContextCancelled(ctx) {
+			g.applyStreamSuccess(cand, started)
+		}
+		g.recordUpstreamAttemptWithClass(route, protocol, ids, monitorAttempt, credDisplay, channel, anonymous, cand.Proxy, resp, nil, streamedAttemptDuration(started), attemptClassification{Class: AttemptClassSuccess}, false, false, false, badRequestDiag{}, failureDiag{})
+		resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
+		return attemptOutcome{Resp: resp, Err: nil, Diag: diag, Started: started}
 	}
-	return attemptOutcome{Resp: resp, Err: err, Diag: diag, Started: started}
+	// Pre-commit startup stall: candidate-local expiry (parent live) is the
+	// bounded timeout sentinel with stream_startup_timeout diagnosis; any
+	// other pre-commit stall stays the generic startup sentinel. Both cool
+	// the single target, enter L1, and walk/fall back. Parent wins above.
+	stopGateTimer()
+	if candGate.expired() && !isContextCancelled(ctx) {
+		g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started, failureDiag{Stage: FailureStageStreamStartup, Reason: FailureReasonStreamStartupTimeout})
+		drainAndClose(resp.Body)
+		return attemptOutcome{Resp: nil, Err: errStreamStartupTimeout, Diag: diag, Started: started}
+	}
+	// Pre-commit startup failure: capture the gate cause before the
+	// sentinel replacement below so the diagnosis stays factual.
+	g.noteStreamStartupFailure(ctx, cand, route, ids, monitorAttempt, started, classifyFailureDiag(ctx, nil, errors.New("upstream stream startup failure"), FailureStageStreamStartup, gate.FailureCause()))
+	drainAndClose(resp.Body)
+	return attemptOutcome{Resp: nil, Err: errors.New("upstream stream startup failure"), Diag: diag, Started: started}
 }
 
 // minL1ObservationDelay is the named internal L1 floor for same-target
@@ -1404,10 +1483,11 @@ type transientLoopResult struct {
 	InitialErr  error
 }
 
-// sawStreamSentinel reports the old pinned poisoning condition: either the
-// initial send or the final outcome is the stream-startup sentinel.
+// sawStreamSentinel reports the pinned startup condition: either the
+// initial send or the final outcome is a pre-commit startup sentinel
+// (generic failure or bounded timeout).
 func (r transientLoopResult) sawStreamSentinel() bool {
-	return isStreamStartupFailureErr(r.InitialErr) || isStreamStartupFailureErr(r.Final.Err)
+	return isAnyStreamStartupErr(r.InitialErr) || isAnyStreamStartupErr(r.Final.Err)
 }
 
 // stableCause names the single post-L1 stable reason observed after
@@ -2167,6 +2247,20 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		if status == http.StatusTooManyRequests || (status >= 500 && status <= 599) {
 			retrySec = pinRetryAfterSeconds(until, now)
 		}
+		// Structurally valid pre-cooled credential: tombstones already
+		// returned above, so a valid binding may still take over custom.
+		// No fabricated live429/attempt/metrics; guards stay central.
+		if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: 0, ZeroSendExhausted: true}}).AllowCustom {
+			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+				if takeErr != nil {
+					return nil, eff, next, takeErr
+				}
+				if resp2 == nil {
+					return nil, eff, next, contextError("custom fallback transport failed")
+				}
+				return resp2, eff, next, nil
+			}
+		}
 		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	if !isAnonymous {
@@ -2175,6 +2269,17 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 				status = http.StatusTooManyRequests
 			}
 			retrySec := pinRetryAfterSeconds(until, now)
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: 0, ZeroSendExhausted: true}}).AllowCustom {
+				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+					if takeErr != nil {
+						return nil, eff, next, takeErr
+					}
+					if resp2 == nil {
+						return nil, eff, next, contextError("custom fallback transport failed")
+					}
+					return resp2, eff, next, nil
+				}
+			}
 			return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 	}
@@ -2199,12 +2304,15 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 // in stable affinity order, sharing one proxy-independent route session and
 // identical body bytes. Each proxy gets at most one 429 send (429 never
 // retries same-target). Local proxy429 cooldown skips without new evidence.
-// Only 429 walks to the next proxy; transport keeps the existing same-target
-// transient retry only, and 400/401/403/408/425/ordinary 4xx/5xx never move.
-// Any 2xx clears state and CAS-updates pin current. Full live 429
-// exhaustion tries the custom final fallback; pre-cooled zero-send keeps
-// native 429 with Retry-After and never tries custom; other terminals
-// return as-is.
+// Unified bound walk: after the unique same-target L1 (true transport,
+// pre-commit startup incl. bounded timeout, 408/425/5xx) or stable 403, walk
+// the next frozen sendable proxy; 429 walks with no L1; 401 is
+// credential-global faithful (no same-credential scan, binding unavailable by
+// credential cause). Any 2xx clears state and CAS-updates pin current. Valid
+// exhaustion (single L1-final, full walk, credential-401, or valid zero-send
+// with all actual proxies filtered incl. pre-cooled 429) tries the custom
+// final fallback; tombstones never do; without custom the native
+// envelope/Retry-After is preserved.
 func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL string, protocol Protocol, body []byte, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	pool := g.pools[pin.Pool]
 	if pool == nil || len(pool.items) == 0 {
@@ -2246,10 +2354,24 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 				latest = until
 			}
 		}
+		// Valid-binding zero-send: every actual proxy is currently
+		// filtered (health/cooldown incl. pre-cooled 429) with zero sends.
+		// Tombstones (nil/empty pool) returned above and never reach here.
+		if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: 0, ZeroSendExhausted: true}}).AllowCustom {
+			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+				if takeErr != nil {
+					return nil, eff, next, takeErr
+				}
+				if resp2 == nil {
+					return nil, eff, next, contextError("custom fallback transport failed")
+				}
+				return resp2, eff, next, nil
+			}
+		}
 		if latest > nowNanos {
 			return pinLocalResponse(http.StatusTooManyRequests, pinRetryAfterSeconds(latest, time.Now()), "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
-		// Suspect exhaustion is 502, not 429: do not trigger custom fallback.
+		// Suspect exhaustion is 502, not 429: no fabricated 429.
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: anonymousZenKey, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
@@ -2336,6 +2458,57 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			live429++
 			consumed = true
 			continue
+		case recoveryWalkNext, recoveryAdvanceNext:
+			// Unified bound walk: L1-final transport/startup/408/425/5xx
+			// or stable 403 walks the next frozen sendable proxy. Mixed
+			// partial 429 never becomes full: drop the stale 429 envelope.
+			if idx == len(eligible)-1 {
+				// Last frozen eligible with object-unavailable final:
+				// single or full exhaustion may take over custom;
+				// otherwise the faithful final envelope is preserved.
+				// Stale partial 429 is dropped; the faithful final body is
+				// preserved undrained for return.
+				if last429 != nil {
+					drainAndClose(last429.Body)
+					last429 = nil
+				}
+				if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: true, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: false, Credential401: isStableCredential401(final.Resp, final.Err)}}).AllowCustom {
+					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
+						if last429 != nil {
+							drainAndClose(last429.Body)
+						}
+						if final.Resp != nil {
+							drainAndClose(final.Resp.Body)
+						}
+						if takeErr != nil {
+							return nil, eff, next, takeErr
+						}
+						if resp2 == nil {
+							return nil, eff, next, contextError("custom fallback transport failed")
+						}
+						return resp2, eff, next, nil
+					}
+				}
+				if last429 != nil {
+					drainAndClose(last429.Body)
+				}
+				if final.Resp != nil {
+					return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
+				}
+				if final.Err != nil {
+					return nil, effectiveRoute, attemptOffset + attempts, final.Err
+				}
+				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
+			}
+			if last429 != nil {
+				drainAndClose(last429.Body)
+				last429 = nil
+			}
+			if final.Resp != nil && final.Resp != rec.InitialResp {
+				drainAndClose(final.Resp.Body)
+			}
+			consumed = true
+			continue
 		case recoverySentinel502:
 			if last429 != nil {
 				drainAndClose(last429.Body)
@@ -2360,13 +2533,13 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		default:
-			// recoveryFaithful (401/403/5xx/transport-last, suppressed
-			// replay) plus defensive advance/walk mapping: consumption-gated
-			// custom, then the faithful envelope with exact HEAD transport
-			// ownership (a retry transport error carrying a non-nil
-			// response was drained before return; an initial transport with
-			// no retry was returned undrained; stable finals never drain).
-			if decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
+			// recoveryFaithful: credential-global 401 (no same-credential
+			// scan, binding unavailable by credential cause), ordinary 4xx,
+			// suppressed replay, build/config, cancel/deadline/committed.
+			// Valid object-unavailable/credential-401 finals may take over
+			// custom with no Consumed prerequisite; tombstones/cancel/
+			// 400/ordinary never do (central guards).
+			if decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429, Credential401: isStableCredential401(final.Resp, final.Err)}}).AllowCustom {
 				if ids.Session != "" {
 					if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 						if last429 != nil {
@@ -2433,39 +2606,33 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 // The durable identity fixes tier, credential, pool, model, protocol, and
 // authority; ProxyRaw is the current/preferred selection with generation
 // fencing. The route session is proxy-independent so moves preserve the same
-// upstream session value and body bytes. Within one request, only transport
-// failure (after same-target L1 observation) or HTTP 429 may try the next
-// eligible healthy proxy in the same pool/tier/credential/model/protocol/
-// authority before client bytes. The L1 observation limit (normalized
+// upstream session value and body bytes. Unified bound walk: after the unique
+// same-target L1 (true transport, pre-commit startup incl. bounded timeout,
+// 408/425/5xx) or stable 403, walk the next frozen sendable proxy in the
+// same credential+pool; 429 walks with no L1; 401 is credential-global
+// faithful (no same-credential scan, binding unavailable by credential
+// cause). The L1 observation limit (normalized
 // retry.max_attempts, including the first send) bounds only same-target
 // stability observation; candidate traversal is bounded by the frozen eligible
 // slice. 429 walks all currently sendable proxies until exhaustion.
 // Credential429 is written only after every eligible proxy has
 // returned live 429 in this request (last Retry-After); partial 429 never
-// writes it and pre-cooled skips never count. Full live 429 exhaustion
-// tries the custom final fallback; pre-cooled zero-send keeps native 429
-// with Retry-After and never tries custom. Pre-existing cooling proxies
-// are skipped before any
-// send and never count as observed evidence. No moves on
-// 400/401/403/408/425/ordinary 4xx/5xx. Success on an alternate updates only
+// writes it and pre-cooled skips never count. Valid exhaustion (single
+// L1-final, full walk, credential-401, or valid zero-send with all actual
+// proxies filtered incl. pre-cooled 429) tries the custom final fallback;
+// tombstones never do; without custom the native envelope is preserved.
+// Pre-existing cooling proxies are skipped before any
+// send and never count as observed evidence. Success on an alternate updates only
 // current/generation via CAS.
 func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL, poolName string, protocol Protocol, body []byte, credKey, credDisplay string, credIndex int, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
 	pool := g.pools[poolName]
 	if pool == nil || len(pool.items) == 0 {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	// Current-proxy target cooling (403/5xx) fast-fails without moves.
-	currentIdentity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, pin.ProxyRaw, pin.Model)
-	if until, status, ok := g.scheduler.targetCooldownStatus(currentIdentity); ok {
-		if status != http.StatusForbidden && !(status >= 500 && status <= 599) {
-			status = http.StatusBadGateway
-		}
-		var retrySec int64
-		if status >= 500 && status <= 599 {
-			retrySec = pinRetryAfterSeconds(until, time.Now())
-		}
-		return pinLocalResponse(status, retrySec, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
-	}
+	// No current-proxy target fast-fail: target cooling filters the frozen
+	// eligible set below so alternates still walk; only a fully filtered
+	// valid binding reaches the zero-send custom gate. Removed/mismatched
+	// identities already returned above as tombstone 502 with no custom.
 	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
 	// Filter to eligible: healthy, not target-cooling, not tier-429-cooling,
 	// not tier-channel-cooling. Current proxy429/channel cooling does not
@@ -2498,10 +2665,23 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
 	}
 	if len(eligible) == 0 {
+		// Valid-binding zero-send: every actual proxy is currently
+		// filtered (health/target/429/channel/suspect incl. pre-cooled
+		// 429) with zero sends. Tombstones (nil/empty pool) returned above.
+		if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: 0, ZeroSendExhausted: true}}).AllowCustom {
+			if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, 0, extra...); handled {
+				if takeErr != nil {
+					return nil, eff, next, takeErr
+				}
+				if resp2 == nil {
+					return nil, eff, next, contextError("custom fallback transport failed")
+				}
+				return resp2, eff, next, nil
+			}
+		}
 		// No eligible proxy: distinguish 429 exhaustion from 502. If any
 		// proxy is under tier-429 cooldown, fast-fail 429 with max remaining
-		// and keep the native envelope (zero-send pre-cooled 429 never
-		// triggers custom: no native send, no proxyPosts, no fallback bind);
+		// and keep the native envelope when no custom is active;
 		// channel/suspect cooling alone fast-fails 502 (its 403/5xx status
 		// is kept in the channel detail table, not as a pinned envelope);
 		// otherwise 502 (unhealthy/removed).
@@ -2616,7 +2796,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			// poison. Preserve the observed429 write, drain both final and
 			// prior last429, and return pin-local 502 with no
 			// next-proxy/custom/credential429.
-			if isStreamStartupFailureErr(rec.InitialErr) || isStreamStartupFailureErr(final.Err) {
+			if isAnyStreamStartupErr(rec.InitialErr) || isAnyStreamStartupErr(final.Err) {
 				drainAndClose(final.Resp.Body)
 				discardLast429()
 				return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
@@ -2647,12 +2827,14 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			}
 			discardLast429()
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset + attempts, nil
-		case recoveryWalkNext:
-			// Authenticated pinned transport rule on the final observation:
-			// walk the next eligible proxy when one remains, else
-			// consumption-gated custom or the faithful transport error.
-			// 5xx/408/425 never reach here (faithful); reverse
-			// transport->stable-HTTP never walks (faithful).
+		case recoveryWalkNext, recoveryAdvanceNext:
+			// Unified bound walk on the final observation: true transport,
+			// pre-commit startup (generic or bounded timeout), 408/425,
+			// 5xx, and stable 403 walk the next frozen sendable proxy in
+			// the same credential+pool. Single-proxy L1-final and full
+			// exhaustion may take over custom with no Consumed
+			// prerequisite; mixed/filtered evidence never writes
+			// credential429.
 			if idx != len(eligible)-1 {
 				if final.Resp != nil {
 					drainAndClose(final.Resp.Body)
@@ -2661,7 +2843,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				consumed = true
 				continue
 			}
-			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429, Credential401: isStableCredential401(final.Resp, final.Err)}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					if final.Resp != nil {
 						drainAndClose(final.Resp.Body)
@@ -2677,18 +2859,24 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 				}
 			}
 			if final.Resp != nil {
-				drainAndClose(final.Resp.Body)
+				discardLast429()
+				// Last frozen eligible walked: preserve the faithful HTTP
+				// envelope when present (403/5xx/408/425 with response).
+				// Transport-only (nil response) falls through to 502 below.
+				return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 			}
 			discardLast429()
 			break
 		default:
-			// recoveryFaithful / recoveryReturnOrdinary (401/403/ordinary
-			// 4xx, 5xx/408/425 no-move finals, suppressed replay): no
-			// cross-proxy moves. Only a consumed last-eligible 401/403 may
-			// take over custom via the single domain authority; ordinary 4xx
-			// and single/unconsumed finals stay faithful. Non-429 takeovers
-			// never write credential429.
-			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429}}).AllowCustom {
+			// recoveryFaithful / recoveryReturnOrdinary: credential-global
+			// 401 (no same-credential resend, binding unavailable by
+			// credential cause), ordinary 4xx, suppressed replay, and
+			// cancel/deadline/committed/build stops. Valid
+			// object-unavailable/credential-401 finals may take over custom
+			// with no Consumed prerequisite; ordinary 4xx/single
+			// non-unavailable/tombstone/cancel/400 never do. Non-429
+			// takeovers never write credential429.
+			if ids.Session != "" && decideDomainRecovery(domainRecoveryInput{Cancelled: isContextCancelled(ctx), Committed: false, Pinned: &pinnedDomainEvidence{Eligible: len(eligible), Attempted: idx + 1, Consumed: consumed, FinalIsObjectUnavailable: finalNon429ObjectUnavailable(final.Resp, final.Err), FinalIsLive429: final.Resp != nil && final.Resp.StatusCode == 429, Credential401: isStableCredential401(final.Resp, final.Err)}}).AllowCustom {
 				if resp2, eff, next, handled, takeErr := g.maybeTakeoverCustomFallback(ctx, route, bodies, ids, attemptOffset, attempts, extra...); handled {
 					discardLast429()
 					if final.Resp != nil {
@@ -2771,8 +2959,12 @@ func (g *Gateway) sendUpstreamOnce(ctx context.Context, route modelRoute, tier T
 	resp, err = cand.Proxy.client.Do(req)
 	duration = time.Since(started)
 	// Streaming inference defers success commitment until the startup gate
-	// reaches commit. For non-stream or non-2xx, handle immediately.
-	if isStreamContext(ctx) && err == nil && resp != nil && resp.StatusCode/100 == 2 {
+	// reaches commit. Native non-stream internal SSE (anonymous agent-shaped
+	// fold, Content-Type SSE) defers the same way so headers alone never
+	// record success or bind a pin; the gate requires the first deliverable
+	// within the bounded candidate startup before success. Non-SSE
+	// non-stream and non-2xx handle immediately beyond headers.
+	if err == nil && resp != nil && resp.StatusCode/100 == 2 && (isStreamContext(ctx) || isSSEStreamBody(resp)) {
 		class = attemptClassification{Class: AttemptClassSuccess}
 		// Defer scheduler success and observability until gate commit; the
 		// caller will invoke applyStreamSuccess and record on commit, or

@@ -73,11 +73,20 @@ func streamKeyGateway(t *testing.T, monitor *Monitor) *Gateway {
 }
 
 func sseResponse(body string) *http.Response {
+	h := make(http.Header)
+	h.Set("Content-Type", "text/event-stream")
 	return &http.Response{
 		StatusCode: 200,
-		Header:     make(http.Header),
+		Header:     h,
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
+}
+
+func sseStallResponse() *http.Response {
+	h := make(http.Header)
+	h.Set("Content-Type", "text/event-stream")
+	pr, _ := io.Pipe()
+	return &http.Response{StatusCode: 200, Header: h, Body: pr}
 }
 
 func chatTextSSE(text string) string {
@@ -420,18 +429,15 @@ func TestStreamGate_PinnedTargetOnlyThen502(t *testing.T) {
 	})
 	ids2 := requestIDs{Session: ses, Request: "req-pinned-retry", Project: "prj-test"}
 	resp2, _, _, err := gw.doUpstreamTiers(ctx, route, streamBodies(), ids2, 0)
-	if resp2 == nil {
-		t.Fatalf("pinned should return 502 response, got nil err=%v", err)
-	}
-	if resp2.StatusCode != 502 {
-		t.Fatalf("pinned startup failure must return 502, got %d", resp2.StatusCode)
+	if err != nil || resp2 == nil || resp2.StatusCode != 200 {
+		t.Fatalf("pinned startup must walk to alternate 200, err=%v resp=%v", err, resp2)
 	}
 	resp2.Body.Close()
 	if pinnedCalls.Load() != 3 {
 		t.Fatalf("pinnedCalls=%d want 3", pinnedCalls.Load())
 	}
-	if otherCalls.Load() != 0 {
-		t.Fatalf("otherCalls=%d want 0", otherCalls.Load())
+	if otherCalls.Load() != 1 {
+		t.Fatalf("otherCalls=%d want 1 (unified walk)", otherCalls.Load())
 	}
 }
 
@@ -690,8 +696,8 @@ func TestStreamGate_HTTPHandler_Pinned502BeforeBytes(t *testing.T) {
 		})
 	}
 	resp2, _, _, err2 := gw.doUpstreamTiers(ctx2, route2, streamBodies(), ids2, 0)
-	if resp2 == nil || resp2.StatusCode != 502 {
-		t.Fatalf("direct pinned startup failure must be 502, got %v err=%v", resp2, err2)
+	if resp2 == nil || resp2.StatusCode != 200 {
+		t.Fatalf("direct pinned startup must walk to 200, got %v err=%v", resp2, err2)
 	}
 	resp2.Body.Close()
 	if pinnedCalls.Load() < 3 {

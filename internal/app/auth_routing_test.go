@@ -294,12 +294,12 @@ func TestAuthEstablishedMoveMatrix(t *testing.T) {
 		{"429_moves", 429, false, true, 1, 200, 1},
 		{"400_no_move", 400, false, false, 2, 400, 0},
 		{"401_no_move", 401, false, false, 1, 401, 0},
-		{"403_no_move", 403, false, false, 1, 403, 0},
-		{"408_no_move", 408, false, false, 2, 408, 0},
-		{"425_no_move", 425, false, false, 2, 425, 0},
+		{"403_moves", 403, false, true, 1, 200, 1},
+		{"408_moves", 408, false, true, 2, 200, 1},
+		{"425_moves", 425, false, true, 2, 200, 1},
 		{"404_no_move", 404, false, false, 1, 404, 0},
-		{"500_no_move", 500, false, false, 2, 500, 0},
-		{"503_no_move", 503, false, false, 2, 503, 0},
+		{"500_moves", 500, false, true, 2, 200, 1},
+		{"503_moves", 503, false, true, 2, 200, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

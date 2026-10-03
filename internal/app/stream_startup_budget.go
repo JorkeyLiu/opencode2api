@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -240,6 +241,115 @@ func isCustomSSEStream(resp *http.Response) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// candidateStartupGate is the single shared per-candidate startup authority
+// used by both the native SSE gate (gateway.go executeAttempt) and the custom
+// SSE gate (fallback.go). It linearizes first-deliverable commit against
+// candidate-local startup expiration: exactly one of pending->committed or
+// pending->expired wins under the mutex.
+//
+// A losing timer never closes the committed tail even if its AfterFunc already
+// entered (expiry rechecks state under the mutex before closing); a winning
+// expiry closes once to unblock the gate read. A losing commit never creates
+// a gated body, records success, or moves a pin/binding. Parent
+// cancel/final-budget wins via context checks plus the callers' existing
+// guard ordering (cancel branch first, expiry checks gated by a live parent).
+func newCandidateStartupGate(d time.Duration, ctx context.Context, body io.Closer) *candidateStartupGate {
+	g := &candidateStartupGate{body: body}
+	if d > 0 {
+		g.timer = time.AfterFunc(d, func() {
+			g.tryExpire(ctx)
+		})
+	}
+	return g
+}
+
+const (
+	candidateGatePending = iota
+	candidateGateCommitted
+	candidateGateExpired
+)
+
+type candidateStartupGate struct {
+	mu    sync.Mutex
+	state int
+	timer *time.Timer
+	body  io.Closer
+}
+
+// tryExpire attempts pending->expired. It wins only from pending while the
+// parent is still live; only the winner closes the stalled body (after
+// unlock) to unblock the gate read. Parent-done callers lose so the
+// cancellation/budget path stays owner.
+func (c *candidateStartupGate) tryExpire(ctx context.Context) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	if c.state != candidateGatePending {
+		c.mu.Unlock()
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		c.mu.Unlock()
+		return false
+	}
+	c.state = candidateGateExpired
+	body := c.body
+	c.mu.Unlock()
+	if body != nil {
+		_ = body.Close()
+	}
+	return true
+}
+
+// tryCommit attempts pending->committed. It wins only from pending while the
+// parent is still live; on success it stops the timer synchronously so the
+// committed tail survives past the candidate budget under the parent only.
+func (c *candidateStartupGate) tryCommit(ctx context.Context) bool {
+	if c == nil {
+		return ctx == nil || ctx.Err() == nil
+	}
+	c.mu.Lock()
+	if c.state != candidateGatePending {
+		c.mu.Unlock()
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		c.mu.Unlock()
+		return false
+	}
+	c.state = candidateGateCommitted
+	timer := c.timer
+	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	return true
+}
+
+// expired reports whether the candidate expiry won the race.
+func (c *candidateStartupGate) expired() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	expired := c.state == candidateGateExpired
+	c.mu.Unlock()
+	return expired
+}
+
+func (c *candidateStartupGate) stop() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	timer := c.timer
+	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
 }
 
 // streamCustomClient returns a client for true-client streaming that never

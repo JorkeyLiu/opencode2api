@@ -84,25 +84,25 @@ func TestPinnedAuthStreamStartupFailureNoWalkNoFallback(t *testing.T) {
 		t.Fatalf("nil resp")
 	}
 	defer drainResp(resp)
-	if resp.StatusCode != 502 {
+	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status=%d want 502, body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
+		t.Fatalf("status=%d want 200 (unified walk to alternate), body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if eff.Tier == TierCustom {
-		t.Fatalf("must not take over custom on pinned startup failure exhaustion")
+		t.Fatalf("walk success must not take over custom")
 	}
 	if customHits.Load() != 0 {
-		t.Fatalf("custom hits=%d want 0 (no fallback)", customHits.Load())
+		t.Fatalf("custom hits=%d want 0 (native walk success)", customHits.Load())
 	}
 	// Same-target retry count must be existing transient config (3)
 	if got := postCount(&pinnedCalls); got != 3 {
 		t.Fatalf("pinnedCalls=%d want 3 (initial + 2 same-target retries)", got)
 	}
-	if got := postCount(&otherCalls); got != 0 {
-		t.Fatalf("otherCalls=%d want 0 (no proxy walk)", got)
+	if got := postCount(&otherCalls); got != 1 {
+		t.Fatalf("otherCalls=%d want 1 (unified walk)", got)
 	}
-	if attempts != 3 {
-		t.Fatalf("attempts=%d want 3", attempts)
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (3 L1 + 1 walk)", attempts)
 	}
 	// Failures stay target-scoped: proxy429/channel/credential429 must not be set
 	for _, proxy := range gw.pools["z"].items {

@@ -1221,10 +1221,22 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 	// or untyped bodies keep the pre-existing passthrough (and its existing
 	// whole-budget semantics). Startup failure returns a
 	// custom error with no native/custom switch and no retry, and never
-	// writes Zen scheduler state (observability recording only).
+	// writes Zen scheduler state (observability recording only). The gate
+	// startup is bounded by the same per-attempt attempt_timeout: a
+	// candidate-local expiry while the parent is live returns the bounded
+	// timeout error (no retry/fallback, no scheduler writes); a parent win
+	// returns the parent error the same way.
 	if streaming && sendErr == nil && resp != nil && resp.StatusCode/100 == 2 && isCustomSSEStream(resp) {
+		// Same shared candidateStartupGate as the native path: commit and
+		// candidate-local expiry arbitrate pending->committed/expired with
+		// one winner. Losing timer never closes the committed tail.
+		candGate := newCandidateStartupGate(g.attemptTimeout(), ctx, resp.Body)
+		stopGateTimer := func() {
+			candGate.stop()
+		}
 		gate, pending, parser, verifyErr := g.verifyStreamGate(ctx, resp.Body, channelProtocol)
 		if verifyErr != nil && isContextCancelled(ctx) {
+			stopGateTimer()
 			drainAndClose(resp.Body)
 			duration := time.Since(started)
 			budgetErr := streamStartupBudgetErr(ctx)
@@ -1240,11 +1252,33 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 			return nil, effectiveRoute, attemptOffset + 1, budgetErr
 		}
 		if gate.ShouldCommit() {
-			// Linearized custom commit: only the pending->committed winner
-			// creates the gated body. Expiry/cancel losers drain and return
-			// the budget/cancel error with no success record and no
-			// established flip (the pinned path flips only on success).
+			// Linearized custom commit through the shared candidate gate
+			// first, then the request startup budget: only the
+			// pending->committed winner hands off the gated body. A
+			// candidate-expiry winner returns the faithful timeout error;
+			// a budget/parent winner returns the budget/cancel error. Both
+			// record without success and without flipping established.
+			// The committed tail survives past attempt_timeout under the
+			// parent only.
+			if !candGate.tryCommit(ctx) {
+				stopGateTimer()
+				if candGate.expired() && !isContextCancelled(ctx) {
+					drainAndClose(resp.Body)
+					duration := time.Since(started)
+					fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
+					class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
+					g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{}, failureDiag{Stage: FailureStageStreamStartup, Reason: FailureReasonStreamStartupTimeout})
+					return nil, effectiveRoute, attemptOffset + 1, errStreamStartupTimeout
+				}
+				drainAndClose(resp.Body)
+				duration := time.Since(started)
+				budgetErr := streamStartupBudgetErr(ctx)
+				class := classifyUpstreamAttempt(nil, budgetErr)
+				g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, nil, budgetErr, duration, class, false, false, false, badRequestDiag{}, classifyFailureDiag(ctx, nil, budgetErr, FailureStageStreamStartup, gate.FailureCause()))
+				return nil, effectiveRoute, attemptOffset + 1, budgetErr
+			}
 			if !markStreamStartupCommitted(ctx) {
+				stopGateTimer()
 				drainAndClose(resp.Body)
 				duration := time.Since(started)
 				budgetErr := streamStartupBudgetErr(ctx)
@@ -1255,8 +1289,20 @@ func (g *Gateway) doCustomFallbackRequestCrossingAuthority(ctx context.Context, 
 			duration := time.Since(started)
 			class := classifyUpstreamAttempt(resp, nil)
 			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, resp, nil, duration, class, false, false, false, badRequestDiag{}, failureDiag{})
+			stopGateTimer()
 			resp.Body = newGatedStreamBody(gate, pending, resp.Body, parser)
 			return resp, effectiveRoute, attemptOffset + 1, nil
+		}
+		stopGateTimer()
+		// Candidate-local custom stall while the parent is live: bounded
+		// timeout error with no retry/fallback and no scheduler writes.
+		if candGate.expired() && !isContextCancelled(ctx) {
+			drainAndClose(resp.Body)
+			duration := time.Since(started)
+			fakeResp := &http.Response{StatusCode: http.StatusBadGateway, Header: make(http.Header)}
+			class := attemptClassification{Class: AttemptClassUpstreamFailure, Retryable: true, CoolsDown: true}
+			g.recordUpstreamAttemptWithClass(customRoute, channelProtocol, ids, attemptOffset+1, display, channel, false, fakeProxy, fakeResp, nil, duration, class, false, false, false, badRequestDiag{}, failureDiag{Stage: FailureStageStreamStartup, Reason: FailureReasonStreamStartupTimeout})
+			return nil, effectiveRoute, attemptOffset + 1, errStreamStartupTimeout
 		}
 		drainAndClose(resp.Body)
 		duration := time.Since(started)

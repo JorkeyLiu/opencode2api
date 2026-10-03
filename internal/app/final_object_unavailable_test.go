@@ -87,11 +87,12 @@ func TestPinnedConsumptionWrapper429AndGates(t *testing.T) {
 	if !decide(2, 2, true, false, nil, transportErr).AllowCustom {
 		t.Fatalf("pinned consumed+full transport must qualify")
 	}
-	if decide(2, 2, false, false, r403, nil).AllowCustom {
-		t.Fatalf("pinned without real switch/send (consumed=false) must not qualify")
+	// Optimal repair: Consumed is observability only, never a prerequisite.
+	if !decide(2, 2, false, false, r403, nil).AllowCustom {
+		t.Fatalf("pinned full 403 without consumed must qualify")
 	}
-	if decide(1, 1, false, false, r403, nil).AllowCustom {
-		t.Fatalf("single-proxy initial non-429 (consumed=false) must stay ineligible")
+	if !decide(1, 1, false, false, r403, nil).AllowCustom {
+		t.Fatalf("single-proxy non-429 must qualify")
 	}
 	if decide(2, 1, true, false, r403, nil).AllowCustom {
 		t.Fatalf("partial eligible unattempted must not qualify")
@@ -106,6 +107,10 @@ func TestPinnedConsumptionWrapper429AndGates(t *testing.T) {
 		t.Fatalf("pinned ordinary 4xx must never qualify")
 	}
 	if decide(0, 0, true, false, r403, nil).AllowCustom {
-		t.Fatalf("zero eligible must never qualify")
+		t.Fatalf("zero eligible without flag must never qualify")
+	}
+	// Zero-send valid exhaustion is a separate flag, not Attempted counts.
+	if !decideDomainRecovery(domainRecoveryInput{Pinned: &pinnedDomainEvidence{Eligible: 0, ZeroSendExhausted: true}}).AllowCustom {
+		t.Fatalf("valid zero-send must qualify")
 	}
 }

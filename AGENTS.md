@@ -7,7 +7,7 @@
 
 ## 1. System Mental Model
 
-> **Supreme Principle — Session Recovery (会话恢复) is the highest behavioral principle.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier. Purpose: every recovery exists to let the session continue. Closed loop: `observe stability -> resolve stable cause -> continue session or faithfully return` (per target protocol). Unified semantic three layers (not object-queue projection): **L1 / Observe stability** — 观察稳定性，先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道/恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级。Stability first. Recovery domain: bound session = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single status code alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避仍由 ADR/后续实现决定且不冻结逐状态码矩阵，本指南仅保留抽象不变式。
+> **Supreme Principle — Session Recovery (会话恢复) is the highest behavioral principle.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier. Purpose: every recovery exists to let the session continue. Closed loop: `observe stability -> resolve stable cause -> continue session or faithfully return` (per target protocol). Unified semantic three layers (not object-queue projection): **L1 / Observe stability** — 观察稳定性，先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道/恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级。Stability first. Recovery domain: bound session = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single status code alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式。
 
 - opencode2api is a Go 1.24 protocol gateway for OpenCode Zen. It
   exposes OpenAI-compatible Chat Completions, Responses, and Models APIs plus
@@ -116,7 +116,7 @@
   only) → authenticated keys → same-protocol passthrough or cross-protocol
   conversion → result recording (metrics, upstream attempts, usage when the
   upstream reports it).
-- **Supreme recovery closed loop (gateway first) — `observe stability -> resolve stable cause -> continue session or faithfully return`.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier; every recovery exists to let the session continue. The gateway absorbs steady-state fluctuations before exposing them to the client. **Unified semantic three layers (not object queue):** **L1 / Observe stability** — 先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3。Recovery domain: bound = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single HTTP status alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避仍由 ADR/后续实现决定且不冻结逐状态码矩阵，本指南仅保留抽象不变式，MUST NOT be invented as a complete matrix here. HTTP 400 is an illegal request and non-fluctuating: its same-target replay after cleaning Responses reasoning/`previous_response_id` 属于 L2 的稳定非法请求解决动作（corrective / policy-removal），不是 L1 retry，完成後按 L3 终止/忠实返回；it MUST keep same target, same route session, and same request identity, and its outcome is always the route's last recovery action with no further candidate, channel, or fallback. `fallback` is an L2 object-selection action taken only when the current object is stably unavailable and recovery-domain availability filtering leaves no sendable object; a single error code MUST NOT mechanically cut to fallback without exhaustion evidence of the current domain's available objects. The existing scheduler / pin / route-session domain ownership and the streaming committed-bytes stop invariant remain unchanged.
+- **Supreme recovery closed loop (gateway first) — `observe stability -> resolve stable cause -> continue session or faithfully return`.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier; every recovery exists to let the session continue. The gateway absorbs steady-state fluctuations before exposing them to the client. **Unified semantic three layers (not object queue):** **L1 / Observe stability** — 先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3。Recovery domain: bound = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single HTTP status alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式，MUST NOT be invented as a complete matrix here. HTTP 400 is an illegal request and non-fluctuating: its same-target replay after cleaning Responses reasoning/`previous_response_id` 属于 L2 的稳定非法请求解决动作（corrective / policy-removal），不是 L1 retry，完成後按 L3 终止/忠实返回；it MUST keep same target, same route session, and same request identity, and its outcome is always the route's last recovery action with no further candidate, channel, or fallback. `fallback` is an L2 object-selection action taken only when the current object is stably unavailable and recovery-domain availability filtering leaves no sendable object; a single error code MUST NOT mechanically cut to fallback without exhaustion evidence of the current domain's available objects. The existing scheduler / pin / route-session domain ownership and the streaming committed-bytes stop invariant remain unchanged.
 - Session affinity spine: explicit client session headers or
   `metadata.session_id` win; otherwise the first user message derives a stable
   client session hash. The derived client session is the establishment identity
@@ -140,30 +140,36 @@
   The first upstream 2xx, including a successful exact-400 replay, pins
   session+model to the binding (channel, internal credential identity,
   pool, model, protocol/authority validity) with the successful proxy as the
-  initial current selection. After the pin,
+  initial current selection.   After the pin,
   every request stays inside that binding with no cross-credential/pool/channel
   fallback and
-  no anonymous→authenticated promotion; the 429 chain walks the currently
-  sendable proxies of the same credential+pool (current first, stable affinity
-  order, one shared proxy-free route session and identical body bytes, local
-  proxy429 cooldowns skipped without new evidence, never truncated by
-  `retry.max_attempts`) while
-  400/401/403/408/425, ordinary 4xx, and 5xx never move to another proxy; a
-  transport error keeps the existing same-target L1 observation only on the
-  anonymous binding, while the authenticated binding may additionally try the
-  next eligible proxy after its same-target L1 observation. A removed/unhealthy/unresolvable target fails
-  locally with 502; full 429 exhaustion of the binding via live sends (proxy429 pre-cooled zero-send keeps native 429 with Retry-After and never tries custom) tries the custom final
-  fallback per §4, and a bounded pinned L2 consumption exhaustion — already switched to the next frozen eligible proxy in this request, every frozen eligible really tried and the final object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup, not exact-400/ordinary 4xx/cancel/deadline/committed bytes) — also may try custom; otherwise the native envelope is kept. Same-target L1 observation and exact-400 replay remain per
-  §4. An established session moves within the same
-  pool, credential, channel, model, protocol, and authority only after an HTTP
-  429 on the current proxy walk (local 429 skip or live 429), before any client bytes
-  and never across channels, keys, or pools; a successful 2xx on an alternate
-  updates only the
-  current proxy under generation fencing (concurrent moves converge to one winner).
-  No move occurs on 400/401/403/408/425, ordinary 4xx, or 5xx; transport errors
-  beyond the same-target L1 observation never move the anonymous binding (the
-  authenticated binding keeps its existing same-target L1 observation plus a
-  next-proxy try).
+  no anonymous→authenticated promotion. Bound anon/auth share one unified walk
+  inside the same credential+pool+channel/model/protocol/authority (current
+  first, stable affinity order, one shared proxy-free route session and
+  identical body bytes, local proxy429 cooldowns skipped without new evidence,
+  before any client bytes, never truncated by `retry.max_attempts`): stable
+  429 walks all sendable proxies with no L1; stable 403 and L1-final true
+  transport / pre-commit startup / 408 / 425 / 5xx walk the frozen sendable
+  proxies after the same-target L1 observation; stable 401 is a global
+  credential failure with no further sends under the same credential while
+  still counting as binding unavailability. Exact-400 same-target corrective
+  replay stays route-terminal on any replay result. Ordinary 4xx,
+  build/config-identity/tombstone invalid, cancel/deadline, and committed
+  bytes stay faithful/local failures with no new credential/channel/pool
+  inside the native pin. A successful 2xx on an alternate updates only the
+  current proxy under generation fencing (concurrent moves converge to one
+  winner), preserving the proxy-free wire session/body identity. A
+  removed/unhealthy/unresolvable or identity-mismatched pinned binding fails
+  locally with 502 and never falls back on deletion. A valid binding whose
+  actual-pool proxies are all filtered by current health/cooldowns may
+  zero-send to the active custom channel (including pre-cooled 429) with no
+  fabricated live evidence/attempts/`credential429`/metrics; otherwise a valid
+  binding reaches the active custom channel after object-unavailable
+  exhaustion, including single-proxy L1-final and stable credential-401, with
+  no prior-switch/consumed prerequisite. Full live-429 proof stays distinct
+  solely for `credential429` writes (mixed/filtered evidence never qualifies).
+  Without an active channel the native status/`Retry-After` is kept. Same-target
+  L1 observation and exact-400 replay remain per §4.
   Both channels share these pin/move semantics. Pins are process-lifetime and never expire/evict; the store is
   fixed-bounded (see `sessionPinStoreCap` in `scheduler.go`) and a new
   session+model at capacity fails closed locally with 502 before any send
@@ -204,7 +210,7 @@
 
 ## 4. Invariants (MUST Preserve)
 
-> **Implementation honesty (current baseline).** Invariants below describe the implemented baseline — 统一会话恢复完整闭环已落地：单候选权威（`classifyStableCause`/`decideCandidateRecovery`/`recoverSingleCandidate`）与单域权威（`decideDomainRecovery`: `domainNone|domainUnboundExhausted|domainPinnedFullLive429|domainPinnedConsumption`，`AllowCustom` 经 `Recovered400/Cancelled/Committed` 停止门）已统一全部重试/回退判定；L1 同目标有界观察仅 `true transport`/`408`/`425`/`500-599` 含 `503`/`pre-commit stream-startup`（`retry.max_attempts` 含首次，`100ms` 下限，`interval`/`Retry-After` 取 max，无 L1 指数/jitter，调度冷却指数退避仍按既有 caps）、L2 `400` 一次同目标 corrective replay 后 route-terminal、未绑定/已绑定双域独立耗尽与双 pinned 证明（`full live429` 与 `bounded consumption` 不合并）及 L3 取消/deadline/committed 停止均已定版；详细矩阵正典为 `docs/adr/0001` 与 `recovery.go`/`gateway.go`/`scheduler.go`，本指南仅保留高层不变式。
+> **Implementation honesty (current baseline).** Invariants below describe the approved completed baseline — 统一会话恢复完整闭环：单候选权威（`classifyStableCause`/`decideCandidateRecovery`/`recoverSingleCandidate`）与单域权威（`decideDomainRecovery`，`AllowCustom` 经 `Recovered400/Cancelled/Committed` 停止门）统一全部重试/回退判定；L1 同目标有界观察仅 `true transport`/`408`/`425`/`500-599` 含 `503`/`pre-commit stream-startup`（`retry.max_attempts` 含首次，`100ms` 下限，`interval`/`Retry-After` 取 max，无 L1 指数/jitter，调度冷却指数退避仍按既有 caps）、L2 `400` 一次同目标 corrective replay 后 route-terminal（任何重放结果）、已绑定 anon/auth 统一漫游（`429`/`403`/`L1-final transport-startup-408-425-5xx` walk、`401` 同凭证停发但计绑定不可用）、pinned 接管为 valid-binding 对象不可用耗尽（含单代理 L1-final 与稳定凭证 401，无 consumed/预切换前提；实际池全过滤时可零发送接管，含预冷 429，无伪造证据；`credential429` 仅全量 live429 写入）及 L3 取消/deadline/committed 停止均已定版；`attempt_timeout_seconds` 仅覆盖单次原生发送启动（响应头至首个可交付 SSE 事件），`timeout_seconds` 为最终预算（客户端流启动期限在可交付事件撤销，非流全请求期限不撤销，成功 SSE 尾流存活于 attempt 计时之外，预算先尽则不保证全耗尽/接管）；详细矩阵正典为 `docs/adr/0001` 与 `recovery.go`/`gateway.go`/`scheduler.go`，本指南仅保留高层不变式。
 
 - Anonymous channel: fixed Zen credential (`Bearer public` for OpenAI-family
   upstream, `x-api-key: public` for Anthropic upstream); free models try it
@@ -277,7 +283,9 @@
   a second 400
   terminates the whole route. Cancel/deadline ends the route. A
   replay 2xx pins the session+model when still unbound; once pinned, the
-  binding walks the same credential+pool on 429 only per the Session affinity spine.
+  binding follows the unified bound walk per the Session affinity spine (429 /
+  403 / L1-final transport-startup-408-425-5xx walk, 401 credential-failed
+  without same-credential resend, not 429-only).
 - Scheduler state: proxy health is transport connectivity only (HTTP statuses
   never change it; bounded temporary transport-suspect filtering is a
   separate short-lived candidate filter, never health); a single foreground transport error never cools
@@ -387,7 +395,7 @@
    with masked GET, authenticated-session reveal (POST-only non-GET behind admin
   session auth + CSRF + Origin, no-store response, and full-chain
   redaction without plaintext logging). When `active` names a channel, it is
-  the final fallback for eligible native-route exhaustion: unbound (new) requests use per-domain real-request state-agnostic object-unavailable exhaustion per b2c4798 (each domain Entered && Frozen>0 && Unavailable>=Frozen, Unavailable=live 429/401/403/L1-final 408/425/5xx/transport incl. L1-final stream startup per frozen candidate, 400/ordinary 4xx/cancel/deadline/committed/build excluded, state-agnostic, not requiring terminal 429;   401 same-credential skips count by credential cause, request-local proxy429 skips count by this-request live-429 evidence with Entered, request-local suspect skips count by this-request live transport evidence with Entered, none counts as live429 for credential429), while established (pinned) bindings keep the existing full-429 live-send path (proxy429 pre-cooled zero-send keeps native 429 with Retry-After and never tries custom) and add a bounded pinned L2 consumption gate — only after a real switch/send to the next frozen eligible proxy has already happened in this request, every frozen eligible has been really tried (pre-cooled skips not counted, BuildErr/no-send not counted) and the final is object-unavailable (401/403/L1-final 408/425/5xx/transport/stream-startup) may the pinned non-429 exhaust to custom; single-proxy initial non-429, exact-400 replay (and its second-400/ordinary 4xx outcome), ordinary 4xx, cancel/deadline, and committed-stream never qualify, and non-429 takeovers never write credential429; unbound and pinned do not decide by single error kind directly and their independent exhaustion proofs differ; other non-429 terminals remain faithful without custom even when 429s were seen earlier on other candidates.
+  the final fallback for eligible native-route exhaustion: unbound (new) requests use per-domain real-request state-agnostic object-unavailable exhaustion per b2c4798 (each domain Entered && Frozen>0 && Unavailable>=Frozen, Unavailable=live 429/401/403/L1-final 408/425/5xx/transport incl. L1-final stream startup per frozen candidate, 400/ordinary 4xx/cancel/deadline/committed/build excluded, state-agnostic, not requiring terminal 429; 401 same-credential skips count by credential cause, request-local proxy429 skips count by this-request live-429 evidence with Entered, request-local suspect skips count by this-request live transport evidence with Entered, none counts as live429 for credential429), while established (pinned) bindings reach the active custom channel after valid-binding object-unavailable exhaustion with no prior-switch/consumed prerequisite (including single-proxy L1-final and stable credential-401); a valid binding whose actual-pool proxies are all filtered by current health/cooldowns may zero-send to the active custom channel (including pre-cooled 429) with no fabricated live evidence/attempts/`credential429`/metrics; exact-400 replay (and its second-400/ordinary 4xx outcome), ordinary 4xx, cancel/deadline, and committed-stream never qualify, and non-429 takeovers never write credential429; unbound and pinned do not decide by single error kind directly and their independent exhaustion proofs differ; other non-429 terminals remain faithful without custom even when 429s were seen earlier on other candidates.
   Without an
   active channel the original envelope is kept (native 429 stays 429, other statuses faithful); with one, the current request retries at
   once through the then-active custom OpenAI-compatible channel (`{root}/v1/chat/completions`
@@ -425,10 +433,21 @@
   cooldowns never count). Zero
   globally available channels degrades readiness; one model's targets all
   cooling or one proxy's 429 cooling never does.
-- Streaming: once bytes have been written to the client, the Gateway MUST
+- Streaming and budgets: once bytes have been written to the client, the Gateway MUST
   NOT switch upstreams or regenerate; error-class upstream stream signals
   MUST surface as structured target-protocol error events, never as clean
-  finish or silent truncation.
+  finish or silent truncation. `retry.attempt_timeout_seconds` keeps its strict
+  bounds/default and covers only each native send/observation startup (response
+  headers through first deliverable SSE event); local startup expiry while the
+  parent lives is a `stream_startup_timeout` target cooldown under the bounded
+  same-target L1 with existing delays. `retry.timeout_seconds` is the unchanged
+  final budget: the client-stream startup deadline is revoked on a deliverable
+  event while a non-stream full-request deadline is NOT revoked (including the
+  anonymous internal agent-shaped SSE gated before a successful outcome);
+  successful native/custom SSE tails live beyond the attempt timer. Caller
+  cancel, final deadline, and committed bytes stop absolutely with no fabricated
+  cooldown from cancellation. No guaranteed full exhaustion or fallback applies
+  once the ultimate budget runs out first.
 - Capability gating: models with unknown capability MUST NOT be exposed;
   model IDs MUST NOT be hardcoded — exposure is driven by the capability
   directory (manual `models.protocols` covers experiments only).

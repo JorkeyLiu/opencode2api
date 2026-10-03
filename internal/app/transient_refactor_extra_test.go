@@ -124,12 +124,12 @@ func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 					t.Fatalf("503 success must not write credential429")
 				}
 			} else {
-				// Exhaustion: transient retries up to max, then final 503, no walk, no custom
+				// Exhaustion: transient retries up to max, then unified walk to alternate 200.
 				if err != nil {
 					t.Fatalf("exhaustion err=%v", err)
 				}
-				if resp == nil || resp.StatusCode != 503 {
-					t.Fatalf("exhaustion want 503, got %v", resp)
+				if resp == nil || resp.StatusCode != 200 {
+					t.Fatalf("exhaustion walk want 200, got %v", resp)
 				}
 				drainResp(resp)
 				if eff.Tier == TierCustom {
@@ -138,18 +138,18 @@ func TestPinnedAuth503Transient_Refactor(t *testing.T) {
 				if postCount(&pinnedCalls) != tc.maxObservation {
 					t.Fatalf("pinned calls=%d want %d (maxObservation)", postCount(&pinnedCalls), tc.maxObservation)
 				}
-				if postCount(&otherCalls) != 0 {
-					t.Fatalf("other calls=%d want 0 (pinned exhaustion must not walk)", postCount(&otherCalls))
+				if postCount(&otherCalls) != 1 {
+					t.Fatalf("other calls=%d want 1 (unified walk)", postCount(&otherCalls))
 				}
 				if customHits.Load() != 0 {
 					t.Fatalf("custom hits=%d want 0 on 503 exhaustion", customHits.Load())
 				}
-				if attempts != tc.maxObservation {
-					t.Fatalf("attempts=%d want %d", attempts, tc.maxObservation)
+				if attempts != tc.maxObservation+1 {
+					t.Fatalf("attempts=%d want %d (maxObservation+walk)", attempts, tc.maxObservation+1)
 				}
 				pinAfter, _ := gw.scheduler.pinGet(ses, "m")
-				if pinAfter != pin {
-					t.Fatalf("pin must not drift on exhaustion: %+v -> %+v", pin, pinAfter)
+				if pinAfter.ProxyRaw == pin.ProxyRaw {
+					t.Fatalf("pin must move on exhaustion walk: %+v -> %+v", pin, pinAfter)
 				}
 				if _, _, ok := gw.scheduler.credential429CooldownStatus(pin.CredID); ok {
 					t.Fatalf("503 exhaustion must not write credential429 (early 503 must not be treated as 429)")

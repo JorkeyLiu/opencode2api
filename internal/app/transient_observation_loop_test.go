@@ -359,25 +359,20 @@ func TestPinnedAuthObservationLimitTransport(t *testing.T) {
 		})
 		pinBefore, _ := gw.scheduler.pinGet(ids.Session, "m")
 		resp, _, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
-		if err != nil {
-			t.Fatalf("err=%v", err)
-		}
-		if resp == nil || resp.StatusCode != 503 {
-			t.Fatalf("want 503, got %v", resp)
+		if err != nil || resp == nil || resp.StatusCode != 200 {
+			t.Fatalf("unified walk: 5xx must walk to 200, err=%v resp=%v", err, resp)
 		}
 		drainResp(resp)
 		if postCount(&pinnedCalls) != 1 {
 			t.Fatalf("pinned=%d want 1", postCount(&pinnedCalls))
 		}
-		if postCount(&otherCalls) != 0 {
-			t.Fatalf("other=%d want 0 (5xx never moves even at observation-limit)", postCount(&otherCalls))
+		if postCount(&otherCalls) != 1 {
+			t.Fatalf("other=%d want 1 (5xx walks)", postCount(&otherCalls))
 		}
-		if attempts != 1 {
-			t.Fatalf("attempts=%d want 1", attempts)
-		}
+		_ = attempts
 		pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
-		if pinAfter != pinBefore {
-			t.Fatalf("pin must not drift on 5xx: %+v -> %+v", pinBefore, pinAfter)
+		if pinAfter.ProxyRaw == pinBefore.ProxyRaw {
+			t.Fatalf("pin must move on 5xx walk: %+v -> %+v", pinBefore, pinAfter)
 		}
 	})
 }
@@ -433,36 +428,29 @@ func TestPinnedAuthMixed503TransportFinalObservation(t *testing.T) {
 		}
 		return nil, errors.New("dial timeout")
 	})
-	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
-	if err != nil {
-		t.Fatalf("single-proxy mixed final must return faithful 502 response, err=%v", err)
-	}
-	if resp == nil || resp.StatusCode != 502 {
-		t.Fatalf("want final-transport faithful 502 (not stale initial 503), got %v err=%v", resp, err)
+	ex := upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}}
+	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0, ex)
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("single-proxy mixed final must take over custom 200 (Final transport wins), err=%v resp=%v eff=%v", err, resp, eff)
 	}
 	drainResp(resp)
 	if postCount(&calls) != 2 {
 		t.Fatalf("pinned calls=%d want 2 (initial 503 + 1 transport observation)", postCount(&calls))
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d want 2", attempts)
+	if customHits.Load() != 1 {
+		t.Fatalf("custom hits=%d want 1 (single L1-final qualifies)", customHits.Load())
 	}
-	if eff.Tier == TierCustom {
-		t.Fatalf("single-proxy first non-429 must not take over custom")
-	}
-	if customHits.Load() != 0 {
-		t.Fatalf("custom hits=%d want 0 (single-proxy first non-429 never reaches custom)", customHits.Load())
-	}
-	if _, ok := gw.scheduler.fallbacks.get(ids.Session); ok {
-		t.Fatalf("mixed final must not create a fallback binding")
+	if _, ok := gw.scheduler.fallbacks.get(ids.Session); !ok {
+		t.Fatalf("mixed final must bind fallback")
 	}
 	pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
 	if pinAfter != pinBefore {
-		t.Fatalf("pin must not move on single-proxy mixed final: %+v -> %+v", pinBefore, pinAfter)
+		t.Fatalf("native pin must not move on custom takeover: %+v -> %+v", pinBefore, pinAfter)
 	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(pinBefore.CredID); ok {
 		t.Fatalf("mixed non-429 final must not write credential429")
 	}
+	_ = attempts
 }
 
 func TestPinnedAuthMixedFinalTransportWalksNextProxy(t *testing.T) {
@@ -649,28 +637,23 @@ func TestPinnedAuthReverseTransportToFinal403(t *testing.T) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	resp, eff, attempts, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), ids, 0)
-	if err != nil {
-		t.Fatalf("final 403 must return faithfully, err=%v", err)
-	}
-	if resp == nil || resp.StatusCode != 403 {
-		t.Fatalf("want final 403 (Final over Initial), got %v", resp)
+	if err != nil || resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("unified walk: final 403 must walk to 200, err=%v resp=%v eff=%v", err, resp, eff)
 	}
 	drainResp(resp)
 	if eff.Tier == TierCustom {
-		t.Fatalf("final 403 must not take over custom")
+		t.Fatalf("walk success must not take over custom")
 	}
 	if postCount(&calls) != 2 {
 		t.Fatalf("pinned calls=%d want 2 (initial transport + 403 observation)", postCount(&calls))
 	}
-	if postCount(&otherCalls) != 0 {
-		t.Fatalf("other=%d want 0 (final HTTP never takes an erroneous transport walk)", postCount(&otherCalls))
+	if postCount(&otherCalls) != 1 {
+		t.Fatalf("other=%d want 1 (403 walks)", postCount(&otherCalls))
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts=%d want 2", attempts)
-	}
+	_ = attempts
 	pinAfter, _ := gw.scheduler.pinGet(ids.Session, "m")
-	if pinAfter != pinBefore {
-		t.Fatalf("pin must not move on final 403: %+v -> %+v", pinBefore, pinAfter)
+	if pinAfter.ProxyRaw == pinBefore.ProxyRaw {
+		t.Fatalf("pin must move on final 403 walk: %+v -> %+v", pinBefore, pinAfter)
 	}
 	if _, ok := gw.scheduler.fallbacks.get(ids.Session); ok {
 		t.Fatalf("final 403 must not create a fallback binding")
@@ -733,23 +716,20 @@ func TestPinnedAuthSentinelPoisoning503(t *testing.T) {
 	route.ID = "m"
 	bodies := map[Tier][]byte{TierZen: []byte(`{"model":"m","stream":true}`)}
 	resp, _, _, err := gw.doUpstreamTiers(ctx, route, bodies, ids, 0, upstreamExtra{External: ProtocolChat, Payload: map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}})
-	if err != nil {
-		t.Fatalf("poisoned sentinel must return 502 response, err=%v", err)
-	}
-	if resp == nil || resp.StatusCode != 502 {
+	if err != nil || resp == nil || resp.StatusCode != 200 {
 		body := ""
 		if resp != nil && resp.Body != nil {
 			b, _ := io.ReadAll(resp.Body)
 			body = strings.TrimSpace(string(b))
 		}
-		t.Fatalf("status=%d want 502 (initial sentinel poisons later 503), body=%q", resp.StatusCode, body)
+		t.Fatalf("unified walk: sentinel+503 must walk to 200, status=%d body=%q err=%v", resp.StatusCode, body, err)
 	}
 	drainResp(resp)
 	if got := postCount(&pinnedCalls); got != 2 {
 		t.Fatalf("pinnedCalls=%d want 2 (sentinel + 503 observation)", got)
 	}
-	if got := postCount(&otherCalls); got != 0 {
-		t.Fatalf("otherCalls=%d want 0 (poisoned 502 never walks)", got)
+	if got := postCount(&otherCalls); got != 1 {
+		t.Fatalf("otherCalls=%d want 1 (startup walk)", got)
 	}
 }
 

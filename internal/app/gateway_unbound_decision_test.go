@@ -6,12 +6,13 @@ import (
 )
 
 // TestDecideCandidateRecovery covers the shared context-aware pure decision
-// across the four recovery lanes. It proves lane differences are preserved,
-// not flattened: context gates, 429/403 mapping, sentinel identity
-// (pinned-auth initial-or-final vs pinned-anonymous final-only vs unbound
-// advance), and pinned-auth transport walk vs faithful elsewhere.
+// across the four recovery lanes. Unified bound walk (optimal repair):
+// pinned anon+auth walk the next frozen proxy for stable 403 and for
+// L1-final transport/startup/408/425/5xx; 401 stays credential-global
+// faithful; 429 stashes; ordinary/400/context/build unchanged.
 func TestDecideCandidateRecovery(t *testing.T) {
 	sentinel := errors.New("upstream stream startup failure")
+	timeoutSentinel := errors.New("upstream stream startup timeout")
 	transportErr := errors.New("dial timeout")
 
 	cases := []struct {
@@ -66,22 +67,22 @@ func TestDecideCandidateRecovery(t *testing.T) {
 		{name: "live429/pinned-anon-stashes", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseLive429, Stop: transientStopStable}, want: recoveryLive429},
 		{name: "live429/pinned-auth-stashes", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseLive429, Stop: transientStopStable}, want: recoveryLive429},
 
-		// Target-scoped 403: unbound advances with mark, pinned stays faithful.
+		// Target-scoped 403: unbound advances with mark, pinned walks unified.
 		{name: "target403/unbound-marks", lane: recoveryLane{Bound: false, Anonymous: false}, in: stableCauseResult{Cause: stableCauseTargetForbidden, Stop: transientStopStable}, want: recoveryAdvanceNext, mark: true},
-		{name: "target403/pinned-anon-faithful", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseTargetForbidden, Stop: transientStopStable}, want: recoveryFaithful},
-		{name: "target403/pinned-auth-faithful", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseTargetForbidden, Stop: transientStopStable}, want: recoveryFaithful},
+		{name: "target403/pinned-anon-walks", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseTargetForbidden, Stop: transientStopStable}, want: recoveryWalkNext, mark: true},
+		{name: "target403/pinned-auth-walks", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseTargetForbidden, Stop: transientStopStable}, want: recoveryWalkNext, mark: true},
 
-		// Sentinel identity: pinned-auth initial-or-final, pinned-anon
-		// final-only, unbound advances.
-		{name: "sentinel/pinned-auth-initial-only", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Stop: transientStopObservationLimit, StreamSentinel: true, StillTransient: true}, want: recoverySentinel502},
-		{name: "sentinel/pinned-anon-initial-only-stays-faithful", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Resp: responseWithBody(503, `x`)}, Stop: transientStopObservationLimit, StreamSentinel: true, StillTransient: true}, want: recoveryFaithful},
-		{name: "sentinel/pinned-anon-final", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: sentinel}, Stop: transientStopObservationLimit}, want: recoverySentinel502},
+		// Startup sentinel walks unified (generic and bounded timeout).
+		{name: "sentinel/pinned-auth-walks", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Stop: transientStopObservationLimit, StreamSentinel: true, StillTransient: true}, want: recoveryWalkNext, mark: true},
+		{name: "sentinel/pinned-anon-walks", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Resp: responseWithBody(503, `x`)}, Stop: transientStopObservationLimit, StreamSentinel: true, StillTransient: true}, want: recoveryWalkNext, mark: true},
+		{name: "sentinel/pinned-anon-final-walks", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: sentinel}, Stop: transientStopObservationLimit}, want: recoveryWalkNext, mark: true},
+		{name: "sentinel-timeout/pinned-anon-walks", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: timeoutSentinel}, Stop: transientStopObservationLimit}, want: recoveryWalkNext, mark: true},
+		{name: "sentinel-timeout/pinned-auth-walks", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: timeoutSentinel}, Stop: transientStopObservationLimit}, want: recoveryWalkNext, mark: true},
 		{name: "sentinel/unbound-advances", lane: recoveryLane{Bound: false, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: sentinel}, Stop: transientStopObservationLimit, StreamSentinel: true}, want: recoveryAdvanceNext, mark: true},
 
-		// L1-final transport walks only on pinned-auth; 5xx-with-body stays
-		// faithful there too.
-		{name: "transport/pinned-auth-walks", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: transportErr}, Stop: transientStopObservationLimit}, want: recoveryWalkNext},
-		{name: "transport/pinned-anon-faithful", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: transportErr}, Stop: transientStopObservationLimit}, want: recoveryFaithful},
+		// L1-final transport walks unified on both pinned lanes.
+		{name: "transport/pinned-auth-walks", lane: recoveryLane{Bound: true, Anonymous: false}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: transportErr}, Stop: transientStopObservationLimit}, want: recoveryWalkNext, mark: true},
+		{name: "transport/pinned-anon-walks", lane: recoveryLane{Bound: true, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: transportErr}, Stop: transientStopObservationLimit}, want: recoveryWalkNext, mark: true},
 		{name: "transport/unbound-marks", lane: recoveryLane{Bound: false, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Final: attemptOutcome{Err: transportErr}, Stop: transientStopObservationLimit}, want: recoveryAdvanceNext, mark: true},
 		{name: "l1final/unbound-context-no-mark", lane: recoveryLane{Bound: false, Anonymous: true}, in: stableCauseResult{Cause: stableCauseL1Final, Stop: transientStopContext}, want: recoveryAdvanceNext},
 	}
@@ -89,7 +90,7 @@ func TestDecideCandidateRecovery(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			in := tc.in
 			// The 503-body case builds its response inline; drain after.
-			if in.Final.Resp != nil && (tc.name == "sentinel/pinned-anon-initial-only-stays-faithful") {
+			if in.Final.Resp != nil && (tc.name == "sentinel/pinned-anon-walks") {
 				defer drainResp(in.Final.Resp)
 			}
 			got := decideCandidateRecovery(tc.lane, in)

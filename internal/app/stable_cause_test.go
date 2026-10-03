@@ -371,20 +371,17 @@ func TestPinnedAuthContextEarlyReturn(t *testing.T) {
 	}{
 		{name: "stopContext", stop: transientStopContext, cancel: false, want: recoveryReturnContext},
 		{name: "stableCancelled", stop: transientStopStable, cancel: true, want: recoveryReturnContext},
-		{name: "observationLimitCancelledNoEarlyReturn", stop: transientStopObservationLimit, cancel: true, want: recoveryFaithful},
-		{name: "observationLimitNoCancel", stop: transientStopObservationLimit, cancel: false, want: recoveryFaithful},
-		{name: "stableNoCancel", stop: transientStopStable, cancel: false, want: recoveryFaithful},
+		{name: "observationLimitCancelledNoEarlyReturn", stop: transientStopObservationLimit, cancel: true, want: recoveryWalkNext},
+		{name: "observationLimitNoCancel", stop: transientStopObservationLimit, cancel: false, want: recoveryWalkNext},
+		{name: "stableNoCancel", stop: transientStopStable, cancel: false, want: recoveryWalkNext},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := mk(tc.stop, tc.cancel)
 			defer drainResp(r.Final.Resp)
-			// The strict pinned-auth context gate now lives in the shared
-			// decision: stop-context or stable+cancelled returns context; an
-			// observation-limit 503 final (transient fact) stays on the
-			// L1-final path even when the ctx cancelled after observation.
-			// 503-with-body carries no transport error, so the L1-final path
-			// is faithful (no walk).
+			// Unified bound walk: an observation-limit/stable 503 final
+			// walks the next frozen proxy; stop-context or stable+cancelled
+			// still returns context via the strict gate.
 			if got := decideCandidateRecovery(recoveryLane{Bound: true, Anonymous: false}, r); got.Action != tc.want {
 				t.Fatalf("action=%v want %v (stop=%v cancelled=%v)", got.Action, tc.want, tc.stop, tc.cancel)
 			}

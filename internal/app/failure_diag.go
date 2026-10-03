@@ -43,6 +43,7 @@ const (
 	FailureReasonConnectionReset        = "connection_reset"
 	FailureReasonUnexpectedEOF          = "unexpected_eof"
 	FailureReasonStreamStartupError     = "stream_startup_error"
+	FailureReasonStreamStartupTimeout   = "stream_startup_timeout"
 	FailureReasonTransportTimeout       = "transport_timeout"
 	FailureReasonTransportError         = "transport_error"
 	FailureReasonUnknown                = "unknown"
@@ -73,6 +74,7 @@ func validFailureReason(r string) bool {
 		FailureReasonConnectTimeout, FailureReasonDNSError,
 		FailureReasonTLSError, FailureReasonConnectionReset,
 		FailureReasonUnexpectedEOF, FailureReasonStreamStartupError,
+		FailureReasonStreamStartupTimeout,
 		FailureReasonTransportTimeout, FailureReasonTransportError,
 		FailureReasonUnknown:
 		return true
@@ -187,6 +189,14 @@ func failureDiagCallerCancel() failureDiag {
 //     neutral transport_error, never a bad-node label. Anything else is
 //     unknown/transport_timeout/transport_error, never invented locality.
 func classifyFailureDiag(ctx context.Context, resp *http.Response, err error, stageHint string, gateCause error) failureDiag {
+	// Candidate-local pre-commit startup timeout (per-attempt attempt_timeout
+	// expiry while the parent request is still live) is an observable
+	// node/target failure, never caller cancellation or request budget.
+	// It wins over generic ctx readings so the stall cools the target and
+	// walks/falls back instead of bypassing recovery as neutral.
+	if isStreamStartupTimeoutErr(err) || isStreamStartupTimeoutErr(gateCause) {
+		return failureDiag{Stage: FailureStageStreamStartup, Reason: FailureReasonStreamStartupTimeout}
+	}
 	if err == nil {
 		if resp == nil {
 			return failureDiag{}

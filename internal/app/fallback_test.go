@@ -293,26 +293,26 @@ func TestFallbackPinnedLocalCooldown429(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer drainResp(resp)
-		if resp.StatusCode != http.StatusTooManyRequests {
-			t.Fatalf("pre-cooled pinned anon zero-send must keep native 429, got %d %+v", resp.StatusCode, eff)
+		// Optimal repair: valid-binding zero-send with every actual proxy
+		// filtered (incl. pre-cooled 429) may take over active custom with
+		// attempts only custom and no fabricated credential429.
+		if resp.StatusCode != 200 || eff.Tier != TierCustom {
+			t.Fatalf("pre-cooled pinned anon zero-send must take over custom 200, got %d %+v", resp.StatusCode, eff)
 		}
-		if eff.Tier == TierCustom {
-			t.Fatalf("pre-cooled zero-send must not enter custom, eff=%+v", eff)
+		if customHits.Load() != 1 {
+			t.Fatalf("pre-cooled zero-send must hit custom once, hits=%d", customHits.Load())
 		}
-		if customHits.Load() != 0 {
-			t.Fatalf("pre-cooled zero-send must not hit custom, hits=%d", customHits.Load())
+		if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+			t.Fatalf("pre-cooled zero-send must bind fallback")
 		}
-		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-			t.Fatalf("pre-cooled zero-send must not bind fallback")
-		}
-		if attempts != 0 {
-			t.Fatalf("pre-cooled zero-send must have attempts 0, got %d", attempts)
+		if attempts != 1 {
+			t.Fatalf("pre-cooled zero-send must have attempts 1 (custom only), got %d", attempts)
 		}
 		if proxyHits.Load() != 0 {
 			t.Fatalf("pre-cooled zero-send must have proxyPosts 0, got %d", proxyHits.Load())
 		}
-		if got := resp.Header.Get("Retry-After"); got == "" {
-			t.Fatalf("pre-cooled 429 must retain Retry-After, got empty")
+		if _, _, ok := gw.scheduler.credential429CooldownStatus(anonymousSchedulerCredentialID); ok {
+			t.Fatalf("zero-send must not fabricate credential429")
 		}
 	})
 	t.Run("PinnedAuth", func(t *testing.T) {
@@ -344,26 +344,23 @@ func TestFallbackPinnedLocalCooldown429(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer drainResp(resp)
-		if resp.StatusCode != http.StatusTooManyRequests {
-			t.Fatalf("pre-cooled pinned auth zero-send must keep native 429, got %d %+v", resp.StatusCode, eff)
+		if resp.StatusCode != 200 || eff.Tier != TierCustom {
+			t.Fatalf("pre-cooled pinned auth zero-send must take over custom 200, got %d %+v", resp.StatusCode, eff)
 		}
-		if eff.Tier == TierCustom {
-			t.Fatalf("pre-cooled zero-send must not enter custom, eff=%+v", eff)
+		if customHits.Load() != 1 {
+			t.Fatalf("pre-cooled zero-send must hit custom once, hits=%d", customHits.Load())
 		}
-		if customHits.Load() != 0 {
-			t.Fatalf("pre-cooled zero-send must not hit custom, hits=%d", customHits.Load())
+		if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+			t.Fatalf("pre-cooled zero-send must bind fallback")
 		}
-		if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-			t.Fatalf("pre-cooled zero-send must not bind fallback")
-		}
-		if attempts != 0 {
-			t.Fatalf("pre-cooled zero-send must have attempts 0, got %d", attempts)
+		if attempts != 1 {
+			t.Fatalf("pre-cooled zero-send must have attempts 1 (custom only), got %d", attempts)
 		}
 		if proxyHits.Load() != 0 {
 			t.Fatalf("pre-cooled zero-send must have proxyPosts 0, got %d", proxyHits.Load())
 		}
-		if got := resp.Header.Get("Retry-After"); got == "" {
-			t.Fatalf("pre-cooled 429 must retain Retry-After, got empty")
+		if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
+			t.Fatalf("zero-send must not fabricate credential429")
 		}
 	})
 }

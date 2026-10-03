@@ -10,10 +10,9 @@ import (
 	"time"
 )
 
-// Pinned anonymous single/current proxy stream-startup failure is observed to
-// the L1 limit on the same target: local 502, never walks another proxy,
-// never takes over custom even when active. Uses real stream-gate behavior
-// (empty SSE => startup sentinel), not direct helper calls.
+// Pinned anonymous stream-startup failure is observed to the L1 limit on the
+// same target then walks the next frozen proxy (unified bound walk). Uses
+// real stream-gate behavior (empty SSE => startup sentinel).
 func TestPinnedAnonStreamStartupFailureNoWalkNoFallback(t *testing.T) {
 	var customHits atomic.Int32
 	gw := pinnedAnonTwoProxyGateway(t, &customHits, true)
@@ -66,24 +65,24 @@ func TestPinnedAnonStreamStartupFailureNoWalkNoFallback(t *testing.T) {
 		t.Fatalf("nil resp")
 	}
 	defer drainResp(resp)
-	if resp.StatusCode != 502 {
+	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status=%d want 502, body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
+		t.Fatalf("status=%d want 200 (walk to alternate), body=%q", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	if eff.Tier == TierCustom {
-		t.Fatalf("must not take over custom on pinned anon startup failure")
+		t.Fatalf("walk success must not take over custom")
 	}
 	if customHits.Load() != 0 {
-		t.Fatalf("custom hits=%d want 0 (no fallback)", customHits.Load())
+		t.Fatalf("custom hits=%d want 0 (native walk success)", customHits.Load())
 	}
 	if got := postCount(&pinnedCalls); got != 3 {
 		t.Fatalf("pinnedCalls=%d want 3 (initial + 2 same-target L1 observations)", got)
 	}
-	if got := postCount(&otherCalls); got != 0 {
-		t.Fatalf("otherCalls=%d want 0 (no proxy walk)", got)
+	if got := postCount(&otherCalls); got != 1 {
+		t.Fatalf("otherCalls=%d want 1 (unified walk)", got)
 	}
-	if attempts != 3 {
-		t.Fatalf("attempts=%d want 3", attempts)
+	if attempts != 4 {
+		t.Fatalf("attempts=%d want 4 (3 L1 + 1 walk)", attempts)
 	}
 	// Isolation: startup cools only its single target; proxy429/channel/
 	// credential429/credential401/suspect must stay unset, proxy stays healthy.
@@ -119,10 +118,10 @@ func TestPinnedAnonStreamStartupFailureNoWalkNoFallback(t *testing.T) {
 	// Pin/current selection unchanged: anonymous bindings never move.
 	after, ok := gw.scheduler.pinGet(ses, "m")
 	if !ok {
-		t.Fatalf("pin must survive startup failure")
+		t.Fatalf("pin must survive startup walk")
 	}
-	if after.ProxyRaw != pin.ProxyRaw || after.Pool != "a" || after.CredID != anonymousSchedulerCredentialID || after.Tier != TierZen {
-		t.Fatalf("pin must stay on current selection, before=%+v after=%+v", pin, after)
+	if after.ProxyRaw != ordered[1].name || after.Pool != "a" || after.CredID != anonymousSchedulerCredentialID || after.Tier != TierZen {
+		t.Fatalf("pin must move to alternate on walk success, before=%+v after=%+v", pin, after)
 	}
 	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
 		t.Fatalf("must not bind fallback on single-proxy startup failure")

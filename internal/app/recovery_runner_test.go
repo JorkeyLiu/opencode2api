@@ -117,8 +117,9 @@ func TestRunnerLaneDivergenceOnTransportFinal(t *testing.T) {
 		t.Fatalf("transport final must never replay")
 		return false, nil, nil, rel
 	}
-	// Pinned-auth walks the next proxy; pinned-anonymous stays faithful;
-	// unbound advances with mark. Same observation, three typed actions.
+	// Pinned-auth and pinned-anon both walk the next proxy (unified bound
+	// walk); unbound advances with mark. Same observation, two walk actions
+	// plus advance.
 	var sendsA, sendsB, sendsC int
 	attempts := 0
 	recA := gw.recoverSingleCandidate(context.Background(), recoveryLane{Bound: true, Anonymous: false}, TierZen, ProtocolChat, 2, 0, &attempts, 0, mkExec(&sendsA), replay)
@@ -129,8 +130,8 @@ func TestRunnerLaneDivergenceOnTransportFinal(t *testing.T) {
 	drainResp(recA.InitialResp)
 	attempts = 0
 	recB := gw.recoverSingleCandidate(context.Background(), recoveryLane{Bound: true, Anonymous: true}, TierZen, ProtocolChat, 2, 0, &attempts, 0, mkExec(&sendsB), replay)
-	if recB.Action != recoveryFaithful {
-		t.Fatalf("pinned-anon transport final must stay faithful: %+v", recB)
+	if recB.Action != recoveryWalkNext {
+		t.Fatalf("pinned-anon transport final must walk (unified): %+v", recB)
 	}
 	attempts = 0
 	recC := gw.recoverSingleCandidate(context.Background(), recoveryLane{Bound: false, Anonymous: false}, TierZen, ProtocolChat, 2, 0, &attempts, 0, mkExec(&sendsC), replay)

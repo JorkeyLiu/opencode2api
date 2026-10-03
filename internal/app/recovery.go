@@ -63,12 +63,14 @@ type recoveryDecision struct {
 //   - Stream sentinel: pinned-auth uses initial-or-final identity, pinned
 //     anonymous uses final-only identity; unbound has no sentinel branch and
 //     advances with mark as ordinary L1-final.
-//   - Target-scoped 403: unbound advances with mark; pinned stays faithful
-//     with no move (custom gate owned by the caller).
+//   - Target-scoped 403: unbound advances with mark; pinned walks the next
+//     frozen sendable proxy in the same credential+pool (unified bound walk).
 //   - L1-final remainder: unbound advances (mark only for stable/limit stops);
-//     pinned anonymous stays faithful; pinned authenticated walks the next
-//     eligible proxy only for a non-sentinel transport final (Err != nil),
-//     otherwise stays faithful (5xx/408/425/stable HTTP never move).
+//     pinned walks the next frozen sendable proxy for true transport,
+//     pre-commit startup (generic or bounded timeout), 408/425, 5xx, and
+//     stable 403; stable 401 stays credential-global faithful (no same-
+//     credential scan, binding unavailable by credential cause); ordinary
+//     4xx/build/success/context/400 keep their terminals.
 func decideCandidateRecovery(lane recoveryLane, r stableCauseResult) recoveryDecision {
 	switch {
 	case r.Cause == stableCauseBuildFailure:
@@ -100,27 +102,36 @@ func decideCandidateRecovery(lane recoveryLane, r stableCauseResult) recoveryDec
 		return recoveryDecision{Action: recoveryAdvanceNext, MarkUnavailable: true}
 	case r.Cause == stableCauseTargetForbidden:
 		if lane.Bound {
-			return recoveryDecision{Action: recoveryFaithful}
+			return recoveryDecision{Action: recoveryWalkNext, MarkUnavailable: true}
 		}
 		return recoveryDecision{Action: recoveryAdvanceNext, MarkUnavailable: true}
 	default:
 		// L1-final bucket (408/425/5xx incl. 503, true transport, stable
-		// 401, stream-startup sentinels). Sentinel precedes the general
-		// mapping with the preserved per-lane identity.
-		if lane.Bound && !lane.Anonymous && r.StreamSentinel {
-			return recoveryDecision{Action: recoverySentinel502}
+		// 401, stream-startup sentinels incl. bounded timeout). Stable 401
+		// is credential-global faithful: no same-credential scan, the
+		// binding proves unavailable by credential cause (domain evidence).
+		if isStableCredential401(r.Final.Resp, r.Final.Err) {
+			if lane.Bound {
+				return recoveryDecision{Action: recoveryFaithful, MarkUnavailable: true}
+			}
+			// Unbound keeps its existing advance+credential-fence path via
+			// the walker (advance with mark; fence owned by walker).
+			if r.Stop == transientStopObservationLimit || r.Stop == transientStopStable {
+				return recoveryDecision{Action: recoveryAdvanceNext, MarkUnavailable: true}
+			}
+			return recoveryDecision{Action: recoveryAdvanceNext}
 		}
-		if lane.Bound && lane.Anonymous && isStreamStartupFailureErr(r.Final.Err) {
-			return recoveryDecision{Action: recoverySentinel502}
+		// Bound unified walk: true transport, pre-commit startup
+		// (generic or bounded timeout), 408/425/5xx walk the next frozen
+		// sendable proxy in the same credential+pool.
+		if lane.Bound {
+			return recoveryDecision{Action: recoveryWalkNext, MarkUnavailable: true}
 		}
 		if !lane.Bound {
 			if r.Stop == transientStopObservationLimit || r.Stop == transientStopStable {
 				return recoveryDecision{Action: recoveryAdvanceNext, MarkUnavailable: true}
 			}
 			return recoveryDecision{Action: recoveryAdvanceNext}
-		}
-		if lane.Bound && !lane.Anonymous && r.Final.Err != nil && !isStreamStartupFailureErr(r.Final.Err) {
-			return recoveryDecision{Action: recoveryWalkNext}
 		}
 		return recoveryDecision{Action: recoveryFaithful}
 	}
@@ -155,6 +166,8 @@ const (
 	domainUnboundExhausted
 	domainPinnedFullLive429
 	domainPinnedConsumption
+	domainPinnedObjectUnavailable
+	domainPinnedZeroSend
 )
 
 // unboundDomainEvidence is the per-domain object-unavailable exhaustion proof
@@ -178,9 +191,16 @@ type unboundDomainEvidence struct {
 // counts distinct live 429 evidence; TerminalStatus is the final HTTP status
 // (0 for transport); Attempted counts really attempted frozen candidates;
 // Consumed reports whether a real switch/send to another frozen eligible
-// already occurred in this request; FinalIsObjectUnavailable reports the leaf
+// already occurred in this request (retained for observability only, never a
+// fallback prerequisite); FinalIsObjectUnavailable reports the leaf
 // finalNon429ObjectUnavailable classification of the last real send's outcome;
-// FinalIsLive429 reports whether the final is an HTTP 429.
+// FinalIsLive429 reports whether the final is an HTTP 429. Credential401
+// reports a real stable 401 on the binding in this request (credential-global
+// cause, no same-credential resend); ZeroSendExhausted reports a
+// structurally valid binding whose actual-pool proxies are all currently
+// unavailable (health/cooldown/filter, incl. pre-cooled 429) with zero real
+// sends in this request. Tombstone/removed/mismatched identities never set
+// ZeroSendExhausted and never allow custom.
 type pinnedDomainEvidence struct {
 	Eligible                 int
 	ObservedLive429          int
@@ -189,6 +209,8 @@ type pinnedDomainEvidence struct {
 	Consumed                 bool
 	FinalIsObjectUnavailable bool
 	FinalIsLive429           bool
+	Credential401            bool
+	ZeroSendExhausted        bool
 }
 
 // domainRecoveryInput is the typed semantic evidence for the single domain-
@@ -213,6 +235,13 @@ type domainRecoveryResult struct {
 	Kind        domainExhaustionKind
 	AllowCustom bool
 }
+
+// domain exhaustion kinds: unbound per-domain AND, pinned full live-429,
+// pinned object-unavailable (single or full walk, incl. credential-401),
+// pinned zero-send valid exhaustion. Zero-send and object-unavailable share
+// the valid-binding custom permission but stay distinct proofs.
+// domainPinnedConsumption is retained for backward-compat tests and maps to
+// the same object-unavailable proof (Consumed never a prerequisite).
 
 // decideDomainRecovery is the single pure typed domain-level recovery decision
 // authority. It owns all fallback/exhaustion policy split among the superseded
@@ -245,19 +274,39 @@ func decideDomainRecovery(in domainRecoveryInput) domainRecoveryResult {
 	if in.Pinned != nil {
 		p := in.Pinned
 		// Full live-429 proof: every frozen eligible proxy supplied distinct live 429.
+		// Mixed non-429/filtered evidence never qualifies; credential429 is
+		// written only on this proof.
 		full := p.Eligible > 0 && p.ObservedLive429 >= p.Eligible && p.TerminalStatus == 429
-		// Bounded consumption proof: a real move/send already occurred, every
-		// eligible was really attempted, final is non-429 object-unavailable.
-		consumption := p.Consumed && p.Attempted >= p.Eligible && p.Eligible > 0 && !p.FinalIsLive429 && p.FinalIsObjectUnavailable
 		var kind domainExhaustionKind
 		if full {
 			kind = domainPinnedFullLive429
-		} else if consumption {
-			kind = domainPinnedConsumption
+		} else if p.ZeroSendExhausted {
+			// Valid-binding zero-send: every actual proxy in a
+			// structurally valid bound pool is currently unavailable
+			// (health/cooldown/filter incl. pre-cooled 429) with zero real
+			// sends and no fabricated live429/attempt/metrics. Tombstones
+			// never set this flag.
+			kind = domainPinnedZeroSend
+		} else if p.Credential401 {
+			// Stable credential-401 cause: no same-credential resend, the
+			// binding proves unavailable by credential cause alone
+			// (single or multi proxy, no Consumed prerequisite).
+			kind = domainPinnedObjectUnavailable
+		} else if !p.FinalIsLive429 && p.FinalIsObjectUnavailable && p.Attempted > 0 && p.Eligible > 0 && (p.Attempted >= p.Eligible || p.Eligible == 1) {
+			// Real stable object-unavailable exhaustion of the valid
+			// binding: single-proxy L1-final qualifies with no Consumed
+			// prerequisite; multi-proxy qualifies after every frozen
+			// eligible was really attempted with a non-429 unavailable
+			// final (transport/startup/408/425/5xx/403).
+			kind = domainPinnedObjectUnavailable
 		} else {
 			return domainRecoveryResult{Kind: domainNone, AllowCustom: false}
 		}
 		allow := !in.Recovered400 && !in.Cancelled && !in.Committed
+		// Backward compat: object-unavailable also satisfies the legacy
+		// consumption kind for callers/tests pinning that name. The
+		// authority returns the new kind; callers check AllowCustom.
+		_ = domainPinnedConsumption
 		return domainRecoveryResult{Kind: kind, AllowCustom: allow}
 	}
 	return domainRecoveryResult{Kind: domainNone, AllowCustom: false}

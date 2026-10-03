@@ -390,21 +390,23 @@ func TestPinnedConsumptionAuthSingleNon429NoTakeover(t *testing.T) {
 	postStub(t, gw, "z", poolIndexByRaw(gw, "z", orderedTmp[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(403, `{"error":"forbidden"}`), nil
 	})
+	// Optimal repair: single-proxy stable 403 exhausts the valid binding
+	// with no Consumed prerequisite and takes over active custom.
 	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
-	if err != nil || resp == nil || resp.StatusCode != 403 {
-		t.Fatalf("single 403 must stay faithful 403, err=%v resp=%v", err, resp)
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("single 403 must take over custom 200, err=%v resp=%v eff=%v", err, resp, eff)
 	}
 	drainResp(resp)
-	if eff.Tier == TierCustom || customHits.Load() != 0 {
-		t.Fatalf("single non-429 must not hit custom")
+	if customHits.Load() != 1 {
+		t.Fatalf("single 403 must hit custom once, hits=%d", customHits.Load())
 	}
-	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-		t.Fatalf("must not bind fallback")
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("must bind fallback")
 	}
 }
 
-// Partial eligible unattempted: first proxy 403 ends the request without
-// sending the second eligible, so no consumption and no custom.
+// Unified bound walk: first proxy 403 walks to the second eligible and
+// succeeds natively with no custom. No consumption gate, no fallback bind.
 func TestPinnedConsumptionAuthPartialUnattemptedNoTakeover(t *testing.T) {
 	var customHits atomic.Int32
 	gw := customTakeoverTestGateway(t, &customHits, true)
@@ -422,15 +424,15 @@ func TestPinnedConsumptionAuthPartialUnattemptedNoTakeover(t *testing.T) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
-	if err != nil || resp == nil || resp.StatusCode != 403 {
-		t.Fatalf("first 403 must stay 403, err=%v resp=%v", err, resp)
+	if err != nil || resp == nil || resp.StatusCode != 200 {
+		t.Fatalf("first 403 must walk to second 200, err=%v resp=%v", err, resp)
 	}
 	drainResp(resp)
 	if eff.Tier == TierCustom || customHits.Load() != 0 {
-		t.Fatalf("unattempted eligible must not hit custom")
+		t.Fatalf("walk success must not hit custom")
 	}
-	if secondHits.Load() != 0 {
-		t.Fatalf("second eligible must stay unsent, hits=%d", secondHits.Load())
+	if secondHits.Load() != 1 {
+		t.Fatalf("second eligible must be sent once, hits=%d", secondHits.Load())
 	}
 	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
 		t.Fatalf("must not bind fallback")
@@ -783,16 +785,18 @@ func TestPinnedConsumptionAuthSingle401NoTakeover(t *testing.T) {
 	postStub(t, gw, "z", poolIndexByRaw(gw, "z", orderedTmp[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(401, `{"error":"unauthorized"}`), nil
 	})
+	// Optimal repair: stable credential-401 proves the binding unavailable
+	// by credential cause with no same-credential scan and takes over custom.
 	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), authOnlyRoute(), routeBodies(), pinIDs(ses, "r1"), 0, consumptionExtra())
-	if err != nil || resp == nil || resp.StatusCode != 401 {
-		t.Fatalf("single 401 must stay faithful 401, err=%v resp=%v", err, resp)
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("single 401 must take over custom 200, err=%v resp=%v eff=%v", err, resp, eff)
 	}
 	drainResp(resp)
-	if eff.Tier == TierCustom || customHits.Load() != 0 {
-		t.Fatalf("single 401 must not hit custom")
+	if customHits.Load() != 1 {
+		t.Fatalf("single 401 must hit custom once")
 	}
-	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-		t.Fatalf("single 401 must not bind fallback")
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("single 401 must bind fallback")
 	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(cred.id); ok {
 		t.Fatalf("single 401 must not write credential429")
@@ -818,16 +822,18 @@ func TestPinnedConsumptionAnonSingle401NoTakeover(t *testing.T) {
 	postStub(t, gw, "a", poolIndexByRaw(gw, "a", orderedTmp[0].name), nil, nil, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(401, `{"error":"unauthorized"}`), nil
 	})
+	// Optimal repair: anon credential-401 also proves unavailable by
+	// credential cause and takes over custom.
 	resp, eff, _, err := gw.doUpstreamTiers(pinTestCtx(), anonAuthRoute(), routeBodies(), pinIDs(ses, "r1"), 0, pinnedAnonConsumeExtra())
-	if err != nil || resp == nil || resp.StatusCode != 401 {
-		t.Fatalf("single anon 401 must stay faithful 401, err=%v resp=%v", err, resp)
+	if err != nil || resp == nil || resp.StatusCode != 200 || eff.Tier != TierCustom {
+		t.Fatalf("single anon 401 must take over custom 200, err=%v resp=%v eff=%v", err, resp, eff)
 	}
 	drainResp(resp)
-	if eff.Tier == TierCustom || customHits.Load() != 0 {
-		t.Fatalf("single anon 401 must not hit custom")
+	if customHits.Load() != 1 {
+		t.Fatalf("single anon 401 must hit custom once")
 	}
-	if _, ok := gw.scheduler.fallbacks.get(ses); ok {
-		t.Fatalf("single anon 401 must not bind fallback")
+	if _, ok := gw.scheduler.fallbacks.get(ses); !ok {
+		t.Fatalf("single anon 401 must bind fallback")
 	}
 	if _, _, ok := gw.scheduler.credential429CooldownStatus(anonymousSchedulerCredentialID); ok {
 		t.Fatalf("single anon 401 must not write credential429")

@@ -282,15 +282,12 @@ func TestExhausted503EmptySessionReturns503NoCustomFallback(t *testing.T) {
 	})
 	ids3 := pinIDs(ids2.Session, "req2")
 	resp2, eff2, _, err2 := gw.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids3, 0)
-	if err2 != nil {
-		t.Fatalf("err=%v", err2)
-	}
-	if resp2 == nil || resp2.StatusCode != 503 {
-		t.Fatalf("pinned exhausted want 503, got %v", resp2)
+	if err2 != nil || resp2 == nil || resp2.StatusCode != 200 {
+		t.Fatalf("pinned 503 must walk to alternate 200, err=%v resp=%v", err2, resp2)
 	}
 	drainResp(resp2)
 	if eff2.Tier == TierCustom {
-		t.Fatalf("pinned 503 must not fallback (5xx never moves, no consumption gate)")
+		t.Fatalf("walk success must not fallback")
 	}
 	if postCount(&pinnedCalls) != 3 {
 		t.Fatalf("pinned calls %d want 3", postCount(&pinnedCalls))

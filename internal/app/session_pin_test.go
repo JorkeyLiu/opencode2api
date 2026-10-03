@@ -347,12 +347,13 @@ func TestPinnedTransportRetryOnly(t *testing.T) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	ids2 := pinIDs(ids.Session, "req-pin-2")
-	_, _, _, err = gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
-	if err == nil {
-		t.Fatalf("pinned transport exhaustion must return error (outer 502)")
+	resp2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
+	if err != nil || resp2 == nil || resp2.StatusCode != 200 {
+		t.Fatalf("pinned transport must walk to alternate 200, err=%v resp=%v", err, resp2)
 	}
-	if postCount(&pinnedCalls) != 2 || postCount(&otherCalls) != 0 || postCount(&zenCalls) != 0 {
-		t.Fatalf("same-target retry only: pinned=%d other=%d zen=%d", postCount(&pinnedCalls), postCount(&otherCalls), postCount(&zenCalls))
+	drainResp(resp2)
+	if postCount(&otherCalls) != 1 || postCount(&zenCalls) != 0 {
+		t.Fatalf("unified walk: other=%d zen=%d want 1/0", postCount(&otherCalls), postCount(&zenCalls))
 	}
 }
 
@@ -390,12 +391,12 @@ func TestPinned5xxRetryOnly(t *testing.T) {
 	})
 	ids2 := pinIDs(ids.Session, "req-pin-2")
 	resp2, _, _, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
-	if err != nil || resp2.StatusCode != 500 {
-		t.Fatalf("err=%v resp=%v want final 500", err, resp2)
+	if err != nil || resp2.StatusCode != 200 {
+		t.Fatalf("pinned 5xx must walk to alternate 200, err=%v resp=%v", err, resp2)
 	}
 	drainResp(resp2)
-	if postCount(&pinnedCalls) != 2 || postCount(&otherCalls) != 0 || postCount(&zenCalls) != 0 {
-		t.Fatalf("5xx same-target only: pinned=%d other=%d zen=%d", postCount(&pinnedCalls), postCount(&otherCalls), postCount(&zenCalls))
+	if postCount(&otherCalls) != 1 || postCount(&zenCalls) != 0 {
+		t.Fatalf("5xx unified walk: other=%d zen=%d want 1/0", postCount(&otherCalls), postCount(&zenCalls))
 	}
 }
 
@@ -1526,8 +1527,8 @@ func TestPinnedCredentialCooldown401(t *testing.T) {
 	drainResp(resp3)
 }
 
-// Pinned anonymous 401/403/ordinary 4xx must not walk proxies, must preserve pin, and must not write proxy429.
-// Table covers 401, 403, 404, 422 with one POST to current, zero to alternate/auth/custom.
+// Pinned anonymous credential-401/ordinary 4xx stay faithful with no walk;
+// stable 403 walks unified to the alternate. Table covers 401, 403, 404, 422.
 func TestPinnedAnonymousNon429NoWalk(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1588,6 +1589,26 @@ func TestPinnedAnonymousNon429NoWalk(t *testing.T) {
 			resp2, _, attempts, err := gateway.doUpstreamTiers(pinTestCtx(), route, routeBodies(), ids2, 0)
 			if err != nil {
 				t.Fatalf("case %s err=%v", tc.name, err)
+			}
+			if tc.status == 403 {
+				// Unified walk: stable 403 walks to alternate 200.
+				if resp2 == nil || resp2.StatusCode != 200 {
+					t.Fatalf("case %s status=%v want 200 (walk)", tc.name, resp2)
+				}
+				drainResp(resp2)
+				if postCount(&pinnedCalls) != 1 || postCount(&otherCalls) != 1 {
+					t.Fatalf("case %s walk sends pinned=%d other=%d want 1/1", tc.name, postCount(&pinnedCalls), postCount(&otherCalls))
+				}
+				if postCount(&zenCalls) != 0 {
+					t.Fatalf("case %s auth sends=%d want 0", tc.name, postCount(&zenCalls))
+				}
+				pin2, _ := gateway.scheduler.pinGet(ses, "m")
+				if pin2.ProxyRaw == rawBefore {
+					t.Fatalf("case %s pin must move on 403 walk", tc.name)
+				}
+				_ = genBefore
+				_ = attempts
+				return
 			}
 			if resp2 == nil || resp2.StatusCode != tc.status {
 				t.Fatalf("case %s status=%v want %d", tc.name, resp2, tc.status)
