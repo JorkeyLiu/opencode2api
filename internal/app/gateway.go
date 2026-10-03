@@ -1643,14 +1643,15 @@ func (g *Gateway) observeSameTargetTransient(ctx context.Context, initial attemp
 
 // bindSessionPin records the successful target for derived session + model.
 // The key uses only the derived client session and model ID; the value is the
-// full target identity plus resolvable protocol/authority. Raw client signals
-// and pin state never leave the Gateway.
+// full target identity plus resolvable protocol/authority. Pool is the
+// immutable origin derivation scope; CurrentPool initializes to the winning
+// candidate pool. Raw client signals and pin state never leave the Gateway.
 func (g *Gateway) bindSessionPin(session, model string, tier Tier, credID, pool, proxyRaw string, protocol Protocol, authority string) {
 	if g == nil || g.scheduler == nil || session == "" || model == "" {
 		return
 	}
 	g.scheduler.pinBind(session, model, sessionPin{
-		Tier: tier, CredID: credID, Pool: pool, ProxyRaw: proxyRaw,
+		Tier: tier, CredID: credID, Pool: pool, CurrentPool: pool, ProxyRaw: proxyRaw,
 		Model: model, Protocol: protocol, Authority: authority,
 	})
 }
@@ -1668,7 +1669,7 @@ func (g *Gateway) bindSessionPinCtx(ctx context.Context, session, model string, 
 		return
 	}
 	g.scheduler.pinBindCtx(ctx, session, model, sessionPin{
-		Tier: tier, CredID: credID, Pool: pool, ProxyRaw: proxyRaw,
+		Tier: tier, CredID: credID, Pool: pool, CurrentPool: pool, ProxyRaw: proxyRaw,
 		Model: model, Protocol: protocol, Authority: authority,
 	})
 }
@@ -2165,10 +2166,11 @@ func (g *Gateway) doUpstreamTiersUnbound(ctx context.Context, route modelRoute, 
 	return nil, effectiveRoute, attempts, lastErr
 }
 
-// doPinnedUpstream serves a request bound to one binding. No cross-credential,
-// cross-pool, or cross-channel fallback is attempted: the walk stays within
-// the same credential+pool. The exact-400 same-target one-replay and the
-// same-target transient rules are preserved. Active credential or target
+// doPinnedUpstream serves a request bound to one binding. No cross-credential
+// or cross-channel fallback is attempted: the walk stays within the same
+// credential and the CURRENT channel-assigned pool (current resource
+// selection, never the removed origin pool). The exact-400 same-target
+// one-replay and the same-target transient rules are preserved. Active credential or target
 // cooldowns before send fail locally without an upstream send; removed or
 // unhealthy pinned resources fail locally with 502. Full 429 exhaustion of
 // the binding's sendable proxies tries the custom final fallback.
@@ -2201,14 +2203,19 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 		}
 		baseURL = g.cfg.Upstream.Zen
 		poolName = g.cfg.ProxyRouting.Anonymous
-		if pin.Pool != poolName || pin.Authority != normalizeRouteAuthority(baseURL) {
+		// CURRENT-POOL natural recovery: pin.Pool is the immutable
+		// route-session derivation origin, never a routing permission. A
+		// removed or reassigned origin pool alone is not a tombstone; the
+		// binding serves from the CURRENT channel-assigned pool. Only
+		// credential/authority/protocol/model removal still tombstones.
+		if pin.Authority != normalizeRouteAuthority(baseURL) {
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 	case pin.Tier == TierZen:
 		baseURL = g.cfg.Upstream.Zen
 		poolName = g.authPoolName()
 		wantCreds = g.credentials()
-		if pin.Pool != poolName || pin.Authority != normalizeRouteAuthority(baseURL) {
+		if pin.Authority != normalizeRouteAuthority(baseURL) {
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 	default:
@@ -2235,7 +2242,10 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 			return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 		}
 	}
-	if g.pools[pin.Pool] == nil {
+	// The CURRENT channel-assigned pool is the only resource constraint. A
+	// missing or empty actual pool cannot serve and fails locally; the
+	// removed origin pool never gates here.
+	if poolName == "" || g.pools[poolName] == nil {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	now := time.Now()
@@ -2297,11 +2307,14 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 }
 
 // doPinnedAnonymous serves an established anonymous binding
-// proxy-independently: the durable identity fixes tier, credential, pool,
-// model, protocol, and authority; ProxyRaw is the generation-fenced mutable
-// current selection. The walk covers all currently sendable proxies in the
-// same pool with the same credential/model/protocol/authority, current first,
-// in stable affinity order, sharing one proxy-independent route session and
+// proxy-independently: the durable identity fixes tier, credential,
+// model, protocol, and authority; pin.Pool is only the immutable
+// route-session derivation origin. The (CurrentPool, ProxyRaw) pair is the
+// generation-fenced mutable current selection resolved from the CURRENT
+// channel-assigned pool. The walk covers all currently sendable proxies in
+// the CURRENT pool with the same credential/model/protocol/authority,
+// current first (only when the stored current pool matches the CURRENT pool),
+// in stable affinity order, sharing one origin-derived route session and
 // identical body bytes. Each proxy gets at most one 429 send (429 never
 // retries same-target). Local proxy429 cooldown skips without new evidence.
 // Unified bound walk: after the unique same-target L1 (true transport,
@@ -2314,11 +2327,16 @@ func (g *Gateway) doPinnedUpstream(ctx context.Context, route modelRoute, bodies
 // final fallback; tombstones never do; without custom the native
 // envelope/Retry-After is preserved.
 func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodies map[Tier][]byte, ids requestIDs, pin sessionPin, effectiveRoute modelRoute, baseURL string, protocol Protocol, body []byte, attemptOffset int, extra ...upstreamExtra) (*http.Response, modelRoute, int, error) {
-	pool := g.pools[pin.Pool]
+	actualPool := g.cfg.ProxyRouting.Anonymous
+	pool := g.pools[actualPool]
 	if pool == nil || len(pool.items) == 0 {
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	preferredRaw := ""
+	if pin.effectiveCurrentPool() == actualPool {
+		preferredRaw = pin.ProxyRaw
+	}
+	ordered := affinityProxyOrder(pool, pin.CredID, preferredRaw)
 	type eligibleProxy struct {
 		proxy *proxyTransport
 		raw   string
@@ -2329,17 +2347,17 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		if proxy == nil || !proxy.healthy.Load() {
 			continue
 		}
-		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, proxy.name, pin.Model)
+		identity := targetIdentity(pin.Tier, pin.CredID, actualPool, proxy.name, pin.Model)
 		if until, _, ok := g.scheduler.targetCooldownStatus(identity); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, actualPool, proxy.name); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, actualPool, proxy.name); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, actualPool, proxy.name); ok && until > nowNanos {
 			continue
 		}
 		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
@@ -2350,7 +2368,7 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			if proxy == nil {
 				continue
 			}
-			if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > latest {
+			if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, actualPool, proxy.name); ok && until > latest {
 				latest = until
 			}
 		}
@@ -2375,6 +2393,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
 	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: anonymousZenKey, CredDisplay: anonymousCredentialID, CredIndex: -1, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
+	// Origin-derived route session: pin.Pool is the immutable derivation
+	// origin, so pool switches keep the same rss_* and wire bytes.
 	scope := routeScopeForCandidate(baseURL, probe, protocol)
 	routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
 	// Frozen body already carries the native free agent shape when free
@@ -2397,10 +2417,10 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
 		}
-		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, ep.raw, pin.Model)
+		identity := targetIdentity(pin.Tier, pin.CredID, actualPool, ep.raw, pin.Model)
 		cand := targetCandidate{
 			Tier: pin.Tier, CredKey: anonymousZenKey, CredID: pin.CredID, CredDisplay: anonymousCredentialID,
-			CredIndex: -1, PoolName: pin.Pool, Proxy: ep.proxy,
+			CredIndex: -1, PoolName: actualPool, Proxy: ep.proxy,
 			ProxyRaw: ep.raw, Model: pin.Model, Identity: identity,
 		}
 		// Single-candidate recovery authority: one initial send, one bounded
@@ -2429,8 +2449,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			if last429 != nil {
 				drainAndClose(last429.Body)
 			}
-			if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
-				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
+			if (pin.effectiveCurrentPool() != actualPool || ep.raw != pin.ProxyRaw) && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, actualPool, ep.raw)
 			}
 			return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 		case recoveryReturnContext:
@@ -2446,8 +2466,8 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 			}
 			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		case recoveryReplayTerminal:
-			if rec.ReplayErr == nil && rec.ReplayResp != nil && rec.ReplayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
-				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
+			if rec.ReplayErr == nil && rec.ReplayResp != nil && rec.ReplayResp.StatusCode/100 == 2 && (pin.effectiveCurrentPool() != actualPool || ep.raw != pin.ProxyRaw) && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, actualPool, ep.raw)
 			}
 			return rec.ReplayResp, effectiveRoute, attemptOffset + attempts, rec.ReplayErr
 		case recoveryLive429:
@@ -2603,10 +2623,12 @@ func (g *Gateway) doPinnedAnonymous(ctx context.Context, route modelRoute, bodie
 }
 
 // doPinnedAuth serves an established authenticated binding proxy-independently.
-// The durable identity fixes tier, credential, pool, model, protocol, and
-// authority; ProxyRaw is the current/preferred selection with generation
-// fencing. The route session is proxy-independent so moves preserve the same
-// upstream session value and body bytes. Unified bound walk: after the unique
+// The durable identity fixes tier, credential, model, protocol, and
+// authority; pin.Pool is only the immutable route-session derivation origin.
+// The (CurrentPool, ProxyRaw) pair is the generation-fenced mutable current
+// selection resolved from the CURRENT channel-assigned pool (poolName). The
+// route session is origin-derived so moves preserve the same upstream session
+// value and body bytes. Unified bound walk: after the unique
 // same-target L1 (true transport, pre-commit startup incl. bounded timeout,
 // 408/425/5xx) or stable 403, walk the next frozen sendable proxy in the
 // same credential+pool; 429 walks with no L1; 401 is credential-global
@@ -2633,7 +2655,13 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 	// eligible set below so alternates still walk; only a fully filtered
 	// valid binding reaches the zero-send custom gate. Removed/mismatched
 	// identities already returned above as tombstone 502 with no custom.
-	ordered := affinityProxyOrder(pool, pin.CredID, pin.ProxyRaw)
+	// poolName is the CURRENT channel-assigned pool; pin.Pool stays only the
+	// origin derivation scope for the route session below.
+	preferredRaw := ""
+	if pin.effectiveCurrentPool() == poolName {
+		preferredRaw = pin.ProxyRaw
+	}
+	ordered := affinityProxyOrder(pool, pin.CredID, preferredRaw)
 	// Filter to eligible: healthy, not target-cooling, not tier-429-cooling,
 	// not tier-channel-cooling. Current proxy429/channel cooling does not
 	// fast-fail immediately; it is skipped in favor of the next eligible
@@ -2649,17 +2677,17 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		if proxy == nil || !proxy.healthy.Load() {
 			continue
 		}
-		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, proxy.name, pin.Model)
+		identity := targetIdentity(pin.Tier, pin.CredID, poolName, proxy.name, pin.Model)
 		if until, _, ok := g.scheduler.targetCooldownStatus(identity); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, poolName, proxy.name); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.channelCooldownStatus(pin.Tier, poolName, proxy.name); ok && until > nowNanos {
 			continue
 		}
-		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > nowNanos {
+		if until, _, ok := g.scheduler.suspectCooldownStatus(pin.Tier, poolName, proxy.name); ok && until > nowNanos {
 			continue
 		}
 		eligible = append(eligible, eligibleProxy{proxy: proxy, raw: proxy.name})
@@ -2690,7 +2718,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			if proxy == nil {
 				continue
 			}
-			if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, pin.Pool, proxy.name); ok && until > latest {
+			if until, _, ok := g.scheduler.proxy429CooldownStatus(pin.Tier, poolName, proxy.name); ok && until > latest {
 				latest = until
 			}
 		}
@@ -2699,7 +2727,7 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 		}
 		return pinLocalResponse(http.StatusBadGateway, 0, "upstream temporarily unavailable"), effectiveRoute, attemptOffset, nil
 	}
-	// Proxy-independent route session: identical across moves.
+	// Origin-derived route session: identical across current-pool moves.
 	probe := targetCandidate{Tier: pin.Tier, CredID: pin.CredID, CredKey: credKey, CredDisplay: credDisplay, CredIndex: credIndex, PoolName: pin.Pool, ProxyRaw: "", Model: pin.Model}
 	scope := routeScopeForCandidate(baseURL, probe, protocol)
 	routeSession := g.scheduler.routeSessionFor(ids.Session, scope)
@@ -2722,10 +2750,10 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			discardLast429()
 			return nil, effectiveRoute, attemptOffset + attempts, ctx.Err()
 		}
-		identity := targetIdentity(pin.Tier, pin.CredID, pin.Pool, ep.raw, pin.Model)
+		identity := targetIdentity(pin.Tier, pin.CredID, poolName, ep.raw, pin.Model)
 		cand := targetCandidate{
 			Tier: pin.Tier, CredKey: credKey, CredID: pin.CredID, CredDisplay: credDisplay,
-			CredIndex: credIndex, PoolName: pin.Pool, Proxy: ep.proxy,
+			CredIndex: credIndex, PoolName: poolName, Proxy: ep.proxy,
 			ProxyRaw: ep.raw, Model: pin.Model, Identity: identity,
 		}
 		// Single-candidate recovery authority: one initial send, one bounded
@@ -2747,16 +2775,16 @@ func (g *Gateway) doPinnedAuth(ctx context.Context, route modelRoute, bodies map
 			return nil, effectiveRoute, attemptOffset + attempts, final.BuildErr
 		case recoveryReturnSuccess:
 			discardLast429()
-			if ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
-				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
+			if (pin.effectiveCurrentPool() != poolName || ep.raw != pin.ProxyRaw) && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, poolName, ep.raw)
 			}
 			return final.Resp, effectiveRoute, attemptOffset + attempts, nil
 		case recoveryReturnContext:
 			discardLast429()
 			return final.Resp, effectiveRoute, attemptOffset + attempts, final.Err
 		case recoveryReplayTerminal:
-			if rec.ReplayErr == nil && rec.ReplayResp != nil && rec.ReplayResp.StatusCode/100 == 2 && ep.raw != pin.ProxyRaw && !isContextCancelled(ctx) {
-				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, ep.raw)
+			if rec.ReplayErr == nil && rec.ReplayResp != nil && rec.ReplayResp.StatusCode/100 == 2 && (pin.effectiveCurrentPool() != poolName || ep.raw != pin.ProxyRaw) && !isContextCancelled(ctx) {
+				_, _ = g.scheduler.pinMoveCurrentCtx(ctx, ids.Session, route.ID, pin.Generation, poolName, ep.raw)
 			}
 			return rec.ReplayResp, effectiveRoute, attemptOffset + attempts, rec.ReplayErr
 		case recoveryLive429:

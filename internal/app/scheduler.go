@@ -2686,18 +2686,21 @@ func credentialDisplayForID(credID string) string {
 
 const sessionPinStoreCap = 4096
 
-// sessionPin is the bound target for one derived session + model. It carries
-// the binding identity plus the mutable current proxy and generation. For both
-// channels ProxyRaw is the current/preferred selection fenced by Generation.
-// Raw client signals, key material, and pin state never leave this struct.
+// sessionPin is the bound target for one derived session + model. Pool is the
+// immutable establishment origin: it seeds the proxy-free route-session
+// derivation and never constrains current resource selection. CurrentPool is
+// the pool-qualified current resource selection paired with ProxyRaw; both
+// move atomically under Generation fencing. Empty CurrentPool is a legacy
+// compatible alias for Pool (existing tests/in-memory pins).
 type sessionPin struct {
-	Tier      Tier
-	CredID    string
-	Pool      string
-	ProxyRaw  string
-	Model     string
-	Protocol  Protocol
-	Authority string
+	Tier        Tier
+	CredID      string
+	Pool        string
+	CurrentPool string
+	ProxyRaw    string
+	Model       string
+	Protocol    Protocol
+	Authority   string
 	// Generation fences concurrent proxy moves for authenticated bindings.
 	// Anonymous bindings never move; generation stays zero.
 	Generation uint64
@@ -2706,10 +2709,21 @@ type sessionPin struct {
 // isAnonymousPin reports whether the pin uses the shared public credential.
 func (p sessionPin) isAnonymousPin() bool { return p.CredID == anonymousSchedulerCredentialID }
 
-// bindingEqual reports durable identity equality: proxy-independent for both
-// channels (excluding proxy and generation).
+// effectiveCurrentPool returns the pool-qualified current resource selection.
+// Empty CurrentPool (legacy pins/tests) aliases the origin Pool.
+func (p sessionPin) effectiveCurrentPool() string {
+	if p.CurrentPool == "" {
+		return p.Pool
+	}
+	return p.CurrentPool
+}
+
+// bindingEqual reports durable identity equality: credential, model,
+// protocol, and authority. Pool (origin derivation scope) and the current
+// (pool, proxy) selection plus generation are excluded: a proxy_routing
+// change is current resource selection only and never breaks the binding.
 func (p sessionPin) bindingEqual(other sessionPin) bool {
-	if p.Tier != other.Tier || p.CredID != other.CredID || p.Pool != other.Pool ||
+	if p.Tier != other.Tier || p.CredID != other.CredID ||
 		p.Model != other.Model || p.Protocol != other.Protocol || p.Authority != other.Authority {
 		return false
 	}
@@ -2791,6 +2805,9 @@ func (st *sessionPinStore) bind(session, model string, pin sessionPin) {
 	if pin.Model == "" {
 		pin.Model = model
 	}
+	if pin.CurrentPool == "" {
+		pin.CurrentPool = pin.Pool
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if existing, ok := st.entries[key]; ok && existing != nil {
@@ -2830,6 +2847,9 @@ func (st *sessionPinStore) bindCtx(ctx context.Context, session, model string, p
 	key := sessionPinKey(session, model)
 	if pin.Model == "" {
 		pin.Model = model
+	}
+	if pin.CurrentPool == "" {
+		pin.CurrentPool = pin.Pool
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -2953,20 +2973,22 @@ func (st *sessionPinStore) reservedCount() int {
 	return st.reserved
 }
 
-// pinMoveCurrent performs generation-fenced current-proxy update for an
-// established binding on either native channel. It succeeds only when the
-// stored binding identity still matches (proxy-independent) and the generation
-// equals the observed generation; stale in-flight outcomes cannot move the pin
-// back and competing moves cannot overwrite a newer selection or split one
-// session. Returns the new generation on success.
-func (s *targetScheduler) pinMoveCurrent(session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
-	if s == nil || s.pins == nil || session == "" || model == "" || newProxyRaw == "" {
+// pinMoveCurrent performs generation-fenced current-selection update for an
+// established binding on either native channel. It atomically moves the
+// pool-qualified current selection (actual pool + proxy raw) and succeeds
+// only when the generation equals the observed generation; stale in-flight
+// outcomes cannot move the pin back and competing moves converge to one
+// winner. Same raw URL in a different pool counts as a selection change
+// (generation increments) because resource identity is pool+URL. A cancelled
+// ctx never mutates (Ctx variant). No generation move on identical pair.
+func (s *targetScheduler) pinMoveCurrent(session, model string, expectedGen uint64, newPool, newProxyRaw string) (uint64, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" || newPool == "" || newProxyRaw == "" {
 		return 0, false
 	}
-	return s.pins.moveCurrent(session, model, expectedGen, newProxyRaw)
+	return s.pins.moveCurrent(session, model, expectedGen, newPool, newProxyRaw)
 }
 
-func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64, newPool, newProxyRaw string) (uint64, bool) {
 	if st == nil {
 		return 0, false
 	}
@@ -2980,9 +3002,10 @@ func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64
 	if entry.Generation != expectedGen {
 		return entry.Generation, false
 	}
-	if entry.ProxyRaw == newProxyRaw {
+	if entry.effectiveCurrentPool() == newPool && entry.ProxyRaw == newProxyRaw {
 		return entry.Generation, true
 	}
+	entry.CurrentPool = newPool
 	entry.ProxyRaw = newProxyRaw
 	entry.Generation++
 	return entry.Generation, true
@@ -2997,14 +3020,14 @@ func (st *sessionPinStore) moveCurrent(session, model string, expectedGen uint64
 // ctx and the store and never touches pin claims, waiters, the fallback
 // store, or first-wins. The non-ctx moveCurrent stays for tests and existing
 // non-gateway callers.
-func (s *targetScheduler) pinMoveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
-	if s == nil || s.pins == nil || session == "" || model == "" || newProxyRaw == "" {
+func (s *targetScheduler) pinMoveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newPool, newProxyRaw string) (uint64, bool) {
+	if s == nil || s.pins == nil || session == "" || model == "" || newPool == "" || newProxyRaw == "" {
 		return 0, false
 	}
-	return s.pins.moveCurrentCtx(ctx, session, model, expectedGen, newProxyRaw)
+	return s.pins.moveCurrentCtx(ctx, session, model, expectedGen, newPool, newProxyRaw)
 }
 
-func (st *sessionPinStore) moveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newProxyRaw string) (uint64, bool) {
+func (st *sessionPinStore) moveCurrentCtx(ctx context.Context, session, model string, expectedGen uint64, newPool, newProxyRaw string) (uint64, bool) {
 	if st == nil {
 		return 0, false
 	}
@@ -3021,22 +3044,72 @@ func (st *sessionPinStore) moveCurrentCtx(ctx context.Context, session, model st
 	if entry.Generation != expectedGen {
 		return entry.Generation, false
 	}
-	if entry.ProxyRaw == newProxyRaw {
+	if entry.effectiveCurrentPool() == newPool && entry.ProxyRaw == newProxyRaw {
 		return entry.Generation, true
 	}
+	entry.CurrentPool = newPool
 	entry.ProxyRaw = newProxyRaw
 	entry.Generation++
 	return entry.Generation, true
 }
 
+// retainedNativePinOriginScopes returns the exact proxy-free origin scope keys
+// for structurally valid retained native pins. A pin qualifies only when it
+// is TierZen with a known protocol, its authority matches the new Zen
+// authority, its credential still exists in the new gateway (cooldowns are
+// transient and never decide validity), and its model/origin pool are present.
+// The returned keys use routeSessionScope.key() with ProxyRaw == "" and
+// exclude client/model dimensions; pool-name alone never qualifies.
+func (st *sessionPinStore) retainedNativePinOriginScopes(validCreds map[string]bool, zenAuthority string) map[string]bool {
+	out := make(map[string]bool)
+	if st == nil {
+		return out
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for _, entry := range st.entries {
+		if entry == nil {
+			continue
+		}
+		if entry.Tier != TierZen {
+			continue
+		}
+		if entry.Protocol != ProtocolChat && entry.Protocol != ProtocolResponses && entry.Protocol != ProtocolAnthropic {
+			continue
+		}
+		if entry.Authority != zenAuthority {
+			continue
+		}
+		if entry.Model == "" || entry.Pool == "" {
+			continue
+		}
+		if !validCreds[entry.CredID] {
+			continue
+		}
+		scope := routeSessionScope{
+			Authority: entry.Authority,
+			Tier:      entry.Tier,
+			CredID:    entry.CredID,
+			Pool:      entry.Pool,
+			ProxyRaw:  "",
+			Protocol:  entry.Protocol,
+		}
+		out[scope.key()] = true
+	}
+	return out
+}
+
 // migratePinsFrom carries all existing pin identities up to the cap without
-// validity filtering. Removed or changed targets migrate as unresolved
-// tombstone-like bindings: the pinned resolver still matches them and fails
-// locally with 502 rather than re-establishing or falling back. Both channels
-// migrate with their current proxy and generation intact; validity is
-// proxy-independent (binding without proxy). Insertion is deterministic key
-// evicting. Restart remains the only clearing boundary (fresh store starts
-// empty).
+// validity filtering. Removed credentials/authorities/models/protocols migrate
+// as unresolved tombstone-like bindings: the pinned resolver still matches
+// them and fails locally with 502 rather than re-establishing or falling
+// back. A removed or reassigned origin pool alone is NOT a tombstone: the
+// origin Pool stays as the immutable route-session derivation origin while
+// the current (CurrentPool, ProxyRaw) selection is re-resolved from the
+// CURRENT channel-assigned pool on next serve. Both channels migrate with
+// their current selection and generation intact. Insertion is deterministic
+// key evicting. Restart remains the only clearing boundary (fresh store
+// starts empty).
 func (st *sessionPinStore) migratePinsFrom(old *sessionPinStore) int {
 	if st == nil || old == nil || st == old {
 		return 0
@@ -3066,6 +3139,9 @@ func (st *sessionPinStore) migratePinsFrom(old *sessionPinStore) int {
 			break
 		}
 		fresh := item.entry
+		if fresh.CurrentPool == "" {
+			fresh.CurrentPool = fresh.Pool
+		}
 		st.entries[item.key] = &fresh
 		migrated++
 	}

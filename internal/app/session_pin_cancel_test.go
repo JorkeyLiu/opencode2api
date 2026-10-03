@@ -55,22 +55,22 @@ func TestPinMoveCurrentCtxPreCancelledNoMove(t *testing.T) {
 	sched.pinBind("ses", "m", pin)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if gen, ok := sched.pinMoveCurrentCtx(ctx, "ses", "m", 0, "proxy-b"); ok || gen != 0 {
+	if gen, ok := sched.pinMoveCurrentCtx(ctx, "ses", "m", 0, "z", "proxy-b"); ok || gen != 0 {
 		t.Fatalf("pre-cancelled moveCtx must not move: gen=%d ok=%v", gen, ok)
 	}
 	if got, _ := sched.pinGet("ses", "m"); got.ProxyRaw != "proxy-a" || got.Generation != 0 {
 		t.Fatalf("pre-cancelled moveCtx must leave pin intact: %+v", got)
 	}
-	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 0, "proxy-b"); !ok || gen != 1 {
+	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 0, "z", "proxy-b"); !ok || gen != 1 {
 		t.Fatalf("uncancelled moveCtx must bump generation: gen=%d ok=%v", gen, ok)
 	}
 	if got, _ := sched.pinGet("ses", "m"); got.ProxyRaw != "proxy-b" || got.Generation != 1 {
 		t.Fatalf("moveCtx must update proxy with fencing: %+v", got)
 	}
-	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 0, "proxy-c"); ok || gen != 1 {
+	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 0, "z", "proxy-c"); ok || gen != 1 {
 		t.Fatalf("stale generation must be rejected: gen=%d ok=%v", gen, ok)
 	}
-	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 1, "proxy-b"); !ok || gen != 1 {
+	if gen, ok := sched.pinMoveCurrentCtx(context.Background(), "ses", "m", 1, "z", "proxy-b"); !ok || gen != 1 {
 		t.Fatalf("same-proxy move must be idempotent without bump: gen=%d ok=%v", gen, ok)
 	}
 	if got, _ := sched.pinGet("ses", "m"); got.ProxyRaw != "proxy-b" || got.Generation != 1 {

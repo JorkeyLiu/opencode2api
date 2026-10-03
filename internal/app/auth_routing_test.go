@@ -565,12 +565,12 @@ func TestAuthPinMoveFencing(t *testing.T) {
 	if !ok || got.Generation != 0 {
 		t.Fatalf("gen0 expected")
 	}
-	ng, ok := s.pinMoveCurrent("ses_fence", "m", 0, "p1")
+	ng, ok := s.pinMoveCurrent("ses_fence", "m", 0, "z", "p1")
 	if !ok || ng != 1 {
 		t.Fatalf("move gen0->p1 must succeed gen1")
 	}
 	// Stale move with old generation must fail and not move back.
-	if _, ok := s.pinMoveCurrent("ses_fence", "m", 0, "p0"); ok {
+	if _, ok := s.pinMoveCurrent("ses_fence", "m", 0, "z", "p0"); ok {
 		t.Fatalf("stale move must fail")
 	}
 	cur, _ := s.pinGet("ses_fence", "m")
@@ -579,10 +579,10 @@ func TestAuthPinMoveFencing(t *testing.T) {
 	}
 	// Competing moves with same expected gen: first wins.
 	s.pinBind("ses_race", "m", sessionPin{Tier: TierZen, CredID: "zen:aaa", Pool: "z", ProxyRaw: "p0", Model: "m", Protocol: ProtocolChat, Authority: auth})
-	if _, ok := s.pinMoveCurrent("ses_race", "m", 0, "p1"); !ok {
+	if _, ok := s.pinMoveCurrent("ses_race", "m", 0, "z", "p1"); !ok {
 		t.Fatalf("first move must win")
 	}
-	if _, ok := s.pinMoveCurrent("ses_race", "m", 0, "p2"); ok {
+	if _, ok := s.pinMoveCurrent("ses_race", "m", 0, "z", "p2"); ok {
 		t.Fatalf("second stale move must lose")
 	}
 	cur2, _ := s.pinGet("ses_race", "m")
@@ -591,14 +591,14 @@ func TestAuthPinMoveFencing(t *testing.T) {
 	}
 	// Anonymous moves with generation fencing like authenticated.
 	s.pinBind("ses_anon_fence", "m", sessionPin{Tier: TierZen, CredID: anonymousSchedulerCredentialID, Pool: "a", ProxyRaw: "p0", Model: "m", Protocol: ProtocolChat, Authority: auth})
-	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "p1"); !ok {
+	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "a", "p1"); !ok {
 		t.Fatalf("anon must move with generation fencing")
 	}
 	curAnon, _ := s.pinGet("ses_anon_fence", "m")
 	if curAnon.ProxyRaw != "p1" || curAnon.Generation != 1 {
 		t.Fatalf("anon move must update current+generation: %+v", curAnon)
 	}
-	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "p0"); ok {
+	if _, ok := s.pinMoveCurrent("ses_anon_fence", "m", 0, "a", "p0"); ok {
 		t.Fatalf("stale anon move must fail")
 	}
 }

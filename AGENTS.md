@@ -7,7 +7,7 @@
 
 ## 1. System Mental Model
 
-> **Supreme Principle — Session Recovery (会话恢复) is the highest behavioral principle.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier. Purpose: every recovery exists to let the session continue. Closed loop: `observe stability -> resolve stable cause -> continue session or faithfully return` (per target protocol). Unified semantic three layers (not object-queue projection): **L1 / Observe stability** — 观察稳定性，先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道/恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级。Stability first. Recovery domain: bound session = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single status code alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式。
+> **Supreme Principle — Session Recovery (会话恢复) is the highest behavioral principle.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier. Purpose: every recovery exists to let the session continue. Closed loop: `observe stability -> resolve stable cause -> continue session or faithfully return` (per target protocol). Unified semantic three layers (not object-queue projection): **L1 / Observe stability** — 观察稳定性，先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道/恢复域都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级。Stability first. Recovery domain: bound session = that session+model pin's credential + CURRENT channel-assigned pool sendable proxies (current resource selection, not pinned-pool permission; see ADR 0001 current-pool natural recovery); unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single status code alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式。
 
 - opencode2api is a Go 1.24 protocol gateway for OpenCode Zen. It
   exposes OpenAI-compatible Chat Completions, Responses, and Models APIs plus
@@ -78,8 +78,13 @@
   (durable binding selecting which target an established session+model may
   use); the former derives the upstream session value, the latter fixes the
   binding itself. Both anonymous and authenticated pins fix channel,
-  credential, pool, model, protocol, and authority while the proxy remains a
-  mutable current selection under generation fencing.
+  credential, model, protocol, authority, and the ORIGINAL upstream
+  route-session identity while pool is NOT fixed: the establishment pool
+  remains an immutable derivation-origin for wire compatibility only, never
+  routing permission nor a requirement that the pool stay configured; the
+  current (actual pool, proxy) pair is the mutable selection under generation
+  fencing resolved from the CURRENT channel-assigned pool (see ADR 0001
+  current-pool natural recovery).
 - Proxy identity is two-level: `proxy_pools` names stable pool identities and
   `proxy_routing` assigns exactly one pool each to the anonymous and
   authenticated channels (same or different). Top-level `proxies` /
@@ -116,7 +121,7 @@
   only) → authenticated keys → same-protocol passthrough or cross-protocol
   conversion → result recording (metrics, upstream attempts, usage when the
   upstream reports it).
-- **Supreme recovery closed loop (gateway first) — `observe stability -> resolve stable cause -> continue session or faithfully return`.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier; every recovery exists to let the session continue. The gateway absorbs steady-state fluctuations before exposing them to the client. **Unified semantic three layers (not object queue):** **L1 / Observe stability** — 先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3。Recovery domain: bound = that session+model pin's credential+pool sendable proxies; unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single HTTP status alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式，MUST NOT be invented as a complete matrix here. HTTP 400 is an illegal request and non-fluctuating: its same-target replay after cleaning Responses reasoning/`previous_response_id` 属于 L2 的稳定非法请求解决动作（corrective / policy-removal），不是 L1 retry，完成後按 L3 终止/忠实返回；it MUST keep same target, same route session, and same request identity, and its outcome is always the route's last recovery action with no further candidate, channel, or fallback. `fallback` is an L2 object-selection action taken only when the current object is stably unavailable and recovery-domain availability filtering leaves no sendable object; a single error code MUST NOT mechanically cut to fallback without exhaustion evidence of the current domain's available objects. The existing scheduler / pin / route-session domain ownership and the streaming committed-bytes stop invariant remain unchanged.
+- **Supreme recovery closed loop (gateway first) — `observe stability -> resolve stable cause -> continue session or faithfully return`.** The gateway is a *session recovery system*, not an HTTP-status-driven retrier; every recovery exists to let the session continue. The gateway absorbs steady-state fluctuations before exposing them to the client. **Unified semantic three layers (not object queue):** **L1 / Observe stability** — 先判断当前状态，本身已稳定则不重试，未稳定则用受约束的多次请求观察至稳定或停止，`retry` 属于这一层的观察手段，不是错误码/对象切换队列，从不立即重发、从不无限；**L2 / Resolve stable cause** — 解决已确认的稳定原因，按 `cause + current object + 当前上下文` 选择最小针对性动作：非法请求清理/修正（同目标 corrective replay，始终 before any client bytes）、代理节点不可用时换节点、对象耗尽时选择下一个可用对象、503 不设独立的 L2 持续观察（稳定性观察仅属 L1 并受其既有边界约束），L1-final 503 后仅按既有对象选择/耗尽规则解决，无法解决则进入忠实返回，代理/代理池/凭证/备用渠道都只是不同粒度的对象/候选，不是 L2/L3 的固定层级；**L3 / Continue session or faithfully return** — 解决成功则继续同一会话（保持必要的 pin/route-session/协议身份约束），解决失败或达到停止边界则按目标协议忠实返回，`fallback` 只是 L2 中一种对象选择/解决动作，不是固定“最后一级”，“恢复域”只是对象/候选组织与可用性过滤的上下文，不是比对象更高的恢复层级，不能把 proxy/pool/channel/domain 映射成 L2/L3。Recovery domain: bound = that session+model pin's credential + CURRENT channel-assigned pool sendable proxies (current resource selection, not pinned-pool permission); unbound = this request's frozen eligible targets; exhaustion = health/cooldown filtering leaves no sendable object. No single HTTP status alone qualifies for fallback; `retry.max_attempts` is L1 观察层判定稳定性所需的最小请求/观察计数，不是错误码/对象队列的统一配额，预算数值与退避以 ADR 为准且不冻结逐状态码矩阵，本指南仅保留抽象不变式，MUST NOT be invented as a complete matrix here. HTTP 400 is an illegal request and non-fluctuating: its same-target replay after cleaning Responses reasoning/`previous_response_id` 属于 L2 的稳定非法请求解决动作（corrective / policy-removal），不是 L1 retry，完成後按 L3 终止/忠实返回；it MUST keep same target, same route session, and same request identity, and its outcome is always the route's last recovery action with no further candidate, channel, or fallback. `fallback` is an L2 object-selection action taken only when the current object is stably unavailable and recovery-domain availability filtering leaves no sendable object; a single error code MUST NOT mechanically cut to fallback without exhaustion evidence of the current domain's available objects. The existing scheduler / pin / route-session domain ownership and the streaming committed-bytes stop invariant remain unchanged.
 - Session affinity spine: explicit client session headers or
   `metadata.session_id` win; otherwise the first user message derives a stable
   client session hash. The derived client session is the establishment identity
@@ -139,12 +144,18 @@
   wait cancellably, then adopt the pin or contend to become the next owner.
   The first upstream 2xx, including a successful exact-400 replay, pins
   session+model to the binding (channel, internal credential identity,
-  pool, model, protocol/authority validity) with the successful proxy as the
-  initial current selection.   After the pin,
-  every request stays inside that binding with no cross-credential/pool/channel
+  model, protocol/authority validity, plus the ORIGINAL upstream route-session
+  identity) with the successful proxy as the
+  initial current selection; the establishment pool is kept only as an
+  immutable derivation-origin for wire compatibility, never as routing
+  permission.   After the pin,
+  every request stays inside that binding with no cross-credential/channel
   fallback and
-  no anonymous→authenticated promotion. Bound anon/auth share one unified walk
-  inside the same credential+pool+channel/model/protocol/authority (current
+  no anonymous→authenticated promotion; the candidate pool is always the
+  CURRENT channel-assigned pool (current resource selection, never any-pool
+  trying, never credential/provider switching). Bound anon/auth share one unified walk
+  inside the same credential+channel/model/protocol/authority within the CURRENT
+  assigned pool (current
   first, stable affinity order, one shared proxy-free route session and
   identical body bytes, local proxy429 cooldowns skipped without new evidence,
   before any client bytes, never truncated by `retry.max_attempts`): stable
@@ -155,12 +166,19 @@
   still counting as binding unavailability. Exact-400 same-target corrective
   replay stays route-terminal on any replay result. Ordinary 4xx,
   build/config-identity/tombstone invalid, cancel/deadline, and committed
-  bytes stay faithful/local failures with no new credential/channel/pool
+  bytes stay faithful/local failures with no new credential/channel
   inside the native pin. A successful 2xx on an alternate updates only the
-  current proxy under generation fencing (concurrent moves converge to one
-  winner), preserving the proxy-free wire session/body identity. A
-  removed/unhealthy/unresolvable or identity-mismatched pinned binding fails
-  locally with 502 and never falls back on deletion. A valid binding whose
+  current (actual pool, proxy) pair under generation fencing (concurrent moves converge to one
+  winner; an original node still present in the CURRENT pool-qualified selection
+  is favored, else current affinity applies; all node health/suspect/429/channel/target
+  cooldowns and observability qualify the ACTUAL send pool, same URL in different
+  pools stays isolated), preserving the ORIGINAL route-session/wire/body identity. A
+  removed/unhealthy/unresolvable credential, provider authority, model, or protocol
+  identity-mismatched pinned binding fails
+  locally with 502 and never falls back on deletion; an old pool name alone
+  being removed or reassigned is NOT a tombstone and never causes an artificial
+  local 502 from pool-name mismatch, obligatory old-node failed POST, or extra
+  cross-pool migration event. A valid binding whose
   actual-pool proxies are all filtered by current health/cooldowns may
   zero-send to the active custom channel (including pre-cooled 429) with no
   fabricated live evidence/attempts/`credential429`/metrics; otherwise a valid
@@ -183,11 +201,16 @@
   channel+pool+URL identity with aggregate counts in the migration log,
   credential 429 by channel+key, route session by native target scope with the client
   dimension excluded from validity — both native scopes are proxy-free and
-  migrate only when pool-routable; legacy proxy-bound overrides drop and
-  re-derive statelessly — and still-fresh/idle-TTL filtering, pins
-  migrated by identity up to the pin cap with aggregate count
-  only where a removed target remains pinned and fails locally with 502 rather
-  than re-establishing; new resources start at
+  still-fresh overrides backing structurally valid native pins migrate even when the
+  original scope pool is unreferenced/removed; legacy proxy-bound overrides drop and
+  re-derive statelessly; unbound route-session scopes still resolve against the
+  CURRENT native candidates — and still-fresh/idle-TTL filtering, pins
+  with current selection and generation origin kept up to the pin cap with aggregate count
+  only where a removed credential/provider authority/model/protocol identity remains pinned
+  and fails locally with 502 rather
+  than re-establishing; an old pool name alone being removed or reassigned is NOT a
+  tombstone and keeps serving from the CURRENT assigned pool (see ADR 0001 current-pool
+  natural recovery); new resources start at
   zero / stateless, removed ones drop except pinned tombstones) → atomically write
   (temp file + `config.json.bak` + replace) → atomically switch new requests
   to the new instance. On write or init failure the old instance MUST keep
@@ -222,7 +245,7 @@
   (credential-scoped L2 cause, skips count as unavailable without sends) and,
   on full anonymous 429 exhaustion or 401-skipped exhaustion without a 400,
   still enters the authenticated channel; once pinned, the binding walks the
-  same credential+pool per the Session affinity spine (not a single target).
+  same credential+channel within the CURRENT assigned pool per the Session affinity spine (not a single target).
   Dispersion and fallback belong to
   the frozen order only (HRW/round-robin); same-target L1 observation never
   disperses. Each same-target transient (transport error, 408/425, 500-599,

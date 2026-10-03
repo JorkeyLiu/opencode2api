@@ -1309,7 +1309,8 @@ func TestPinMigrationTombstone502(t *testing.T) {
 		t.Fatalf("valid migrated pin must serve 200, err=%v resp=%v", err, keepResp)
 	}
 	drainResp(keepResp)
-	// Changed-pool tombstone: pool identity changed, pin still migrates then 502s.
+	// Changed-pool natural recovery: pool identity changed, pin still migrates
+	// and serves from the CURRENT assigned pool with origin-derived session.
 	oldGateway2, _ := NewGateway(oldNormalized, nil, NewMonitor())
 	oldGateway2.scheduler.pinBind("ses_pool", "m", keepPin)
 	newCfg2 := testGatewayConfig(map[string][]string{"other": {"direct"}}, ProxyRoutingConfig{Anonymous: "other", Authenticated: "other"})
@@ -1321,18 +1322,44 @@ func TestPinMigrationTombstone502(t *testing.T) {
 	if summary2.Pins != 1 {
 		t.Fatalf("changed-pool pin must still migrate, got %d", summary2.Pins)
 	}
+	if newGateway2.pools["shared"] != nil {
+		t.Fatalf("old pool must be unreferenced after routing switch")
+	}
 	var w0 atomic.Int32
-	postStub(t, newGateway2, "other", 0, &w0, nil, func(*http.Request) (*http.Response, error) {
+	wcap := &capturedUpstream{}
+	postStub(t, newGateway2, "other", 0, &w0, wcap, func(*http.Request) (*http.Response, error) {
 		return responseWithBody(200, `{"ok":true}`), nil
 	})
 	poolResp, _, poolAttempts, err := newGateway2.doUpstreamTiers(pinTestCtx(), validRoute, routeBodies(), pinIDs("ses_pool", "req-pool-1"), 0)
-	if err != nil || poolResp == nil || poolResp.StatusCode != 502 {
-		t.Fatalf("changed-pool tombstone must 502, err=%v resp=%v", err, poolResp)
-	}
-	if poolAttempts != 0 || postCount(&w0) != 0 {
-		t.Fatalf("changed-pool tombstone must not send: attempts=%d sends=%d", poolAttempts, postCount(&w0))
+	if err != nil || poolResp == nil || poolResp.StatusCode != 200 {
+		t.Fatalf("changed-pool pin must serve 200 from current pool, err=%v resp=%v", err, poolResp)
 	}
 	drainResp(poolResp)
+	if poolAttempts == 0 || postCount(&w0) != 1 {
+		t.Fatalf("changed-pool must send once via current pool: attempts=%d sends=%d", poolAttempts, postCount(&w0))
+	}
+	migrated, ok := newGateway2.scheduler.pinGet("ses_pool", "m")
+	if !ok {
+		t.Fatalf("changed-pool pin must remain after serve")
+	}
+	if migrated.Pool != "shared" {
+		t.Fatalf("origin pool must stay shared, got %q", migrated.Pool)
+	}
+	if migrated.effectiveCurrentPool() != "other" {
+		t.Fatalf("current pool must be other, got %+v", migrated)
+	}
+	if migrated.Generation != 1 {
+		t.Fatalf("pool change must bump generation, got %+v", migrated)
+	}
+	sessions, _ := wcap.get()
+	if len(sessions) != 1 || sessions[0] == "" {
+		t.Fatalf("current-pool send must carry wire session, got %v", sessions)
+	}
+	originProbe := targetCandidate{Tier: migrated.Tier, CredID: migrated.CredID, PoolName: "shared", Model: "m"}
+	wantSession := newGateway2.scheduler.routeSessionFor("ses_pool", routeScopeForCandidate(normalizeRouteAuthority(newNormalized2.Upstream.Zen), originProbe, ProtocolChat))
+	if sessions[0] != routeWireSession(wantSession) {
+		t.Fatalf("wire session must stay origin-derived: got %q want %q", sessions[0], routeWireSession(wantSession))
+	}
 }
 
 // Fresh construction starts empty: restart is the only clearing boundary and

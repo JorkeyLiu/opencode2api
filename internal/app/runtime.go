@@ -439,6 +439,14 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 	}
 	newGateway.scheduler.retainOnly(validCreds, validPoolProxy, validTierPool)
 	zenAuthority := normalizeRouteAuthority(newGateway.cfg.Upstream.Zen)
+	// Pins migrate before route sessions so retention can reference the
+	// actual retained (cap-truncated, deterministic-order) pin set. The two
+	// stores are disjoint and old inflight claims are never migrated, so
+	// reordering changes neither count nor old-gateway behavior.
+	if oldGateway.scheduler.pins != nil && newGateway.scheduler.pins != nil {
+		summary.Pins = newGateway.scheduler.pins.migratePinsFrom(oldGateway.scheduler.pins)
+	}
+	validPinOrigins := newGateway.scheduler.pins.retainedNativePinOriginScopes(validCreds, zenAuthority)
 	if oldGateway.scheduler.routeSessions != nil && newGateway.scheduler.routeSessions != nil {
 		validScope := func(scope routeSessionScope) bool {
 			if !validCreds[scope.CredID] {
@@ -451,35 +459,46 @@ func migrateGatewaySchedulerState(oldGateway, newGateway *Gateway) gatewayMigrat
 			if scope.ProxyRaw != "" {
 				return false
 			}
-			if _, ok := validPoolProxy[scope.Pool]; !ok {
-				return false
-			}
 			if scope.Protocol != ProtocolChat && scope.Protocol != ProtocolResponses && scope.Protocol != ProtocolAnthropic {
 				return false
 			}
-			// Target scope must still be routable: authority matches the tier
-			// upstream and the pool is still the assigned pool for that
-			// channel. Indexing by target scope (not client) keeps migration
-			// bounded.
+			// Ordinary unbound validity: the origin pool must still exist
+			// and still be the assigned pool for the scope's channel.
+			// A removed/unreferenced or reassigned origin pool alone keeps
+			// only the narrow exception below.
+			var assigned string
 			switch {
 			case scope.CredID == anonymousSchedulerCredentialID:
 				if scope.Tier != TierZen || scope.Authority != zenAuthority {
 					return false
 				}
-				return scope.Pool == newGateway.cfg.ProxyRouting.Anonymous
+				assigned = newGateway.cfg.ProxyRouting.Anonymous
 			case scope.Tier == TierZen:
 				if scope.Authority != zenAuthority {
 					return false
 				}
-				return scope.Pool == newGateway.authPoolName()
+				assigned = newGateway.authPoolName()
 			default:
 				return false
 			}
+			if _, ok := validPoolProxy[scope.Pool]; ok && scope.Pool == assigned {
+				return true
+			}
+			// CURRENT-POOL natural recovery narrow exception: the origin
+			// Pool is the immutable route-session derivation origin, never
+			// a routing permission. A still-fresh proxy-free scope is also
+			// retained when its exact scope key (authority, tier,
+			// credential, origin pool, protocol; client/model excluded)
+			// backs a retained structurally valid native pin, so rss_* and
+			// wire bytes stay stable across proxy_routing switches.
+			// Tombstone pins (removed credential/authority/protocol/model)
+			// never grant this exception, and pool name alone never does.
+			if validPinOrigins[scope.key()] {
+				return true
+			}
+			return false
 		}
 		newGateway.scheduler.routeSessions.migrateRouteSessionsFrom(oldGateway.scheduler.routeSessions, validScope)
-	}
-	if oldGateway.scheduler.pins != nil && newGateway.scheduler.pins != nil {
-		summary.Pins = newGateway.scheduler.pins.migratePinsFrom(oldGateway.scheduler.pins)
 	}
 	if oldGateway.scheduler.fallbacks != nil && newGateway.scheduler.fallbacks != nil {
 		summary.Fallbacks = newGateway.scheduler.fallbacks.migrateFallbackFrom(oldGateway.scheduler.fallbacks)
